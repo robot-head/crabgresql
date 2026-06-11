@@ -248,6 +248,7 @@ checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
 name = "catalog"
 version = "0.1.0"
 dependencies = [
+ "kv",
  "pgtypes",
  "proptest",
  "thiserror 2.0.18",

@@ -22,6 +22,38 @@ pub fn row_key(table_id: u32, rowid: u64) -> Vec<u8> {
     k
 }
 
+/// Reserved table id for system metadata (catalog, sequences, global meta).
+pub const SYSTEM_TABLE_ID: u32 = 0;
+
+fn system_prefix(tag: &str) -> Vec<u8> {
+    let mut k = Vec::new();
+    put_u32(&mut k, SYSTEM_TABLE_ID);
+    k.extend_from_slice(tag.as_bytes());
+    k.push(b'/');
+    k
+}
+
+/// Key for a table's stored schema: `/0/catalog/<name>`.
+pub fn catalog_key(table_name: &str) -> Vec<u8> {
+    let mut k = system_prefix("catalog");
+    k.extend_from_slice(table_name.as_bytes());
+    k
+}
+
+/// Key for a table's next-rowid sequence: `/0/seq/<table_id>`.
+pub fn seq_key(table_id: u32) -> Vec<u8> {
+    let mut k = system_prefix("seq");
+    put_u32(&mut k, table_id);
+    k
+}
+
+/// Key for the global next-table-id counter: `/0/meta/next_table_id`.
+pub fn meta_next_table_id_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"next_table_id");
+    k
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;
@@ -63,5 +95,33 @@ mod tests {
     fn rowid_of_rejects_wrong_table() {
         let k = row_key(7, 42);
         assert!(rowid_of(8, &k).is_err(), "wrong table id must be rejected");
+    }
+
+    #[test]
+    fn system_keys_are_distinct_and_under_table_zero() {
+        let cat = catalog_key("users");
+        let seq = seq_key(7);
+        let meta = meta_next_table_id_key();
+        // All start with the reserved table-id 0 prefix.
+        let zero = {
+            let mut k = Vec::new();
+            crate::keyenc::put_u32(&mut k, 0);
+            k
+        };
+        assert!(cat.starts_with(&zero));
+        assert!(seq.starts_with(&zero));
+        assert!(meta.starts_with(&zero));
+        // Distinct namespaces.
+        assert_ne!(cat, seq);
+        assert_ne!(seq, meta);
+        assert_ne!(catalog_key("a"), catalog_key("b"));
+        assert_ne!(seq_key(7), seq_key(8));
+    }
+
+    #[test]
+    fn system_keys_do_not_collide_with_user_rows() {
+        // User rows use table_id >= 1; system keys use table_id 0.
+        assert!(!catalog_key("t").starts_with(&table_prefix(1)));
+        assert!(!seq_key(1).starts_with(&table_prefix(1)));
     }
 }

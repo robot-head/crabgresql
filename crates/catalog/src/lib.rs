@@ -1,6 +1,8 @@
 //! In-memory system catalog: tables, their columns, and CRUD with PostgreSQL
 //! error codes. Persistence arrives in SP3; no pg_catalog SQL views in SP2.
 
+pub mod serde;
+
 use std::collections::HashMap;
 use std::sync::RwLock;
 

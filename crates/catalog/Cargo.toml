@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 pgtypes.workspace = true
+kv.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
