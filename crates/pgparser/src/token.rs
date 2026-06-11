@@ -20,6 +20,7 @@ pub enum Token {
     Le,
     Gt,
     Ge,
+    Param(u32),
     Eof,
 }
 

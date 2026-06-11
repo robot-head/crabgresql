@@ -95,6 +95,18 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
             b'=' => push1(&mut out, Token::Eq, &mut i),
             b'<' => push1(&mut out, Token::Lt, &mut i),
             b'>' => push1(&mut out, Token::Gt, &mut i),
+            b'$' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let start = i;
+                i += 1;
+                let ds = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: u32 = sql[ds..i]
+                    .parse()
+                    .map_err(|_| ParseError::new("parameter number out of range", start))?;
+                out.push((Token::Param(n), start));
+            }
             c if c.is_ascii_digit() => {
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -216,6 +228,11 @@ mod tests {
     fn unterminated_string_errors_with_position() {
         let e = lex("'abc").expect_err("unterminated");
         assert_eq!(e.position, 0);
+    }
+
+    #[test]
+    fn lexes_parameter_placeholder() {
+        assert_eq!(toks("$1")[0], Token::Param(1));
     }
 
     proptest! {
