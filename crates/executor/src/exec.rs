@@ -291,8 +291,17 @@ pub(crate) fn describe(
     engine: &SqlEngine,
     sql: &str,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let _ = (engine, sql);
-    Ok(Vec::new()) // real describe lands in Task 18
+    let statements = pgparser::parse(sql)?;
+    // Extended-protocol Describe targets a single statement.
+    let Some(Statement::Select(s)) = statements.first() else {
+        return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
+    };
+    let table = match &s.from {
+        Some(name) => Some(engine.catalog.get_table(name)?),
+        None => None,
+    };
+    let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
+    Ok(fields)
 }
 
 #[cfg(test)]
@@ -512,5 +521,29 @@ mod tests {
         let engine = SqlEngine::new();
         let err = engine.simple_query("SELCT 1").await.expect_err("syntax");
         assert_eq!(err.code, "42601");
+    }
+
+    #[tokio::test]
+    async fn describe_select_returns_field_types_without_executing() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, name text)").await;
+        let fields = engine
+            .describe("SELECT id, name FROM t")
+            .await
+            .expect("describe");
+        assert_eq!(
+            fields.iter().map(|f| f.type_oid).collect::<Vec<_>>(),
+            vec![pgtypes::oids::INT4, pgtypes::oids::TEXT]
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_non_select_has_no_fields() {
+        let engine = SqlEngine::new();
+        let fields = engine
+            .describe("CREATE TABLE t (id int4)")
+            .await
+            .expect("describe");
+        assert!(fields.is_empty());
     }
 }
