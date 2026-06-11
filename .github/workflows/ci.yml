@@ -16,3 +16,38 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses }
       - run: ./scripts/check-no-native.sh
+
+  conformance:
+    runs-on: ubuntu-latest
+    services:
+      oracle:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 54320:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: cargo build --locked -p crabgresql -p conformance
+      - run: ./scripts/psql-smoke.sh
+      - name: Run conformance harness
+        run: |
+          ./target/debug/crabgresql --listen 127.0.0.1:54333 &
+          sleep 2
+          ./target/debug/conformance \
+            --oracle-url "host=127.0.0.1 port=54320 user=postgres dbname=postgres" \
+            --subject-url "host=127.0.0.1 port=54333 user=crab dbname=crab" \
+            --corpus crates/conformance/corpus \
+            --out parity.json --summary parity.md
+      - run: cat parity.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parity-report
+          path: |
+            parity.json
+            parity.md
