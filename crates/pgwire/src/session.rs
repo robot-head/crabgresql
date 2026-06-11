@@ -407,6 +407,7 @@ where
                 if ext.failed {
                     continue;
                 }
+                // Cancel window: between extended messages no engine future runs; the pending flag in CancelRegistry makes a cancel received there fire on the next engine call.
                 let token = cancel.begin_query();
                 if let Err(e) = handle_execute(&ext, &*engine, &portal, token, &mut out).await {
                     fail_extended(&mut ext, &mut out, &e);

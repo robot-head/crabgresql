@@ -40,6 +40,8 @@ pub enum QueryResult {
 
 /// The seam between the wire protocol and the query engine. SP1 ships only
 /// `StubEngine`; the real engine arrives in SP2 behind this same trait.
+///
+/// Cancellation: the wire layer may DROP an in-flight simple_query future (tokio::select!). Engine implementations must be drop-safe mid-execution; SP2's real engine needs transaction cleanup on drop.
 pub trait Engine: Send + Sync + 'static {
     /// Execute the full text of a simple-protocol Query message (may contain
     /// multiple statements — splitting is the engine's job).
