@@ -19,14 +19,14 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     ty: c.ty,
                 })
                 .collect();
-            let _guard = engine.ddl_lock.lock().expect("ddl lock");
+            let _guard = engine.write_lock.lock().expect("write lock");
             catalog::create_table(&*engine.kv, name, cols)?;
             Ok(QueryResult::Command {
                 tag: "CREATE TABLE".into(),
             })
         }
         Statement::DropTable { name } => {
-            let _guard = engine.ddl_lock.lock().expect("ddl lock");
+            let _guard = engine.write_lock.lock().expect("write lock");
             catalog::drop_table(&*engine.kv, name)?;
             Ok(QueryResult::Command {
                 tag: "DROP TABLE".into(),
@@ -37,6 +37,12 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
             columns,
             rows,
         } => {
+            // Acquire the write lock BEFORE reading the sequence so the
+            // read-modify-write (read_seq → write_batch with bumped seq) is
+            // atomic with respect to other concurrent INSERTs.  execute() is
+            // a sync fn with no .await, so a std::sync::Mutex guard is safe
+            // here — it is never held across an await point.
+            let _guard = engine.write_lock.lock().expect("write lock");
             let t = catalog::get_table(&*engine.kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols

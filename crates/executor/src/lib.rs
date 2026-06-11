@@ -16,10 +16,14 @@ use pgwire::error::PgError;
 pub use error::ExecError;
 
 /// The SQL engine over a durable (or in-memory) KV store. Catalog and sequences
-/// live in the KV store; the DDL mutex serializes catalog mutations.
+/// live in the KV store; the write mutex serializes all writes (INSERT, CREATE
+/// TABLE, DROP TABLE). SELECT is lock-free (reads are safe concurrently).
+///
+/// SP3 is single-node autocommit with no MVCC, so one global write mutex is
+/// correct and simple — it is exactly the seam that SP4's transactions replace.
 pub struct SqlEngine {
     pub(crate) kv: Arc<dyn Kv>,
-    pub(crate) ddl_lock: Mutex<()>,
+    pub(crate) write_lock: Mutex<()>,
 }
 
 impl Default for SqlEngine {
@@ -42,7 +46,7 @@ impl SqlEngine {
     pub fn with_kv(kv: Arc<dyn Kv>) -> Self {
         Self {
             kv,
-            ddl_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }
     }
 
