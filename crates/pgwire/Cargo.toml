@@ -28,3 +28,4 @@ proptest = { workspace = true }
 rustls-rustcrypto.workspace = true
 rustls-pemfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
