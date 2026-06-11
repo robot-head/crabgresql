@@ -54,6 +54,28 @@ mod tests {
         assert!(take_u32(&mut cur).is_err());
     }
 
+    #[test]
+    fn order_preservation_boundaries() {
+        let enc = |v: u64| {
+            let mut b = Vec::new();
+            put_u64(&mut b, v);
+            b
+        };
+        // Adjacent low values, the top boundary, and a carry boundary.
+        assert!(enc(0) < enc(1));
+        assert!(enc(u64::MAX - 1) < enc(u64::MAX));
+        assert!(enc(0x00FF_FFFF_FFFF_FFFF) < enc(0x0100_0000_0000_0000));
+        // u32 boundaries too.
+        let enc32 = |v: u32| {
+            let mut b = Vec::new();
+            put_u32(&mut b, v);
+            b
+        };
+        assert!(enc32(0) < enc32(1));
+        assert!(enc32(u32::MAX - 1) < enc32(u32::MAX));
+        assert!(enc32(0x00FF_FFFF) < enc32(0x0100_0000));
+    }
+
     proptest! {
         #[test]
         fn u64_encoding_is_order_preserving(a: u64, b: u64) {

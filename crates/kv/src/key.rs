@@ -58,4 +58,10 @@ mod tests {
         let k = row_key(7, 42);
         assert_eq!(rowid_of(7, &k).expect("rowid"), 42);
     }
+
+    #[test]
+    fn rowid_of_rejects_wrong_table() {
+        let k = row_key(7, 42);
+        assert!(rowid_of(8, &k).is_err(), "wrong table id must be rejected");
+    }
 }
