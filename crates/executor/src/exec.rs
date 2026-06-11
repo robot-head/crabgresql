@@ -268,6 +268,11 @@ fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
                 }
             }
             (false, false) => {
+                // SLICE INVARIANT: each ORDER BY key position is type-homogeneous
+                // (one column = one declared type; one expression = one static
+                // type), so ops::compare never errors here. The Equal fallback is
+                // defensive — when CAST / heterogeneous keys arrive in a later SP,
+                // this must become a real error path or the sort loses total order.
                 let base = pgtypes::ops::compare(x, y)
                     .ok()
                     .flatten()
@@ -387,6 +392,20 @@ mod tests {
         let r = &run(&engine, "SELECT id FROM t ORDER BY id ASC").await[0];
         let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
         assert_eq!(got, vec![Some("1".into()), Some("2".into()), None]); // NULLS LAST
+    }
+
+    #[tokio::test]
+    async fn order_by_mixed_width_expression_key() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (a int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1),(3),(2)").await;
+        // a + 3000000000 promotes each key to int8; sort must still be 1,2,3.
+        let r = &run(&engine, "SELECT a FROM t ORDER BY a + 3000000000 ASC").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(
+            got,
+            vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
     }
 
     async fn run(engine: &SqlEngine, sql: &str) -> Vec<QueryResult> {
