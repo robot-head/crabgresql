@@ -3,8 +3,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac};
-use rand::Rng;
-use rand::distr::Alphanumeric;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -13,6 +11,37 @@ use crate::error::{PgError, sqlstate};
 type HmacSha256 = Hmac<Sha256>;
 
 pub const DEFAULT_ITERATIONS: u32 = 4096; // PostgreSQL's default
+
+/// Precomputed SCRAM-SHA-256 verifier — stores no plaintext password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScramVerifier {
+    pub salt: Vec<u8>,
+    pub iterations: u32,
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+}
+
+impl ScramVerifier {
+    pub fn from_password(password: &str, salt: Vec<u8>, iterations: u32) -> Self {
+        let mut salted = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted);
+        let client_key = hmac(&salted, b"Client Key");
+        let stored_key: [u8; 32] = Sha256::digest(&client_key).into();
+        let server_key: [u8; 32] =
+            hmac(&salted, b"Server Key").try_into().expect("hmac-sha256 is 32 bytes");
+        Self { salt, iterations, stored_key, server_key }
+    }
+
+    /// Deterministic fake verifier for an unknown user (mock authentication).
+    pub fn mock(server_secret: &[u8; 32], user: &str) -> Self {
+        let salt = hmac(server_secret, format!("mock-salt:{user}").as_bytes());
+        let stored_key: [u8; 32] =
+            hmac(server_secret, format!("mock-stored:{user}").as_bytes()).try_into().expect("32 bytes");
+        let server_key: [u8; 32] =
+            hmac(server_secret, format!("mock-server:{user}").as_bytes()).try_into().expect("32 bytes");
+        Self { salt, iterations: DEFAULT_ITERATIONS, stored_key, server_key }
+    }
+}
 
 enum State {
     Initial,
@@ -26,33 +55,23 @@ enum State {
 }
 
 pub struct ScramServer {
-    password: String,
-    salt: Vec<u8>,
-    iterations: u32,
+    verifier: ScramVerifier,
     server_nonce: String,
     state: State,
 }
 
 impl ScramServer {
-    pub fn new(password: &str) -> Self {
-        let salt: [u8; 16] = rand::rng().random();
-        let server_nonce: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(24)
-            .map(char::from)
-            .collect();
-        Self::new_with(password, salt.to_vec(), DEFAULT_ITERATIONS, server_nonce)
+    pub fn from_verifier(verifier: ScramVerifier, server_nonce: String) -> Self {
+        Self {
+            verifier,
+            server_nonce,
+            state: State::Initial,
+        }
     }
 
     /// Deterministic constructor for tests.
     pub fn new_with(password: &str, salt: Vec<u8>, iterations: u32, server_nonce: String) -> Self {
-        Self {
-            password: password.to_string(),
-            salt,
-            iterations,
-            server_nonce,
-            state: State::Initial,
-        }
+        Self::from_verifier(ScramVerifier::from_password(password, salt, iterations), server_nonce)
     }
 
     pub fn handle_client_first(&mut self, msg: &[u8]) -> Result<Vec<u8>, PgError> {
@@ -78,8 +97,8 @@ impl ScramServer {
         let full_nonce = format!("{client_nonce}{}", self.server_nonce);
         let server_first = format!(
             "r={full_nonce},s={},i={}",
-            B64.encode(&self.salt),
-            self.iterations
+            B64.encode(&self.verifier.salt),
+            self.verifier.iterations
         );
 
         self.state = State::SentServerFirst {
@@ -119,15 +138,7 @@ impl ScramServer {
             .map(|(head, _)| head)
             .ok_or_else(|| PgError::protocol("SCRAM: missing proof"))?;
 
-        let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(
-            self.password.as_bytes(),
-            &self.salt,
-            self.iterations,
-            &mut salted,
-        );
-        let client_key = hmac(&salted, b"Client Key");
-        let stored_key = Sha256::digest(&client_key);
+        let stored_key = self.verifier.stored_key;
         let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
         let client_signature = hmac(&stored_key, auth_message.as_bytes());
 
@@ -150,8 +161,7 @@ impl ScramServer {
             ));
         }
 
-        let server_key = hmac(&salted, b"Server Key");
-        let server_signature = hmac(&server_key, auth_message.as_bytes());
+        let server_signature = hmac(&self.verifier.server_key, auth_message.as_bytes());
         Ok(format!("v={}", B64.encode(server_signature)).into_bytes())
     }
 }
@@ -173,6 +183,54 @@ fn attr(msg: &str, name: char) -> Result<&str, PgError> {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
+
+    #[test]
+    fn verifier_from_password_then_verify_roundtrip() {
+        let salt = vec![1u8; 16];
+        let v = ScramVerifier::from_password("pencil", salt.clone(), 4096);
+        assert_eq!(v.salt, salt);
+        assert_eq!(v.iterations, 4096);
+        let mut server = ScramServer::from_verifier(v.clone(), "SNONCE".into());
+        let server_first = server
+            .handle_client_first(b"n,,n=user,r=CNONCE")
+            .expect("client-first");
+        let final_msg = client_final_for(&v, "pencil", "CNONCE", &server_first);
+        let server_final = server.handle_client_final(final_msg.as_bytes()).expect("verify");
+        assert!(server_final.starts_with(b"v="));
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_password() {
+        let v = ScramVerifier::from_password("pencil", vec![2u8; 16], 4096);
+        let mut server = ScramServer::from_verifier(v.clone(), "SNONCE".into());
+        let server_first = server.handle_client_first(b"n,,n=user,r=CNONCE").expect("cf");
+        let final_msg = client_final_for(&v, "WRONG", "CNONCE", &server_first);
+        let err = server.handle_client_final(final_msg.as_bytes()).expect_err("reject");
+        assert_eq!(err.code, crate::error::sqlstate::INVALID_PASSWORD);
+    }
+
+    fn client_final_for(v: &ScramVerifier, password: &str, cnonce: &str, server_first: &[u8]) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        let sf = std::str::from_utf8(server_first).expect("utf8");
+        let full_nonce = sf.split(',').find_map(|p| p.strip_prefix("r=")).expect("r");
+        let client_first_bare = format!("n=user,r={cnonce}");
+        let without_proof = format!("c=biws,r={full_nonce}");
+        let auth_message = format!("{client_first_bare},{sf},{without_proof}");
+        let mut salted = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &v.salt, v.iterations, &mut salted);
+        let mut m = Hmac::<Sha256>::new_from_slice(&salted).expect("hmac");
+        m.update(b"Client Key");
+        let client_key = m.finalize().into_bytes();
+        let stored_key = Sha256::digest(client_key);
+        let mut ms = Hmac::<Sha256>::new_from_slice(&stored_key).expect("hmac");
+        ms.update(auth_message.as_bytes());
+        let client_sig = ms.finalize().into_bytes();
+        let proof: Vec<u8> = client_key.iter().zip(client_sig.iter()).map(|(k, s)| k ^ s).collect();
+        format!("{without_proof},p={}", B64.encode(proof))
+    }
 
     /// The exact exchange from RFC 7677 §3 (user "user", password "pencil").
     #[test]

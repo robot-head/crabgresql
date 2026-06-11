@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use pgwire::session::{AuthMode, SessionConfig};
@@ -6,15 +5,23 @@ use pgwire::stub::StubEngine;
 use tokio::net::TcpListener;
 use tokio_postgres::NoTls;
 
+fn scram_config() -> SessionConfig {
+    use pgwire::scram::ScramVerifier;
+    let mut verifiers = std::collections::HashMap::new();
+    verifiers.insert(
+        "crab".to_string(),
+        ScramVerifier::from_password("hunter2", vec![7u8; 16], 4096),
+    );
+    SessionConfig {
+        auth: AuthMode::ScramSha256 { verifiers, mock_secret: [42u8; 32] },
+        ..SessionConfig::trust()
+    }
+}
+
 async fn spawn_scram_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    let mut users = HashMap::new();
-    users.insert("crab".to_string(), "hunter2".to_string());
-    let config = SessionConfig {
-        auth: AuthMode::ScramSha256 { users },
-        ..SessionConfig::trust()
-    };
+    let config = scram_config();
     tokio::spawn(pgwire::server::serve(
         listener,
         Arc::new(StubEngine::new()),

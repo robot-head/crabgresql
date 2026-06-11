@@ -78,32 +78,24 @@ fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
     match args.auth.as_str() {
         "trust" => Ok(SessionConfig::trust()),
         "scram" => {
+            use pgwire::scram::ScramVerifier;
+            use rand::Rng;
             if args.user_creds.is_empty() {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "--auth scram requires at least one --user-cred USER=PASSWORD",
-                ));
+                return Err(Error::new(ErrorKind::InvalidInput, "--auth scram requires --user-cred"));
             }
-            let mut users = std::collections::HashMap::new();
+            let mut verifiers = std::collections::HashMap::new();
             for cred in &args.user_creds {
-                let (user, password) = cred.split_once('=').ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("malformed --user-cred {cred:?}: expected USER=PASSWORD"),
-                    )
-                })?;
+                let (user, pass) = cred
+                    .split_once('=')
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "--user-cred must be USER=PASSWORD"))?;
                 if user.is_empty() {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("malformed --user-cred {cred:?}: user name must not be empty"),
-                    ));
+                    return Err(Error::new(ErrorKind::InvalidInput, "--user-cred user name is empty"));
                 }
-                users.insert(user.to_string(), password.to_string());
+                let salt: [u8; 16] = rand::rng().random();
+                verifiers.insert(user.to_string(), ScramVerifier::from_password(pass, salt.to_vec(), 4096));
             }
-            Ok(SessionConfig {
-                auth: pgwire::session::AuthMode::ScramSha256 { users },
-                ..SessionConfig::trust()
-            })
+            let mock_secret: [u8; 32] = rand::rng().random();
+            Ok(SessionConfig { auth: pgwire::session::AuthMode::ScramSha256 { verifiers, mock_secret }, ..SessionConfig::trust() })
         }
         other => Err(Error::new(
             ErrorKind::InvalidInput,

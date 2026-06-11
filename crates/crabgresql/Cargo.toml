@@ -17,3 +17,4 @@ tracing-subscriber.workspace = true
 rustls.workspace = true
 rustls-rustcrypto.workspace = true
 rustls-pemfile.workspace = true
+rand.workspace = true

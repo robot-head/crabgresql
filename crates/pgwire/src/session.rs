@@ -18,18 +18,13 @@ use crate::server::SessionCancel;
 #[derive(Debug, Clone)]
 pub enum AuthMode {
     Trust,
-    /// SCRAM-SHA-256 with users stored as PLAINTEXT passwords — an SP1
-    /// simplification with three linked gaps, all fixed together in SP2 by
-    /// storing SCRAM verifiers (StoredKey/ServerKey/salt/iters) like real
-    /// PostgreSQL:
-    /// 1. plaintext at rest;
-    /// 2. server pays PBKDF2 (4096 iters) per unauthenticated attempt
-    ///    (real SCRAM puts that cost on the client);
-    /// 3. unknown users get no SASL challenge — a username-enumeration
-    ///    oracle; the fix is mock authentication (RFC 5802 §7) against a
-    ///    deterministic fake verifier.
+    /// SCRAM-SHA-256 against stored verifiers (no plaintext at rest). A server
+    /// mock secret derives a deterministic fake verifier for unknown users so
+    /// the message sequence and timing match a real user — closing the
+    /// username-enumeration oracle (RFC 5802 mock authentication).
     ScramSha256 {
-        users: std::collections::HashMap<String, String>,
+        verifiers: std::collections::HashMap<String, crate::scram::ScramVerifier>,
+        mock_secret: [u8; 32],
     },
 }
 
@@ -307,24 +302,23 @@ where
             backend::authentication_ok(out);
             Ok(true)
         }
-        AuthMode::ScramSha256 { users } => {
+        AuthMode::ScramSha256 { verifiers, mock_secret } => {
             let user = startup_params
                 .iter()
                 .find(|(k, _)| k == "user")
                 .map(|(_, v)| v.as_str())
                 .unwrap_or_default();
-            // Unknown user: run no exchange, fail like PostgreSQL.
-            let Some(password) = users.get(user) else {
-                return send_auth_failure(stream, out, user).await.map(|()| false);
+            let verifier = match verifiers.get(user) {
+                Some(v) => v.clone(),
+                None => crate::scram::ScramVerifier::mock(mock_secret, user),
             };
 
             backend::authentication_sasl(out, &["SCRAM-SHA-256"]);
             stream.write_all(out).await?;
             out.clear();
 
-            // SASLInitialResponse: mechanism cstring + i32 length + body.
             let Some(mut body) = read_password(stream, inbuf).await? else {
-                return Ok(false); // client hung up
+                return Ok(false);
             };
             let mechanism = frontend::get_cstr(&mut body).map_err(|_| bad_proto())?;
             if mechanism != "SCRAM-SHA-256" {
@@ -336,7 +330,7 @@ where
             }
             let client_first = body;
 
-            let mut scram = crate::scram::ScramServer::new(password);
+            let mut scram = crate::scram::ScramServer::from_verifier(verifier, server_nonce());
             let server_first = match scram.handle_client_first(&client_first) {
                 Ok(m) => m,
                 Err(_) => return send_auth_failure(stream, out, user).await.map(|()| false),
@@ -345,7 +339,6 @@ where
             stream.write_all(out).await?;
             out.clear();
 
-            // SASLResponse: raw client-final bytes.
             let Some(client_final) = read_password(stream, inbuf).await? else {
                 return Ok(false);
             };
@@ -377,6 +370,12 @@ where
 
 fn bad_proto() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SASL message")
+}
+
+fn server_nonce() -> String {
+    use rand::Rng;
+    use rand::distr::Alphanumeric;
+    rand::rng().sample_iter(&Alphanumeric).take(24).map(char::from).collect()
 }
 
 /// Reads the next frontend message, expecting Password ('p'); returns its body.

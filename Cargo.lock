@@ -388,6 +388,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "pgwire",
+ "rand 0.9.4",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",
