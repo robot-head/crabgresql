@@ -81,5 +81,6 @@ mod tests {
         let e = PgError::error(sqlstate::SYNTAX_ERROR, "oops");
         assert_eq!(e.severity, Severity::Error);
         assert_eq!(e.code, "42601");
+        assert_eq!(e.message, "oops");
     }
 }
