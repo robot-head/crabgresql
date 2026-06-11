@@ -78,3 +78,26 @@ async fn undefined_table_errors_but_session_survives() {
     let v: i32 = rows[0].get(0);
     assert_eq!(v, 1);
 }
+
+#[tokio::test]
+async fn parameterized_query_is_unsupported_0a000() {
+    let client = connect(spawn().await).await;
+    // The SP2 slice is literals-only; $1 parameters must reach SQLSTATE 0A000
+    // (feature_not_supported), not a panic or a wrong code, through the real
+    // engine.  tokio-postgres sends this via the extended protocol (Parse →
+    // Describe); the server rejects it at Parse time when infer_type hits
+    // Expr::Param and returns ExecError::Unsupported → 0A000.
+    let err = client
+        .query("SELECT $1", &[&5_i32])
+        .await
+        .expect_err("parameters are not supported in the SP2 slice");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "0A000");
+    // Session survives — a normal query still works after the failed exchange.
+    let rows = client
+        .query("SELECT 1", &[])
+        .await
+        .expect("session survives");
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, 1);
+}
