@@ -31,7 +31,6 @@ impl Parser {
         t
     }
 
-    #[allow(dead_code)] // Task 12
     fn eat_keyword(&mut self, kw: Keyword) -> bool {
         if *self.peek() == Token::Keyword(kw) {
             self.bump();
@@ -53,7 +52,6 @@ impl Parser {
         }
     }
 
-    #[allow(dead_code)] // Task 12
     fn expect_ident(&mut self) -> Result<String, ParseError> {
         match self.bump() {
             Token::Ident(s) => Ok(s),
@@ -154,9 +152,210 @@ impl Parser {
         }
     }
 
-    #[allow(unreachable_code)] // Task 12
     pub(crate) fn program(&mut self) -> Result<Vec<crate::ast::Statement>, ParseError> {
-        unimplemented!("statement grammar lands in Task 12")
+        use crate::ast::Statement;
+        let mut stmts: Vec<Statement> = Vec::new();
+        loop {
+            while *self.peek() == Token::Semicolon {
+                self.bump();
+            }
+            if *self.peek() == Token::Eof {
+                break;
+            }
+            stmts.push(self.statement()?);
+            match self.peek() {
+                Token::Semicolon => {
+                    self.bump();
+                }
+                Token::Eof => break,
+                other => {
+                    return Err(ParseError::new(
+                        format!("expected ; or end of input, found {other:?}"),
+                        self.peek_pos(),
+                    ));
+                }
+            }
+        }
+        Ok(stmts)
+    }
+
+    fn statement(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        match self.peek() {
+            Token::Keyword(Keyword::Create) => self.create_table(),
+            Token::Keyword(Keyword::Drop) => self.drop_table(),
+            Token::Keyword(Keyword::Insert) => self.insert(),
+            Token::Keyword(Keyword::Select) => self.select(),
+            other => Err(ParseError::new(
+                format!("unexpected statement start {other:?}"),
+                self.peek_pos(),
+            )),
+        }
+    }
+
+    fn create_table(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{ColumnDef, Statement};
+        self.expect(&Token::Keyword(Keyword::Create))?;
+        self.expect(&Token::Keyword(Keyword::Table))?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            let col_name = self.expect_ident()?;
+            let type_pos = self.peek_pos();
+            let type_word = self.expect_ident()?;
+            let ty = pgtypes::ColumnType::from_sql_name(&type_word).ok_or_else(|| {
+                ParseError::new(format!("unknown type \"{type_word}\""), type_pos)
+            })?;
+            columns.push(ColumnDef { name: col_name, ty });
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn drop_table(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Drop))?;
+        self.expect(&Token::Keyword(Keyword::Table))?;
+        Ok(Statement::DropTable {
+            name: self.expect_ident()?,
+        })
+    }
+
+    fn insert(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Insert))?;
+        self.expect(&Token::Keyword(Keyword::Into))?;
+        let table = self.expect_ident()?;
+        let columns = if *self.peek() == Token::LParen {
+            self.bump();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect(&Token::Keyword(Keyword::Values))?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&Token::LParen)?;
+            let mut row = Vec::new();
+            loop {
+                row.push(self.expr(0)?);
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+            rows.push(row);
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn select(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{OrderItem, SelectItem, SelectStmt, Statement};
+        self.expect(&Token::Keyword(Keyword::Select))?;
+        let mut projection = Vec::new();
+        if *self.peek() == Token::Star {
+            self.bump();
+            projection.push(SelectItem::Wildcard);
+        } else {
+            loop {
+                let expr = self.expr(0)?;
+                let alias = if self.eat_keyword(Keyword::As) {
+                    Some(self.expect_ident()?)
+                } else if let Token::Ident(_) = self.peek() {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                projection.push(SelectItem::Expr { expr, alias });
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+        }
+        let from = if self.eat_keyword(Keyword::From) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        let filter = if self.eat_keyword(Keyword::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        let mut order_by = Vec::new();
+        if self.eat_keyword(Keyword::Order) {
+            self.expect(&Token::Keyword(Keyword::By))?;
+            loop {
+                let expr = self.expr(0)?;
+                let asc = if self.eat_keyword(Keyword::Desc) {
+                    false
+                } else {
+                    self.eat_keyword(Keyword::Asc);
+                    true
+                };
+                order_by.push(OrderItem { expr, asc });
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+        }
+        let limit = if self.eat_keyword(Keyword::Limit) {
+            let pos = self.peek_pos();
+            match self.bump() {
+                Token::IntLit(s) => Some(
+                    s.parse::<i64>()
+                        .map_err(|_| ParseError::new("LIMIT value out of range", pos))?,
+                ),
+                other => {
+                    return Err(ParseError::new(
+                        format!("expected LIMIT count, found {other:?}"),
+                        pos,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Statement::Select(SelectStmt {
+            projection,
+            from,
+            filter,
+            order_by,
+            limit,
+        }))
+    }
+
+    fn eat_comma(&mut self) -> bool {
+        if *self.peek() == Token::Comma {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -185,6 +384,106 @@ pub fn parse(sql: &str) -> Result<Vec<crate::ast::Statement>, ParseError> {
 mod tests {
     use super::*;
     use crate::ast::{BinaryOp, Expr, UnaryOp};
+    use crate::ast::{ColumnDef, SelectItem, Statement};
+    use pgtypes::ColumnType;
+
+    fn one(sql: &str) -> Statement {
+        let mut v = parse(sql).expect("parse");
+        assert_eq!(v.len(), 1);
+        v.pop().expect("one statement")
+    }
+
+    #[test]
+    fn parses_create_table() {
+        assert_eq!(
+            one("CREATE TABLE t (id int4, name text)"),
+            Statement::CreateTable {
+                name: "t".into(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        ty: ColumnType::Int4
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        ty: ColumnType::Text
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_column_type_is_error() {
+        let e = parse("CREATE TABLE t (x widget)").expect_err("bad type");
+        assert_eq!(e.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn parses_drop_table() {
+        assert_eq!(
+            one("DROP TABLE t"),
+            Statement::DropTable { name: "t".into() }
+        );
+    }
+
+    #[test]
+    fn parses_multi_row_insert_with_columns() {
+        match one("INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')") {
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(columns, Some(vec!["a".into(), "b".into()]));
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].len(), 2);
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_select_with_all_clauses() {
+        match one("SELECT a, b AS bee FROM t WHERE a > 1 ORDER BY a DESC, b LIMIT 10") {
+            Statement::Select(s) => {
+                assert_eq!(s.projection.len(), 2);
+                assert!(
+                    matches!(s.projection[1], SelectItem::Expr { alias: Some(ref n), .. } if n == "bee")
+                );
+                assert_eq!(s.from.as_deref(), Some("t"));
+                assert!(s.filter.is_some());
+                assert_eq!(s.order_by.len(), 2);
+                assert!(!s.order_by[0].asc); // DESC
+                assert!(s.order_by[1].asc); // default ASC
+                assert_eq!(s.limit, Some(10));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_select_star_no_from() {
+        match one("SELECT *") {
+            Statement::Select(s) => {
+                assert_eq!(s.projection, vec![SelectItem::Wildcard]);
+                assert!(s.from.is_none());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_multiple_statements() {
+        let v = parse("SELECT 1; SELECT 2;").expect("parse");
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn trailing_garbage_is_error() {
+        assert!(parse("SELECT 1 foo bar").is_err());
+    }
 
     fn expr(sql: &str) -> Expr {
         // Wrap in a SELECT so the public parse() entry can reach it once
