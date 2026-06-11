@@ -119,6 +119,7 @@ where
                 stream.write_all(&out).await?;
                 out.clear();
             }
+            // Every arm write_all()s eagerly, so there is never pending response data; Flush has nothing to drain and TcpStream::flush is a no-op.
             FrontendMessage::Flush => stream.flush().await?,
             // Extended protocol lands in its own task; until then reply with a
             // non-fatal error so clients fail a statement, not the session.

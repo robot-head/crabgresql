@@ -20,6 +20,7 @@ pub async fn serve<E: Engine>(
         let (stream, peer) = listener.accept().await?;
         let engine = Arc::clone(&engine);
         let config = Arc::clone(&config);
+        // TODO(config-era): connection cap (Semaphore) and pre-auth read timeout — slowloris guard. Deliberately deferred in SP1.
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, engine, config).await {
                 tracing::debug!("connection from {peer} ended: {e}");

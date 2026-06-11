@@ -92,3 +92,19 @@ async fn empty_query_returns_cleanly() {
             .any(|m| matches!(m, SimpleQueryMessage::Row(_)))
     );
 }
+
+#[tokio::test]
+async fn three_sequential_queries_on_one_session() {
+    let client = connect(spawn_server().await).await;
+    for _ in 0..3 {
+        let messages = client.simple_query("SELECT 1").await.expect("query");
+        let row = messages
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .expect("one row");
+        assert_eq!(row.get(0), Some("1"));
+    }
+}
