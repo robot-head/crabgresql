@@ -52,4 +52,28 @@ if [ -f "${CERT_DIR}/test-server.pem" ]; then
         echo "FAIL (TLS): expected '1', got '${out}'" >&2
         exit 1
     fi
+
+    # Leg 3: TLS + SCRAM-SHA-256 composed (headline spec criterion).
+    # psql performs SCRAM natively over TLS — no extra Rust deps required.
+    SCRAM_TLS_PORT=$((PORT + 2))
+    ./target/debug/crabgresql --listen "127.0.0.1:${SCRAM_TLS_PORT}" \
+        --tls-cert "${CERT_DIR}/test-server.pem" \
+        --tls-key "${CERT_DIR}/test-server-key.pem" \
+        --auth scram \
+        --user-cred "crab=hunter2" &
+    SCRAM_TLS_PID=$!
+    trap 'kill "$SERVER_PID" "${TLS_PID:-}" "${SCRAM_TLS_PID:-}" 2>/dev/null || true' EXIT
+    for _ in $(seq 10); do
+        if PGPASSWORD=hunter2 psql "host=127.0.0.1 port=${SCRAM_TLS_PORT} user=crab dbname=crab sslmode=require sslrootcert=${CERT_DIR}/test-ca.pem" -tAc 'SELECT 1' >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.3
+    done
+    out=$(PGPASSWORD=hunter2 psql "host=127.0.0.1 port=${SCRAM_TLS_PORT} user=crab dbname=crab sslmode=require sslrootcert=${CERT_DIR}/test-ca.pem" -tAc 'SELECT 1')
+    if [ "$out" = "1" ]; then
+        echo "PASS: psql over TLS+SCRAM SELECT 1 -> ${out}"
+    else
+        echo "FAIL (TLS+SCRAM): expected '1', got '${out}'" >&2
+        exit 1
+    fi
 fi

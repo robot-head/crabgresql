@@ -20,6 +20,14 @@ struct Args {
     /// Path to the server private key (PEM).
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<std::path::PathBuf>,
+
+    /// Authentication mode: "trust" or "scram".
+    #[arg(long, default_value = "trust")]
+    auth: String,
+
+    /// User credentials for --auth scram, as user=password (repeatable).
+    #[arg(long = "user-cred", value_name = "USER=PASSWORD")]
+    user_creds: Vec<String>,
 }
 
 fn tls_acceptor(
@@ -55,11 +63,51 @@ async fn main() -> std::io::Result<()> {
         (Some(c), Some(k)) => Some(tls_acceptor(c, k)?),
         _ => None,
     };
+    let session_config = build_session_config(&args)?;
     pgwire::server::serve_tls(
         listener,
         Arc::new(StubEngine::new()),
-        Arc::new(SessionConfig::trust()),
+        Arc::new(session_config),
         tls,
     )
     .await
+}
+
+fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
+    use std::io::{Error, ErrorKind};
+    match args.auth.as_str() {
+        "trust" => Ok(SessionConfig::trust()),
+        "scram" => {
+            if args.user_creds.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "--auth scram requires at least one --user-cred USER=PASSWORD",
+                ));
+            }
+            let mut users = std::collections::HashMap::new();
+            for cred in &args.user_creds {
+                let (user, password) = cred.split_once('=').ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("malformed --user-cred {cred:?}: expected USER=PASSWORD"),
+                    )
+                })?;
+                if user.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("malformed --user-cred {cred:?}: user name must not be empty"),
+                    ));
+                }
+                users.insert(user.to_string(), password.to_string());
+            }
+            Ok(SessionConfig {
+                auth: pgwire::session::AuthMode::ScramSha256 { users },
+                ..SessionConfig::trust()
+            })
+        }
+        other => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("unknown --auth {other:?}: expected \"trust\" or \"scram\""),
+        )),
+    }
 }
