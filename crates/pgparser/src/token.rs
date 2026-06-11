@@ -1,0 +1,78 @@
+//! Lexical tokens for the SP2 SQL slice.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Token {
+    Ident(String),
+    Keyword(Keyword),
+    IntLit(String),
+    StringLit(String),
+    LParen,
+    RParen,
+    Comma,
+    Semicolon,
+    Star,
+    Plus,
+    Minus,
+    Slash,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keyword {
+    Create,
+    Table,
+    Drop,
+    Insert,
+    Into,
+    Values,
+    Select,
+    From,
+    Where,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Limit,
+    And,
+    Or,
+    Not,
+    True,
+    False,
+    Null,
+    As,
+}
+
+impl Keyword {
+    pub fn from_word(w: &str) -> Option<Keyword> {
+        Some(match w {
+            "create" => Keyword::Create,
+            "table" => Keyword::Table,
+            "drop" => Keyword::Drop,
+            "insert" => Keyword::Insert,
+            "into" => Keyword::Into,
+            "values" => Keyword::Values,
+            "select" => Keyword::Select,
+            "from" => Keyword::From,
+            "where" => Keyword::Where,
+            "order" => Keyword::Order,
+            "by" => Keyword::By,
+            "asc" => Keyword::Asc,
+            "desc" => Keyword::Desc,
+            "limit" => Keyword::Limit,
+            "and" => Keyword::And,
+            "or" => Keyword::Or,
+            "not" => Keyword::Not,
+            "true" => Keyword::True,
+            "false" => Keyword::False,
+            "null" => Keyword::Null,
+            "as" => Keyword::As,
+            _ => return None,
+        })
+    }
+}
