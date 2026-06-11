@@ -125,46 +125,102 @@ pub async fn run_one(client: &tokio_postgres::Client, sql: &str) -> QueryOutcome
     }
 }
 
-/// Minimal statement splitter: semicolons outside single/double quotes and
-/// line comments. Dollar-quoting is NOT handled yet — tracked for the
-/// pg_regress import in SP2, which needs it.
-/// Doubled quotes ('') net-cancel under the toggle approach, keeping ; inside strings protected.
+/// Statement splitter: semicolons outside single/double quotes, line comments,
+/// and dollar-quoted strings. Doubled quotes ('') net-cancel under the toggle
+/// approach, keeping ; inside strings protected.
 pub fn split_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut current = String::new();
-    let mut chars = sql.chars().peekable();
+    let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
 
-    while let Some(c) = chars.next() {
-        if !in_single && !in_double && c == '-' && chars.peek() == Some(&'-') {
-            for c2 in chars.by_ref() {
-                if c2 == '\n' {
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Line comment (outside strings).
+        if !in_single && !in_double && c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Dollar-quoted string (outside other strings).
+        if !in_single
+            && !in_double
+            && c == b'$'
+            && let Some(tag_len) = dollar_tag_len(&bytes[i..])
+        {
+            let tag = &sql[i..i + tag_len];
+            current.push_str(tag);
+            i += tag_len;
+            // Consume until the matching closing tag.
+            loop {
+                if i >= bytes.len() {
+                    break; // unterminated; emit what we have
+                }
+                if sql[i..].starts_with(tag) {
+                    current.push_str(tag);
+                    i += tag_len;
                     break;
                 }
+                current.push(bytes[i] as char);
+                i += 1;
             }
             continue;
         }
         match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ';' if !in_single && !in_double => {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => {
                 let stmt = current.trim().to_string();
                 if !stmt.is_empty() {
                     statements.push(stmt);
                 }
                 current.clear();
+                i += 1;
                 continue;
             }
             _ => {}
         }
-        current.push(c);
+        current.push(c as char);
+        i += 1;
     }
     let stmt = current.trim().to_string();
     if !stmt.is_empty() {
         statements.push(stmt);
     }
     statements
+}
+
+/// If `s` begins with a dollar-quote opening tag (`$$` or `$tag$`), return its
+/// byte length, else None. A tag body is `[A-Za-z_][A-Za-z0-9_]*`.
+fn dollar_tag_len(s: &[u8]) -> Option<usize> {
+    if s.first() != Some(&b'$') {
+        return None;
+    }
+    let mut j = 1;
+    if s.get(j) == Some(&b'$') {
+        return Some(2); // `$$`
+    }
+    // First tag char must be a letter or underscore.
+    match s.get(j) {
+        Some(&b) if b == b'_' || b.is_ascii_alphabetic() => {}
+        _ => return None,
+    }
+    j += 1;
+    while let Some(&b) = s.get(j) {
+        if b == b'_' || b.is_ascii_alphanumeric() {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if s.get(j) == Some(&b'$') {
+        Some(j + 1)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +283,24 @@ mod tests {
         assert_eq!(
             split_statements(sql),
             vec!["SELECT 'it''s;bad'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_body_is_not_split_on_inner_semicolons() {
+        let sql = "SELECT 1;\nDO $$ BEGIN x; y; END $$;\nSELECT 2";
+        assert_eq!(
+            split_statements(sql),
+            vec!["SELECT 1", "DO $$ BEGIN x; y; END $$", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn tagged_dollar_quote_is_matched_by_tag() {
+        let sql = "SELECT $tag$a;b$tag$ ; SELECT 2";
+        assert_eq!(
+            split_statements(sql),
+            vec!["SELECT $tag$a;b$tag$", "SELECT 2"]
         );
     }
 }
