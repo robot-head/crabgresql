@@ -12,6 +12,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const DEFAULT_ITERATIONS: u32 = 4096; // PostgreSQL's default
 
+/// Salt length used for both real and mock verifiers. Mock salts MUST match
+/// the real salt length so the server-first `s=` field is the same size for
+/// known and unknown users (no username-enumeration oracle via salt length).
+pub const SALT_LEN: usize = 16;
+
 /// Precomputed SCRAM-SHA-256 verifier — stores no plaintext password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScramVerifier {
@@ -27,19 +32,32 @@ impl ScramVerifier {
         pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key: [u8; 32] = Sha256::digest(&client_key).into();
-        let server_key: [u8; 32] =
-            hmac(&salted, b"Server Key").try_into().expect("hmac-sha256 is 32 bytes");
-        Self { salt, iterations, stored_key, server_key }
+        let server_key: [u8; 32] = hmac(&salted, b"Server Key")
+            .try_into()
+            .expect("hmac-sha256 is 32 bytes");
+        Self {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        }
     }
 
     /// Deterministic fake verifier for an unknown user (mock authentication).
     pub fn mock(server_secret: &[u8; 32], user: &str) -> Self {
-        let salt = hmac(server_secret, format!("mock-salt:{user}").as_bytes());
-        let stored_key: [u8; 32] =
-            hmac(server_secret, format!("mock-stored:{user}").as_bytes()).try_into().expect("32 bytes");
-        let server_key: [u8; 32] =
-            hmac(server_secret, format!("mock-server:{user}").as_bytes()).try_into().expect("32 bytes");
-        Self { salt, iterations: DEFAULT_ITERATIONS, stored_key, server_key }
+        let salt = hmac(server_secret, format!("mock-salt:{user}").as_bytes())[..SALT_LEN].to_vec();
+        let stored_key: [u8; 32] = hmac(server_secret, format!("mock-stored:{user}").as_bytes())
+            .try_into()
+            .expect("32 bytes");
+        let server_key: [u8; 32] = hmac(server_secret, format!("mock-server:{user}").as_bytes())
+            .try_into()
+            .expect("32 bytes");
+        Self {
+            salt,
+            iterations: DEFAULT_ITERATIONS,
+            stored_key,
+            server_key,
+        }
     }
 }
 
@@ -71,7 +89,10 @@ impl ScramServer {
 
     /// Deterministic constructor for tests.
     pub fn new_with(password: &str, salt: Vec<u8>, iterations: u32, server_nonce: String) -> Self {
-        Self::from_verifier(ScramVerifier::from_password(password, salt, iterations), server_nonce)
+        Self::from_verifier(
+            ScramVerifier::from_password(password, salt, iterations),
+            server_nonce,
+        )
     }
 
     pub fn handle_client_first(&mut self, msg: &[u8]) -> Result<Vec<u8>, PgError> {
@@ -195,7 +216,9 @@ mod tests {
             .handle_client_first(b"n,,n=user,r=CNONCE")
             .expect("client-first");
         let final_msg = client_final_for(&v, "pencil", "CNONCE", &server_first);
-        let server_final = server.handle_client_final(final_msg.as_bytes()).expect("verify");
+        let server_final = server
+            .handle_client_final(final_msg.as_bytes())
+            .expect("verify");
         assert!(server_final.starts_with(b"v="));
     }
 
@@ -203,13 +226,22 @@ mod tests {
     fn verifier_rejects_wrong_password() {
         let v = ScramVerifier::from_password("pencil", vec![2u8; 16], 4096);
         let mut server = ScramServer::from_verifier(v.clone(), "SNONCE".into());
-        let server_first = server.handle_client_first(b"n,,n=user,r=CNONCE").expect("cf");
+        let server_first = server
+            .handle_client_first(b"n,,n=user,r=CNONCE")
+            .expect("cf");
         let final_msg = client_final_for(&v, "WRONG", "CNONCE", &server_first);
-        let err = server.handle_client_final(final_msg.as_bytes()).expect_err("reject");
+        let err = server
+            .handle_client_final(final_msg.as_bytes())
+            .expect_err("reject");
         assert_eq!(err.code, crate::error::sqlstate::INVALID_PASSWORD);
     }
 
-    fn client_final_for(v: &ScramVerifier, password: &str, cnonce: &str, server_first: &[u8]) -> String {
+    fn client_final_for(
+        v: &ScramVerifier,
+        password: &str,
+        cnonce: &str,
+        server_first: &[u8],
+    ) -> String {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as B64;
         use hmac::{Hmac, Mac};
@@ -228,7 +260,11 @@ mod tests {
         let mut ms = Hmac::<Sha256>::new_from_slice(&stored_key).expect("hmac");
         ms.update(auth_message.as_bytes());
         let client_sig = ms.finalize().into_bytes();
-        let proof: Vec<u8> = client_key.iter().zip(client_sig.iter()).map(|(k, s)| k ^ s).collect();
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_sig.iter())
+            .map(|(k, s)| k ^ s)
+            .collect();
         format!("{without_proof},p={}", B64.encode(proof))
     }
 

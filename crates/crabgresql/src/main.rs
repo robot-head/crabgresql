@@ -81,21 +81,36 @@ fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
             use pgwire::scram::ScramVerifier;
             use rand::Rng;
             if args.user_creds.is_empty() {
-                return Err(Error::new(ErrorKind::InvalidInput, "--auth scram requires --user-cred"));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "--auth scram requires --user-cred",
+                ));
             }
             let mut verifiers = std::collections::HashMap::new();
             for cred in &args.user_creds {
-                let (user, pass) = cred
-                    .split_once('=')
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "--user-cred must be USER=PASSWORD"))?;
+                let (user, pass) = cred.split_once('=').ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "--user-cred must be USER=PASSWORD")
+                })?;
                 if user.is_empty() {
-                    return Err(Error::new(ErrorKind::InvalidInput, "--user-cred user name is empty"));
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "--user-cred user name is empty",
+                    ));
                 }
-                let salt: [u8; 16] = rand::rng().random();
-                verifiers.insert(user.to_string(), ScramVerifier::from_password(pass, salt.to_vec(), 4096));
+                let salt: [u8; pgwire::scram::SALT_LEN] = rand::rng().random();
+                verifiers.insert(
+                    user.to_string(),
+                    ScramVerifier::from_password(pass, salt.to_vec(), 4096),
+                );
             }
             let mock_secret: [u8; 32] = rand::rng().random();
-            Ok(SessionConfig { auth: pgwire::session::AuthMode::ScramSha256 { verifiers, mock_secret }, ..SessionConfig::trust() })
+            Ok(SessionConfig {
+                auth: pgwire::session::AuthMode::ScramSha256 {
+                    verifiers,
+                    mock_secret,
+                },
+                ..SessionConfig::trust()
+            })
         }
         other => Err(Error::new(
             ErrorKind::InvalidInput,

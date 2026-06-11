@@ -302,7 +302,10 @@ where
             backend::authentication_ok(out);
             Ok(true)
         }
-        AuthMode::ScramSha256 { verifiers, mock_secret } => {
+        AuthMode::ScramSha256 {
+            verifiers,
+            mock_secret,
+        } => {
             let user = startup_params
                 .iter()
                 .find(|(k, _)| k == "user")
@@ -375,7 +378,11 @@ fn bad_proto() -> std::io::Error {
 fn server_nonce() -> String {
     use rand::Rng;
     use rand::distr::Alphanumeric;
-    rand::rng().sample_iter(&Alphanumeric).take(24).map(char::from).collect()
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect()
 }
 
 /// Reads the next frontend message, expecting Password ('p'); returns its body.
