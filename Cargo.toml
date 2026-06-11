@@ -29,7 +29,7 @@ rustls-rustcrypto = "0.0.2-alpha"
 rustls-pemfile = "2"
 sha2 = "0.10"
 hmac = "0.12"
-pbkdf2 = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 base64 = "0.22"
 rand = "0.9"
 subtle = "2"

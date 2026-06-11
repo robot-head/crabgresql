@@ -18,7 +18,9 @@ use crate::server::SessionCancel;
 #[derive(Debug, Clone)]
 pub enum AuthMode {
     Trust,
-    // ScramSha256 added in the SCRAM task
+    ScramSha256 {
+        users: std::collections::HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +274,116 @@ async fn handle_execute<E: Engine>(
     Ok(())
 }
 
+// ── Authentication helpers ──────────────────────────────────────────────────
+
+/// Runs the authentication exchange. Returns Ok(false) if the client failed
+/// authentication (error already written to the stream).
+async fn authenticate<S>(
+    stream: &mut S,
+    startup_params: &[(String, String)],
+    config: &SessionConfig,
+    out: &mut BytesMut,
+    inbuf: &mut BytesMut,
+) -> std::io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    match &config.auth {
+        AuthMode::Trust => {
+            backend::authentication_ok(out);
+            Ok(true)
+        }
+        AuthMode::ScramSha256 { users } => {
+            let user = startup_params
+                .iter()
+                .find(|(k, _)| k == "user")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default();
+            // Unknown user: run no exchange, fail like PostgreSQL.
+            let Some(password) = users.get(user) else {
+                return send_auth_failure(stream, out, user).await.map(|()| false);
+            };
+
+            backend::authentication_sasl(out, &["SCRAM-SHA-256"]);
+            stream.write_all(out).await?;
+            out.clear();
+
+            // SASLInitialResponse: mechanism cstring + i32 length + body.
+            let Some(mut body) = read_password(stream, inbuf).await? else {
+                return Ok(false); // client hung up
+            };
+            let mechanism = frontend::get_cstr(&mut body).map_err(|_| bad_proto())?;
+            if mechanism != "SCRAM-SHA-256" {
+                return send_auth_failure(stream, out, user).await.map(|()| false);
+            }
+            let len = frontend::get_i32(&mut body).map_err(|_| bad_proto())?;
+            if len < 0 {
+                return send_auth_failure(stream, out, user).await.map(|()| false);
+            }
+            let client_first = body;
+
+            let mut scram = crate::scram::ScramServer::new(password);
+            let server_first = match scram.handle_client_first(&client_first) {
+                Ok(m) => m,
+                Err(_) => return send_auth_failure(stream, out, user).await.map(|()| false),
+            };
+            backend::authentication_sasl_continue(out, &server_first);
+            stream.write_all(out).await?;
+            out.clear();
+
+            // SASLResponse: raw client-final bytes.
+            let Some(client_final) = read_password(stream, inbuf).await? else {
+                return Ok(false);
+            };
+            match scram.handle_client_final(&client_final) {
+                Ok(server_final) => {
+                    backend::authentication_sasl_final(out, &server_final);
+                    backend::authentication_ok(out);
+                    Ok(true)
+                }
+                Err(_) => send_auth_failure(stream, out, user).await.map(|()| false),
+            }
+        }
+    }
+}
+
+async fn send_auth_failure<S>(stream: &mut S, out: &mut BytesMut, user: &str) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let e = PgError::fatal(
+        sqlstate::INVALID_PASSWORD,
+        format!("password authentication failed for user \"{user}\""),
+    );
+    backend::error_response(out, &e);
+    stream.write_all(out).await?;
+    out.clear();
+    Ok(())
+}
+
+fn bad_proto() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SASL message")
+}
+
+/// Reads the next frontend message, expecting Password ('p'); returns its body.
+async fn read_password<S>(stream: &mut S, inbuf: &mut BytesMut) -> std::io::Result<Option<Bytes>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        match frontend::decode_message(inbuf) {
+            Ok(Some(FrontendMessage::Password(body))) => return Ok(Some(body)),
+            Ok(Some(FrontendMessage::Terminate)) | Err(_) => return Ok(None),
+            Ok(Some(_)) => return Ok(None), // anything else mid-auth: give up
+            Ok(None) => {
+                if stream.read_buf(inbuf).await? == 0 {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 // ── Main session loop ───────────────────────────────────────────────────────
 
 /// Drive a single connection from the point immediately after the StartupMessage
@@ -283,7 +395,7 @@ async fn handle_execute<E: Engine>(
 /// dropping those bytes.
 pub async fn run_session<S, E>(
     mut stream: S,
-    _startup_params: Vec<(String, String)>,
+    startup_params: Vec<(String, String)>,
     engine: Arc<E>,
     config: Arc<SessionConfig>,
     cancel: SessionCancel,
@@ -295,8 +407,8 @@ where
 {
     let mut out = BytesMut::with_capacity(1024);
 
-    match config.auth {
-        AuthMode::Trust => backend::authentication_ok(&mut out),
+    if !authenticate(&mut stream, &startup_params, &config, &mut out, &mut inbuf).await? {
+        return Ok(());
     }
     for (name, value) in &config.server_params {
         backend::parameter_status(&mut out, name, value);
