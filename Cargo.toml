@@ -5,7 +5,7 @@ members = ["crates/pgwire", "crates/crabgresql", "crates/conformance"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "PostgreSQL"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
