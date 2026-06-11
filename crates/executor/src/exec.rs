@@ -19,13 +19,15 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     ty: c.ty,
                 })
                 .collect();
-            engine.catalog.create_table(name, cols)?;
+            let _guard = engine.ddl_lock.lock().expect("ddl lock");
+            catalog::create_table(&*engine.kv, name, cols)?;
             Ok(QueryResult::Command {
                 tag: "CREATE TABLE".into(),
             })
         }
         Statement::DropTable { name } => {
-            engine.catalog.drop_table(name)?;
+            let _guard = engine.ddl_lock.lock().expect("ddl lock");
+            catalog::drop_table(&*engine.kv, name)?;
             Ok(QueryResult::Command {
                 tag: "DROP TABLE".into(),
             })
@@ -35,7 +37,7 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
             columns,
             rows,
         } => {
-            let t = engine.catalog.get_table(table)?;
+            let t = catalog::get_table(&*engine.kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
                     .iter()
@@ -46,7 +48,8 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let mut n: u64 = 0;
+            let mut rowid = engine.read_seq(t.id)?;
+            let mut ops: Vec<kv::WriteOp> = Vec::new();
             for row_exprs in rows {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(
@@ -59,12 +62,18 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     let v = crate::eval::eval(expr, None, &[])?;
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
-                let rowid = engine.next_rowid(t.id);
-                engine
-                    .kv
-                    .put(kv::key::row_key(t.id, rowid), kv::rowenc::encode_row(&full))?;
-                n += 1;
+                ops.push(kv::WriteOp::Put {
+                    key: kv::key::row_key(t.id, rowid),
+                    value: kv::rowenc::encode_row(&full),
+                });
+                rowid += 1;
             }
+            let n = ops.len() as u64;
+            ops.push(kv::WriteOp::Put {
+                key: kv::key::seq_key(t.id),
+                value: rowid.to_be_bytes().to_vec(),
+            });
+            engine.kv.write_batch(&ops)?;
             Ok(QueryResult::Command {
                 tag: format!("INSERT 0 {n}"),
             })
@@ -98,7 +107,7 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
 
 fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
-        Some(name) => Some(engine.catalog.get_table(name)?),
+        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
         None => None,
     };
 
@@ -298,7 +307,7 @@ pub(crate) fn describe(
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let table = match &s.from {
-        Some(name) => Some(engine.catalog.get_table(name)?),
+        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
         None => None,
     };
     let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;

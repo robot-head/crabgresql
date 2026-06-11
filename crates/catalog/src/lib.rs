@@ -1,12 +1,12 @@
-//! In-memory system catalog: tables, their columns, and CRUD with PostgreSQL
-//! error codes. Persistence arrives in SP3; no pg_catalog SQL views in SP2.
+//! Catalog as a stateless view over a `Kv` store: tables, their columns, and
+//! CRUD with PostgreSQL error codes. Persistence via SP3's KV layer.
 
 pub mod serde;
 
-use std::collections::HashMap;
-use std::sync::RwLock;
-
+use kv::{Kv, KvError, WriteOp, key};
 use pgtypes::ColumnType;
+
+use crate::serde::{deserialize_schema, serialize_schema};
 
 /// OID-style table identifier (never 0; 0 is reserved/invalid).
 pub type TableId = u32;
@@ -39,6 +39,8 @@ pub enum CatalogError {
     UndefinedTable(String),
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
+    #[error("catalog storage error: {0}")]
+    Storage(#[from] KvError),
 }
 
 impl CatalogError {
@@ -47,77 +49,91 @@ impl CatalogError {
             CatalogError::DuplicateTable(_) => "42P07",
             CatalogError::UndefinedTable(_) => "42P01",
             CatalogError::UndefinedColumn(_) => "42703",
+            CatalogError::Storage(KvError::Io(_)) => "58030",
+            CatalogError::Storage(KvError::CorruptRow(_)) => "XX000",
         }
     }
 }
 
-struct Inner {
-    next_id: TableId,
-    by_name: HashMap<String, Table>,
+/// Create a table: allocate a TableId, persist the schema, init the sequence —
+/// all in one atomic batch. Caller serializes concurrent DDL.
+pub fn create_table(
+    kv: &dyn Kv,
+    name: &str,
+    columns: Vec<Column>,
+) -> Result<TableId, CatalogError> {
+    if kv.get(&key::catalog_key(name))?.is_some() {
+        return Err(CatalogError::DuplicateTable(name.to_string()));
+    }
+    let next = read_next_table_id(kv)?;
+    let batch = vec![
+        WriteOp::Put {
+            key: key::catalog_key(name),
+            value: serialize_schema(next, &columns),
+        },
+        WriteOp::Put {
+            key: key::seq_key(next),
+            value: 1u64.to_be_bytes().to_vec(),
+        },
+        WriteOp::Put {
+            key: key::meta_next_table_id_key(),
+            value: (next + 1).to_be_bytes().to_vec(),
+        },
+    ];
+    kv.write_batch(&batch)?;
+    Ok(next)
 }
 
-/// The catalog. Cheap to share behind an `Arc`; internally `RwLock`-guarded.
-pub struct Catalog {
-    inner: RwLock<Inner>,
+/// Look up a table by name.
+pub fn get_table(kv: &dyn Kv, name: &str) -> Result<Table, CatalogError> {
+    let bytes = kv
+        .get(&key::catalog_key(name))?
+        .ok_or_else(|| CatalogError::UndefinedTable(name.to_string()))?;
+    let (id, columns) = deserialize_schema(&bytes)?;
+    Ok(Table {
+        id,
+        name: name.to_string(),
+        columns,
+    })
 }
 
-impl Default for Catalog {
-    fn default() -> Self {
-        Self::new()
+/// Drop a table: delete the catalog entry, the sequence, and all its rows — one
+/// atomic batch.
+pub fn drop_table(kv: &dyn Kv, name: &str) -> Result<(), CatalogError> {
+    let table = get_table(kv, name)?;
+    let mut ops = vec![
+        WriteOp::Delete {
+            key: key::catalog_key(name),
+        },
+        WriteOp::Delete {
+            key: key::seq_key(table.id),
+        },
+    ];
+    for (row_key, _) in kv.scan_prefix(&key::table_prefix(table.id))? {
+        ops.push(WriteOp::Delete { key: row_key });
     }
+    kv.write_batch(&ops)?;
+    Ok(())
 }
 
-impl Catalog {
-    pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(Inner {
-                next_id: 1,
-                by_name: HashMap::new(),
-            }),
+/// Read the next TableId (defaults to 1 when the meta key is absent).
+fn read_next_table_id(kv: &dyn Kv) -> Result<TableId, CatalogError> {
+    match kv.get(&key::meta_next_table_id_key())? {
+        Some(b) => {
+            let arr: [u8; 4] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| KvError::CorruptRow("next_table_id is not u32".into()))?;
+            Ok(u32::from_be_bytes(arr))
         }
-    }
-
-    pub fn create_table(&self, name: &str, columns: Vec<Column>) -> Result<TableId, CatalogError> {
-        let mut inner = self.inner.write().expect("catalog lock");
-        if inner.by_name.contains_key(name) {
-            return Err(CatalogError::DuplicateTable(name.to_string()));
-        }
-        let id = inner.next_id;
-        inner.next_id += 1;
-        inner.by_name.insert(
-            name.to_string(),
-            Table {
-                id,
-                name: name.to_string(),
-                columns,
-            },
-        );
-        Ok(id)
-    }
-
-    pub fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
-        let mut inner = self.inner.write().expect("catalog lock");
-        if inner.by_name.remove(name).is_none() {
-            return Err(CatalogError::UndefinedTable(name.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Snapshot of a table's metadata by name.
-    pub fn get_table(&self, name: &str) -> Result<Table, CatalogError> {
-        self.inner
-            .read()
-            .expect("catalog lock")
-            .by_name
-            .get(name)
-            .cloned()
-            .ok_or_else(|| CatalogError::UndefinedTable(name.to_string()))
+        None => Ok(1),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kv::{FjallKv, MemKv};
     use pgtypes::ColumnType;
 
     fn cols() -> Vec<Column> {
@@ -133,45 +149,38 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn create_lookup_drop() {
-        let cat = Catalog::new();
-        let id = cat.create_table("t", cols()).expect("create");
-        let t = cat.get_table("t").expect("lookup");
+    fn check_crud(kv: &dyn Kv) {
+        let id = create_table(kv, "t", cols()).expect("create");
+        let t = get_table(kv, "t").expect("lookup");
         assert_eq!(t.id, id);
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.column_index("name"), Some(1));
-        assert_eq!(t.column_index("missing"), None);
-        cat.drop_table("t").expect("drop");
-        assert!(matches!(
-            cat.get_table("t"),
-            Err(CatalogError::UndefinedTable(_))
-        ));
+        // Duplicate → 42P07.
+        assert_eq!(
+            create_table(kv, "t", cols()).expect_err("dup").sqlstate(),
+            "42P07"
+        );
+        // Distinct ids.
+        let id2 = create_table(kv, "u", cols()).expect("create u");
+        assert_ne!(id, id2);
+        // Drop → gone.
+        drop_table(kv, "t").expect("drop");
+        assert_eq!(get_table(kv, "t").expect_err("gone").sqlstate(), "42P01");
+        // Drop missing → 42P01.
+        assert_eq!(
+            drop_table(kv, "nope").expect_err("missing").sqlstate(),
+            "42P01"
+        );
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn duplicate_table_is_42P07() {
-        let cat = Catalog::new();
-        cat.create_table("t", cols()).expect("create");
-        let err = cat.create_table("t", cols()).expect_err("dup");
-        assert_eq!(err.sqlstate(), "42P07");
+    fn crud_on_memkv() {
+        check_crud(&MemKv::new());
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn drop_missing_is_42P01() {
-        let cat = Catalog::new();
-        let err = cat.drop_table("nope").expect_err("missing");
-        assert_eq!(err.sqlstate(), "42P01");
-    }
-
-    #[test]
-    fn table_ids_are_distinct_and_nonzero() {
-        let cat = Catalog::new();
-        let a = cat.create_table("a", cols()).expect("a");
-        let b = cat.create_table("b", cols()).expect("b");
-        assert_ne!(a, b);
-        assert!(a >= 1 && b >= 1);
+    fn crud_on_fjallkv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        check_crud(&FjallKv::open(dir.path()).expect("open"));
     }
 }

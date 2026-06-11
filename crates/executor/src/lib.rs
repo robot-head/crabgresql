@@ -5,21 +5,21 @@ mod error;
 mod eval;
 mod exec;
 
-use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use catalog::{Catalog, TableId};
-use kv::{Kv, MemKv};
+use catalog::TableId;
+use kv::{FjallKv, Kv, MemKv};
 use pgwire::engine::{Engine, FieldDescription, QueryResult};
 use pgwire::error::PgError;
 
 pub use error::ExecError;
 
-/// The SQL engine: a catalog, a KV store, and per-table rowid counters.
+/// The SQL engine over a durable (or in-memory) KV store. Catalog and sequences
+/// live in the KV store; the DDL mutex serializes catalog mutations.
 pub struct SqlEngine {
-    pub(crate) catalog: Arc<Catalog>,
     pub(crate) kv: Arc<dyn Kv>,
-    pub(crate) rowids: Mutex<HashMap<TableId, u64>>,
+    pub(crate) ddl_lock: Mutex<()>,
 }
 
 impl Default for SqlEngine {
@@ -29,25 +29,35 @@ impl Default for SqlEngine {
 }
 
 impl SqlEngine {
+    /// Ephemeral in-memory engine (tests, default when no --data-dir).
     pub fn new() -> Self {
         Self::with_kv(Arc::new(MemKv::new()))
     }
 
+    /// Durable engine backed by a fjall store at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecError> {
+        Ok(Self::with_kv(Arc::new(FjallKv::open(path)?)))
+    }
+
     pub fn with_kv(kv: Arc<dyn Kv>) -> Self {
         Self {
-            catalog: Arc::new(Catalog::new()),
             kv,
-            rowids: Mutex::new(HashMap::new()),
+            ddl_lock: Mutex::new(()),
         }
     }
 
-    /// Allocate the next rowid for a table (monotonic per table).
-    pub(crate) fn next_rowid(&self, table: TableId) -> u64 {
-        let mut ids = self.rowids.lock().expect("rowid lock");
-        let n = ids.entry(table).or_insert(1);
-        let id = *n;
-        *n += 1;
-        id
+    /// Read a table's durable next-rowid (1 if unset).
+    pub(crate) fn read_seq(&self, table: TableId) -> Result<u64, ExecError> {
+        match self.kv.get(&kv::key::seq_key(table))? {
+            Some(b) => {
+                let arr: [u8; 8] = b
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| kv::KvError::CorruptRow("sequence is not u64".into()))?;
+                Ok(u64::from_be_bytes(arr))
+            }
+            None => Ok(1),
+        }
     }
 }
 
