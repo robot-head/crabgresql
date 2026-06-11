@@ -3,4 +3,6 @@
 pub mod engine;
 pub mod error;
 pub mod messages;
+pub mod server;
+pub mod session;
 pub mod stub;
