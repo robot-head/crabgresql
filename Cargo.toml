@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/pgwire", "crates/crabgresql", "crates/conformance"]
+members = [
+    "crates/pgwire",
+    "crates/crabgresql",
+    "crates/conformance",
+    "crates/pgtypes",
+    "crates/kv",
+    "crates/catalog",
+    "crates/pgparser",
+    "crates/executor",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +26,11 @@ unwrap_used = "warn"
 
 [workspace.dependencies]
 pgwire = { path = "crates/pgwire" }
+pgtypes = { path = "crates/pgtypes" }
+kv = { path = "crates/kv" }
+catalog = { path = "crates/catalog" }
+pgparser = { path = "crates/pgparser" }
+executor = { path = "crates/executor" }
 bytes = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

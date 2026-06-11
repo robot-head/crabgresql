@@ -210,6 +210,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "catalog"
+version = "0.1.0"
+dependencies = [
+ "pgtypes",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +661,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "executor"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "catalog",
+ "kv",
+ "pgparser",
+ "pgtypes",
+ "pgwire",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,6 +1111,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1359,6 +1391,23 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pgparser"
+version = "0.1.0"
+dependencies = [
+ "pgtypes",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "pgtypes"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "pgwire"

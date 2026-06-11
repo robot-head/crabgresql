@@ -1,0 +1,21 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+pgtypes.workspace = true
+kv.workspace = true
+catalog.workspace = true
+pgparser.workspace = true
+pgwire.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-postgres.workspace = true
