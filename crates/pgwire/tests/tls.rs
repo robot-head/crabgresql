@@ -106,3 +106,49 @@ async fn ssl_request_without_tls_config_gets_n() {
     tcp.read_exact(&mut answer).await.expect("read");
     assert_eq!(answer[0], b'N');
 }
+
+#[tokio::test]
+async fn pipelined_bytes_after_ssl_request_are_rejected() {
+    // CVE-2021-23222 class: plaintext startup pipelined with SSLRequest must
+    // NOT be processed as if it arrived over TLS.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(pgwire::server::serve_tls(
+        listener,
+        Arc::new(StubEngine::new()),
+        Arc::new(SessionConfig::trust()),
+        Some(server_tls()),
+    ));
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.expect("tcp");
+
+    // SSLRequest immediately followed by a plaintext StartupMessage in one write.
+    let mut evil = BytesMut::new();
+    evil.put_i32(8);
+    evil.put_i32(80_877_103);
+    let mut body = BytesMut::new();
+    body.put_i32(196_608);
+    body.put_slice(b"user\0mallory\0\0");
+    evil.put_i32(body.len() as i32 + 4);
+    evil.put_slice(&body);
+    tcp.write_all(&evil).await.expect("write");
+
+    // Server must close without sending 'S' (or close immediately after);
+    // it must NOT complete a TLS session that honors the injected startup.
+    let mut answer = [0u8; 1];
+    match tcp.read_exact(&mut answer).await {
+        Err(_) => {} // closed before any byte: acceptable rejection
+        Ok(_) => {
+            // If a byte arrived it must not be 'S'-then-working-session;
+            // connection must be closed right after.
+            // (With the fix the server returns Err BEFORE writing 'S', so the
+            // Err(_) arm above is the expected path.)
+            let mut rest = [0u8; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), tcp.read(&mut rest))
+                .await
+                .expect("server must close promptly")
+                .expect("read");
+            assert_eq!(n, 0, "server must close the connection, got more bytes");
+        }
+    }
+}

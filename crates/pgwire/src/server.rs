@@ -198,6 +198,19 @@ async fn handle_conn<E: Engine>(
         // Consume the SSLRequest (exactly 8 bytes, fully buffered).
         // decode_startup cannot fail or return None here — len==8, code known.
         let _ = frontend::decode_startup(&mut buf);
+
+        // SECURITY (CVE-2021-23222 class): any bytes pipelined after SSLRequest
+        // arrived BEFORE the TLS handshake; processing them as if they came over
+        // TLS lets an active MITM inject a chosen startup packet.  Real
+        // PostgreSQL rejects this (it sends a fatal ErrorResponse first; we
+        // simply close, which is equivalent for SP1 — fatal + close semantics).
+        if !buf.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "junk after SSLRequest: refusing pre-handshake pipelined bytes",
+            ));
+        }
+
         match &tls {
             Some(acceptor) => {
                 stream.write_all(b"S").await?;
