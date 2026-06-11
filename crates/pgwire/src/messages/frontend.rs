@@ -61,8 +61,8 @@ pub fn decode_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>, PgErr
         }
         other => Err(PgError::protocol(format!(
             "unsupported frontend protocol {}.{}; server supports 3.0",
-            (other >> 16) & 0xffff,
-            other & 0xffff,
+            (other as u32) >> 16,
+            (other as u32) & 0xffff,
         ))),
     }
 }
@@ -196,5 +196,15 @@ mod tests {
         buf.put_i32(i32::MAX);
         buf.put_i32(PROTOCOL_3_0);
         assert!(decode_startup(&mut buf).is_err());
+    }
+
+    #[test]
+    fn length_field_present_body_absent_returns_none() {
+        let full = startup_bytes(&[("user", "crab")]);
+        // Keep exactly 4 bytes: length field only.
+        let mut partial = BytesMut::from(&full[..4]);
+        assert_eq!(decode_startup(&mut partial).expect("ok"), None);
+        // Buffer must be untouched (no split_to happened).
+        assert_eq!(partial.len(), 4);
     }
 }
