@@ -103,7 +103,7 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Unary {
                     op: UnaryOp::Not,
-                    expr: Box::new(self.expr(3)?),
+                    expr: Box::new(self.expr(4)?),
                 })
             }
             Token::Minus => {
@@ -264,5 +264,54 @@ mod tests {
         assert_eq!(expr("null"), Expr::NullLiteral);
         assert_eq!(expr("col"), Expr::Column("col".into()));
         assert_eq!(expr("$2"), Expr::Param(2));
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and() {
+        // NOT x AND y == (NOT x) AND y
+        let e = expr("NOT x AND y");
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                ..
+            } => {
+                assert!(
+                    matches!(
+                        *left,
+                        Expr::Unary {
+                            op: UnaryOp::Not,
+                            ..
+                        }
+                    ),
+                    "left of AND must be (NOT x), got {left:?}"
+                );
+            }
+            _ => panic!("expected AND at root, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn comparison_binds_tighter_than_not() {
+        // NOT a = 1 == NOT (a = 1)
+        let e = expr("NOT a = 1");
+        match e {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => {
+                assert!(
+                    matches!(
+                        *expr,
+                        Expr::Binary {
+                            op: BinaryOp::Eq,
+                            ..
+                        }
+                    ),
+                    "NOT operand must be (a = 1), got {expr:?}"
+                );
+            }
+            _ => panic!("expected NOT at root, got {e:?}"),
+        }
     }
 }
