@@ -10,7 +10,6 @@ use pgtypes::{ColumnType, Datum, ops};
 use crate::error::ExecError;
 
 /// Evaluate `expr` against a row (`values`, aligned to `table.columns`).
-#[allow(dead_code)] // used from Task 16/17
 pub(crate) fn eval(
     expr: &Expr,
     table: Option<&Table>,
