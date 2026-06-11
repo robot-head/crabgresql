@@ -28,7 +28,12 @@ fn msg(out: &mut BytesMut, tag: u8, f: impl FnOnce(&mut BytesMut)) {
     let len_at = out.len();
     out.put_i32(0); // patched below
     f(out);
-    let len = (out.len() - len_at) as i32;
+    let body_len = out.len() - len_at;
+    debug_assert!(
+        body_len <= i32::MAX as usize,
+        "message body exceeds i32::MAX"
+    );
+    let len = body_len as i32;
     out[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
 }
 
@@ -219,9 +224,10 @@ mod tests {
             format: 0,
         }];
         row_description(&mut out, &fields);
-        assert_eq!(out[0], b'T');
-        // field count 1
-        assert_eq!(&out[5..7], &1i16.to_be_bytes());
+        assert_eq!(
+            &out[..],
+            &b"T\x00\x00\x00\x21\x00\x01?column?\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x17\x00\x04\xff\xff\xff\xff\x00\x00"[..]
+        );
 
         let mut out = BytesMut::new();
         data_row(&mut out, &[Some(Bytes::from_static(b"1")), None]);
@@ -238,6 +244,8 @@ mod tests {
         backend_key_data(&mut out, 4242, 777);
         assert_eq!(out[0], b'K');
         assert_eq!(out.len(), 13);
+        assert_eq!(&out[5..9], &4242i32.to_be_bytes());
+        assert_eq!(&out[9..13], &777i32.to_be_bytes());
     }
 
     #[test]
