@@ -42,6 +42,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y postgresql-client-18
       - run: cargo build --locked -p crabgresql -p conformance
       - run: ./scripts/psql-smoke.sh
+      - name: Durable restart smoke
+        run: ./scripts/durable-restart-smoke.sh
       - name: Run conformance harness
         run: |
           ./target/debug/crabgresql --listen 127.0.0.1:54333 &
