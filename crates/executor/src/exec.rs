@@ -1,8 +1,10 @@
 //! Per-statement execution.
 
-use catalog::Column;
-use pgparser::ast::Statement;
-use pgwire::engine::QueryResult;
+use bytes::Bytes;
+use catalog::{Column, Table};
+use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
+use pgtypes::{ColumnType, Datum};
+use pgwire::engine::{Cell, FieldDescription, QueryResult};
 
 use crate::SqlEngine;
 use crate::error::ExecError;
@@ -67,7 +69,7 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                 tag: format!("INSERT 0 {n}"),
             })
         }
-        Statement::Select(_) => Err(ExecError::Unsupported("SELECT lands in Task 17".into())),
+        Statement::Select(s) => exec_select(engine, s),
     }
 }
 
@@ -94,6 +96,192 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
     })
 }
 
+fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecError> {
+    let table: Option<Table> = match &s.from {
+        Some(name) => Some(engine.catalog.get_table(name)?),
+        None => None,
+    };
+
+    // Source rows: scan the table, or a single empty row for FROM-less SELECT.
+    let source: Vec<Vec<Datum>> = match &table {
+        Some(t) => engine
+            .kv
+            .scan_prefix(&kv::key::table_prefix(t.id))
+            .into_iter()
+            .map(|(_, v)| kv::rowenc::decode_row(&v))
+            .collect::<Result<_, _>>()?,
+        None => vec![vec![]],
+    };
+
+    // Resolve the projection into (field, expr) pairs.
+    let (fields, out_exprs) = resolve_projection(&s.projection, table.as_ref())?;
+
+    // Filter, keeping each surviving source row for ORDER BY evaluation.
+    let mut kept: Vec<Vec<Datum>> = Vec::new();
+    for row in &source {
+        let keep = match &s.filter {
+            None => true,
+            Some(f) => match crate::eval::eval(f, table.as_ref(), row)? {
+                Datum::Bool(b) => b,
+                Datum::Null => false,
+                _ => {
+                    return Err(ExecError::TypeMismatch(
+                        "argument of WHERE must be type boolean".into(),
+                    ));
+                }
+            },
+        };
+        if keep {
+            kept.push(row.clone());
+        }
+    }
+
+    // ORDER BY: sort by evaluated order keys (over the source row).
+    if !s.order_by.is_empty() {
+        // Precompute keys to keep comparisons total and error-free during sort.
+        let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(kept.len());
+        for row in kept {
+            let mut keys = Vec::with_capacity(s.order_by.len());
+            for item in &s.order_by {
+                keys.push(crate::eval::eval(&item.expr, table.as_ref(), &row)?);
+            }
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+        kept = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+
+    // LIMIT.
+    if let Some(limit) = s.limit {
+        let n = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+        kept.truncate(n);
+    }
+
+    // Project + encode to cells.
+    let mut out_rows: Vec<Vec<Option<Cell>>> = Vec::with_capacity(kept.len());
+    for row in &kept {
+        let mut cells = Vec::with_capacity(out_exprs.len());
+        for e in &out_exprs {
+            let d = crate::eval::eval(e, table.as_ref(), row)?;
+            cells.push(datum_to_cell(&d));
+        }
+        out_rows.push(cells);
+    }
+
+    let tag = format!("SELECT {}", out_rows.len());
+    Ok(QueryResult::Rows {
+        fields,
+        rows: out_rows,
+        tag,
+    })
+}
+
+/// Expand the projection list into output FieldDescriptions and the expressions
+/// that produce each column.
+fn resolve_projection(
+    items: &[SelectItem],
+    table: Option<&Table>,
+) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
+    // SELECT * requires a FROM.
+    if items == [SelectItem::Wildcard] {
+        let t = table.ok_or_else(|| {
+            ExecError::Unsupported("SELECT * with no FROM clause is not supported".into())
+        })?;
+        let fields = t.columns.iter().map(|c| field(&c.name, c.ty)).collect();
+        let exprs = t
+            .columns
+            .iter()
+            .map(|c| Expr::Column(c.name.clone()))
+            .collect();
+        return Ok((fields, exprs));
+    }
+    let mut fields = Vec::with_capacity(items.len());
+    let mut exprs = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                return Err(ExecError::Unsupported(
+                    "* mixed with other items is not supported".into(),
+                ));
+            }
+            SelectItem::Expr { expr, alias } => {
+                let name = alias.clone().unwrap_or_else(|| derived_name(expr));
+                let ty = crate::eval::infer_type(expr, table)?;
+                fields.push(field(&name, ty));
+                exprs.push(expr.clone());
+            }
+        }
+    }
+    Ok((fields, exprs))
+}
+
+fn derived_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Column(c) => c.clone(),
+        _ => "?column?".to_string(),
+    }
+}
+
+fn field(name: &str, ty: ColumnType) -> FieldDescription {
+    FieldDescription {
+        name: name.to_string(),
+        table_oid: 0,
+        column_id: 0,
+        type_oid: ty.oid(),
+        type_size: ty.type_size(),
+        type_modifier: -1,
+        format: 0,
+    }
+}
+
+fn datum_to_cell(d: &Datum) -> Option<Cell> {
+    if d.is_null() {
+        return None;
+    }
+    Some(Cell {
+        text: Bytes::from(pgtypes::encoding::encode_text(d)),
+        binary: Bytes::from(pgtypes::encoding::encode_binary(d)),
+    })
+}
+
+/// Compare two order-key vectors per the SELECT's ASC/DESC flags, with PG's
+/// default null placement (NULLS LAST for ASC, NULLS FIRST for DESC).
+fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (i, item) in s.order_by.iter().enumerate() {
+        let (x, y) = (&a[i], &b[i]);
+        let ord = match (x.is_null(), y.is_null()) {
+            (true, true) => Ordering::Equal,
+            // NULLS LAST for ASC: null is "greater"; NULLS FIRST for DESC.
+            (true, false) => {
+                if item.asc {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, true) => {
+                if item.asc {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, false) => {
+                let base = pgtypes::ops::compare(x, y)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Ordering::Equal);
+                if item.asc { base } else { base.reverse() }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 pub(crate) fn describe(
     engine: &SqlEngine,
     sql: &str,
@@ -105,7 +293,101 @@ pub(crate) fn describe(
 #[cfg(test)]
 mod tests {
     use crate::SqlEngine;
-    use pgwire::engine::{Engine, QueryResult};
+    use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult};
+
+    fn rows_of(r: &QueryResult) -> &Vec<Vec<Option<Cell>>> {
+        match r {
+            QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    fn fields_of(r: &QueryResult) -> &Vec<FieldDescription> {
+        match r {
+            QueryResult::Rows { fields, .. } => fields,
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    fn text(cell: &Option<Cell>) -> Option<String> {
+        cell.as_ref()
+            .map(|c| String::from_utf8(c.text.to_vec()).expect("cell text is valid UTF-8"))
+    }
+
+    #[tokio::test]
+    async fn select_literal_no_from() {
+        let engine = SqlEngine::new();
+        let r = &run(&engine, "SELECT 1 + 1 AS two").await[0];
+        assert_eq!(fields_of(r)[0].name, "two");
+        assert_eq!(fields_of(r)[0].type_oid, pgtypes::oids::INT4);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+    }
+
+    #[tokio::test]
+    async fn select_where_order_limit() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, name text)").await;
+        run(&engine, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+        let r = &run(
+            &engine,
+            "SELECT name FROM t WHERE id > 1 ORDER BY id DESC LIMIT 5",
+        )
+        .await[0];
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(text(&rows[0][0]), Some("c".into())); // id=3 first (DESC)
+        assert_eq!(text(&rows[1][0]), Some("b".into()));
+    }
+
+    #[tokio::test]
+    async fn select_star_projects_all_columns() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, name text)").await;
+        run(&engine, "INSERT INTO t VALUES (7,'x')").await;
+        let r = &run(&engine, "SELECT * FROM t").await[0];
+        assert_eq!(
+            fields_of(r)
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+        assert_eq!(text(&rows_of(r)[0][0]), Some("7".into()));
+        assert_eq!(text(&rows_of(r)[0][1]), Some("x".into()));
+    }
+
+    #[tokio::test]
+    async fn select_command_tag_counts_rows() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1),(2)").await;
+        match &run(&engine, "SELECT id FROM t").await[0] {
+            QueryResult::Rows { tag, .. } => assert_eq!(tag, "SELECT 2"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_boolean_where_is_42804() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let err = engine
+            .simple_query("SELECT id FROM t WHERE id")
+            .await
+            .expect_err("non-bool");
+        assert_eq!(err.code, "42804");
+    }
+
+    #[tokio::test]
+    async fn null_orders_last_ascending() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (2),(null),(1)").await;
+        let r = &run(&engine, "SELECT id FROM t ORDER BY id ASC").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(got, vec![Some("1".into()), Some("2".into()), None]); // NULLS LAST
+    }
 
     async fn run(engine: &SqlEngine, sql: &str) -> Vec<QueryResult> {
         engine.simple_query(sql).await.expect("ok")

@@ -18,11 +18,7 @@ pub use error::ExecError;
 /// The SQL engine: a catalog, a KV store, and per-table rowid counters.
 pub struct SqlEngine {
     pub(crate) catalog: Arc<Catalog>,
-    // Used from Task 16 onward; scaffolded here so exec.rs reaches it.
-    #[allow(dead_code)]
     pub(crate) kv: Arc<dyn Kv>,
-    // Used from Task 16 onward; scaffolded here so exec.rs reaches it.
-    #[allow(dead_code)]
     pub(crate) rowids: Mutex<HashMap<TableId, u64>>,
 }
 
@@ -46,8 +42,6 @@ impl SqlEngine {
     }
 
     /// Allocate the next rowid for a table (monotonic per table).
-    /// Used from Task 16 onward.
-    #[allow(dead_code)]
     pub(crate) fn next_rowid(&self, table: TableId) -> u64 {
         let mut ids = self.rowids.lock().expect("rowid lock");
         let n = ids.entry(table).or_insert(1);

@@ -80,7 +80,6 @@ fn cmp_result(op: BinaryOp, ord: Option<Ordering>) -> Datum {
 }
 
 /// Statically infer the result column type of an expression, for RowDescription.
-#[allow(dead_code)] // used from Task 16/17
 pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
     match expr {
         Expr::IntLiteral(s) => match ops::int_literal(s)? {
