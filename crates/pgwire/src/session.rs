@@ -244,11 +244,15 @@ async fn handle_execute<E: Engine>(
     }; // ext borrow ends here, before the await
 
     let results = tokio::select! {
-        r = engine.simple_query(&sql) => r?,
+        // biased + cancellation-first: a cancel that arrived before execution
+        // (the pending flag from the extended-batch window) must win even
+        // against an engine future that is ready on its first poll.
+        biased;
         _ = token.cancelled() => return Err(PgError::error(
             sqlstate::QUERY_CANCELED,
             "canceling statement due to user request",
         )),
+        r = engine.simple_query(&sql) => r?,
     };
     // Extended protocol carries exactly one statement per Parse.
     match results.first() {
@@ -451,11 +455,13 @@ where
             FrontendMessage::Query { sql } => {
                 let token = cancel.begin_query();
                 let outcome = tokio::select! {
-                    r = engine.simple_query(&sql) => r,
+                    // biased + cancellation-first; see handle_execute.
+                    biased;
                     _ = token.cancelled() => Err(PgError::error(
                         sqlstate::QUERY_CANCELED,
                         "canceling statement due to user request",
                     )),
+                    r = engine.simple_query(&sql) => r,
                 };
                 match outcome {
                     Ok(results) => write_results(&mut out, &results),
