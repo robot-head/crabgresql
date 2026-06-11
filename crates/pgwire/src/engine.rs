@@ -14,6 +14,11 @@ pub mod oids {
 }
 
 /// A single value, pre-encoded in both wire formats.
+///
+/// SP2 NOTE: pre-computing both encodings is fine for the stub but doubles
+/// encoding work for a real engine; the wire layer knows the negotiated
+/// format at Bind time and could request only one. Revisit this seam when
+/// the real engine lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub text: Bytes,
@@ -90,7 +95,7 @@ mod tests {
     async fn stub_answers_version_case_insensitively() {
         let engine = StubEngine::new();
         let results = engine.simple_query("select VERSION()").await.expect("ok");
-        let [QueryResult::Rows { fields, rows, .. }] = &results[..] else {
+        let [QueryResult::Rows { fields, rows, tag }] = &results[..] else {
             panic!("expected Rows");
         };
         assert_eq!(fields[0].type_oid, oids::TEXT);
@@ -99,6 +104,7 @@ mod tests {
             text.starts_with("PostgreSQL 18"),
             "clients parse this prefix: {text}"
         );
+        assert_eq!(tag, "SELECT 1");
     }
 
     #[tokio::test]
@@ -124,5 +130,17 @@ mod tests {
         let described = engine.describe("SELECT 1").await.expect("ok");
         assert_eq!(described.len(), 1);
         assert_eq!(described[0].type_oid, oids::INT4);
+    }
+
+    #[tokio::test]
+    async fn stub_pg_sleep_zero_completes_with_one_row() {
+        let engine = StubEngine::new();
+        let results = engine.simple_query("SELECT pg_sleep(0)").await.expect("ok");
+        let [QueryResult::Rows { fields, rows, tag }] = &results[..] else {
+            panic!("expected Rows");
+        };
+        assert_eq!(fields[0].name, "pg_sleep");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(tag, "SELECT 1");
     }
 }

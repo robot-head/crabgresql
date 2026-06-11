@@ -18,19 +18,26 @@ impl StubEngine {
     }
 
     fn canned(&self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
-        let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
-        match normalized.as_str() {
+        match normalize(sql).as_str() {
             "" => Ok(vec![QueryResult::Empty]),
-            "select 1" => Ok(vec![QueryResult::Rows {
-                fields: vec![int4_field("?column?")],
-                rows: vec![vec![Some(int4_cell(1))]],
-                tag: "SELECT 1".into(),
-            }]),
-            "select version()" => Ok(vec![QueryResult::Rows {
-                fields: vec![text_field("version")],
-                rows: vec![vec![Some(text_cell(STUB_VERSION))]],
-                tag: "SELECT 1".into(),
-            }]),
+            "select 1" => {
+                let rows = vec![vec![Some(int4_cell(1))]];
+                let tag = select_tag(&rows);
+                Ok(vec![QueryResult::Rows {
+                    fields: vec![int4_field("?column?")],
+                    rows,
+                    tag,
+                }])
+            }
+            "select version()" => {
+                let rows = vec![vec![Some(text_cell(STUB_VERSION))]];
+                let tag = select_tag(&rows);
+                Ok(vec![QueryResult::Rows {
+                    fields: vec![text_field("version")],
+                    rows,
+                    tag,
+                }])
+            }
             other => Err(PgError::error(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 format!("stub engine does not implement: {other}"),
@@ -42,28 +49,38 @@ impl StubEngine {
 impl Engine for StubEngine {
     async fn simple_query(&self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
         // `pg_sleep` exists so cancellation has something to cancel.
-        let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
-        if let Some(secs) = normalized
+        if let Some(secs) = normalize(sql)
             .strip_prefix("select pg_sleep(")
             .and_then(|rest| rest.strip_suffix(')'))
             .and_then(|n| n.parse::<u64>().ok())
         {
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let rows = vec![vec![Some(text_cell(""))]];
+            let tag = select_tag(&rows);
             return Ok(vec![QueryResult::Rows {
                 fields: vec![text_field("pg_sleep")],
-                rows: vec![vec![Some(text_cell(""))]],
-                tag: "SELECT 1".into(),
+                rows,
+                tag,
             }]);
         }
         self.canned(sql)
     }
 
+    // Returns 0A000 for any unrecognized SQL — acceptable for the stub; a real engine reports proper codes (e.g. 26000) per statement state.
     async fn describe(&self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
         match self.canned(sql)?.first() {
             Some(QueryResult::Rows { fields, .. }) => Ok(fields.clone()),
             _ => Ok(Vec::new()),
         }
     }
+}
+
+fn normalize(sql: &str) -> String {
+    sql.trim().trim_end_matches(';').trim().to_ascii_lowercase()
+}
+
+fn select_tag(rows: &[Vec<Option<Cell>>]) -> String {
+    format!("SELECT {}", rows.len())
 }
 
 fn int4_field(name: &str) -> FieldDescription {
