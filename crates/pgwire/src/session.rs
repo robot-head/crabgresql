@@ -7,10 +7,13 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::engine::{Engine, FieldDescription, QueryResult};
 use crate::error::{PgError, Severity, sqlstate};
 use crate::messages::backend::{self, TxStatus};
 use crate::messages::frontend::{self, FrontendMessage};
+use crate::server::SessionCancel;
 
 #[derive(Debug, Clone)]
 pub enum AuthMode {
@@ -215,6 +218,7 @@ async fn handle_execute<E: Engine>(
     ext: &ExtendedState,
     engine: &E,
     portal_name: &str,
+    token: CancellationToken,
     out: &mut BytesMut,
 ) -> Result<(), PgError> {
     let (sql, formats) = {
@@ -227,7 +231,13 @@ async fn handle_execute<E: Engine>(
         (portal.sql.clone(), portal.formats.clone())
     }; // ext borrow ends here, before the await
 
-    let results = engine.simple_query(&sql).await?;
+    let results = tokio::select! {
+        r = engine.simple_query(&sql) => r?,
+        _ = token.cancelled() => return Err(PgError::error(
+            sqlstate::QUERY_CANCELED,
+            "canceling statement due to user request",
+        )),
+    };
     // Extended protocol carries exactly one statement per Parse.
     match results.first() {
         Some(QueryResult::Rows { rows, tag, .. }) => {
@@ -276,6 +286,7 @@ pub async fn run_session<S, E>(
     _startup_params: Vec<(String, String)>,
     engine: Arc<E>,
     config: Arc<SessionConfig>,
+    cancel: SessionCancel,
     mut inbuf: BytesMut,
 ) -> std::io::Result<()>
 where
@@ -290,8 +301,7 @@ where
     for (name, value) in &config.server_params {
         backend::parameter_status(&mut out, name, value);
     }
-    // Placeholder key data; the cancellation task wires real values.
-    backend::backend_key_data(&mut out, 0, 0);
+    backend::backend_key_data(&mut out, cancel.pid, cancel.secret);
     backend::ready_for_query(&mut out, TxStatus::Idle);
     stream.write_all(&out).await?;
     out.clear();
@@ -317,7 +327,15 @@ where
         match msg {
             FrontendMessage::Terminate => return Ok(()),
             FrontendMessage::Query { sql } => {
-                match engine.simple_query(&sql).await {
+                let token = cancel.begin_query();
+                let outcome = tokio::select! {
+                    r = engine.simple_query(&sql) => r,
+                    _ = token.cancelled() => Err(PgError::error(
+                        sqlstate::QUERY_CANCELED,
+                        "canceling statement due to user request",
+                    )),
+                };
+                match outcome {
                     Ok(results) => write_results(&mut out, &results),
                     Err(e) => {
                         backend::error_response(&mut out, &e);
@@ -389,8 +407,8 @@ where
                 if ext.failed {
                     continue;
                 }
-                // NOTE(task10): wrap the engine call in select! with the cancel token here only.
-                if let Err(e) = handle_execute(&ext, &*engine, &portal, &mut out).await {
+                let token = cancel.begin_query();
+                if let Err(e) = handle_execute(&ext, &*engine, &portal, token, &mut out).await {
                     fail_extended(&mut ext, &mut out, &e);
                 }
                 stream.write_all(&out).await?;
