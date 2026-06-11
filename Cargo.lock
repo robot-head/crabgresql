@@ -430,6 +430,7 @@ name = "crabgresql"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "executor",
  "pgwire",
  "rand 0.9.4",
  "rustls",

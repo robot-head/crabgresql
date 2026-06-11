@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use executor::SqlEngine;
 use pgwire::session::SessionConfig;
-use pgwire::stub::StubEngine;
 use tokio::net::TcpListener;
 
 /// crabgresql node binary. SP1: serves the stub engine.
@@ -66,7 +66,7 @@ async fn main() -> std::io::Result<()> {
     let session_config = build_session_config(&args)?;
     pgwire::server::serve_tls(
         listener,
-        Arc::new(StubEngine::new()),
+        Arc::new(SqlEngine::new()),
         Arc::new(session_config),
         tls,
     )

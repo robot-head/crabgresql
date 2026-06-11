@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+executor.workspace = true
 pgwire.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
