@@ -10,6 +10,8 @@ license = "MIT"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+# unwrap_used stays on for ALL targets including tests (CI runs -D warnings):
+# the project convention is expect("reason") everywhere, tests included.
 [workspace.lints.clippy]
 unwrap_used = "warn"
 

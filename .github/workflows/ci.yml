@@ -11,8 +11,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses }
       - run: ./scripts/check-no-native.sh

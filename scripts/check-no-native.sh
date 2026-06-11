@@ -2,6 +2,7 @@
 # Verifies the SHIPPED dependency tree (normal + build deps of the node binary)
 # contains no native code. Dev-dependencies (test oracle tooling) are exempt
 # per the spec's safety policy.
+# The conformance crate is intentionally NOT checked: it is test tooling.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 bad=$(cargo tree -p crabgresql -e normal,build --prefix none \
