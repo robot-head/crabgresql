@@ -14,7 +14,15 @@ cargo build -p crabgresql
 ./target/debug/crabgresql --listen "127.0.0.1:${PORT}" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-sleep 1
+
+# Non-standard default port avoids clashing with a local postgres.
+# Readiness loop: cold CI runners can take >1s to start the binary.
+for _ in $(seq 10); do
+    if psql "host=127.0.0.1 port=${PORT} user=crab dbname=crab sslmode=prefer" -tAc 'SELECT 1' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.3
+done
 
 out=$(psql "host=127.0.0.1 port=${PORT} user=crab dbname=crab sslmode=prefer" -tAc 'SELECT 1')
 if [ "$out" = "1" ]; then
