@@ -217,20 +217,24 @@ async fn handle_execute<E: Engine>(
     portal_name: &str,
     out: &mut BytesMut,
 ) -> Result<(), PgError> {
-    let portal = ext.portals.get(portal_name).ok_or_else(|| {
-        PgError::error(
-            sqlstate::INVALID_CURSOR_NAME,
-            format!("portal \"{portal_name}\" does not exist"),
-        )
-    })?;
-    let results = engine.simple_query(&portal.sql).await?;
+    let (sql, formats) = {
+        let portal = ext.portals.get(portal_name).ok_or_else(|| {
+            PgError::error(
+                sqlstate::INVALID_CURSOR_NAME,
+                format!("portal \"{portal_name}\" does not exist"),
+            )
+        })?;
+        (portal.sql.clone(), portal.formats.clone())
+    }; // ext borrow ends here, before the await
+
+    let results = engine.simple_query(&sql).await?;
     // Extended protocol carries exactly one statement per Parse.
     match results.first() {
         Some(QueryResult::Rows { rows, tag, .. }) => {
             for row in rows {
                 let values: Vec<Option<Bytes>> = row
                     .iter()
-                    .zip(&portal.formats)
+                    .zip(&formats)
                     .map(|(cell, &format)| {
                         cell.as_ref().map(|c| {
                             if format == 1 {
@@ -246,7 +250,14 @@ async fn handle_execute<E: Engine>(
             backend::command_complete(out, tag);
         }
         Some(QueryResult::Command { tag }) => backend::command_complete(out, tag),
-        Some(QueryResult::Empty) | None => backend::empty_query_response(out),
+        Some(QueryResult::Empty) => backend::empty_query_response(out),
+        None => {
+            // SP2-fragile: extended protocol must send EmptyQueryResponse ONLY for an
+            // empty query string; a zero-row real query must send CommandComplete.
+            // None is unreachable for single-statement extended exec against a real
+            // engine — revisit in SP2.
+            backend::empty_query_response(out);
+        }
     }
     Ok(())
 }
@@ -378,6 +389,7 @@ where
                 if ext.failed {
                     continue;
                 }
+                // NOTE(task10): wrap the engine call in select! with the cancel token here only.
                 if let Err(e) = handle_execute(&ext, &*engine, &portal, &mut out).await {
                     fail_extended(&mut ext, &mut out, &e);
                 }

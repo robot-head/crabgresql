@@ -73,3 +73,20 @@ async fn reusing_a_prepared_statement_works() {
         assert_eq!(v, 1);
     }
 }
+
+#[tokio::test]
+async fn execute_returns_affected_count_path() {
+    let client = connect(spawn_server().await).await;
+    // execute() returns the CommandComplete row count for the Rows path.
+    let n = client.execute("SELECT 1", &[]).await.expect("execute");
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn empty_query_via_extended_protocol() {
+    let client = connect(spawn_server().await).await;
+    // Parse("") → describe → NoData; Execute → EmptyQueryResponse.
+    // tokio-postgres surfaces EmptyQueryResponse as an Ok result with zero rows.
+    let rows = client.query("", &[]).await.expect("empty ok");
+    assert!(rows.is_empty());
+}
