@@ -71,6 +71,19 @@ semantics under distribution, `pg_stat_*` views, and the C-ABI extension
 ecosystem (out of scope by definition — zero C — and the largest permanent
 parity asterisk; native-Rust extension points are a future design).
 
+### Parser conformance oracle (SP2+)
+
+In addition to the end-to-end differential harness, `pgparser` gets its own
+dedicated oracle: **libpg_query** (the extracted PostgreSQL parser, used via
+its Rust bindings as a **dev-only dependency**, exempt from zero-C like the
+PostgreSQL test container). Every grammar production `pgparser` implements is
+differential-tested against libpg_query's parse trees and fingerprints, so
+parser parity is a measured number independent of — and much cheaper than —
+testing through a running PostgreSQL. Prior art: PgDog's libpg_query work
+(pgdog.dev, Jan 2026) demonstrates both the comparison technique and the AST
+surface to compare against. libpg_query never appears in the shipped
+dependency tree; `scripts/check-no-native.sh` enforces this mechanically.
+
 ### Roadmap
 
 Each item is one spec → plan → implementation cycle. The first four are
