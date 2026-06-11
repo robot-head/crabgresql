@@ -19,3 +19,4 @@ bytes.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tokio-postgres.workspace = true
+tempfile = "3"
