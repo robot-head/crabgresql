@@ -28,6 +28,10 @@ struct Args {
     /// User credentials for --auth scram, as user=password (repeatable).
     #[arg(long = "user-cred", value_name = "USER=PASSWORD")]
     user_creds: Vec<String>,
+
+    /// Directory for durable storage. Absent → ephemeral in-memory engine.
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
 }
 
 fn tls_acceptor(
@@ -63,14 +67,15 @@ async fn main() -> std::io::Result<()> {
         (Some(c), Some(k)) => Some(tls_acceptor(c, k)?),
         _ => None,
     };
+    let engine = match &args.data_dir {
+        Some(dir) => Arc::new(
+            SqlEngine::open(dir)
+                .map_err(|e| std::io::Error::other(format!("opening data dir: {e:?}")))?,
+        ),
+        None => Arc::new(SqlEngine::new()),
+    };
     let session_config = build_session_config(&args)?;
-    pgwire::server::serve_tls(
-        listener,
-        Arc::new(SqlEngine::new()),
-        Arc::new(session_config),
-        tls,
-    )
-    .await
+    pgwire::server::serve_tls(listener, engine, Arc::new(session_config), tls).await
 }
 
 fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
