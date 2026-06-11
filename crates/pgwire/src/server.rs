@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::Engine;
 use crate::messages::backend;
-use crate::messages::frontend::{self, StartupPacket};
+use crate::messages::frontend::{self, SSL_REQUEST_CODE, StartupPacket};
 use crate::session::{self, SessionConfig};
 
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
@@ -135,10 +136,27 @@ impl Drop for SessionCancel {
     }
 }
 
+/// Serve plaintext connections (no TLS). Convenience wrapper over [`serve_tls`].
 pub async fn serve<E: Engine>(
     listener: TcpListener,
     engine: Arc<E>,
     config: Arc<SessionConfig>,
+) -> std::io::Result<()> {
+    serve_tls(listener, engine, config, None).await
+}
+
+/// Serve connections with optional TLS upgrade support.
+///
+/// When `tls` is `Some`, a client that sends an `SSLRequest` will be upgraded
+/// to a TLS stream; all subsequent protocol bytes flow over TLS.  When `tls`
+/// is `None`, an `SSLRequest` is answered with `'N'` (decline) and the
+/// connection continues in plaintext — matching the existing behaviour of
+/// [`serve`].
+pub async fn serve_tls<E: Engine>(
+    listener: TcpListener,
+    engine: Arc<E>,
+    config: Arc<SessionConfig>,
+    tls: Option<TlsAcceptor>,
 ) -> std::io::Result<()> {
     let registry = Arc::new(CancelRegistry::default());
     loop {
@@ -146,9 +164,10 @@ pub async fn serve<E: Engine>(
         let engine = Arc::clone(&engine);
         let config = Arc::clone(&config);
         let registry = Arc::clone(&registry);
+        let tls = tls.clone();
         // TODO(config-era): connection cap (Semaphore) and pre-auth read timeout — slowloris guard. Deliberately deferred in SP1.
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, engine, config, registry).await {
+            if let Err(e) = handle_conn(stream, engine, config, registry, tls).await {
                 tracing::debug!("connection from {peer} ended: {e}");
             }
         });
@@ -160,12 +179,63 @@ async fn handle_conn<E: Engine>(
     engine: Arc<E>,
     config: Arc<SessionConfig>,
     registry: Arc<CancelRegistry>,
+    tls: Option<TlsAcceptor>,
 ) -> std::io::Result<()> {
     let mut buf = BytesMut::with_capacity(1024);
+
+    // Phase 1: wait for at least the first packet header (8 bytes minimum for
+    // any legal startup packet).  Peek at bytes [4..8] to detect SSLRequest
+    // WITHOUT consuming the data — this lets non-SSLRequest packets fall
+    // through to startup_loop with their bytes intact.
+    while buf.len() < 8 {
+        if stream.read_buf(&mut buf).await? == 0 {
+            return Ok(()); // client disconnected before sending anything
+        }
+    }
+
+    let code = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if code == SSL_REQUEST_CODE {
+        // Consume the SSLRequest (exactly 8 bytes, fully buffered).
+        // decode_startup cannot fail or return None here — len==8, code known.
+        let _ = frontend::decode_startup(&mut buf);
+        match &tls {
+            Some(acceptor) => {
+                stream.write_all(b"S").await?;
+                let tls_stream = acceptor.accept(stream).await?;
+                return startup_loop(tls_stream, buf, engine, config, registry).await;
+            }
+            None => {
+                stream.write_all(b"N").await?;
+                // Fall through to plaintext startup_loop below.
+            }
+        }
+    }
+
+    startup_loop(stream, buf, engine, config, registry).await
+}
+
+/// Post-TLS-decision startup loop, generic over the stream type.
+///
+/// Handles the remaining startup packets (GssEncRequest → 'N', CancelRequest,
+/// Startup) on any stream that implements `AsyncRead + AsyncWrite + Unpin`.
+/// A second SSLRequest (or one received over TLS) is declined with 'N' and
+/// the loop continues — the client may then send a normal Startup.
+async fn startup_loop<S, E>(
+    mut stream: S,
+    mut buf: BytesMut,
+    engine: Arc<E>,
+    config: Arc<SessionConfig>,
+    registry: Arc<CancelRegistry>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    E: Engine,
+{
     loop {
         match frontend::decode_startup(&mut buf) {
-            Ok(Some(StartupPacket::SslRequest)) | Ok(Some(StartupPacket::GssEncRequest)) => {
-                // TLS task upgrades the SslRequest arm; until then: not supported.
+            Ok(Some(StartupPacket::SslRequest | StartupPacket::GssEncRequest)) => {
+                // A second SSLRequest, GssEncRequest, or either over TLS:
+                // decline; client may proceed with a normal Startup.
                 stream.write_all(b"N").await?;
             }
             Ok(Some(StartupPacket::CancelRequest {
@@ -184,7 +254,7 @@ async fn handle_conn<E: Engine>(
             }
             Ok(None) => {
                 if stream.read_buf(&mut buf).await? == 0 {
-                    return Ok(());
+                    return Ok(()); // EOF
                 }
             }
             Err(e) => {

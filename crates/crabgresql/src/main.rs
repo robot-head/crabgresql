@@ -12,6 +12,33 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:5433")]
     listen: String,
+
+    /// Path to the server certificate chain (PEM). Enables TLS with --tls-key.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to the server private key (PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+}
+
+fn tls_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> std::io::Result<tokio_rustls::TlsAcceptor> {
+    use std::io::{BufReader, Error, ErrorKind};
+    let certs = rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(cert_path)?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(std::fs::File::open(key_path)?))?
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no private key in file"))?;
+    let provider = Arc::new(rustls_rustcrypto::provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 #[tokio::main]
@@ -24,10 +51,15 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("crabgresql listening on {}", args.listen);
-    pgwire::server::serve(
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(c), Some(k)) => Some(tls_acceptor(c, k)?),
+        _ => None,
+    };
+    pgwire::server::serve_tls(
         listener,
         Arc::new(StubEngine::new()),
         Arc::new(SessionConfig::trust()),
+        tls,
     )
     .await
 }

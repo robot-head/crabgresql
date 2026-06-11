@@ -359,6 +359,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-rustcrypto",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
