@@ -48,6 +48,7 @@ pub fn decode_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>, PgErr
             secret_key: get_i32(&mut body)?,
         })),
         PROTOCOL_3_0 => {
+            // Bounded by MAX_STARTUP_PACKET_LEN, like real PostgreSQL — no per-pair cap needed.
             let mut params = Vec::new();
             loop {
                 let key = get_cstr(&mut body)?;
@@ -90,6 +91,7 @@ pub enum FrontendMessage {
         params: Vec<Option<Bytes>>,
         result_formats: Vec<i16>,
     },
+    /// `kind` is NOT validated here ('S'/'P' expected); the session maps invalid kinds to 08P01.
     Describe {
         kind: u8,
         name: String,
@@ -98,6 +100,7 @@ pub enum FrontendMessage {
         portal: String,
         max_rows: i32,
     },
+    /// `kind` is NOT validated here ('S'/'P' expected); the session maps invalid kinds to 08P01.
     Close {
         kind: u8,
         name: String,
@@ -133,13 +136,17 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, PgE
         b'X' => FrontendMessage::Terminate,
         b'S' => FrontendMessage::Sync,
         b'H' => FrontendMessage::Flush,
-        b'p' => FrontendMessage::Password(body.clone()),
+        b'p' => {
+            let payload = body.clone();
+            body.advance(body.len());
+            FrontendMessage::Password(payload)
+        }
         b'P' => {
             let name = get_cstr(&mut body)?;
             let sql = get_cstr(&mut body)?;
             let n = get_i16(&mut body)?;
             let n =
-                usize::try_from(n).map_err(|_| PgError::protocol("negative parameter count"))?;
+                usize::try_from(n).map_err(|_| PgError::protocol("negative count in message"))?;
             let mut param_types = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 param_types.push(get_i32(&mut body)? as u32);
@@ -155,8 +162,8 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, PgE
             let statement = get_cstr(&mut body)?;
             let param_formats = decode_i16_vec(&mut body)?;
             let nparams = get_i16(&mut body)?;
-            let nparams =
-                usize::try_from(nparams).map_err(|_| PgError::protocol("negative param count"))?;
+            let nparams = usize::try_from(nparams)
+                .map_err(|_| PgError::protocol("negative count in message"))?;
             let mut params = Vec::with_capacity(nparams.min(1024));
             for _ in 0..nparams {
                 let len = get_i32(&mut body)?;
@@ -194,12 +201,19 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, PgE
             )));
         }
     };
+    if !body.is_empty() {
+        return Err(PgError::protocol(format!(
+            "invalid message format: {} trailing bytes after '{}' message",
+            body.len(),
+            tag as char
+        )));
+    }
     Ok(Some(msg))
 }
 
 fn decode_i16_vec(body: &mut Bytes) -> Result<Vec<i16>, PgError> {
     let n = get_i16(body)?;
-    let n = usize::try_from(n).map_err(|_| PgError::protocol("negative count"))?;
+    let n = usize::try_from(n).map_err(|_| PgError::protocol("negative count in message"))?;
     let mut out = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
         out.push(get_i16(body)?);
@@ -472,6 +486,13 @@ mod tests {
     }
 
     #[test]
+    fn trailing_bytes_after_message_are_rejected() {
+        let mut buf = tagged(b'Q', b"SELECT 1\0junk");
+        let err = decode_message(&mut buf).expect_err("trailing bytes must be rejected");
+        assert_eq!(err.code, crate::error::sqlstate::PROTOCOL_VIOLATION);
+    }
+
+    #[test]
     fn absurd_length_is_error_not_panic() {
         let mut buf = BytesMut::new();
         buf.put_i32(i32::MAX);
@@ -507,6 +528,52 @@ mod proptests {
         fn decode_startup_never_panics(data: Vec<u8>) {
             let mut buf = BytesMut::from(&data[..]);
             let _ = decode_startup(&mut buf);
+        }
+    }
+
+    /// Builds a structurally valid Bind message body — the deepest parse path.
+    fn valid_bind_frame(nparams: u16, param_len: u16) -> Vec<u8> {
+        use bytes::BufMut;
+        let mut body = bytes::BytesMut::new();
+        body.put_slice(b"portal\0stmt\0");
+        body.put_i16(1);
+        body.put_i16(0);
+        body.put_i16(nparams as i16);
+        for _ in 0..nparams {
+            body.put_i32(i32::from(param_len));
+            body.put_slice(&vec![0x42u8; usize::from(param_len)]);
+        }
+        body.put_i16(1);
+        body.put_i16(1);
+        let mut frame = Vec::with_capacity(body.len() + 5);
+        frame.push(b'B');
+        frame.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    proptest! {
+        #[test]
+        fn mutated_valid_frames_never_panic(
+            nparams in 0u16..64,
+            param_len in 0u16..64,
+            mutate_at in 0usize..256,
+            mutate_to: u8,
+        ) {
+            let mut frame = valid_bind_frame(nparams, param_len);
+            let idx = mutate_at % frame.len();
+            frame[idx] = mutate_to;
+            let mut buf = BytesMut::from(&frame[..]);
+            let _ = decode_message(&mut buf);
+        }
+
+        #[test]
+        fn valid_bind_frames_roundtrip(nparams in 0u16..16, param_len in 0u16..32) {
+            let frame = valid_bind_frame(nparams, param_len);
+            let mut buf = BytesMut::from(&frame[..]);
+            let msg = decode_message(&mut buf).expect("valid frame decodes").expect("complete");
+            let bind_len = if let FrontendMessage::Bind { ref params, .. } = msg { Some(params.len()) } else { None };
+            prop_assert_eq!(bind_len, Some(usize::from(nparams)));
         }
     }
 }
