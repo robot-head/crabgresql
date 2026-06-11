@@ -67,6 +67,146 @@ pub fn decode_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>, PgErr
     }
 }
 
+/// Cap matching PostgreSQL's PQ_LARGE_MESSAGE_LIMIT order of magnitude.
+pub const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendMessage {
+    Query {
+        sql: String,
+    },
+    /// 'p' carries password / SASLInitialResponse / SASLResponse depending on
+    /// auth state; the session layer interprets the raw body.
+    Password(Bytes),
+    Parse {
+        name: String,
+        sql: String,
+        param_types: Vec<u32>,
+    },
+    Bind {
+        portal: String,
+        statement: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Bytes>>,
+        result_formats: Vec<i16>,
+    },
+    Describe {
+        kind: u8,
+        name: String,
+    },
+    Execute {
+        portal: String,
+        max_rows: i32,
+    },
+    Close {
+        kind: u8,
+        name: String,
+    },
+    Sync,
+    Flush,
+    Terminate,
+}
+
+pub fn decode_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, PgError> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let tag = buf[0];
+    let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    if len < 4 || len as usize > MAX_MESSAGE_LEN {
+        return Err(PgError::protocol(format!(
+            "invalid message length {len} for tag {}",
+            tag as char
+        )));
+    }
+    let total = 1 + len as usize;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let mut body = buf.split_to(total).freeze();
+    body.advance(5); // tag + length
+
+    let msg = match tag {
+        b'Q' => FrontendMessage::Query {
+            sql: get_cstr(&mut body)?,
+        },
+        b'X' => FrontendMessage::Terminate,
+        b'S' => FrontendMessage::Sync,
+        b'H' => FrontendMessage::Flush,
+        b'p' => FrontendMessage::Password(body.clone()),
+        b'P' => {
+            let name = get_cstr(&mut body)?;
+            let sql = get_cstr(&mut body)?;
+            let n = get_i16(&mut body)?;
+            let n =
+                usize::try_from(n).map_err(|_| PgError::protocol("negative parameter count"))?;
+            let mut param_types = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                param_types.push(get_i32(&mut body)? as u32);
+            }
+            FrontendMessage::Parse {
+                name,
+                sql,
+                param_types,
+            }
+        }
+        b'B' => {
+            let portal = get_cstr(&mut body)?;
+            let statement = get_cstr(&mut body)?;
+            let param_formats = decode_i16_vec(&mut body)?;
+            let nparams = get_i16(&mut body)?;
+            let nparams =
+                usize::try_from(nparams).map_err(|_| PgError::protocol("negative param count"))?;
+            let mut params = Vec::with_capacity(nparams.min(1024));
+            for _ in 0..nparams {
+                let len = get_i32(&mut body)?;
+                if len < 0 {
+                    params.push(None);
+                } else {
+                    params.push(Some(get_bytes(&mut body, len as usize)?));
+                }
+            }
+            let result_formats = decode_i16_vec(&mut body)?;
+            FrontendMessage::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            }
+        }
+        b'D' => FrontendMessage::Describe {
+            kind: get_u8(&mut body)?,
+            name: get_cstr(&mut body)?,
+        },
+        b'E' => FrontendMessage::Execute {
+            portal: get_cstr(&mut body)?,
+            max_rows: get_i32(&mut body)?,
+        },
+        b'C' => FrontendMessage::Close {
+            kind: get_u8(&mut body)?,
+            name: get_cstr(&mut body)?,
+        },
+        other => {
+            return Err(PgError::protocol(format!(
+                "unknown frontend message tag {:?}",
+                other as char
+            )));
+        }
+    };
+    Ok(Some(msg))
+}
+
+fn decode_i16_vec(body: &mut Bytes) -> Result<Vec<i16>, PgError> {
+    let n = get_i16(body)?;
+    let n = usize::try_from(n).map_err(|_| PgError::protocol("negative count"))?;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        out.push(get_i16(body)?);
+    }
+    Ok(out)
+}
+
 // ---- checked readers (Bytes::get_* panic on underflow; never call those) ----
 
 pub(crate) fn get_i32(buf: &mut Bytes) -> Result<i32, PgError> {
@@ -76,7 +216,6 @@ pub(crate) fn get_i32(buf: &mut Bytes) -> Result<i32, PgError> {
     Ok(buf.get_i32())
 }
 
-#[allow(dead_code)] // used from Task 4
 pub(crate) fn get_i16(buf: &mut Bytes) -> Result<i16, PgError> {
     if buf.len() < 2 {
         return Err(PgError::protocol("message truncated reading i16"));
@@ -84,7 +223,6 @@ pub(crate) fn get_i16(buf: &mut Bytes) -> Result<i16, PgError> {
     Ok(buf.get_i16())
 }
 
-#[allow(dead_code)] // used from Task 4
 pub(crate) fn get_u8(buf: &mut Bytes) -> Result<u8, PgError> {
     if buf.is_empty() {
         return Err(PgError::protocol("message truncated reading byte"));
@@ -92,7 +230,6 @@ pub(crate) fn get_u8(buf: &mut Bytes) -> Result<u8, PgError> {
     Ok(buf.get_u8())
 }
 
-#[allow(dead_code)] // used from Task 4
 pub(crate) fn get_bytes(buf: &mut Bytes, n: usize) -> Result<Bytes, PgError> {
     if buf.len() < n {
         return Err(PgError::protocol("message truncated reading bytes"));
@@ -113,7 +250,151 @@ pub(crate) fn get_cstr(buf: &mut Bytes) -> Result<String, PgError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{BufMut, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
+
+    fn tagged(tag: u8, body: &[u8]) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(tag);
+        buf.put_i32(body.len() as i32 + 4);
+        buf.put_slice(body);
+        buf
+    }
+
+    #[test]
+    fn decodes_query() {
+        let mut buf = tagged(b'Q', b"SELECT 1\0");
+        let msg = decode_message(&mut buf).expect("ok").expect("complete");
+        assert_eq!(
+            msg,
+            FrontendMessage::Query {
+                sql: "SELECT 1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_terminate_sync_flush() {
+        for (tag, want) in [
+            (b'X', FrontendMessage::Terminate),
+            (b'S', FrontendMessage::Sync),
+            (b'H', FrontendMessage::Flush),
+        ] {
+            let mut buf = tagged(tag, b"");
+            assert_eq!(
+                decode_message(&mut buf).expect("ok").expect("complete"),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_parse_with_param_types() {
+        let mut body = BytesMut::new();
+        body.put_slice(b"stmt1\0SELECT $1\0");
+        body.put_i16(1);
+        body.put_i32(23); // int4 oid
+        let mut buf = tagged(b'P', &body);
+        let msg = decode_message(&mut buf).expect("ok").expect("complete");
+        assert_eq!(
+            msg,
+            FrontendMessage::Parse {
+                name: "stmt1".into(),
+                sql: "SELECT $1".into(),
+                param_types: vec![23],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_bind() {
+        let mut body = BytesMut::new();
+        body.put_slice(b"portal1\0stmt1\0");
+        body.put_i16(1); // one param format code
+        body.put_i16(0); // text
+        body.put_i16(2); // two params
+        body.put_i32(2);
+        body.put_slice(b"42");
+        body.put_i32(-1); // NULL param
+        body.put_i16(1); // one result format code
+        body.put_i16(1); // binary
+        let mut buf = tagged(b'B', &body);
+        let msg = decode_message(&mut buf).expect("ok").expect("complete");
+        assert_eq!(
+            msg,
+            FrontendMessage::Bind {
+                portal: "portal1".into(),
+                statement: "stmt1".into(),
+                param_formats: vec![0],
+                params: vec![Some(Bytes::from_static(b"42")), None],
+                result_formats: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_describe_execute_close() {
+        let mut buf = tagged(b'D', b"Sstmt1\0");
+        assert_eq!(
+            decode_message(&mut buf).expect("ok").expect("complete"),
+            FrontendMessage::Describe {
+                kind: b'S',
+                name: "stmt1".into()
+            }
+        );
+
+        let mut body = BytesMut::new();
+        body.put_slice(b"portal1\0");
+        body.put_i32(0);
+        let mut buf = tagged(b'E', &body);
+        assert_eq!(
+            decode_message(&mut buf).expect("ok").expect("complete"),
+            FrontendMessage::Execute {
+                portal: "portal1".into(),
+                max_rows: 0
+            }
+        );
+
+        let mut buf = tagged(b'C', b"P\0");
+        assert_eq!(
+            decode_message(&mut buf).expect("ok").expect("complete"),
+            FrontendMessage::Close {
+                kind: b'P',
+                name: "".into()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_password_message_raw() {
+        let mut buf = tagged(b'p', b"SCRAM-SHA-256\0\0\0\0\x05hello");
+        let msg = decode_message(&mut buf).expect("ok").expect("complete");
+        assert_eq!(
+            msg,
+            FrontendMessage::Password(Bytes::from_static(b"SCRAM-SHA-256\0\0\0\0\x05hello"))
+        );
+    }
+
+    #[test]
+    fn partial_message_returns_none_and_keeps_buffer() {
+        let full = tagged(b'Q', b"SELECT 1\0");
+        let mut partial = BytesMut::from(&full[..4]);
+        assert_eq!(decode_message(&mut partial).expect("ok"), None);
+        assert_eq!(partial.len(), 4, "no bytes consumed");
+    }
+
+    #[test]
+    fn unknown_tag_is_error() {
+        let mut buf = tagged(b'?', b"");
+        assert!(decode_message(&mut buf).is_err());
+    }
+
+    #[test]
+    fn oversized_length_is_error_not_panic() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'Q');
+        buf.put_i32(i32::MAX);
+        assert!(decode_message(&mut buf).is_err());
+    }
 
     fn startup_bytes(params: &[(&str, &str)]) -> BytesMut {
         let mut body = BytesMut::new();
@@ -206,5 +487,26 @@ mod tests {
         assert_eq!(decode_startup(&mut partial).expect("ok"), None);
         // Buffer must be untouched (no split_to happened).
         assert_eq!(partial.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use bytes::BytesMut;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn decode_message_never_panics(data: Vec<u8>) {
+            let mut buf = BytesMut::from(&data[..]);
+            let _ = decode_message(&mut buf);
+        }
+
+        #[test]
+        fn decode_startup_never_panics(data: Vec<u8>) {
+            let mut buf = BytesMut::from(&data[..]);
+            let _ = decode_startup(&mut buf);
+        }
     }
 }
