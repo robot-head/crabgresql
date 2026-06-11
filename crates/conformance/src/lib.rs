@@ -57,11 +57,12 @@ impl Report {
         );
         md.push_str("| file | statement | result |\n|---|---|---|\n");
         for c in &self.cases {
-            let sql = c.sql.replace('|', "\\|");
+            let sql = c.sql.replace('|', "\\|").replace('\n', " ");
             let result = if c.matched {
                 "match".to_string()
             } else {
-                format!("MISMATCH: {}", c.detail)
+                let detail = c.detail.replace('|', "\\|").replace('\n', " ");
+                format!("MISMATCH: {}", detail)
             };
             md.push_str(&format!("| {} | `{}` | {} |\n", c.file, sql, result));
         }
@@ -127,6 +128,7 @@ pub async fn run_one(client: &tokio_postgres::Client, sql: &str) -> QueryOutcome
 /// Minimal statement splitter: semicolons outside single/double quotes and
 /// line comments. Dollar-quoting is NOT handled yet — tracked for the
 /// pg_regress import in SP2, which needs it.
+/// Doubled quotes ('') net-cancel under the toggle approach, keeping ; inside strings protected.
 pub fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -215,5 +217,16 @@ mod tests {
             error_code: Some("0A000".into()),
         };
         assert!(!diff(&a, &b).matched);
+    }
+
+    #[test]
+    fn doubled_quotes_keep_semicolons_protected() {
+        // SQL escapes a quote by doubling it; the toggle approach keeps the
+        // in-string state net-unchanged across '' so the ; stays protected.
+        let sql = "SELECT 'it''s;bad';SELECT 2";
+        assert_eq!(
+            split_statements(sql),
+            vec!["SELECT 'it''s;bad'", "SELECT 2"]
+        );
     }
 }
