@@ -28,7 +28,14 @@ impl ExecError {
             ExecError::Parse(e) => PgError::error(e.sqlstate(), e.to_string()),
             ExecError::Catalog(e) => PgError::error(e.sqlstate(), e.to_string()),
             ExecError::Type(e) => PgError::error(e.sqlstate(), e.to_string()),
-            ExecError::Kv(e) => PgError::error("XX000", e.to_string()),
+            ExecError::Kv(e) => match e {
+                kv::KvError::Io(msg) => {
+                    PgError::error("58030", format!("storage I/O error: {msg}"))
+                }
+                kv::KvError::CorruptRow(msg) => {
+                    PgError::error("XX000", format!("corrupt storage: {msg}"))
+                }
+            },
             ExecError::UndefinedColumn(c) => {
                 PgError::error("42703", format!("column \"{c}\" does not exist"))
             }

@@ -8,4 +8,4 @@ pub mod rowenc;
 pub mod store;
 
 pub use error::KvError;
-pub use store::{Kv, MemKv};
+pub use store::{Kv, MemKv, WriteOp};

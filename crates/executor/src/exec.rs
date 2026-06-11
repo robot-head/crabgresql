@@ -62,7 +62,7 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                 let rowid = engine.next_rowid(t.id);
                 engine
                     .kv
-                    .put(kv::key::row_key(t.id, rowid), kv::rowenc::encode_row(&full));
+                    .put(kv::key::row_key(t.id, rowid), kv::rowenc::encode_row(&full))?;
                 n += 1;
             }
             Ok(QueryResult::Command {
@@ -104,12 +104,13 @@ fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecEr
 
     // Source rows: scan the table, or a single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => engine
-            .kv
-            .scan_prefix(&kv::key::table_prefix(t.id))
-            .into_iter()
-            .map(|(_, v)| kv::rowenc::decode_row(&v))
-            .collect::<Result<_, _>>()?,
+        Some(t) => {
+            let scanned = engine.kv.scan_prefix(&kv::key::table_prefix(t.id))?;
+            scanned
+                .into_iter()
+                .map(|(_, v)| kv::rowenc::decode_row(&v))
+                .collect::<Result<_, _>>()?
+        }
         None => vec![vec![]],
     };
 

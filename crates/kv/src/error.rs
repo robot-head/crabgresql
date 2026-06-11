@@ -1,8 +1,9 @@
-//! Errors from decoding stored bytes. Our own writes never produce these, but
-//! decoders must fail rather than panic on corrupt or truncated input.
+//! Errors from the storage layer.
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KvError {
     #[error("corrupt row encoding: {0}")]
     CorruptRow(String),
+    #[error("storage I/O error: {0}")]
+    Io(String),
 }
