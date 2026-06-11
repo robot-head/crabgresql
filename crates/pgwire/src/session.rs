@@ -18,6 +18,16 @@ use crate::server::SessionCancel;
 #[derive(Debug, Clone)]
 pub enum AuthMode {
     Trust,
+    /// SCRAM-SHA-256 with users stored as PLAINTEXT passwords — an SP1
+    /// simplification with three linked gaps, all fixed together in SP2 by
+    /// storing SCRAM verifiers (StoredKey/ServerKey/salt/iters) like real
+    /// PostgreSQL:
+    /// 1. plaintext at rest;
+    /// 2. server pays PBKDF2 (4096 iters) per unauthenticated attempt
+    ///    (real SCRAM puts that cost on the client);
+    /// 3. unknown users get no SASL challenge — a username-enumeration
+    ///    oracle; the fix is mock authentication (RFC 5802 §7) against a
+    ///    deterministic fake verifier.
     ScramSha256 {
         users: std::collections::HashMap<String, String>,
     },
