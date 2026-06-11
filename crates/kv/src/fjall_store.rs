@@ -29,7 +29,11 @@ impl FjallKv {
         Ok(Self { db, ks })
     }
 
-    /// Fsync the journal so every prior write survives a crash.
+    /// Flush the journal to disk (full fsync). Called as the TAIL of every
+    /// mutating op (put/delete/write_batch) so the method returns `Ok` only
+    /// after the data is power-loss durable. DO NOT refactor those calls to
+    /// early-return before sync() — that would make a returned-Ok write
+    /// survivable only across a clean process exit, not a power loss.
     fn sync(&self) -> Result<(), KvError> {
         self.db.persist(PersistMode::SyncAll).map_err(io)
     }
