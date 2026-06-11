@@ -7,9 +7,13 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+oracle = ["dep:pg_query"]
+
 [dependencies]
 thiserror.workspace = true
 pgtypes.workspace = true
+pg_query = { version = "6", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
