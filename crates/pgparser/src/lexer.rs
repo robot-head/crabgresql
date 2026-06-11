@@ -135,6 +135,7 @@ fn push1(out: &mut Vec<(Token, usize)>, tok: Token, i: &mut usize) {
 mod tests {
     use super::*;
     use crate::token::{Keyword, Token};
+    use proptest::prelude::*;
 
     fn toks(sql: &str) -> Vec<Token> {
         lex(sql).expect("lex").into_iter().map(|(t, _)| t).collect()
@@ -215,5 +216,14 @@ mod tests {
     fn unterminated_string_errors_with_position() {
         let e = lex("'abc").expect_err("unterminated");
         assert_eq!(e.position, 0);
+    }
+
+    proptest! {
+        #[test]
+        fn lex_never_panics(s: String) {
+            // The lexer must never panic on arbitrary (valid-UTF-8) input —
+            // it returns Ok(tokens) or Err(ParseError), never unwinds.
+            let _ = lex(&s);
+        }
     }
 }
