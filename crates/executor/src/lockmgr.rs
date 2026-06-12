@@ -15,14 +15,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
 pub enum LockMode {
     Shared,
     Exclusive,
 }
 
 /// Result of a non-blocking lock attempt.
-#[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
 pub enum Acquire {
     Acquired,
     /// Held by `holder` (one of the holders) — an xid to wait on.
@@ -30,7 +28,6 @@ pub enum Acquire {
 }
 
 /// Result of the eager cycle check.
-#[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
 pub enum CycleCheck {
     Ok,
     Deadlock,
@@ -44,15 +41,20 @@ struct RowLock {
 struct Inner {
     locks: HashMap<(catalog::TableId, u64), RowLock>,
     waiters: HashMap<u64, Vec<Arc<Notify>>>, // holder xid -> waiters' notifiers
-    wait_for: HashMap<u64, u64>,             // waiter xid -> holder xid
+    // wait-for graph: each waiting xid -> the single holder xid it blocks on.
+    // NOTE: this is single-successor (one out-edge per waiter), so the eager
+    // cycle check is exact for exclusive locks. A deadlock cycle that runs only
+    // through a non-chosen *shared* co-holder may not be flagged on the first
+    // check — but it cannot hang permanently: every release re-wakes the waiter,
+    // which re-checks against a possibly-different chosen holder until the cyclic
+    // one is the edge. Shared-only deadlocks are out of SP6's tested scope.
+    wait_for: HashMap<u64, u64>,
 }
 
-#[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
 pub(crate) struct RowLockManager {
     inner: Mutex<Inner>,
 }
 
-#[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
 impl RowLockManager {
     pub fn new() -> Self {
         Self {
@@ -67,7 +69,8 @@ impl RowLockManager {
     /// Non-blocking acquire. Idempotent if `my_xid` already holds compatibly; a
     /// sole shared holder may upgrade to exclusive. Thin wrapper that locks and
     /// delegates to [`try_acquire_locked`].
-    pub fn try_acquire(
+    #[cfg(test)]
+    pub(crate) fn try_acquire(
         &self,
         table: catalog::TableId,
         rowid: u64,

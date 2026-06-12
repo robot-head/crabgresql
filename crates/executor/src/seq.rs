@@ -11,13 +11,10 @@ use kv::Kv;
 
 use crate::error::ExecError;
 
-// wired in by the SP6 cutover (Task 5)
-#[allow(dead_code)]
 pub(crate) struct SequenceManager {
     inner: Mutex<HashMap<catalog::TableId, u64>>,
 }
 
-#[allow(dead_code)]
 impl SequenceManager {
     pub fn new() -> Self {
         Self {
