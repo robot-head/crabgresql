@@ -11,6 +11,7 @@ workspace = true
 thiserror.workspace = true
 pgtypes.workspace = true
 fjall = "3.1.5"
+zerocopy.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
