@@ -207,8 +207,14 @@ impl Parser {
 
     fn begin(&mut self) -> Result<crate::ast::Statement, ParseError> {
         use crate::ast::{IsolationLevel, Statement};
-        self.bump(); // BEGIN or START
-        self.eat_keyword(Keyword::Transaction); // optional
+        let leading = self.bump(); // BEGIN or START
+        if leading == Token::Keyword(Keyword::Start) {
+            // START TRANSACTION is valid; bare START is not a statement.
+            self.expect(&Token::Keyword(Keyword::Transaction))?;
+        } else {
+            // TRANSACTION is optional after BEGIN.
+            self.eat_keyword(Keyword::Transaction);
+        }
         let isolation = if self.eat_keyword(Keyword::Isolation) {
             self.expect(&Token::Keyword(Keyword::Level))?;
             if self.eat_keyword(Keyword::Repeatable) {
@@ -582,6 +588,16 @@ mod tests {
                 isolation: Some(IsolationLevel::ReadCommitted)
             }
         );
+    }
+
+    #[test]
+    fn start_requires_transaction_keyword() {
+        // START TRANSACTION is valid; bare START is not a statement.
+        assert_eq!(
+            one("START TRANSACTION"),
+            Statement::Begin { isolation: None }
+        );
+        assert!(parse("START").is_err());
     }
 
     #[test]
