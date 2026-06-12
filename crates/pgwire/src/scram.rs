@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -244,7 +244,7 @@ mod tests {
     ) -> String {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as B64;
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::{Digest, Sha256};
         let sf = std::str::from_utf8(server_first).expect("utf8");
         let full_nonce = sf.split(',').find_map(|p| p.strip_prefix("r=")).expect("r");
