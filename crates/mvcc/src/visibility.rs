@@ -20,6 +20,11 @@ pub struct Snapshot {
 impl Snapshot {
     /// Was `xid` running at (or started after) the moment this snapshot was taken?
     fn is_running(&self, xid: u64) -> bool {
+        // NOTE: PostgreSQL also treats `xid < self.xmin` as a fast "settled" case.
+        // We omit that fast path: such xids fall through to the clog, which gives
+        // the identical committed/aborted answer (xmin is the lowest running xid,
+        // so everything below it is already settled). Pure optimization, not
+        // correctness — safe to add later if clog lookups become hot.
         xid >= self.xmax || self.xip.binary_search(&xid).is_ok()
     }
 }
@@ -51,6 +56,10 @@ pub fn satisfies_mvcc(
     own: Option<u64>,
     status: impl Fn(u64) -> Result<XidStatus, KvError>,
 ) -> Result<bool, KvError> {
+    debug_assert!(
+        snapshot.xip.windows(2).all(|w| w[0] <= w[1]),
+        "Snapshot.xip must be sorted ascending for binary_search visibility"
+    );
     if !committed_visible(xmin, snapshot, own, &status)? {
         return Ok(false);
     }
@@ -136,5 +145,15 @@ mod tests {
     fn own_delete_hides_row_from_me() {
         let s = snap(7, &[]);
         assert!(!satisfies_mvcc(7, 7, &s, Some(7), status_map(&[], &[])).expect("ok"));
+    }
+
+    #[test]
+    fn sorted_multi_element_xip_resolves_correctly() {
+        // Snapshot xmax=20, running={5,9,14}: committed row xmin=3 (below xmin=5,
+        // settled) should be visible; xmin=9 (in xip, still running) should not.
+        let s = snap(20, &[5, 9, 14]);
+        assert_eq!(s.xip, vec![5, 9, 14]); // verify snap() sorted them
+        assert!(satisfies_mvcc(3, 0, &s, None, status_map(&[3], &[])).expect("ok"));
+        assert!(!satisfies_mvcc(9, 0, &s, None, status_map(&[9], &[])).expect("ok"));
     }
 }
