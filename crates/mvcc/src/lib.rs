@@ -6,6 +6,7 @@
 pub mod clog;
 pub mod snapshot;
 pub mod version;
+pub mod visibility;
 pub mod xid;
 
 pub use snapshot::{Snapshot, visible_version};
