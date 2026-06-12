@@ -242,7 +242,7 @@ impl SqlSession {
                 // Autocommit: acquire the lock, allocate an xid, execute, and
                 // commit in one atomic batch (versions + next_xid + clog).
                 let guard = self.writer_lock.clone().lock_owned().await;
-                let xid = self.procarray.begin_write();
+                let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
                 let kv = Arc::clone(&self.kv);
                 let outcome = crate::exec::execute_write(&*kv, &snapshot, xid, stmt);
@@ -284,7 +284,7 @@ impl SqlSession {
             return Ok(());
         }
         let guard = self.writer_lock.clone().lock_owned().await;
-        let xid = self.procarray.begin_write();
+        let xid = self.procarray.begin_write()?;
         if let TxnState::InTransaction(c) = &mut self.state {
             c.xid = Some(xid);
             c.writer_guard = Some(guard);

@@ -71,7 +71,11 @@ mod tests {
         let seq = SequenceManager::new();
         seq.alloc(&*kv, 7, 5).expect("alloc"); // consumes 1..=5, persists next=6
         let seq2 = SequenceManager::new(); // simulate restart
-        assert_eq!(seq2.alloc(&*kv, 7, 1).expect("alloc"), 6, "must not reuse 1..=5");
+        assert_eq!(
+            seq2.alloc(&*kv, 7, 1).expect("alloc"),
+            6,
+            "must not reuse 1..=5"
+        );
     }
 
     #[test]

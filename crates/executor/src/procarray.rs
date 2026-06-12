@@ -5,7 +5,7 @@
 //! any clog `in-progress` xid is in no snapshot and resolves as aborted.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kv::Kv;
 use mvcc::visibility::Snapshot;
@@ -20,12 +20,13 @@ struct Inner {
 /// The running-transaction registry.
 pub(crate) struct ProcArray {
     inner: Mutex<Inner>,
+    kv: Arc<dyn Kv>,
 }
 
 impl ProcArray {
     /// Seed the next-xid counter from the durable key (default 1 — real xids
     /// start at 1; 0 is the invalid sentinel).
-    pub fn open(kv: &dyn Kv) -> Result<Self, ExecError> {
+    pub fn open(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
         let next_xid = match kv.get(&kv::key::next_xid_key())? {
             Some(b) => {
                 let a: [u8; 8] = b
@@ -41,18 +42,27 @@ impl ProcArray {
                 next_xid: next_xid.max(1),
                 running: BTreeSet::new(),
             }),
+            kv,
         })
     }
 
-    /// Allocate the next xid and register it as running. The caller MUST persist
-    /// `next_xid()` in the same write batch as the transaction's first version so
-    /// a crash cannot reuse the xid.
-    pub fn begin_write(&self) -> u64 {
+    /// Allocate the next xid and register it as running. Persists the bumped
+    /// counter durably under the lock so it advances monotonically — a restart
+    /// never reuses an xid even when concurrent commit batches land out of order.
+    pub fn begin_write(&self) -> Result<u64, ExecError> {
         let mut g = self.inner.lock().expect("procarray");
         let xid = g.next_xid;
-        g.next_xid += 1;
+        let new_next = xid + 1;
+        // Persist the bumped counter durably under the lock so it advances
+        // monotonically — a restart never reuses an xid even when concurrent
+        // commit batches land out of order.
+        self.kv.write_batch(&[kv::WriteOp::Put {
+            key: kv::key::next_xid_key(),
+            value: new_next.to_be_bytes().to_vec(),
+        }])?;
+        g.next_xid = new_next;
         g.running.insert(xid);
-        xid
+        Ok(xid)
     }
 
     /// The durable next-xid value to persist (one past the highest allocated).
@@ -84,12 +94,14 @@ impl ProcArray {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use kv::MemKv;
 
     #[test]
     fn fresh_store_starts_at_xid_one() {
-        let pa = ProcArray::open(&MemKv::new()).expect("open");
+        let pa = ProcArray::open(Arc::new(MemKv::new())).expect("open");
         let s = pa.snapshot();
         assert_eq!(s.xmax, 1);
         assert!(s.xip.is_empty());
@@ -97,9 +109,9 @@ mod tests {
 
     #[test]
     fn allocate_registers_running_and_snapshot_excludes_committed() {
-        let pa = ProcArray::open(&MemKv::new()).expect("open");
-        let x1 = pa.begin_write();
-        let x2 = pa.begin_write();
+        let pa = ProcArray::open(Arc::new(MemKv::new())).expect("open");
+        let x1 = pa.begin_write().expect("begin_write");
+        let x2 = pa.begin_write().expect("begin_write");
         assert_eq!((x1, x2), (1, 2));
         let s = pa.snapshot();
         assert_eq!(s.xmax, 3);
@@ -112,14 +124,23 @@ mod tests {
 
     #[test]
     fn open_seeds_next_xid_from_durable_counter() {
-        let kv = MemKv::new();
+        let kv = Arc::new(MemKv::new());
         kv.write_batch(&[kv::WriteOp::Put {
             key: kv::key::next_xid_key(),
             value: 42u64.to_be_bytes().to_vec(),
         }])
         .expect("seed");
-        let pa = ProcArray::open(&kv).expect("open");
-        assert_eq!(pa.begin_write(), 42);
+        let pa = ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>).expect("open");
+        assert_eq!(pa.begin_write().expect("begin_write"), 42);
         assert_eq!(pa.next_xid(), 43);
+
+        // Prove monotonic persist: a fresh ProcArray on the same kv should pick
+        // up the durable counter (43) and return 43 as its first xid.
+        let pa2 = ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>).expect("open2");
+        assert_eq!(
+            pa2.begin_write().expect("begin_write2"),
+            43,
+            "durable counter must have advanced to 43"
+        );
     }
 }

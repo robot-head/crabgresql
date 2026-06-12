@@ -52,7 +52,7 @@ impl SqlEngine {
     }
 
     pub fn with_kv(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
-        let procarray = Arc::new(ProcArray::open(&*kv)?);
+        let procarray = Arc::new(ProcArray::open(Arc::clone(&kv))?);
         Ok(Self {
             kv,
             writer_lock: Arc::new(Mutex::new(())),

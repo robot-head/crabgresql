@@ -23,6 +23,11 @@ pub enum ExecError {
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
+    /// A write conflicted with a concurrently-committed change under REPEATABLE
+    /// READ (40001) — the client should retry the transaction.
+    SerializationFailure,
+    /// A deadlock was detected and this transaction was chosen as the victim (40P01).
+    Deadlock,
 }
 
 impl ExecError {
@@ -48,6 +53,11 @@ impl ExecError {
                 "25P02",
                 "current transaction is aborted, commands ignored until end of transaction block",
             ),
+            ExecError::SerializationFailure => PgError::error(
+                "40001",
+                "could not serialize access due to concurrent update",
+            ),
+            ExecError::Deadlock => PgError::error("40P01", "deadlock detected"),
         }
     }
 }
