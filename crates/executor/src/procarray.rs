@@ -17,13 +17,11 @@ struct Inner {
     running: BTreeSet<u64>,
 }
 
-/// The running-transaction registry. Wire in Task 5 (SP5 cutover).
-#[allow(dead_code)] // wired in by the SP5 cutover (Task 5)
+/// The running-transaction registry.
 pub(crate) struct ProcArray {
     inner: Mutex<Inner>,
 }
 
-#[allow(dead_code)] // wired in by the SP5 cutover (Task 5)
 impl ProcArray {
     /// Seed the next-xid counter from the durable key (default 1 — real xids
     /// start at 1; 0 is the invalid sentinel).

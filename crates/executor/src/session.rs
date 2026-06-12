@@ -1,94 +1,108 @@
-//! Per-connection session: runs SQL against the shared KV store. SP4 Task 5
-//! adds the transaction state machine — BEGIN/COMMIT/ROLLBACK, an in-memory
-//! write-set buffered until COMMIT, write-set-overlay reads (read-your-writes),
-//! and READ COMMITTED vs REPEATABLE READ snapshots.
+//! Per-connection session: runs SQL against the shared KV store. SP5 uses
+//! PostgreSQL's xid/clog/snapshot MVCC: writes go through to disk tagged with
+//! the transaction's xid (read-your-writes via `satisfies_mvcc` + own xid),
+//! commit/rollback record the outcome in the clog, and a transaction-scoped
+//! async writer lock keeps writers serialized.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use catalog::TableId;
 use kv::Kv;
+use mvcc::clog::XidStatus;
+use mvcc::visibility::Snapshot;
 use pgparser::ast::{IsolationLevel, Statement};
 use pgwire::engine::{FieldDescription, QueryResult, Session, TxStatus};
 use pgwire::error::PgError;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::ExecError;
+use crate::procarray::ProcArray;
 
-/// A buffered write in a transaction's write-set, keyed by `(TableId, rowid)`.
-#[derive(Clone)]
-pub(crate) enum Pending {
-    /// An encoded live-row version value — already `encode_version(false, row)`.
-    Row(Vec<u8>),
-    /// A delete: the row is invisible to this txn and tombstoned at COMMIT.
-    /// Constructed by UPDATE/DELETE in Task 6; the read/flush paths already
-    /// handle it so the overlay and commit are complete now.
-    Tombstone,
-}
-
-/// In-flight transaction context: the snapshot the txn reads at, its isolation,
-/// the buffered write-set, and per-table next-rowid counters.
-#[derive(Default)]
+/// In-flight transaction context.
 pub(crate) struct TxnCtx {
-    pub(crate) snapshot: u64,
+    /// Assigned lazily at the first write (None for a read-only transaction).
+    pub(crate) xid: Option<u64>,
+    /// The visibility snapshot: re-taken per statement under READ COMMITTED,
+    /// fixed at BEGIN under REPEATABLE READ.
+    pub(crate) snapshot: Snapshot,
     pub(crate) repeatable_read: bool,
-    pub(crate) writes: HashMap<(TableId, u64), Pending>,
-    pub(crate) seq: HashMap<TableId, u64>,
+    /// The engine writer lock, held from the first write until COMMIT/ROLLBACK.
+    pub(crate) writer_guard: Option<OwnedMutexGuard<()>>,
 }
 
-/// Per-connection transaction state.
+/// Per-connection transaction state. `Failed` carries the aborted block's
+/// context so its writer lock and xid stay held until COMMIT/ROLLBACK (which
+/// records the abort in the clog and releases them).
 enum TxnState {
     Idle,
     InTransaction(TxnCtx),
-    Failed,
+    Failed(TxnCtx),
 }
 
-/// One connection's view of the engine. Holds shared handles to the KV store
-/// and the engine-wide write mutex, plus this connection's transaction state.
-/// Not shared between connections.
+/// One connection's view of the engine. Holds shared handles to the KV store,
+/// the engine-wide async writer mutex, and the shared ProcArray, plus this
+/// connection's transaction state. Not shared between connections.
 pub struct SqlSession {
     pub(crate) kv: Arc<dyn Kv>,
-    pub(crate) write_lock: Arc<Mutex<()>>,
+    writer_lock: Arc<Mutex<()>>,
+    procarray: Arc<ProcArray>,
     state: TxnState,
 }
 
 impl SqlSession {
-    pub fn new(kv: Arc<dyn Kv>, write_lock: Arc<Mutex<()>>) -> Self {
+    pub(crate) fn new(
+        kv: Arc<dyn Kv>,
+        writer_lock: Arc<Mutex<()>>,
+        procarray: Arc<ProcArray>,
+    ) -> Self {
         Self {
             kv,
-            write_lock,
+            writer_lock,
+            procarray,
             state: TxnState::Idle,
         }
     }
 
-    /// Read the global commit timestamp (0 if unset).
-    pub(crate) fn read_commit_ts(&self) -> Result<u64, ExecError> {
-        match self.kv.get(&kv::key::commit_ts_key())? {
-            Some(b) => {
-                let arr: [u8; 8] = b
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| kv::KvError::CorruptRow("commit_ts is not u64".into()))?;
-                Ok(u64::from_be_bytes(arr))
-            }
-            None => Ok(0),
-        }
-    }
-
-    fn run_one(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        if matches!(self.state, TxnState::Failed)
+    async fn run_one(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        if matches!(self.state, TxnState::Failed(_))
             && !matches!(stmt, Statement::Commit | Statement::Rollback)
         {
             return Err(ExecError::InFailedTransaction);
         }
-        match stmt {
+        let result = match stmt {
             Statement::Begin { isolation } => self.begin(*isolation),
             Statement::Commit => self.commit_cmd(),
             Statement::Rollback => self.rollback_cmd(),
-            Statement::CreateTable { .. } | Statement::DropTable { .. } => {
-                crate::exec::execute_ddl(self, stmt)
+            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
+            Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+                self.run_write(stmt).await
             }
-            _ => self.run_dml(stmt),
+            Statement::Select(_) => self.run_select(stmt),
+        };
+        // Any error inside a transaction block aborts it (PostgreSQL 25P02): the
+        // block stays Failed (carrying its ctx, so the writer lock and xid stay
+        // held) until COMMIT/ROLLBACK releases them. Autocommit errors leave us
+        // Idle (the statement was its own transaction).
+        if result.is_err()
+            && let TxnState::InTransaction(ctx) = std::mem::replace(&mut self.state, TxnState::Idle)
+        {
+            self.state = TxnState::Failed(ctx);
         }
+        result
+    }
+
+    /// Record an aborted transaction's outcome (clog Aborted + deregister) and
+    /// release its writer lock. Shared by ROLLBACK and COMMIT-of-failed.
+    fn abort_ctx(&self, ctx: TxnCtx) -> Result<(), ExecError> {
+        if let Some(xid) = ctx.xid {
+            // Best-effort abort record; the versions are already invisible
+            // (in-progress in no future snapshot once deregistered), so even if
+            // this write is lost the rows never become visible.
+            self.kv
+                .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)])?;
+            self.procarray.finish(xid);
+        }
+        drop(ctx.writer_guard);
+        Ok(())
     }
 
     fn begin(&mut self, isolation: Option<IsolationLevel>) -> Result<QueryResult, ExecError> {
@@ -99,15 +113,15 @@ impl SqlSession {
             });
         }
         let rr = matches!(isolation, Some(IsolationLevel::RepeatableRead));
-        let mut ctx = TxnCtx {
+        // RR fixes its snapshot at BEGIN; RC leaves a placeholder refreshed per
+        // statement. Either way we capture the current running set now.
+        let snapshot = self.procarray.snapshot();
+        self.state = TxnState::InTransaction(TxnCtx {
+            xid: None,
+            snapshot,
             repeatable_read: rr,
-            ..Default::default()
-        };
-        if rr {
-            // REPEATABLE READ fixes its snapshot at BEGIN.
-            ctx.snapshot = self.read_commit_ts()?;
-        }
-        self.state = TxnState::InTransaction(ctx);
+            writer_guard: None,
+        });
         Ok(QueryResult::Command {
             tag: "BEGIN".into(),
         })
@@ -116,18 +130,24 @@ impl SqlSession {
     fn commit_cmd(&mut self) -> Result<QueryResult, ExecError> {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::InTransaction(ctx) => {
-                // flush requires the write_lock to already be held, so take it
-                // here to make the commit_ts read-modify-write atomic.
-                let _guard = self.write_lock.lock().expect("write lock");
-                self.flush(ctx)?;
+                if let Some(xid) = ctx.xid {
+                    // Record the commit, then release the lock and deregister.
+                    self.kv
+                        .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Committed)])?;
+                    self.procarray.finish(xid);
+                }
+                drop(ctx.writer_guard); // release the writer lock (if held)
                 Ok(QueryResult::Command {
                     tag: "COMMIT".into(),
                 })
             }
             // COMMIT of a failed transaction behaves as a ROLLBACK.
-            TxnState::Failed => Ok(QueryResult::Command {
-                tag: "ROLLBACK".into(),
-            }),
+            TxnState::Failed(ctx) => {
+                self.abort_ctx(ctx)?;
+                Ok(QueryResult::Command {
+                    tag: "ROLLBACK".into(),
+                })
+            }
             TxnState::Idle => Ok(QueryResult::Command {
                 tag: "COMMIT".into(),
             }),
@@ -135,88 +155,120 @@ impl SqlSession {
     }
 
     fn rollback_cmd(&mut self) -> Result<QueryResult, ExecError> {
-        // Discard the write-set and any failed state.
-        self.state = TxnState::Idle;
+        match std::mem::replace(&mut self.state, TxnState::Idle) {
+            TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => self.abort_ctx(ctx)?,
+            TxnState::Idle => {}
+        }
         Ok(QueryResult::Command {
             tag: "ROLLBACK".into(),
         })
     }
 
-    fn run_dml(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        match &self.state {
-            TxnState::InTransaction(_) => {
-                // RC re-snapshots per statement; RR keeps its BEGIN snapshot.
-                let refresh =
-                    matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
-                if refresh {
-                    let ts = self.read_commit_ts()?;
-                    if let TxnState::InTransaction(c) = &mut self.state {
-                        c.snapshot = ts;
-                    }
+    fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        let (snapshot, own) = self.read_context()?;
+        crate::exec::execute_read(&*self.kv, &snapshot, own, stmt)
+    }
+
+    /// The snapshot + own-xid a read should use. Autocommit: a fresh snapshot,
+    /// no own xid. In a txn: RC re-snapshots per statement, RR reuses its
+    /// snapshot; own xid is the txn's (Some after its first write).
+    fn read_context(&mut self) -> Result<(Snapshot, Option<u64>), ExecError> {
+        match &mut self.state {
+            TxnState::Idle => Ok((self.procarray.snapshot(), None)),
+            TxnState::InTransaction(ctx) => {
+                if !ctx.repeatable_read {
+                    ctx.snapshot = self.procarray.snapshot();
                 }
-                // Break the aliasing borrow of self.kv vs &mut self.state.
-                let kv = Arc::clone(&self.kv);
-                let result = {
-                    let ctx = match &mut self.state {
-                        TxnState::InTransaction(c) => c,
-                        _ => unreachable!(),
-                    };
-                    crate::exec::execute_dml(&*kv, ctx, stmt)
-                };
-                if result.is_err() {
-                    self.state = TxnState::Failed;
-                }
-                result
+                Ok((ctx.snapshot.clone(), ctx.xid))
             }
-            TxnState::Idle => {
-                // Implicit one-statement transaction (autocommit): hold the
-                // write_lock across read_seq → execute_dml → flush so the whole
-                // read-modify-write is atomic vs concurrent writers. flush does
-                // NOT re-lock (it requires the lock already held).
-                let kv = Arc::clone(&self.kv);
-                let _guard = self.write_lock.lock().expect("write lock");
-                let mut ctx = TxnCtx {
-                    snapshot: self.read_commit_ts()?,
-                    ..Default::default()
-                };
-                let result = crate::exec::execute_dml(&*kv, &mut ctx, stmt)?;
-                self.flush(ctx)?;
-                Ok(result)
-            }
-            TxnState::Failed => unreachable!("guarded in run_one"),
+            TxnState::Failed(_) => unreachable!("guarded in run_one"),
         }
     }
 
-    /// Write a committed write-set to the store. CALLER MUST HOLD `write_lock`.
-    /// A read-only transaction (empty write-set and seq) is a no-op and does not
-    /// bump the global commit_ts.
-    fn flush(&self, ctx: TxnCtx) -> Result<(), ExecError> {
-        if ctx.writes.is_empty() && ctx.seq.is_empty() {
+    async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        // DDL is non-transactional: it auto-commits under a short-lived lock.
+        let _guard = self.writer_lock.clone().lock_owned().await;
+        crate::exec::execute_ddl(&*self.kv, stmt)
+    }
+
+    async fn run_write(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        match &self.state {
+            TxnState::InTransaction(_) => {
+                self.ensure_write_xid().await?;
+                // RC refreshes the read snapshot used by UPDATE/DELETE's scan.
+                let refresh =
+                    matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
+                if refresh {
+                    let s = self.procarray.snapshot();
+                    if let TxnState::InTransaction(c) = &mut self.state {
+                        c.snapshot = s;
+                    }
+                }
+                let (snapshot, xid) = match &self.state {
+                    TxnState::InTransaction(c) => (c.snapshot.clone(), c.xid.expect("xid set")),
+                    _ => unreachable!(),
+                };
+                let kv = Arc::clone(&self.kv);
+                // An error here propagates to run_one, which transitions the
+                // block to Failed (keeping the lock + xid until COMMIT/ROLLBACK).
+                let (result, mut ops) = crate::exec::execute_write(&*kv, &snapshot, xid, stmt)?;
+                // Persist next_xid with the statement's writes (no clog entry —
+                // the txn commits later).
+                ops.push(kv::WriteOp::Put {
+                    key: kv::key::next_xid_key(),
+                    value: self.procarray.next_xid().to_be_bytes().to_vec(),
+                });
+                self.kv.write_batch(&ops)?;
+                Ok(result)
+            }
+            TxnState::Idle => {
+                // Autocommit: acquire the lock, allocate an xid, execute, and
+                // commit in one atomic batch (versions + next_xid + clog).
+                let guard = self.writer_lock.clone().lock_owned().await;
+                let xid = self.procarray.begin_write();
+                let snapshot = self.procarray.snapshot();
+                let kv = Arc::clone(&self.kv);
+                let outcome = crate::exec::execute_write(&*kv, &snapshot, xid, stmt);
+                let (result, mut ops) = match outcome {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Autocommit error: abort and stay Idle. Record the abort
+                        // (best-effort) and deregister; the lock drops with guard.
+                        let _ = self
+                            .kv
+                            .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)]);
+                        self.procarray.finish(xid);
+                        drop(guard);
+                        return Err(e);
+                    }
+                };
+                ops.push(kv::WriteOp::Put {
+                    key: kv::key::next_xid_key(),
+                    value: self.procarray.next_xid().to_be_bytes().to_vec(),
+                });
+                ops.push(mvcc::clog::put_op(xid, XidStatus::Committed));
+                self.kv.write_batch(&ops)?;
+                self.procarray.finish(xid);
+                drop(guard);
+                Ok(result)
+            }
+            TxnState::Failed(_) => unreachable!("guarded in run_one"),
+        }
+    }
+
+    /// On a transaction's first write: acquire the writer lock and allocate the
+    /// xid (idempotent on later writes).
+    async fn ensure_write_xid(&mut self) -> Result<(), ExecError> {
+        let needs = matches!(&self.state, TxnState::InTransaction(c) if c.xid.is_none());
+        if !needs {
             return Ok(());
         }
-        let new_ts = self.read_commit_ts()? + 1;
-        let mut ops: Vec<kv::WriteOp> = Vec::new();
-        for ((table, rowid), pending) in &ctx.writes {
-            let value = match pending {
-                Pending::Row(v) => v.clone(),
-                Pending::Tombstone => mvcc::encode_version(true, &[]),
-            };
-            ops.push(kv::WriteOp::Put {
-                key: mvcc::version_key(*table, *rowid, new_ts),
-                value,
-            });
+        let guard = self.writer_lock.clone().lock_owned().await;
+        let xid = self.procarray.begin_write();
+        if let TxnState::InTransaction(c) = &mut self.state {
+            c.xid = Some(xid);
+            c.writer_guard = Some(guard);
         }
-        for (table, next) in &ctx.seq {
-            ops.push(kv::WriteOp::Put {
-                key: kv::key::seq_key(*table),
-                value: next.to_be_bytes().to_vec(),
-            });
-        }
-        ops.push(kv::WriteOp::Put {
-            key: kv::key::commit_ts_key(),
-            value: new_ts.to_be_bytes().to_vec(),
-        });
-        self.kv.write_batch(&ops)?;
         Ok(())
     }
 }
@@ -232,20 +284,20 @@ impl Session for SqlSession {
         }
         let mut results = Vec::with_capacity(statements.len());
         for stmt in statements {
-            results.push(self.run_one(&stmt).map_err(ExecError::into_pg)?);
+            results.push(self.run_one(&stmt).await.map_err(ExecError::into_pg)?);
         }
         Ok(results)
     }
 
     async fn describe(&mut self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
-        crate::exec::describe(self, sql).map_err(ExecError::into_pg)
+        crate::exec::describe(&*self.kv, sql).map_err(ExecError::into_pg)
     }
 
     fn tx_status(&self) -> TxStatus {
         match self.state {
             TxnState::Idle => TxStatus::Idle,
             TxnState::InTransaction(_) => TxStatus::InTransaction,
-            TxnState::Failed => TxStatus::Failed,
+            TxnState::Failed(_) => TxStatus::Failed,
         }
     }
 }

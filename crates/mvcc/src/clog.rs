@@ -58,8 +58,10 @@ mod tests {
     #[test]
     fn committed_and_aborted_roundtrip() {
         let kv = MemKv::new();
-        kv.write_batch(&[put_op(7, XidStatus::Committed)]).expect("put");
-        kv.write_batch(&[put_op(8, XidStatus::Aborted)]).expect("put");
+        kv.write_batch(&[put_op(7, XidStatus::Committed)])
+            .expect("put");
+        kv.write_batch(&[put_op(8, XidStatus::Aborted)])
+            .expect("put");
         assert_eq!(get(&kv, 7).expect("get"), XidStatus::Committed);
         assert_eq!(get(&kv, 8).expect("get"), XidStatus::Aborted);
     }
@@ -67,8 +69,11 @@ mod tests {
     #[test]
     fn corrupt_status_byte_errors() {
         let kv = MemKv::new();
-        kv.write_batch(&[kv::WriteOp::Put { key: kv::key::clog_key(9), value: vec![99] }])
-            .expect("put");
+        kv.write_batch(&[kv::WriteOp::Put {
+            key: kv::key::clog_key(9),
+            value: vec![99],
+        }])
+        .expect("put");
         assert!(get(&kv, 9).is_err());
     }
 }

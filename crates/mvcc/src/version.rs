@@ -240,7 +240,10 @@ mod tests {
         assert_eq!(decode_tuple(&bytes).expect("decode"), (5, 0, row));
         // a deleted/superseded version keeps its row bytes and carries xmax.
         let bytes = encode_tuple(5, 9, &[Datum::Int4(1)]);
-        assert_eq!(decode_tuple(&bytes).expect("decode"), (5, 9, vec![Datum::Int4(1)]));
+        assert_eq!(
+            decode_tuple(&bytes).expect("decode"),
+            (5, 9, vec![Datum::Int4(1)])
+        );
     }
 
     #[test]
