@@ -1,10 +1,12 @@
-//! mvcc: commit-timestamp multiversion concurrency control primitives for
-//! crabgresql — versioned keys, tombstone version values, snapshots, and
-//! visibility. The durable store holds only committed versions (SP4); the
-//! commit-status log (clog) arrives with concurrent writers in SP5.
+//! mvcc: PostgreSQL-faithful multiversion concurrency control for crabgresql —
+//! xids, the clog (pg_xact), xid-keyed tuple (xmin/xmax) encoding, xid-list
+//! snapshots, and HeapTupleSatisfiesMVCC visibility. Concurrent writers (row
+//! locks, block-and-retry, EvalPlanQual) arrive in SP6; deadlock detection SP7.
 
-pub mod snapshot;
+pub mod clog;
 pub mod version;
+pub mod visibility;
+pub mod xid;
 
-pub use snapshot::{Snapshot, visible_version};
-pub use version::{commit_ts_of, decode_version, encode_version, version_key};
+pub use visibility::{Snapshot, satisfies_mvcc};
+pub use xid::{INVALID_XID, Xid};

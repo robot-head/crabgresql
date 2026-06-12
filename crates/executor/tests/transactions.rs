@@ -193,3 +193,27 @@ async fn repeatable_read_sees_old_value_after_concurrent_update() {
     let r = rows(&mut reader, "SELECT name FROM t").await;
     assert_eq!(text(&r[0][0]), Some("new".into()));
 }
+
+#[tokio::test]
+async fn ddl_inside_a_writing_transaction_does_not_deadlock() {
+    let engine = SqlEngine::new();
+    let mut s = engine.connect();
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create t");
+    s.simple_query("BEGIN").await.expect("begin");
+    s.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
+    // DDL while the txn already holds the writer lock must not deadlock.
+    s.simple_query("CREATE TABLE u (x int4)")
+        .await
+        .expect("create u");
+    s.simple_query("COMMIT").await.expect("commit");
+    // both tables usable afterward
+    s.simple_query("INSERT INTO u VALUES (2)")
+        .await
+        .expect("insert u");
+    let r = rows(&mut s, "SELECT id FROM t").await;
+    assert_eq!(r.len(), 1);
+}
