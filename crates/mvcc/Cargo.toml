@@ -1,0 +1,16 @@
+[package]
+name = "mvcc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+kv.workspace = true
+pgtypes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

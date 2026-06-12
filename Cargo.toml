@@ -9,6 +9,7 @@ members = [
     "crates/catalog",
     "crates/pgparser",
     "crates/executor",
+    "crates/mvcc",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ unwrap_used = "warn"
 pgwire = { path = "crates/pgwire" }
 pgtypes = { path = "crates/pgtypes" }
 kv = { path = "crates/kv" }
+mvcc = { path = "crates/mvcc" }
 catalog = { path = "crates/catalog" }
 pgparser = { path = "crates/pgparser" }
 executor = { path = "crates/executor" }
