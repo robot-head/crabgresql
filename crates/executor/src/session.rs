@@ -154,10 +154,21 @@ impl SqlSession {
                 if let Some(xid) = ctx.xid {
                     // Record the commit. Deregister xid BEFORE propagating any
                     // write error so the xid never stays stuck in the running set.
-                    let r = self
-                        .committer
-                        .commit(vec![mvcc::clog::put_op(xid, XidStatus::Committed)])
-                        .await;
+                    let mut ops = vec![mvcc::clog::put_op(xid, XidStatus::Committed)];
+                    // In Replicated mode, fold the next_xid advance into the
+                    // committed batch (the state machine max-merges it). A txn
+                    // that allocated its xid only via a locking SELECT (FOR
+                    // UPDATE / FOR SHARE) wrote no rows, so without this its
+                    // next_xid bump would never reach the replicated state
+                    // machine — after failover the new leader would reseed from a
+                    // stale next_xid and re-hand-out this xid, whose clog entry is
+                    // durably Committed (dirty reads). Redundant-but-harmless for
+                    // data-writing txns: their write entry already folded
+                    // next_xid and this COMMIT entry is ordered after it.
+                    if self.persist_mode == crate::PersistMode::Replicated {
+                        ops.push(self.procarray.next_xid_op());
+                    }
+                    let r = self.committer.commit(ops).await;
                     self.procarray.finish(xid);
                     // Free every row this transaction locked, waking waiters.
                     self.lockmgr.release_all(xid);

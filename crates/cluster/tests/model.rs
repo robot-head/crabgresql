@@ -69,16 +69,29 @@ struct State {
 /// The model. `reseed` toggles whether `ElectAndReseed` lifts the leader's
 /// counter to the applied high-water mark: `true` is the real, correct system;
 /// `false` is the deliberately-broken variant the teeth test uses to prove the
-/// checker detects id reuse.
+/// checker detects id reuse. `fold_on_commit` toggles whether a commit-only
+/// allocation (a locking SELECT that wrote no rows) folds `id + 1` into the log
+/// at COMMIT time: `true` is the fixed system; `false` is the pre-fix bug where
+/// such an allocation acks (durably commits its clog entry) without ever
+/// advancing the applied counter — so even a correct reseed re-hands-out the id.
 struct CounterModel {
     max_steps: usize,
     reseed: bool,
+    fold_on_commit: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum Action {
-    /// Hand out the current in-memory id and propose `id + 1`.
+    /// A data-writing allocation: hand out the current in-memory id and propose
+    /// `id + 1` into the log (the write entry folds next_xid).
     Allocate,
+    /// A locking-SELECT-then-COMMIT allocation that writes no rows: hand out the
+    /// current id and *immediately ack it* (its clog[id]=Committed replicates and
+    /// applies durably). It advances the applied counter (proposes `id + 1`) ONLY
+    /// if `fold_on_commit` — that is the fix. Without the fold the durable ack
+    /// lands but the applied high-water mark never moves, so a reseeded leader can
+    /// re-hand-out the committed id.
+    AllocateCommitOnly,
     /// Apply the `i`th in-flight proposal (out of order), max-merged; the id it
     /// allocated becomes acked.
     ApplyAny(usize),
@@ -110,6 +123,7 @@ impl Model for CounterModel {
             return;
         }
         out.push(Action::Allocate);
+        out.push(Action::AllocateCommitOnly);
         for i in 0..s.in_flight.len() {
             out.push(Action::ApplyAny(i));
         }
@@ -126,6 +140,22 @@ impl Model for CounterModel {
                 n.handed_out.push(id);
                 n.in_flight.push(id + 1);
                 n.leader_inmem = id + 1;
+            }
+            Action::AllocateCommitOnly => {
+                // A locking-SELECT-then-COMMIT that wrote no rows. The commit
+                // batch is one Raft entry applied atomically on return, so the id
+                // is durably acked immediately. The fix folds `id + 1` into that
+                // same batch, advancing the applied high-water mark together with
+                // the ack; without it the ack lands but the counter never moves.
+                let id = n.leader_inmem;
+                n.handed_out.push(id);
+                n.leader_inmem = id + 1;
+                // The clog[id]=Committed entry applied => the using txn is durable.
+                n.acked.push(id);
+                if self.fold_on_commit {
+                    // Folded next_xid applies in the same atomic batch (max-merge).
+                    n.applied_counter = n.applied_counter.max(id + 1);
+                }
             }
             Action::ApplyAny(i) => {
                 // Apply out of order, max-merged; the allocated id is now acked.
@@ -200,6 +230,7 @@ fn counter_invariants_hold_under_all_interleavings() {
     let checker = CounterModel {
         max_steps: 8,
         reseed: true,
+        fold_on_commit: true,
     }
     .checker()
     .spawn_bfs()
@@ -226,6 +257,7 @@ fn model_without_reseed_is_caught() {
     let checker = CounterModel {
         max_steps: 8,
         reseed: false,
+        fold_on_commit: true,
     }
     .checker()
     .spawn_bfs()
@@ -253,4 +285,65 @@ fn model_without_reseed_is_caught() {
             discoveries.keys().collect::<Vec<_>>()
         );
     }
+}
+
+/// Teeth test for *this* fix: a commit-only allocation (a locking SELECT that
+/// wrote no rows) that does NOT fold `next_xid` at COMMIT time. The clog entry
+/// is durably committed (the id acks) but the applied high-water mark never
+/// advances, so even with a *correct* reseed the new leader re-hands-out the
+/// committed id. This asserts the checker catches that reuse — proving the
+/// commit-time fold is load-bearing and the passing model is not vacuous.
+#[test]
+fn commit_only_without_fold_is_caught() {
+    let checker = CounterModel {
+        max_steps: 8,
+        // Reseed is present and correct — the bug is purely the missing fold, so
+        // this isolates *this* fix's failure mode from the reseed one.
+        reseed: true,
+        fold_on_commit: false,
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+
+    let discoveries = checker.discoveries();
+    assert!(
+        !discoveries.is_empty(),
+        "omitting the commit-time next_xid fold must produce a property \
+         counterexample; if empty, the fix is not load-bearing in the model"
+    );
+    // Both safety invariants must break: a durably-committed id is genuinely
+    // re-handed-out (the real defect), and the leader counter fails to dominate
+    // the acked id it reuses.
+    for name in ["no acked id reuse", "leader counter dominates acked ids"] {
+        assert!(
+            discoveries.contains_key(name),
+            "expected a '{name}' counterexample from the no-commit-fold variant, \
+             got: {:?}",
+            discoveries.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// With BOTH the reseed and the commit-time fold present (the fully-fixed
+/// system), the commit-only allocation path introduces no new reuse: every
+/// interleaving of data-writes, commit-only allocations, out-of-order applies,
+/// and failovers still upholds the invariants. This guards against the new
+/// action silently weakening the model.
+#[test]
+fn invariants_hold_with_commit_only_path_and_fix() {
+    let checker = CounterModel {
+        max_steps: 8,
+        reseed: true,
+        fold_on_commit: true,
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+
+    checker.assert_properties();
+    assert!(
+        checker.unique_state_count() > 1,
+        "model checking must have explored a non-trivial state space"
+    );
 }
