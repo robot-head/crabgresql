@@ -46,22 +46,37 @@ impl Switchboard {
 
     /// Register a node's Raft handle so peers can route RPCs to it.
     pub fn register(&self, id: NodeId, raft: openraft::Raft<TypeConfig>) {
-        self.handles.lock().expect("switchboard handles").insert(id, raft);
+        self.handles
+            .lock()
+            .expect("switchboard handles")
+            .insert(id, raft);
     }
 
     /// Pause (crash) a node: it drops every RPC it would send or receive.
     pub fn pause(&self, id: NodeId) {
-        self.faults.lock().expect("switchboard faults").paused.insert(id);
+        self.faults
+            .lock()
+            .expect("switchboard faults")
+            .paused
+            .insert(id);
     }
 
     /// Resume a previously paused node.
     pub fn resume(&self, id: NodeId) {
-        self.faults.lock().expect("switchboard faults").paused.remove(&id);
+        self.faults
+            .lock()
+            .expect("switchboard faults")
+            .paused
+            .remove(&id);
     }
 
     /// Cut the link between `a` and `b` in both directions (a partition).
     pub fn cut(&self, a: NodeId, b: NodeId) {
-        self.faults.lock().expect("switchboard faults").cuts.insert(norm(a, b));
+        self.faults
+            .lock()
+            .expect("switchboard faults")
+            .cuts
+            .insert(norm(a, b));
     }
 
     /// Clear every fault: all cuts healed and all paused nodes resumed.
@@ -73,7 +88,10 @@ impl Switchboard {
 
     /// Per-node network factory carrying the owning node's id as `from`.
     pub fn for_node(&self, from: NodeId) -> NodeFactory {
-        NodeFactory { sb: self.clone(), from }
+        NodeFactory {
+            sb: self.clone(),
+            from,
+        }
     }
 
     /// True if an RPC from `from` to `to` should be dropped: either endpoint is
@@ -86,7 +104,11 @@ impl Switchboard {
     /// Clone the target's Raft handle out of the registry. Returns an owned
     /// handle so the caller never holds the mutex across an `.await`.
     fn handle(&self, to: NodeId) -> Option<openraft::Raft<TypeConfig>> {
-        self.handles.lock().expect("switchboard handles").get(&to).cloned()
+        self.handles
+            .lock()
+            .expect("switchboard handles")
+            .get(&to)
+            .cloned()
     }
 }
 

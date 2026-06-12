@@ -148,7 +148,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             last_membership: last_membership.clone(),
             kv,
         };
-        let data = serde_json::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let data =
+            serde_json::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
 
         let snapshot_idx = {
             let mut idx = self.snapshot_idx.write().await;
@@ -301,11 +302,7 @@ impl RaftLogReader<TypeConfig> for Arc<LogStore> {
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let inner = self.inner.read().await;
-        Ok(inner
-            .log
-            .range(range)
-            .map(|(_, ent)| ent.clone())
-            .collect())
+        Ok(inner.log.range(range).map(|(_, ent)| ent.clone()).collect())
     }
 }
 

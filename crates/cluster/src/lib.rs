@@ -2,12 +2,12 @@
 //! Wraps the SP1-SP6 engine in one in-process openraft group. In-memory and
 //! ephemeral: no sockets, no on-disk Raft state, no restart recovery (all D2).
 
-mod types;
-mod store;
+mod cluster;
+mod committer;
 mod network;
 mod node;
-mod committer;
-mod cluster;
+mod store;
+mod types;
 
 pub use cluster::Cluster;
 pub use network::Switchboard;

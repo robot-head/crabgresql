@@ -74,7 +74,10 @@ async fn paused_follower_catches_up_on_resume() {
     // the five writes. The paused follower must apply up to index 6.
     applied_to(c.node(follower), 6).await;
     assert_eq!(
-        c.node(follower).sm_kv.get(&kv::key::row_key(1, 4)).expect("get"),
+        c.node(follower)
+            .sm_kv
+            .get(&kv::key::row_key(1, 4))
+            .expect("get"),
         Some(vec![4]),
         "resumed follower must have the last write"
     );
@@ -127,12 +130,13 @@ async fn minority_partition_cannot_commit() {
     // Bound the call: an isolated leader may block until openraft notices it lost
     // quorum. A timeout is itself proof it did not commit; a prompt error is the
     // same outcome. Either way `is_err()`/timeout means "did not commit".
-    let client_write = c.node(l0).raft.client_write(cluster::WriteBatch(vec![
-        kv::WriteOp::Put {
+    let client_write = c
+        .node(l0)
+        .raft
+        .client_write(cluster::WriteBatch(vec![kv::WriteOp::Put {
             key: kv::key::row_key(1, 9),
             value: vec![9],
-        },
-    ]));
+        }]));
     let outcome = tokio::time::timeout(Duration::from_secs(5), client_write).await;
     match outcome {
         Err(_elapsed) => { /* timed out waiting for quorum -> did not commit */ }
@@ -166,7 +170,10 @@ async fn far_behind_follower_recovers_via_snapshot() {
     // the twenty writes. The follower must apply up to index 21.
     applied_to(c.node(follower), 21).await;
     assert_eq!(
-        c.node(follower).sm_kv.get(&kv::key::row_key(1, 19)).expect("get"),
+        c.node(follower)
+            .sm_kv
+            .get(&kv::key::row_key(1, 19))
+            .expect("get"),
         Some(vec![19]),
         "recovered follower must have the last write"
     );
