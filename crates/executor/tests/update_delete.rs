@@ -121,3 +121,43 @@ async fn update_unknown_column_is_42703() {
         .expect_err("no column");
     assert_eq!(err.code, "42703");
 }
+
+#[tokio::test]
+async fn fromless_select_where_false_returns_no_rows() {
+    let engine = SqlEngine::new();
+    let mut s = engine.connect();
+    // WHERE without FROM must still be honored.
+    let r = run(&mut s, "SELECT 1 WHERE false").await;
+    assert!(
+        col0(&r[0]).is_empty(),
+        "WHERE false must filter the single row out"
+    );
+    let r = run(&mut s, "SELECT 1 WHERE true").await;
+    assert_eq!(col0(&r[0]), vec![Some("1".into())]);
+}
+
+#[tokio::test]
+async fn update_and_delete_zero_matches_tag_zero() {
+    let engine = SqlEngine::new();
+    let mut s = engine.connect();
+    run(&mut s, "CREATE TABLE t (id int4)").await;
+    run(&mut s, "INSERT INTO t VALUES (1),(2),(3)").await;
+    assert_eq!(
+        tag_of(&run(&mut s, "UPDATE t SET id = 9 WHERE id = 9999").await[0]),
+        "UPDATE 0"
+    );
+    assert_eq!(
+        tag_of(&run(&mut s, "DELETE FROM t WHERE id = 9999").await[0]),
+        "DELETE 0"
+    );
+    // a NULL-producing WHERE matches nothing
+    assert_eq!(
+        tag_of(&run(&mut s, "DELETE FROM t WHERE null").await[0]),
+        "DELETE 0"
+    );
+    // table still intact
+    assert_eq!(
+        col0(&run(&mut s, "SELECT id FROM t ORDER BY id").await[0]).len(),
+        3
+    );
+}

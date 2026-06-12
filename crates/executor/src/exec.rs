@@ -138,7 +138,7 @@ pub(crate) fn execute_dml(
                 .collect::<Result<_, _>>()?;
             let mut n: u64 = 0;
             for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
-                if !row_matches(filter.as_ref(), &t, &row)? {
+                if !row_matches(filter.as_ref(), Some(&t), &row)? {
                     continue;
                 }
                 let mut next = row.clone();
@@ -160,7 +160,7 @@ pub(crate) fn execute_dml(
             let t = catalog::get_table(kv, table)?;
             let mut n: u64 = 0;
             for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
-                if !row_matches(filter.as_ref(), &t, &row)? {
+                if !row_matches(filter.as_ref(), Some(&t), &row)? {
                     continue;
                 }
                 ctx.writes.insert((t.id, rowid), Pending::Tombstone);
@@ -250,12 +250,12 @@ pub(crate) fn scan_live_rows(
 /// Evaluate an optional WHERE predicate against a row (NULL => false, like SELECT).
 fn row_matches(
     filter: Option<&Expr>,
-    table: &catalog::Table,
+    table: Option<&catalog::Table>,
     row: &[pgtypes::Datum],
 ) -> Result<bool, ExecError> {
     match filter {
         None => Ok(true),
-        Some(f) => match crate::eval::eval(f, Some(table), row)? {
+        Some(f) => match crate::eval::eval(f, table, row)? {
             pgtypes::Datum::Bool(b) => Ok(b),
             pgtypes::Datum::Null => Ok(false),
             _ => Err(ExecError::TypeMismatch(
@@ -287,12 +287,7 @@ fn exec_select(kv: &dyn Kv, ctx: &TxnCtx, s: &SelectStmt) -> Result<QueryResult,
     // Filter, keeping each surviving source row for ORDER BY evaluation.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
-        let keep = match table.as_ref() {
-            Some(t) => row_matches(s.filter.as_ref(), t, row)?,
-            // FROM-less SELECT: no table context; WHERE is not supported here
-            // (the parser doesn't produce it), so treat as always-true.
-            None => true,
-        };
+        let keep = row_matches(s.filter.as_ref(), table.as_ref(), row)?;
         if keep {
             kept.push(row.clone());
         }
