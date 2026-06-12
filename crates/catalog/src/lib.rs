@@ -5,6 +5,8 @@ pub mod serde;
 
 use kv::{Kv, KvError, WriteOp, key};
 use pgtypes::ColumnType;
+use zerocopy::byteorder::big_endian::{U32, U64};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::serde::{deserialize_schema, serialize_schema};
 
@@ -73,11 +75,11 @@ pub fn create_table(
         },
         WriteOp::Put {
             key: key::seq_key(next),
-            value: 1u64.to_be_bytes().to_vec(),
+            value: U64::new(1).as_bytes().to_vec(),
         },
         WriteOp::Put {
             key: key::meta_next_table_id_key(),
-            value: (next + 1).to_be_bytes().to_vec(),
+            value: U32::new(next + 1).as_bytes().to_vec(),
         },
     ];
     kv.write_batch(&batch)?;
@@ -120,11 +122,9 @@ pub fn drop_table(kv: &dyn Kv, name: &str) -> Result<(), CatalogError> {
 fn read_next_table_id(kv: &dyn Kv) -> Result<TableId, CatalogError> {
     match kv.get(&key::meta_next_table_id_key())? {
         Some(b) => {
-            let arr: [u8; 4] = b
-                .as_slice()
-                .try_into()
+            let (v, _) = U32::read_from_prefix(b.as_slice())
                 .map_err(|_| KvError::CorruptRow("next_table_id is not u32".into()))?;
-            Ok(u32::from_be_bytes(arr))
+            Ok(v.get())
         }
         None => Ok(1),
     }
