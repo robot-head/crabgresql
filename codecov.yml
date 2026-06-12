@@ -1,0 +1,16 @@
+# Codecov configuration. See https://docs.codecov.com/docs/codecovyml-reference
+coverage:
+  status:
+    # Start in informational mode so coverage changes never block a PR.
+    # Flip `informational` to false once you want these to gate merges.
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# The conformance crate is test-harness tooling (a differential oracle runner),
+# not shipped code, so exclude it from coverage numbers.
+ignore:
+  - "crates/conformance"
