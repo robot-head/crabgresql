@@ -4,6 +4,7 @@
 mod error;
 mod eval;
 mod exec;
+mod procarray;
 mod session;
 
 use std::path::Path;
