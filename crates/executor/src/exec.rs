@@ -6,10 +6,10 @@ use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 
-use crate::SqlEngine;
+use crate::SqlSession;
 use crate::error::ExecError;
 
-pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResult, ExecError> {
+pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryResult, ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
             let cols = columns
@@ -19,15 +19,15 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     ty: c.ty,
                 })
                 .collect();
-            let _guard = engine.write_lock.lock().expect("write lock");
-            catalog::create_table(&*engine.kv, name, cols)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            catalog::create_table(&*session.kv, name, cols)?;
             Ok(QueryResult::Command {
                 tag: "CREATE TABLE".into(),
             })
         }
         Statement::DropTable { name } => {
-            let _guard = engine.write_lock.lock().expect("write lock");
-            catalog::drop_table(&*engine.kv, name)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            catalog::drop_table(&*session.kv, name)?;
             Ok(QueryResult::Command {
                 tag: "DROP TABLE".into(),
             })
@@ -42,8 +42,8 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
             // atomic with respect to other concurrent INSERTs.  execute() is
             // a sync fn with no .await, so a std::sync::Mutex guard is safe
             // here — it is never held across an await point.
-            let _guard = engine.write_lock.lock().expect("write lock");
-            let t = catalog::get_table(&*engine.kv, table)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            let t = catalog::get_table(&*session.kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
                     .iter()
@@ -54,7 +54,7 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let mut rowid = engine.read_seq(t.id)?;
+            let mut rowid = session.read_seq(t.id)?;
             let mut ops: Vec<kv::WriteOp> = Vec::new();
             for row_exprs in rows {
                 if row_exprs.len() != target_idx.len() {
@@ -79,12 +79,12 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                 key: kv::key::seq_key(t.id),
                 value: rowid.to_be_bytes().to_vec(),
             });
-            engine.kv.write_batch(&ops)?;
+            session.kv.write_batch(&ops)?;
             Ok(QueryResult::Command {
                 tag: format!("INSERT 0 {n}"),
             })
         }
-        Statement::Select(s) => exec_select(engine, s),
+        Statement::Select(s) => exec_select(session, s),
         // SP4 stubs — real implementations land in Tasks 5 and 6.
         Statement::Begin { .. } | Statement::Commit | Statement::Rollback => Err(
             ExecError::Unsupported("transaction control lands in Task 5".into()),
@@ -117,16 +117,16 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
     })
 }
 
-fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecError> {
+fn exec_select(session: &SqlSession, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
+        Some(name) => Some(catalog::get_table(&*session.kv, name)?),
         None => None,
     };
 
     // Source rows: scan the table, or a single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
         Some(t) => {
-            let scanned = engine.kv.scan_prefix(&kv::key::table_prefix(t.id))?;
+            let scanned = session.kv.scan_prefix(&kv::key::table_prefix(t.id))?;
             scanned
                 .into_iter()
                 .map(|(_, v)| kv::rowenc::decode_row(&v))
@@ -310,7 +310,7 @@ fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
 }
 
 pub(crate) fn describe(
-    engine: &SqlEngine,
+    session: &SqlSession,
     sql: &str,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
@@ -319,7 +319,7 @@ pub(crate) fn describe(
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let table = match &s.from {
-        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
+        Some(name) => Some(catalog::get_table(&*session.kv, name)?),
         None => None,
     };
     let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
@@ -329,7 +329,7 @@ pub(crate) fn describe(
 #[cfg(test)]
 mod tests {
     use crate::SqlEngine;
-    use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult};
+    use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult, Session};
 
     fn rows_of(r: &QueryResult) -> &Vec<Vec<Option<Cell>>> {
         match r {
@@ -409,6 +409,7 @@ mod tests {
         run(&engine, "CREATE TABLE t (id int4)").await;
         run(&engine, "INSERT INTO t VALUES (1)").await;
         let err = engine
+            .connect()
             .simple_query("SELECT id FROM t WHERE id")
             .await
             .expect_err("non-bool");
@@ -440,7 +441,9 @@ mod tests {
     }
 
     async fn run(engine: &SqlEngine, sql: &str) -> Vec<QueryResult> {
-        engine.simple_query(sql).await.expect("ok")
+        // Autocommit per statement: a fresh session per call preserves the same
+        // semantics the old direct `engine.simple_query` had.
+        engine.connect().simple_query(sql).await.expect("ok")
     }
 
     #[tokio::test]
@@ -477,6 +480,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (flag bool)").await;
         let err = engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1)")
             .await
             .expect_err("mismatch");
@@ -488,6 +492,7 @@ mod tests {
     async fn insert_into_missing_table_is_42P01() {
         let engine = SqlEngine::new();
         let err = engine
+            .connect()
             .simple_query("INSERT INTO nope VALUES (1)")
             .await
             .expect_err("no table");
@@ -499,6 +504,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (a int4, b int4)").await;
         let err = engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1)")
             .await
             .expect_err("arity");
@@ -517,6 +523,7 @@ mod tests {
         );
         // Re-creating is a duplicate error (42P07), session survives.
         let err = engine
+            .connect()
             .simple_query("CREATE TABLE t (id int4)")
             .await
             .expect_err("dup");
@@ -528,7 +535,11 @@ mod tests {
                 tag: "DROP TABLE".into()
             }]
         );
-        let err = engine.simple_query("DROP TABLE t").await.expect_err("gone");
+        let err = engine
+            .connect()
+            .simple_query("DROP TABLE t")
+            .await
+            .expect_err("gone");
         assert_eq!(err.code, "42P01");
     }
 
@@ -541,7 +552,11 @@ mod tests {
     #[tokio::test]
     async fn syntax_error_is_42601() {
         let engine = SqlEngine::new();
-        let err = engine.simple_query("SELCT 1").await.expect_err("syntax");
+        let err = engine
+            .connect()
+            .simple_query("SELCT 1")
+            .await
+            .expect_err("syntax");
         assert_eq!(err.code, "42601");
     }
 
@@ -550,6 +565,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (id int4, name text)").await;
         let fields = engine
+            .connect()
             .describe("SELECT id, name FROM t")
             .await
             .expect("describe");
@@ -563,6 +579,7 @@ mod tests {
     async fn describe_non_select_has_no_fields() {
         let engine = SqlEngine::new();
         let fields = engine
+            .connect()
             .describe("CREATE TABLE t (id int4)")
             .await
             .expect("describe");

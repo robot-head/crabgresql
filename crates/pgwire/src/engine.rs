@@ -38,24 +38,43 @@ pub enum QueryResult {
     Empty,
 }
 
-/// The seam between the wire protocol and the query engine. SP1 ships only
-/// `StubEngine`; the real engine arrives in SP2 behind this same trait.
+pub use crate::messages::backend::TxStatus;
+
+/// A database engine: a factory for per-connection sessions. Shared across all
+/// connections (`Send + Sync`); each connection gets its own [`Session`].
 ///
-/// Cancellation: the wire layer may DROP an in-flight simple_query future (tokio::select!). Engine implementations must be drop-safe mid-execution; SP2's real engine needs transaction cleanup on drop.
+/// SP1 ships only `StubEngine`; the real engine implements this same trait.
 pub trait Engine: Send + Sync + 'static {
+    type Session: Session;
+
+    /// Create a fresh per-connection session. Called once per connection.
+    fn connect(&self) -> Self::Session;
+}
+
+/// A per-connection session. Owns transaction state; not shared between
+/// connections. `simple_query`/`describe` take `&mut self` because they mutate
+/// transaction state.
+///
+/// Cancellation: the wire layer may DROP an in-flight `simple_query` future
+/// (tokio::select!). Session implementations must be drop-safe mid-execution;
+/// the real engine needs transaction cleanup on drop.
+pub trait Session: Send {
     /// Execute the full text of a simple-protocol Query message (may contain
     /// multiple statements — splitting is the engine's job).
     fn simple_query(
-        &self,
+        &mut self,
         sql: &str,
     ) -> impl Future<Output = Result<Vec<QueryResult>, PgError>> + Send;
 
     /// Row description for a statement without executing it (extended-protocol
     /// Describe). Empty vec = statement returns no rows.
     fn describe(
-        &self,
+        &mut self,
         sql: &str,
     ) -> impl Future<Output = Result<Vec<FieldDescription>, PgError>> + Send;
+
+    /// The transaction status reported to the client in ReadyForQuery.
+    fn tx_status(&self) -> TxStatus;
 }
 
 /// One column in a RowDescription. Field order matches the wire format.
@@ -79,7 +98,8 @@ mod tests {
     #[tokio::test]
     async fn stub_answers_select_1() {
         let engine = StubEngine::new();
-        let results = engine.simple_query("SELECT 1").await.expect("ok");
+        let mut s = engine.connect();
+        let results = s.simple_query("SELECT 1").await.expect("ok");
         let [QueryResult::Rows { fields, rows, tag }] = &results[..] else {
             panic!("expected one Rows result, got {results:?}");
         };
@@ -96,7 +116,8 @@ mod tests {
     #[tokio::test]
     async fn stub_answers_version_case_insensitively() {
         let engine = StubEngine::new();
-        let results = engine.simple_query("select VERSION()").await.expect("ok");
+        let mut s = engine.connect();
+        let results = s.simple_query("select VERSION()").await.expect("ok");
         let [QueryResult::Rows { fields, rows, tag }] = &results[..] else {
             panic!("expected Rows");
         };
@@ -112,7 +133,8 @@ mod tests {
     #[tokio::test]
     async fn stub_rejects_unknown_sql_with_feature_not_supported() {
         let engine = StubEngine::new();
-        let err = engine
+        let mut s = engine.connect();
+        let err = s
             .simple_query("SELECT * FROM t")
             .await
             .expect_err("must fail");
@@ -122,14 +144,16 @@ mod tests {
     #[tokio::test]
     async fn stub_handles_empty_query() {
         let engine = StubEngine::new();
-        let results = engine.simple_query("   ").await.expect("ok");
+        let mut s = engine.connect();
+        let results = s.simple_query("   ").await.expect("ok");
         assert_eq!(results, vec![QueryResult::Empty]);
     }
 
     #[tokio::test]
     async fn stub_describe_returns_fields_without_executing() {
         let engine = StubEngine::new();
-        let described = engine.describe("SELECT 1").await.expect("ok");
+        let mut s = engine.connect();
+        let described = s.describe("SELECT 1").await.expect("ok");
         assert_eq!(described.len(), 1);
         assert_eq!(described[0].type_oid, oids::INT4);
     }
@@ -137,7 +161,8 @@ mod tests {
     #[tokio::test]
     async fn stub_pg_sleep_zero_completes_with_one_row() {
         let engine = StubEngine::new();
-        let results = engine.simple_query("SELECT pg_sleep(0)").await.expect("ok");
+        let mut s = engine.connect();
+        let results = s.simple_query("SELECT pg_sleep(0)").await.expect("ok");
         let [QueryResult::Rows { fields, rows, tag }] = &results[..] else {
             panic!("expected Rows");
         };

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use executor::SqlEngine;
-use pgwire::engine::{Engine, QueryResult};
+use pgwire::engine::{Engine, QueryResult, Session};
 
 /// Regression test for the concurrent-INSERT lost-update bug.
 ///
@@ -16,6 +16,7 @@ use pgwire::engine::{Engine, QueryResult};
 async fn concurrent_inserts_do_not_lose_rows() {
     let engine = Arc::new(SqlEngine::new());
     engine
+        .connect()
         .simple_query("CREATE TABLE t (id int4)")
         .await
         .expect("create");
@@ -26,7 +27,8 @@ async fn concurrent_inserts_do_not_lose_rows() {
     for i in 0..N {
         let e = Arc::clone(&engine);
         handles.push(tokio::spawn(async move {
-            e.simple_query(&format!("INSERT INTO t VALUES ({i})"))
+            e.connect()
+                .simple_query(&format!("INSERT INTO t VALUES ({i})"))
                 .await
                 .expect("insert");
         }));
@@ -37,6 +39,7 @@ async fn concurrent_inserts_do_not_lose_rows() {
 
     // All N rows must be present — none overwritten by a colliding rowid.
     let mut results = engine
+        .connect()
         .simple_query("SELECT id FROM t")
         .await
         .expect("select");

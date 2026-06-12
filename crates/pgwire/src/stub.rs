@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 
-use crate::engine::{Cell, Engine, FieldDescription, QueryResult, oids};
+use crate::engine::{Cell, Engine, FieldDescription, QueryResult, Session, TxStatus, oids};
 use crate::error::{PgError, sqlstate};
 
 pub const STUB_VERSION: &str =
@@ -16,7 +16,21 @@ impl StubEngine {
     pub fn new() -> Self {
         Self {}
     }
+}
 
+impl Engine for StubEngine {
+    type Session = StubSession;
+
+    fn connect(&self) -> StubSession {
+        StubSession
+    }
+}
+
+/// Per-connection session for the canned stub engine. Holds no state; the
+/// transaction status is always `Idle`.
+pub struct StubSession;
+
+impl StubSession {
     fn canned(&self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
         match normalize(sql).as_str() {
             "" => Ok(vec![QueryResult::Empty]),
@@ -46,8 +60,8 @@ impl StubEngine {
     }
 }
 
-impl Engine for StubEngine {
-    async fn simple_query(&self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
+impl Session for StubSession {
+    async fn simple_query(&mut self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
         // `pg_sleep` exists so cancellation has something to cancel.
         if let Some(secs) = normalize(sql)
             .strip_prefix("select pg_sleep(")
@@ -67,11 +81,15 @@ impl Engine for StubEngine {
     }
 
     // Returns 0A000 for any unrecognized SQL — acceptable for the stub; a real engine reports proper codes (e.g. 26000) per statement state.
-    async fn describe(&self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
+    async fn describe(&mut self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
         match self.canned(sql)?.first() {
             Some(QueryResult::Rows { fields, .. }) => Ok(fields.clone()),
             _ => Ok(Vec::new()),
         }
+    }
+
+    fn tx_status(&self) -> TxStatus {
+        TxStatus::Idle
     }
 }
 
