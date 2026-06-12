@@ -6,6 +6,7 @@
 pub mod clog;
 pub mod snapshot;
 pub mod version;
+pub mod xid;
 
 pub use snapshot::{Snapshot, visible_version};
 pub use version::{commit_ts_of, decode_version, encode_version, version_key};

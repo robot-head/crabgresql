@@ -46,6 +46,50 @@ pub fn ts_of_key(key: &[u8]) -> Result<u64, KvError> {
 const V_ROW: u8 = 1;
 const V_TOMBSTONE: u8 = 2;
 
+// ── SP5 xid-keyed tuple format ────────────────────────────────────────────────
+
+/// SP5 version key: the row key followed by the creating xid (big-endian,
+/// ascending). A rowid's versions all share `kv::key::row_key(table, rowid)`.
+pub fn version_key_xid(table_id: u32, rowid: u64, xid: u64) -> Vec<u8> {
+    let mut k = kv::key::row_key(table_id, rowid);
+    k.extend_from_slice(&xid.to_be_bytes());
+    k
+}
+
+/// The creating xid encoded in a version key's 8-byte suffix.
+pub fn xid_of_key(key: &[u8]) -> Result<u64, KvError> {
+    if key.len() < 8 {
+        return Err(KvError::CorruptRow("version key too short".into()));
+    }
+    let suffix: [u8; 8] = key[key.len() - 8..].try_into().expect("8 bytes");
+    Ok(u64::from_be_bytes(suffix))
+}
+
+const T_TUPLE: u8 = 1;
+
+/// Encode a tuple version: a 1-byte tag, the `xmin`/`xmax` header, then the row.
+/// `xmax == INVALID_XID` (0) marks a live version. A delete keeps the row bytes
+/// and sets `xmax` (PostgreSQL retains the tuple until vacuum).
+pub fn encode_tuple(xmin: u64, xmax: u64, row: &[Datum]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + row.len() * 8);
+    out.push(T_TUPLE);
+    out.extend_from_slice(&xmin.to_be_bytes());
+    out.extend_from_slice(&xmax.to_be_bytes());
+    out.extend_from_slice(&kv::rowenc::encode_row(row));
+    out
+}
+
+/// Decode a tuple version into `(xmin, xmax, row)`.
+pub fn decode_tuple(bytes: &[u8]) -> Result<(u64, u64, Vec<Datum>), KvError> {
+    if bytes.len() < 17 || bytes[0] != T_TUPLE {
+        return Err(KvError::CorruptRow("bad tuple header".into()));
+    }
+    let xmin = u64::from_be_bytes(bytes[1..9].try_into().expect("8 bytes"));
+    let xmax = u64::from_be_bytes(bytes[9..17].try_into().expect("8 bytes"));
+    let row = kv::rowenc::decode_row(&bytes[17..])?;
+    Ok((xmin, xmax, row))
+}
+
 /// Encode a version value: a live row, or a tombstone (DELETE).
 pub fn encode_version(deleted: bool, row: &[Datum]) -> Vec<u8> {
     if deleted {
@@ -173,5 +217,36 @@ mod tests {
             let kb = version_key(1, 1, b);
             prop_assert_eq!(a.cmp(&b), kb.cmp(&ka));
         }
+    }
+
+    // ── SP5 xid-keyed tuple tests ─────────────────────────────────────────────
+
+    #[test]
+    fn version_key_xid_is_rowid_prefix_plus_ascending_xid() {
+        let prefix = kv::key::row_key(7, 42);
+        let k = version_key_xid(7, 42, 100);
+        assert!(k.starts_with(&prefix));
+        assert_eq!(xid_of_key(&k).expect("xid"), 100);
+        // ascending: a higher xid sorts after a lower one for the same row.
+        assert!(version_key_xid(7, 42, 100) < version_key_xid(7, 42, 200));
+        // row_prefix_of strips the 8-byte xid suffix back to the row key.
+        assert_eq!(row_prefix_of(&k).expect("prefix"), prefix.as_slice());
+    }
+
+    #[test]
+    fn tuple_roundtrips_header_and_row() {
+        let row = vec![Datum::Int4(1), Datum::Text("a".into())];
+        let bytes = encode_tuple(5, crate::xid::INVALID_XID, &row);
+        assert_eq!(decode_tuple(&bytes).expect("decode"), (5, 0, row));
+        // a deleted/superseded version keeps its row bytes and carries xmax.
+        let bytes = encode_tuple(5, 9, &[Datum::Int4(1)]);
+        assert_eq!(decode_tuple(&bytes).expect("decode"), (5, 9, vec![Datum::Int4(1)]));
+    }
+
+    #[test]
+    fn decode_tuple_rejects_corrupt() {
+        assert!(decode_tuple(&[]).is_err());
+        assert!(decode_tuple(&[99, 0, 0, 0, 0, 0, 0, 0, 0]).is_err()); // bad tag
+        assert!(decode_tuple(&[1, 0, 0]).is_err()); // too short for header
     }
 }
