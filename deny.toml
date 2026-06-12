@@ -17,6 +17,13 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack; only via sqlx-mysql dev-dependency, never shipped" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive dev-dependency only" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dev-dependency only" },
+    # --- tokio-postgres / postgres-protocol (the test CLIENT driver) — dev-dependency
+    # only, never shipped. All three are client-side DoS triggered by a malicious or
+    # compromised SERVER's responses; crabgresql is a server, not a client, so these
+    # paths are unreachable in the shipped binary. Remove once tokio-postgres ships a fix.
+    { id = "RUSTSEC-2026-0178", reason = "tokio-postgres DataRow panic; dev-only client driver, crabgresql is a server" },
+    { id = "RUSTSEC-2026-0179", reason = "postgres-protocol unbounded SCRAM iterations; dev-only client driver, not shipped" },
+    { id = "RUSTSEC-2026-0180", reason = "postgres-protocol hstore decode panic; dev-only client driver, not shipped" },
 ]
 
 [licenses]
