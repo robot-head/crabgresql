@@ -84,7 +84,7 @@ fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
         "trust" => Ok(SessionConfig::trust()),
         "scram" => {
             use pgwire::scram::ScramVerifier;
-            use rand::Rng;
+            use rand::RngExt;
             if args.user_creds.is_empty() {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
