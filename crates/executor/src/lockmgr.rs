@@ -1,10 +1,13 @@
 //! In-memory row-lock manager for concurrent writers. Per `(table, rowid)`
 //! exclusive/shared locks, transaction-scoped (released at COMMIT/ROLLBACK). A
-//! blocked writer awaits a per-holder `Notify`; the holder's `release_all`
-//! wakes it. A wait-for graph (each waiting xid -> the xid it blocks on) is
-//! checked eagerly for cycles before blocking, aborting the would-be waiter
-//! with a deadlock error. Purely in-memory: after a restart no transactions are
-//! in flight, so no lock state must survive.
+//! blocked writer calls the integrated async `acquire`, which detects a
+//! conflict and registers a per-waiter `Notify` ATOMICALLY under one guard; the
+//! holder's `release_all` wakes each waiter with `notify_one` (which stores a
+//! permit if the waiter has not yet awaited, so no wakeup is ever lost). A
+//! wait-for graph (each waiting xid -> the xid it blocks on) is checked eagerly
+//! for cycles before blocking, aborting the would-be waiter with a deadlock
+//! error. Purely in-memory: after a restart no transactions are in flight, so
+//! no lock state must survive.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,8 +43,8 @@ struct RowLock {
 
 struct Inner {
     locks: HashMap<(catalog::TableId, u64), RowLock>,
-    notifiers: HashMap<u64, Arc<Notify>>, // holder xid -> notifier (woken on release)
-    wait_for: HashMap<u64, u64>,          // waiter xid -> holder xid
+    waiters: HashMap<u64, Vec<Arc<Notify>>>, // holder xid -> waiters' notifiers
+    wait_for: HashMap<u64, u64>,             // waiter xid -> holder xid
 }
 
 #[allow(dead_code)] // wired in by the SP6 cutover (Task 5)
@@ -55,14 +58,15 @@ impl RowLockManager {
         Self {
             inner: Mutex::new(Inner {
                 locks: HashMap::new(),
-                notifiers: HashMap::new(),
+                waiters: HashMap::new(),
                 wait_for: HashMap::new(),
             }),
         }
     }
 
     /// Non-blocking acquire. Idempotent if `my_xid` already holds compatibly; a
-    /// sole shared holder may upgrade to exclusive.
+    /// sole shared holder may upgrade to exclusive. Thin wrapper that locks and
+    /// delegates to [`try_acquire_locked`].
     pub fn try_acquire(
         &self,
         table: catalog::TableId,
@@ -71,85 +75,68 @@ impl RowLockManager {
         my_xid: u64,
     ) -> Acquire {
         let mut g = self.inner.lock().expect("lockmgr");
-        match g.locks.get_mut(&(table, rowid)) {
-            None => {
-                let mut holders = HashSet::new();
-                holders.insert(my_xid);
-                g.locks.insert((table, rowid), RowLock { mode, holders });
-                Acquire::Acquired
-            }
-            Some(lock) => {
-                if lock.holders.contains(&my_xid) {
-                    if mode == LockMode::Exclusive && lock.mode == LockMode::Shared {
-                        if lock.holders.len() == 1 {
-                            lock.mode = LockMode::Exclusive;
-                            Acquire::Acquired
-                        } else {
-                            let other = *lock
-                                .holders
-                                .iter()
-                                .find(|&&h| h != my_xid)
-                                .expect("other holder");
-                            Acquire::Conflict(other)
-                        }
-                    } else {
-                        Acquire::Acquired
-                    }
-                } else if mode == LockMode::Shared && lock.mode == LockMode::Shared {
-                    lock.holders.insert(my_xid);
-                    Acquire::Acquired
-                } else {
-                    Acquire::Conflict(*lock.holders.iter().next().expect("a holder"))
-                }
-            }
-        }
+        try_acquire_locked(&mut g, table, rowid, mode, my_xid)
     }
 
-    /// Block until `holder` releases, after an eager deadlock check. `Err(())`
-    /// means registering the wait would close a cycle (caller maps to 40P01).
-    /// Lost-wakeup-free via `Notified::enable()` before releasing the guard.
-    pub async fn wait_for(&self, my_xid: u64, holder: u64) -> Result<(), ()> {
-        let notify = {
-            let mut g = self.inner.lock().expect("lockmgr");
-            if matches!(
-                check_cycle(&g.wait_for, holder, my_xid),
-                CycleCheck::Deadlock
-            ) {
-                return Err(());
-            }
-            g.wait_for.insert(my_xid, holder);
-            Arc::clone(
-                g.notifiers
-                    .entry(holder)
-                    .or_insert_with(|| Arc::new(Notify::new())),
-            )
-        };
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        // Register this waiter NOW, while we still control ordering: a
-        // `notify_waiters()` from the holder's `release_all` after we drop the
-        // guard below still wakes us (no lost wakeup). `notify` is held by Arc,
-        // so the inner-mutex guard is already dropped at this point.
-        notified.as_mut().enable();
-        notified.await;
-        self.inner
-            .lock()
-            .expect("lockmgr")
-            .wait_for
-            .remove(&my_xid);
-        Ok(())
+    /// Acquire `(table, rowid)` in `mode` for `my_xid`, blocking until granted.
+    /// Returns `Err(())` if blocking would close a wait-for cycle (caller maps
+    /// to 40P01). Conflict-detect and waiter-register happen ATOMICALLY under
+    /// one guard, and the holder's `release_all` wakes us via a permit-backed
+    /// `notify_one` — so there is no lost-wakeup window and no chance of
+    /// registering on a holder that already released.
+    pub async fn acquire(
+        &self,
+        table: catalog::TableId,
+        rowid: u64,
+        mode: LockMode,
+        my_xid: u64,
+    ) -> Result<(), ()> {
+        loop {
+            let notify = {
+                let mut g = self.inner.lock().expect("lockmgr");
+                match try_acquire_locked(&mut g, table, rowid, mode, my_xid) {
+                    Acquire::Acquired => {
+                        g.wait_for.remove(&my_xid); // no longer waiting
+                        return Ok(());
+                    }
+                    Acquire::Conflict(holder) => {
+                        if matches!(
+                            check_cycle(&g.wait_for, holder, my_xid),
+                            CycleCheck::Deadlock
+                        ) {
+                            g.wait_for.remove(&my_xid);
+                            return Err(());
+                        }
+                        g.wait_for.insert(my_xid, holder);
+                        let n = Arc::new(Notify::new());
+                        g.waiters.entry(holder).or_default().push(Arc::clone(&n));
+                        n
+                    }
+                }
+            };
+            // Guard dropped. `notify_one()` stores a permit if it fires before
+            // we await, so this cannot lose a wakeup; on wake we loop and
+            // re-attempt the acquire.
+            notify.notified().await;
+        }
     }
 
     /// Release every lock held by `my_xid`, wake its waiters, clear its edge.
     pub fn release_all(&self, my_xid: u64) {
-        let mut g = self.inner.lock().expect("lockmgr");
-        g.locks.retain(|_, lock| {
-            lock.holders.remove(&my_xid);
-            !lock.holders.is_empty()
-        });
-        g.wait_for.remove(&my_xid);
-        if let Some(n) = g.notifiers.remove(&my_xid) {
-            n.notify_waiters();
+        let to_wake = {
+            let mut g = self.inner.lock().expect("lockmgr");
+            g.locks.retain(|_, lock| {
+                lock.holders.remove(&my_xid);
+                !lock.holders.is_empty()
+            });
+            g.wait_for.remove(&my_xid);
+            g.waiters.remove(&my_xid).unwrap_or_default()
+        };
+        // Each per-waiter `Notify` has exactly one consumer; `notify_one` stores
+        // a permit if the waiter has not yet reached `.await`, so no wakeup is
+        // ever lost.
+        for n in to_wake {
+            n.notify_one();
         }
     }
 
@@ -163,7 +150,56 @@ impl RowLockManager {
     }
     #[cfg(test)]
     pub(crate) fn check_cycle(&self, holder: u64, my_xid: u64) -> CycleCheck {
-        check_cycle(&self.inner.lock().expect("lockmgr").wait_for, holder, my_xid)
+        check_cycle(
+            &self.inner.lock().expect("lockmgr").wait_for,
+            holder,
+            my_xid,
+        )
+    }
+}
+
+/// Locked, non-blocking acquire over `&mut Inner`. Idempotent if `my_xid`
+/// already holds compatibly; a sole shared holder may upgrade to exclusive.
+fn try_acquire_locked(
+    inner: &mut Inner,
+    table: catalog::TableId,
+    rowid: u64,
+    mode: LockMode,
+    my_xid: u64,
+) -> Acquire {
+    match inner.locks.get_mut(&(table, rowid)) {
+        None => {
+            let mut holders = HashSet::new();
+            holders.insert(my_xid);
+            inner
+                .locks
+                .insert((table, rowid), RowLock { mode, holders });
+            Acquire::Acquired
+        }
+        Some(lock) => {
+            if lock.holders.contains(&my_xid) {
+                if mode == LockMode::Exclusive && lock.mode == LockMode::Shared {
+                    if lock.holders.len() == 1 {
+                        lock.mode = LockMode::Exclusive;
+                        Acquire::Acquired
+                    } else {
+                        let other = *lock
+                            .holders
+                            .iter()
+                            .find(|&&h| h != my_xid)
+                            .expect("other holder");
+                        Acquire::Conflict(other)
+                    }
+                } else {
+                    Acquire::Acquired
+                }
+            } else if mode == LockMode::Shared && lock.mode == LockMode::Shared {
+                lock.holders.insert(my_xid);
+                Acquire::Acquired
+            } else {
+                Acquire::Conflict(*lock.holders.iter().next().expect("a holder"))
+            }
+        }
     }
 }
 
@@ -264,36 +300,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_resumes_when_holder_releases() {
+    async fn acquire_resumes_when_holder_releases() {
         use std::sync::Arc;
         let m = Arc::new(RowLockManager::new());
         m.try_acquire(1, 1, LockMode::Exclusive, 10);
         let m2 = Arc::clone(&m);
         let waiter = tokio::spawn(async move {
-            assert!(matches!(
-                m2.try_acquire(1, 1, LockMode::Exclusive, 11),
-                Acquire::Conflict(10)
-            ));
-            m2.wait_for(11, 10).await.expect("not a deadlock");
+            // blocks: row is held exclusively by xid 10
+            m2.acquire(1, 1, LockMode::Exclusive, 11)
+                .await
+                .expect("not a deadlock");
         });
         tokio::task::yield_now().await;
         m.release_all(10);
-        waiter.await.expect("waiter completes"); // must not hang
+        // bound the wait so a regression FAILS instead of hanging forever
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter did not hang")
+            .expect("waiter completes");
     }
 
     #[tokio::test]
-    async fn wait_for_does_not_lose_a_wakeup_under_race() {
-        // Stress: holder releases immediately; the waiter must still wake. Run a
-        // few iterations to shake out a lost-wakeup.
+    async fn acquire_does_not_lose_wakeup_under_race() {
+        // Stress: holder releases immediately, racing the waiter's registration.
+        // The waiter must still wake. Run many iterations to shake out a
+        // lost-wakeup.
         use std::sync::Arc;
         for _ in 0..50 {
             let m = Arc::new(RowLockManager::new());
             m.try_acquire(1, 1, LockMode::Exclusive, 10);
             let m2 = Arc::clone(&m);
-            let waiter = tokio::spawn(async move {
-                let _ = m2.try_acquire(1, 1, LockMode::Exclusive, 11);
-                m2.wait_for(11, 10).await
-            });
+            let waiter =
+                tokio::spawn(async move { m2.acquire(1, 1, LockMode::Exclusive, 11).await });
             let m3 = Arc::clone(&m);
             let releaser = tokio::spawn(async move {
                 m3.release_all(10);
@@ -307,6 +345,42 @@ mod tests {
                 .expect("waiter task")
                 .expect("not a deadlock");
         }
+    }
+
+    #[tokio::test]
+    async fn acquire_succeeds_when_holder_released_before_wait() {
+        // The holder-released-before-register bug: the row is freed BEFORE the
+        // waiter ever calls `acquire`, so `acquire` must simply succeed (the
+        // atomic try-acquire-or-register under one guard sees a free row).
+        use std::sync::Arc;
+        let m = Arc::new(RowLockManager::new());
+        m.try_acquire(1, 1, LockMode::Exclusive, 10);
+        m.release_all(10); // released before the waiter starts
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            m.acquire(1, 1, LockMode::Exclusive, 11),
+        )
+        .await
+        .expect("did not hang")
+        .expect("acquires the now-free row");
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_err_when_edge_closes_a_cycle() {
+        // Deadlock path: pre-register 10 -> 11 (10 waits for 11). Now have 11
+        // try to acquire a row held by 10: the edge 11 -> 10 closes the cycle
+        // 10 -> 11 -> 10, so `acquire` must return Err(()) instead of blocking.
+        use std::sync::Arc;
+        let m = Arc::new(RowLockManager::new());
+        m.wait_for_register_only(10, 11); // 10 waits for 11
+        m.try_acquire(1, 1, LockMode::Exclusive, 10); // 10 holds row 1
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            m.acquire(1, 1, LockMode::Exclusive, 11), // 11 wants row 1 held by 10
+        )
+        .await
+        .expect("did not hang");
+        assert!(res.is_err(), "closing the cycle must abort with Err(())");
     }
 
     #[test]
