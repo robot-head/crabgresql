@@ -17,7 +17,7 @@ use kv::KvError;
 /// ascending). A rowid's versions all share `kv::key::row_key(table, rowid)`.
 pub fn version_key_xid(table_id: u32, rowid: u64, xid: u64) -> Vec<u8> {
     let mut k = kv::key::row_key(table_id, rowid);
-    k.extend_from_slice(&xid.to_be_bytes());
+    k.extend_from_slice(U64::new(xid).as_bytes());
     k
 }
 
@@ -31,11 +31,9 @@ pub fn row_prefix_of(key: &[u8]) -> Result<&[u8], KvError> {
 
 /// The creating xid encoded in a version key's 8-byte suffix.
 pub fn xid_of_key(key: &[u8]) -> Result<u64, KvError> {
-    if key.len() < 8 {
-        return Err(KvError::CorruptRow("version key too short".into()));
-    }
-    let suffix: [u8; 8] = key[key.len() - 8..].try_into().expect("8 bytes");
-    Ok(u64::from_be_bytes(suffix))
+    let (_, xid) = U64::read_from_suffix(key)
+        .map_err(|_| KvError::CorruptRow("version key too short".into()))?;
+    Ok(xid.get())
 }
 
 /// Fixed 17-byte tuple header: tag + big-endian xmin/xmax. `#[repr(C)]` with
