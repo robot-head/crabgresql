@@ -2,7 +2,7 @@
 //! survived — including the rowid allocator (the SP2 carry-over fix).
 
 use executor::SqlEngine;
-use pgwire::engine::{Cell, Engine, QueryResult};
+use pgwire::engine::{Cell, Engine, QueryResult, Session};
 
 fn text(cell: &Option<Cell>) -> Option<String> {
     cell.as_ref()
@@ -10,7 +10,7 @@ fn text(cell: &Option<Cell>) -> Option<String> {
 }
 
 async fn rows(engine: &SqlEngine, sql: &str) -> Vec<Vec<Option<Cell>>> {
-    let mut results = engine.simple_query(sql).await.expect("query");
+    let mut results = engine.connect().simple_query(sql).await.expect("query");
     match results.remove(0) {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected Rows, got {other:?}"),
@@ -24,10 +24,12 @@ async fn data_schema_and_rowid_survive_reopen() {
     {
         let engine = SqlEngine::open(dir.path()).expect("open");
         engine
+            .connect()
             .simple_query("CREATE TABLE t (id int4, name text)")
             .await
             .expect("create");
         engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1,'a'),(2,'b')")
             .await
             .expect("insert");
@@ -45,6 +47,7 @@ async fn data_schema_and_rowid_survive_reopen() {
     // (rowids are the hidden key, not the id column; insert two more and confirm
     // all four rows are present and distinct.)
     engine
+        .connect()
         .simple_query("INSERT INTO t VALUES (3,'c')")
         .await
         .expect("insert after reopen");
@@ -61,20 +64,81 @@ async fn data_schema_and_rowid_survive_reopen() {
 }
 
 #[tokio::test]
+async fn committed_transaction_survives_reopen() {
+    let dir = tempfile::tempdir().expect("tmp");
+    {
+        let engine = SqlEngine::open(dir.path()).expect("open");
+        engine
+            .connect()
+            .simple_query("CREATE TABLE t (id int4, name text)")
+            .await
+            .expect("create");
+        // Use the same session for the transaction so state is kept.
+        let mut s = engine.connect();
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("INSERT INTO t VALUES (1,'a'),(2,'b')")
+            .await
+            .expect("insert");
+        s.simple_query("UPDATE t SET name = 'z' WHERE id = 2")
+            .await
+            .expect("update");
+        s.simple_query("COMMIT").await.expect("commit");
+    } // drop closes the store
+
+    let engine = SqlEngine::open(dir.path()).expect("reopen");
+    let got = rows(&engine, "SELECT name FROM t ORDER BY id").await;
+    assert_eq!(
+        got.iter().map(|r| text(&r[0])).collect::<Vec<_>>(),
+        vec![Some("a".into()), Some("z".into())]
+    );
+}
+
+#[tokio::test]
+async fn rolled_back_transaction_leaves_nothing() {
+    let dir = tempfile::tempdir().expect("tmp");
+    {
+        let engine = SqlEngine::open(dir.path()).expect("open");
+        engine
+            .connect()
+            .simple_query("CREATE TABLE t (id int4)")
+            .await
+            .expect("create");
+        let mut s = engine.connect();
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("INSERT INTO t VALUES (1),(2),(3)")
+            .await
+            .expect("insert");
+        s.simple_query("ROLLBACK").await.expect("rollback");
+    }
+
+    let engine = SqlEngine::open(dir.path()).expect("reopen");
+    // Table exists (DDL is non-transactional) but holds no rows.
+    let got = rows(&engine, "SELECT id FROM t").await;
+    assert!(got.is_empty(), "rolled-back rows must not survive a reopen");
+}
+
+#[tokio::test]
 async fn drop_and_recreate_survive_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let engine = SqlEngine::open(dir.path()).expect("open");
         engine
+            .connect()
             .simple_query("CREATE TABLE t (id int4)")
             .await
             .expect("create");
         engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1)")
             .await
             .expect("insert");
-        engine.simple_query("DROP TABLE t").await.expect("drop");
         engine
+            .connect()
+            .simple_query("DROP TABLE t")
+            .await
+            .expect("drop");
+        engine
+            .connect()
             .simple_query("CREATE TABLE t (id int4)")
             .await
             .expect("recreate");

@@ -20,6 +20,9 @@ pub enum ExecError {
     /// Wrong type in a context that demands a specific one (42804) — e.g. a
     /// non-boolean WHERE.
     TypeMismatch(String),
+    /// A statement was issued in an aborted transaction block (25P02): every
+    /// command after an error (until COMMIT/ROLLBACK) is rejected.
+    InFailedTransaction,
 }
 
 impl ExecError {
@@ -41,6 +44,10 @@ impl ExecError {
             }
             ExecError::Unsupported(m) => PgError::error("0A000", m),
             ExecError::TypeMismatch(m) => PgError::error("42804", m),
+            ExecError::InFailedTransaction => PgError::error(
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
         }
     }
 }

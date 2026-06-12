@@ -1,15 +1,38 @@
 //! Per-statement execution.
 
 use bytes::Bytes;
-use catalog::{Column, Table};
+use catalog::{Column, Table, TableId};
+use kv::Kv;
 use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 
-use crate::SqlEngine;
+use crate::SqlSession;
 use crate::error::ExecError;
+use crate::session::{Pending, TxnCtx};
 
-pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResult, ExecError> {
+/// Read a table's durable next-rowid (1 if unset). Single source of truth for
+/// the sequence read.
+pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError> {
+    match kv.get(&kv::key::seq_key(table))? {
+        Some(b) => {
+            let arr: [u8; 8] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| kv::KvError::CorruptRow("sequence is not u64".into()))?;
+            Ok(u64::from_be_bytes(arr))
+        }
+        None => Ok(1),
+    }
+}
+
+/// DDL (CREATE/DROP TABLE) is its own immediate critical section: it takes the
+/// write_lock itself and writes through to the store. Non-DDL is unreachable
+/// here (routed via `run_one`) but handled defensively to keep the match total.
+pub(crate) fn execute_ddl(
+    session: &SqlSession,
+    stmt: &Statement,
+) -> Result<QueryResult, ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
             let cols = columns
@@ -19,31 +42,45 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     ty: c.ty,
                 })
                 .collect();
-            let _guard = engine.write_lock.lock().expect("write lock");
-            catalog::create_table(&*engine.kv, name, cols)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            catalog::create_table(&*session.kv, name, cols)?;
             Ok(QueryResult::Command {
                 tag: "CREATE TABLE".into(),
             })
         }
         Statement::DropTable { name } => {
-            let _guard = engine.write_lock.lock().expect("write lock");
-            catalog::drop_table(&*engine.kv, name)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            catalog::drop_table(&*session.kv, name)?;
             Ok(QueryResult::Command {
                 tag: "DROP TABLE".into(),
             })
         }
+        _ => Err(ExecError::Unsupported("not a DDL statement".into())),
+    }
+}
+
+/// DML (INSERT/SELECT, plus UPDATE/DELETE in Task 6). Reads and writes go
+/// through the transaction's `ctx`: writes buffer into `ctx.writes`/`ctx.seq`
+/// (flushed at COMMIT by the caller) and reads overlay the write-set on top of
+/// the visible store snapshot. This function NEVER takes the write_lock — the
+/// caller decides locking (autocommit holds it; in-txn DML does not).
+pub(crate) fn execute_dml(
+    kv: &dyn Kv,
+    ctx: &mut TxnCtx,
+    stmt: &Statement,
+) -> Result<QueryResult, ExecError> {
+    match stmt {
         Statement::Insert {
             table,
             columns,
             rows,
         } => {
-            // Acquire the write lock BEFORE reading the sequence so the
-            // read-modify-write (read_seq → write_batch with bumped seq) is
-            // atomic with respect to other concurrent INSERTs.  execute() is
-            // a sync fn with no .await, so a std::sync::Mutex guard is safe
-            // here — it is never held across an await point.
-            let _guard = engine.write_lock.lock().expect("write lock");
-            let t = catalog::get_table(&*engine.kv, table)?;
+            if rows.is_empty() {
+                return Ok(QueryResult::Command {
+                    tag: "INSERT 0 0".into(),
+                });
+            }
+            let t = catalog::get_table(kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
                     .iter()
@@ -54,8 +91,10 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let mut rowid = engine.read_seq(t.id)?;
-            let mut ops: Vec<kv::WriteOp> = Vec::new();
+            // Allocate rowids from the write-set's per-table counter, seeded
+            // from the durable next-rowid the first time this txn touches it.
+            let start = *ctx.seq.entry(t.id).or_insert(read_seq_kv(kv, t.id)?);
+            let mut rowid = start;
             for row_exprs in rows {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(
@@ -68,23 +107,70 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
                     let v = crate::eval::eval(expr, None, &[])?;
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
-                ops.push(kv::WriteOp::Put {
-                    key: kv::key::row_key(t.id, rowid),
-                    value: kv::rowenc::encode_row(&full),
-                });
+                ctx.writes.insert(
+                    (t.id, rowid),
+                    Pending::Row(mvcc::encode_version(false, &full)),
+                );
                 rowid += 1;
             }
-            let n = ops.len() as u64;
-            ops.push(kv::WriteOp::Put {
-                key: kv::key::seq_key(t.id),
-                value: rowid.to_be_bytes().to_vec(),
-            });
-            engine.kv.write_batch(&ops)?;
+            let n = rowid - start;
+            // Advance the txn-local sequence to the new next-rowid.
+            ctx.seq.insert(t.id, rowid);
             Ok(QueryResult::Command {
                 tag: format!("INSERT 0 {n}"),
             })
         }
-        Statement::Select(s) => exec_select(engine, s),
+        Statement::Select(s) => exec_select(kv, ctx, s),
+        Statement::Update {
+            table,
+            assignments,
+            filter,
+        } => {
+            let t = catalog::get_table(kv, table)?;
+            // Resolve each assignment's target column index up front (42703 on miss).
+            let targets: Vec<(usize, &Expr)> = assignments
+                .iter()
+                .map(|(col, expr)| {
+                    t.column_index(col)
+                        .map(|idx| (idx, expr))
+                        .ok_or_else(|| ExecError::UndefinedColumn(col.clone()))
+                })
+                .collect::<Result<_, _>>()?;
+            let mut n: u64 = 0;
+            for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
+                if !row_matches(filter.as_ref(), Some(&t), &row)? {
+                    continue;
+                }
+                let mut next = row.clone();
+                for (idx, expr) in &targets {
+                    let v = crate::eval::eval(expr, Some(&t), &row)?;
+                    next[*idx] = coerce(v, t.columns[*idx].ty)?;
+                }
+                ctx.writes.insert(
+                    (t.id, rowid),
+                    Pending::Row(mvcc::encode_version(false, &next)),
+                );
+                n += 1;
+            }
+            Ok(QueryResult::Command {
+                tag: format!("UPDATE {n}"),
+            })
+        }
+        Statement::Delete { table, filter } => {
+            let t = catalog::get_table(kv, table)?;
+            let mut n: u64 = 0;
+            for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
+                if !row_matches(filter.as_ref(), Some(&t), &row)? {
+                    continue;
+                }
+                ctx.writes.insert((t.id, rowid), Pending::Tombstone);
+                n += 1;
+            }
+            Ok(QueryResult::Command {
+                tag: format!("DELETE {n}"),
+            })
+        }
+        _ => Err(ExecError::Unsupported("not a DML statement".into())),
     }
 }
 
@@ -111,21 +197,87 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
     })
 }
 
-fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecError> {
+/// Scan a table's live rows under the txn snapshot, overlaying the write-set
+/// (read-your-writes). Returns `(rowid, row)` pairs sorted by rowid so the
+/// buffered writes interleave deterministically with the store rows.
+pub(crate) fn scan_live_rows(
+    kv: &dyn Kv,
+    ctx: &TxnCtx,
+    table: &catalog::Table,
+) -> Result<Vec<(u64, Vec<pgtypes::Datum>)>, ExecError> {
+    let snapshot = mvcc::Snapshot(ctx.snapshot);
+    let scanned = kv.scan_prefix(&kv::key::table_prefix(table.id))?;
+    let mut out: Vec<(u64, Vec<pgtypes::Datum>)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < scanned.len() {
+        let prefix = mvcc::version::row_prefix_of(&scanned[i].0)?.to_vec();
+        let rowid = kv::key::rowid_of(table.id, &prefix)?;
+        let mut versions: Vec<(u64, &[u8])> = Vec::new();
+        while i < scanned.len() && mvcc::version::row_prefix_of(&scanned[i].0)? == prefix.as_slice()
+        {
+            versions.push((
+                mvcc::version::ts_of_key(&scanned[i].0)?,
+                scanned[i].1.as_slice(),
+            ));
+            i += 1;
+        }
+        seen.insert(rowid);
+        match ctx.writes.get(&(table.id, rowid)) {
+            Some(Pending::Tombstone) => {}
+            Some(Pending::Row(v)) => out.push((rowid, mvcc::decode_version(v)?.1)),
+            None => {
+                if let Some(row) = mvcc::visible_version(snapshot, versions)? {
+                    out.push((rowid, row));
+                }
+            }
+        }
+    }
+    // Rows created in this txn that have no store version yet. A Tombstone for
+    // a not-yet-stored rowid (created then deleted in this txn) surfaces nothing.
+    for ((t, rowid), pending) in &ctx.writes {
+        if *t != table.id || seen.contains(rowid) {
+            continue;
+        }
+        if let Pending::Row(v) = pending {
+            out.push((*rowid, mvcc::decode_version(v)?.1));
+        }
+    }
+    out.sort_by_key(|(rowid, _)| *rowid);
+    Ok(out)
+}
+
+/// Evaluate an optional WHERE predicate against a row (NULL => false, like SELECT).
+fn row_matches(
+    filter: Option<&Expr>,
+    table: Option<&catalog::Table>,
+    row: &[pgtypes::Datum],
+) -> Result<bool, ExecError> {
+    match filter {
+        None => Ok(true),
+        Some(f) => match crate::eval::eval(f, table, row)? {
+            pgtypes::Datum::Bool(b) => Ok(b),
+            pgtypes::Datum::Null => Ok(false),
+            _ => Err(ExecError::TypeMismatch(
+                "argument of WHERE must be type boolean".into(),
+            )),
+        },
+    }
+}
+
+fn exec_select(kv: &dyn Kv, ctx: &TxnCtx, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
+        Some(name) => Some(catalog::get_table(kv, name)?),
         None => None,
     };
 
-    // Source rows: scan the table, or a single empty row for FROM-less SELECT.
+    // Source rows: scan the table (dropping the rowid for projection), or a
+    // single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => {
-            let scanned = engine.kv.scan_prefix(&kv::key::table_prefix(t.id))?;
-            scanned
-                .into_iter()
-                .map(|(_, v)| kv::rowenc::decode_row(&v))
-                .collect::<Result<_, _>>()?
-        }
+        Some(t) => scan_live_rows(kv, ctx, t)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect(),
         None => vec![vec![]],
     };
 
@@ -135,18 +287,7 @@ fn exec_select(engine: &SqlEngine, s: &SelectStmt) -> Result<QueryResult, ExecEr
     // Filter, keeping each surviving source row for ORDER BY evaluation.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
-        let keep = match &s.filter {
-            None => true,
-            Some(f) => match crate::eval::eval(f, table.as_ref(), row)? {
-                Datum::Bool(b) => b,
-                Datum::Null => false,
-                _ => {
-                    return Err(ExecError::TypeMismatch(
-                        "argument of WHERE must be type boolean".into(),
-                    ));
-                }
-            },
-        };
+        let keep = row_matches(s.filter.as_ref(), table.as_ref(), row)?;
         if keep {
             kept.push(row.clone());
         }
@@ -304,7 +445,7 @@ fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
 }
 
 pub(crate) fn describe(
-    engine: &SqlEngine,
+    session: &SqlSession,
     sql: &str,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
@@ -313,7 +454,7 @@ pub(crate) fn describe(
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let table = match &s.from {
-        Some(name) => Some(catalog::get_table(&*engine.kv, name)?),
+        Some(name) => Some(catalog::get_table(&*session.kv, name)?),
         None => None,
     };
     let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
@@ -323,7 +464,7 @@ pub(crate) fn describe(
 #[cfg(test)]
 mod tests {
     use crate::SqlEngine;
-    use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult};
+    use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult, Session};
 
     fn rows_of(r: &QueryResult) -> &Vec<Vec<Option<Cell>>> {
         match r {
@@ -403,6 +544,7 @@ mod tests {
         run(&engine, "CREATE TABLE t (id int4)").await;
         run(&engine, "INSERT INTO t VALUES (1)").await;
         let err = engine
+            .connect()
             .simple_query("SELECT id FROM t WHERE id")
             .await
             .expect_err("non-bool");
@@ -434,7 +576,9 @@ mod tests {
     }
 
     async fn run(engine: &SqlEngine, sql: &str) -> Vec<QueryResult> {
-        engine.simple_query(sql).await.expect("ok")
+        // Autocommit per statement: a fresh session per call preserves the same
+        // semantics the old direct `engine.simple_query` had.
+        engine.connect().simple_query(sql).await.expect("ok")
     }
 
     #[tokio::test]
@@ -459,6 +603,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_writes_a_versioned_row_visible_to_select() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let r = &run(&engine, "SELECT id FROM t").await[0];
+        assert_eq!(rows_of(r).len(), 1);
+    }
+
+    #[tokio::test]
     async fn insert_widens_int4_to_int8_column() {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (big int8)").await;
@@ -471,6 +624,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (flag bool)").await;
         let err = engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1)")
             .await
             .expect_err("mismatch");
@@ -482,6 +636,7 @@ mod tests {
     async fn insert_into_missing_table_is_42P01() {
         let engine = SqlEngine::new();
         let err = engine
+            .connect()
             .simple_query("INSERT INTO nope VALUES (1)")
             .await
             .expect_err("no table");
@@ -493,6 +648,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (a int4, b int4)").await;
         let err = engine
+            .connect()
             .simple_query("INSERT INTO t VALUES (1)")
             .await
             .expect_err("arity");
@@ -511,6 +667,7 @@ mod tests {
         );
         // Re-creating is a duplicate error (42P07), session survives.
         let err = engine
+            .connect()
             .simple_query("CREATE TABLE t (id int4)")
             .await
             .expect_err("dup");
@@ -522,7 +679,11 @@ mod tests {
                 tag: "DROP TABLE".into()
             }]
         );
-        let err = engine.simple_query("DROP TABLE t").await.expect_err("gone");
+        let err = engine
+            .connect()
+            .simple_query("DROP TABLE t")
+            .await
+            .expect_err("gone");
         assert_eq!(err.code, "42P01");
     }
 
@@ -535,7 +696,11 @@ mod tests {
     #[tokio::test]
     async fn syntax_error_is_42601() {
         let engine = SqlEngine::new();
-        let err = engine.simple_query("SELCT 1").await.expect_err("syntax");
+        let err = engine
+            .connect()
+            .simple_query("SELCT 1")
+            .await
+            .expect_err("syntax");
         assert_eq!(err.code, "42601");
     }
 
@@ -544,6 +709,7 @@ mod tests {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (id int4, name text)").await;
         let fields = engine
+            .connect()
             .describe("SELECT id, name FROM t")
             .await
             .expect("describe");
@@ -557,9 +723,28 @@ mod tests {
     async fn describe_non_select_has_no_fields() {
         let engine = SqlEngine::new();
         let fields = engine
+            .connect()
             .describe("CREATE TABLE t (id int4)")
             .await
             .expect("describe");
         assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_inserts_are_both_visible() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        run(&engine, "INSERT INTO t VALUES (2)").await;
+        let r = &run(&engine, "SELECT id FROM t ORDER BY id").await[0];
+        assert_eq!(rows_of(r).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn select_on_empty_table_sees_no_rows() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        let r = &run(&engine, "SELECT id FROM t").await[0];
+        assert_eq!(rows_of(r).len(), 0);
     }
 }

@@ -16,6 +16,19 @@ const ACCEPTED: &[&str] = &[
     "SELECT * FROM t",
     "SELECT NOT a OR b AND c FROM t",
     "SELECT 'it''s' FROM t",
+    // SP4: transaction control
+    "BEGIN",
+    "START TRANSACTION",
+    "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "ABORT",
+    // SP4: DML
+    "UPDATE t SET a = 1 WHERE id = 5",
+    "UPDATE t SET a = 1, b = 2",
+    "DELETE FROM t WHERE id > 3",
+    "DELETE FROM t",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.

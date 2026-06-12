@@ -80,6 +80,78 @@ async fn undefined_table_errors_but_session_survives() {
 }
 
 #[tokio::test]
+async fn wire_transaction_commit_and_rollback() {
+    let mut client = connect(spawn().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int4, name text)")
+        .await
+        .expect("create");
+
+    // Rollback path: tokio-postgres transaction dropped without commit.
+    {
+        let tx = client.transaction().await.expect("begin");
+        tx.batch_execute("INSERT INTO t VALUES (1,'a')")
+            .await
+            .expect("insert");
+        // drop without commit → ROLLBACK sent over the wire
+    }
+    let rows = client
+        .query("SELECT id FROM t", &[])
+        .await
+        .expect("select after rollback");
+    assert_eq!(rows.len(), 0, "rolled-back insert must be gone");
+
+    // Commit path.
+    {
+        let tx = client.transaction().await.expect("begin");
+        tx.batch_execute("INSERT INTO t VALUES (2,'b')")
+            .await
+            .expect("insert");
+        tx.commit().await.expect("commit");
+    }
+    let rows = client
+        .query("SELECT id FROM t", &[])
+        .await
+        .expect("select after commit");
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get(0);
+    assert_eq!(id, 2);
+}
+
+#[tokio::test]
+async fn wire_update_delete_roundtrip() {
+    let client = connect(spawn().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int4, name text)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .await
+        .expect("insert");
+
+    let updated = client
+        .execute("UPDATE t SET name = 'z' WHERE id > 1", &[])
+        .await
+        .expect("update");
+    assert_eq!(updated, 2, "UPDATE must report 2 affected rows");
+
+    let deleted = client
+        .execute("DELETE FROM t WHERE id = 1", &[])
+        .await
+        .expect("delete");
+    assert_eq!(deleted, 1, "DELETE must report 1 affected row");
+
+    let rows = client
+        .query("SELECT id, name FROM t ORDER BY id", &[])
+        .await
+        .expect("select");
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows.iter().map(|r| r.get::<_, &str>(1)).collect();
+    assert_eq!(names, vec!["z", "z"]);
+}
+
+#[tokio::test]
 async fn parameterized_query_is_unsupported_0a000() {
     let client = connect(spawn().await).await;
     // The SP2 slice is literals-only; $1 parameters must reach SQLSTATE 0A000

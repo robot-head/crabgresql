@@ -9,9 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::{Engine, FieldDescription, QueryResult};
+use crate::engine::{Engine, FieldDescription, QueryResult, Session};
 use crate::error::{PgError, Severity, sqlstate};
-use crate::messages::backend::{self, TxStatus};
+use crate::messages::backend;
 use crate::messages::frontend::{self, FrontendMessage};
 use crate::server::SessionCancel;
 
@@ -108,9 +108,9 @@ fn fail_extended(ext: &mut ExtendedState, out: &mut BytesMut, e: &PgError) {
     backend::error_response(out, e);
 }
 
-async fn handle_parse<E: Engine>(
+async fn handle_parse<Sess: Session>(
     ext: &mut ExtendedState,
-    engine: &E,
+    session: &mut Sess,
     name: String,
     sql: String,
     param_types: Vec<u32>,
@@ -122,7 +122,7 @@ async fn handle_parse<E: Engine>(
             format!("prepared statement \"{name}\" already exists"),
         ));
     }
-    let fields = engine.describe(&sql).await?;
+    let fields = session.describe(&sql).await?;
     ext.statements.insert(
         name,
         Prepared {
@@ -221,9 +221,9 @@ fn handle_describe(
     Ok(())
 }
 
-async fn handle_execute<E: Engine>(
+async fn handle_execute<Sess: Session>(
     ext: &ExtendedState,
-    engine: &E,
+    session: &mut Sess,
     portal_name: &str,
     token: CancellationToken,
     out: &mut BytesMut,
@@ -247,7 +247,7 @@ async fn handle_execute<E: Engine>(
             sqlstate::QUERY_CANCELED,
             "canceling statement due to user request",
         )),
-        r = engine.simple_query(&sql) => r?,
+        r = session.simple_query(&sql) => r?,
     };
     // Extended protocol carries exactly one statement per Parse.
     match results.first() {
@@ -434,7 +434,12 @@ where
         backend::parameter_status(&mut out, name, value);
     }
     backend::backend_key_data(&mut out, cancel.pid, cancel.secret);
-    backend::ready_for_query(&mut out, TxStatus::Idle);
+
+    // One session per connection; it owns the (currently trivial) transaction
+    // state and is threaded by `&mut` through the message loop.
+    let mut session = engine.connect();
+
+    backend::ready_for_query(&mut out, session.tx_status());
     stream.write_all(&out).await?;
     out.clear();
 
@@ -467,7 +472,7 @@ where
                         sqlstate::QUERY_CANCELED,
                         "canceling statement due to user request",
                     )),
-                    r = engine.simple_query(&sql) => r,
+                    r = session.simple_query(&sql) => r,
                 };
                 match outcome {
                     Ok(results) => write_results(&mut out, &results),
@@ -479,14 +484,14 @@ where
                         }
                     }
                 }
-                backend::ready_for_query(&mut out, TxStatus::Idle);
+                backend::ready_for_query(&mut out, session.tx_status());
                 stream.write_all(&out).await?;
                 out.clear();
             }
             FrontendMessage::Sync => {
                 ext.failed = false;
                 ext.portals.clear(); // implicit transaction ends at Sync
-                backend::ready_for_query(&mut out, TxStatus::Idle);
+                backend::ready_for_query(&mut out, session.tx_status());
                 stream.write_all(&out).await?;
                 out.clear();
             }
@@ -501,7 +506,7 @@ where
                     continue;
                 }
                 if let Err(e) =
-                    handle_parse(&mut ext, &*engine, name, sql, param_types, &mut out).await
+                    handle_parse(&mut ext, &mut session, name, sql, param_types, &mut out).await
                 {
                     fail_extended(&mut ext, &mut out, &e);
                 }
@@ -543,7 +548,7 @@ where
                 }
                 // Cancel window: between extended messages no engine future runs; the pending flag in CancelRegistry makes a cancel received there fire on the next engine call.
                 let token = cancel.begin_query();
-                if let Err(e) = handle_execute(&ext, &*engine, &portal, token, &mut out).await {
+                if let Err(e) = handle_execute(&ext, &mut session, &portal, token, &mut out).await {
                     fail_extended(&mut ext, &mut out, &e);
                 }
                 stream.write_all(&out).await?;

@@ -4,26 +4,30 @@
 mod error;
 mod eval;
 mod exec;
+mod session;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use catalog::TableId;
 use kv::{FjallKv, Kv, MemKv};
-use pgwire::engine::{Engine, FieldDescription, QueryResult};
-use pgwire::error::PgError;
+use pgwire::engine::Engine;
 
 pub use error::ExecError;
+pub use session::SqlSession;
 
 /// The SQL engine over a durable (or in-memory) KV store. Catalog and sequences
 /// live in the KV store; the write mutex serializes all writes (INSERT, CREATE
 /// TABLE, DROP TABLE). SELECT is lock-free (reads are safe concurrently).
 ///
+/// As of SP4 Task 3 the engine is a connection factory: it produces one
+/// [`SqlSession`] per connection. The KV store and the write mutex are shared
+/// (`Arc`) across all sessions so writes remain serialized engine-wide.
+///
 /// SP3 is single-node autocommit with no MVCC, so one global write mutex is
 /// correct and simple — it is exactly the seam that SP4's transactions replace.
 pub struct SqlEngine {
     pub(crate) kv: Arc<dyn Kv>,
-    pub(crate) write_lock: Mutex<()>,
+    pub(crate) write_lock: Arc<Mutex<()>>,
 }
 
 impl Default for SqlEngine {
@@ -46,42 +50,15 @@ impl SqlEngine {
     pub fn with_kv(kv: Arc<dyn Kv>) -> Self {
         Self {
             kv,
-            write_lock: Mutex::new(()),
-        }
-    }
-
-    /// Read a table's durable next-rowid (1 if unset).
-    pub(crate) fn read_seq(&self, table: TableId) -> Result<u64, ExecError> {
-        match self.kv.get(&kv::key::seq_key(table))? {
-            Some(b) => {
-                let arr: [u8; 8] = b
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| kv::KvError::CorruptRow("sequence is not u64".into()))?;
-                Ok(u64::from_be_bytes(arr))
-            }
-            None => Ok(1),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 impl Engine for SqlEngine {
-    async fn simple_query(&self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
-        if sql.trim().is_empty() {
-            return Ok(vec![QueryResult::Empty]);
-        }
-        let statements = pgparser::parse(sql).map_err(|e| ExecError::from(e).into_pg())?;
-        if statements.is_empty() {
-            return Ok(vec![QueryResult::Empty]);
-        }
-        let mut results = Vec::with_capacity(statements.len());
-        for stmt in statements {
-            results.push(exec::execute(self, &stmt).map_err(ExecError::into_pg)?);
-        }
-        Ok(results)
-    }
+    type Session = SqlSession;
 
-    async fn describe(&self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
-        exec::describe(self, sql).map_err(ExecError::into_pg)
+    fn connect(&self) -> SqlSession {
+        SqlSession::new(Arc::clone(&self.kv), Arc::clone(&self.write_lock))
     }
 }
