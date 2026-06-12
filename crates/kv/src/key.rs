@@ -54,13 +54,6 @@ pub fn meta_next_table_id_key() -> Vec<u8> {
     k
 }
 
-/// Key for the global commit-timestamp clock: `/0/meta/commit_ts`.
-pub fn commit_ts_key() -> Vec<u8> {
-    let mut k = system_prefix("meta");
-    k.extend_from_slice(b"commit_ts");
-    k
-}
-
 /// Key for the global next-transaction-id counter: `/0/meta/next_xid`.
 pub fn next_xid_key() -> Vec<u8> {
     let mut k = system_prefix("meta");
