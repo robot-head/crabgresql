@@ -187,6 +187,14 @@ Option<Expr> }`. The libpg_query oracle corpus gains accept cases for these.
   INT4/TEXT; `conformance::split_statements` Latin-1 corner;
   `kv::FjallKv::scan_prefix` full materialization (matters a bit more now that
   MVCC scans every version — flagged for a streaming-iterator follow-up).
+- **Minor coverage gap:** no wire-level test explicitly asserts the ReadyForQuery
+  `T`/`E`/`I` status byte value; the byte is exercised implicitly by
+  `wire_transaction_commit_and_rollback` (tokio-postgres tracks tx state via that
+  byte) and the session-layer `error_in_block_fails_transaction_until_rollback`
+  asserts `TxStatus::Failed`. An explicit raw-socket test is deferred.
+- **`cargo deny` pre-existing advisories:** rustls/rsa advisory failures exist in
+  the dependency tree before SP4 (dev-deps via tokio-postgres/sqlx). Blocked on
+  upstream crate updates; not introduced by SP4.
 
 ## Success criteria
 

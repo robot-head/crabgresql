@@ -21,7 +21,9 @@ const ACCEPTED: &[&str] = &[
     "START TRANSACTION",
     "BEGIN ISOLATION LEVEL REPEATABLE READ",
     "COMMIT",
+    "END",
     "ROLLBACK",
+    "ABORT",
     // SP4: DML
     "UPDATE t SET a = 1 WHERE id = 5",
     "UPDATE t SET a = 1, b = 2",
