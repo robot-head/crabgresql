@@ -70,7 +70,7 @@ jobs:
             --corpus crates/conformance/corpus \
             --out parity.json --summary parity.md
       - run: cat parity.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: parity-report
           path: |
