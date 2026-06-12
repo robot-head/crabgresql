@@ -293,6 +293,22 @@ impl SqlSession {
     }
 }
 
+impl Drop for SqlSession {
+    /// A connection dropped mid-transaction (client disconnect) must not leak
+    /// its xid in the ProcArray. Deregister it so it stops pinning snapshots'
+    /// xmin. The writer lock releases on its own when `writer_guard` drops; the
+    /// uncommitted versions stay invisible (no clog Committed entry).
+    fn drop(&mut self) {
+        let xid = match &self.state {
+            TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => ctx.xid,
+            TxnState::Idle => None,
+        };
+        if let Some(xid) = xid {
+            self.procarray.finish(xid);
+        }
+    }
+}
+
 impl Session for SqlSession {
     async fn simple_query(&mut self, sql: &str) -> Result<Vec<QueryResult>, PgError> {
         if sql.trim().is_empty() {
@@ -319,5 +335,43 @@ impl Session for SqlSession {
             TxnState::InTransaction(_) => TxStatus::InTransaction,
             TxnState::Failed(_) => TxStatus::Failed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pgwire::engine::{Engine, Session};
+
+    use crate::SqlEngine;
+
+    /// A session dropped while a write transaction is open (client disconnect)
+    /// must deregister its xid from the ProcArray so it no longer pins
+    /// `snapshot().xmin`.
+    #[tokio::test]
+    async fn dropping_a_session_mid_txn_deregisters_its_xid() {
+        let engine = SqlEngine::new();
+
+        {
+            let mut s = engine.connect();
+            s.simple_query("CREATE TABLE t (id int4)")
+                .await
+                .expect("create");
+            s.simple_query("BEGIN").await.expect("begin");
+            s.simple_query("INSERT INTO t VALUES (1)")
+                .await
+                .expect("insert");
+            assert_eq!(
+                engine.procarray.running_len(),
+                1,
+                "xid must be registered while the transaction is open"
+            );
+            // s is dropped here, mid-transaction (no COMMIT/ROLLBACK)
+        }
+
+        assert_eq!(
+            engine.procarray.running_len(),
+            0,
+            "xid must be deregistered when the session is dropped mid-transaction"
+        );
     }
 }

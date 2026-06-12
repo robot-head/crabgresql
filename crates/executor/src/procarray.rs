@@ -74,6 +74,12 @@ impl ProcArray {
     pub fn finish(&self, xid: u64) {
         self.inner.lock().expect("procarray").running.remove(&xid);
     }
+
+    /// Number of currently-registered running transactions (test helper).
+    #[cfg(test)]
+    pub(crate) fn running_len(&self) -> usize {
+        self.inner.lock().expect("procarray").running.len()
+    }
 }
 
 #[cfg(test)]
