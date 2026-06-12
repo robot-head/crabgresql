@@ -1,8 +1,10 @@
-//! Per-connection session: runs SQL against the shared KV store. SP5 uses
-//! PostgreSQL's xid/clog/snapshot MVCC: writes go through to disk tagged with
-//! the transaction's xid (read-your-writes via `satisfies_mvcc` + own xid),
-//! commit/rollback record the outcome in the clog, and a transaction-scoped
-//! async writer lock keeps writers serialized.
+//! Per-connection session: runs SQL against the shared KV store. SP6 uses
+//! PostgreSQL's xid/clog/snapshot MVCC with concurrent writers: writes go
+//! through to disk tagged with the transaction's xid (read-your-writes via
+//! `satisfies_mvcc` + own xid), commit/rollback record the outcome in the clog,
+//! row-level conflicts serialize through the `RowLockManager` (held until
+//! COMMIT/ROLLBACK and freed by `release_all`), and DDL serializes among DDLs
+//! behind a small `catalog_lock`.
 
 use std::sync::Arc;
 
@@ -12,10 +14,11 @@ use mvcc::visibility::Snapshot;
 use pgparser::ast::{IsolationLevel, Statement};
 use pgwire::engine::{FieldDescription, QueryResult, Session, TxStatus};
 use pgwire::error::PgError;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::ExecError;
+use crate::lockmgr::RowLockManager;
 use crate::procarray::ProcArray;
+use crate::seq::SequenceManager;
 
 /// In-flight transaction context.
 pub(crate) struct TxnCtx {
@@ -25,13 +28,11 @@ pub(crate) struct TxnCtx {
     /// fixed at BEGIN under REPEATABLE READ.
     pub(crate) snapshot: Snapshot,
     pub(crate) repeatable_read: bool,
-    /// The engine writer lock, held from the first write until COMMIT/ROLLBACK.
-    pub(crate) writer_guard: Option<OwnedMutexGuard<()>>,
 }
 
 /// Per-connection transaction state. `Failed` carries the aborted block's
-/// context so its writer lock and xid stay held until COMMIT/ROLLBACK (which
-/// records the abort in the clog and releases them).
+/// context so its xid (and any row locks it holds) stay held until
+/// COMMIT/ROLLBACK, which records the abort in the clog and releases them.
 enum TxnState {
     Idle,
     InTransaction(TxnCtx),
@@ -39,25 +40,32 @@ enum TxnState {
 }
 
 /// One connection's view of the engine. Holds shared handles to the KV store,
-/// the engine-wide async writer mutex, and the shared ProcArray, plus this
-/// connection's transaction state. Not shared between connections.
+/// the ProcArray, the SequenceManager, the RowLockManager, and the DDL catalog
+/// lock, plus this connection's transaction state. Not shared between
+/// connections.
 pub struct SqlSession {
     pub(crate) kv: Arc<dyn Kv>,
-    writer_lock: Arc<Mutex<()>>,
     procarray: Arc<ProcArray>,
+    seq: Arc<SequenceManager>,
+    lockmgr: Arc<RowLockManager>,
+    catalog_lock: Arc<std::sync::Mutex<()>>,
     state: TxnState,
 }
 
 impl SqlSession {
     pub(crate) fn new(
         kv: Arc<dyn Kv>,
-        writer_lock: Arc<Mutex<()>>,
         procarray: Arc<ProcArray>,
+        seq: Arc<SequenceManager>,
+        lockmgr: Arc<RowLockManager>,
+        catalog_lock: Arc<std::sync::Mutex<()>>,
     ) -> Self {
         Self {
             kv,
-            writer_lock,
             procarray,
+            seq,
+            lockmgr,
+            catalog_lock,
             state: TxnState::Idle,
         }
     }
@@ -72,16 +80,16 @@ impl SqlSession {
             Statement::Begin { isolation } => self.begin(*isolation),
             Statement::Commit => self.commit_cmd(),
             Statement::Rollback => self.rollback_cmd(),
-            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
+            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt),
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
             Statement::Select(_) => self.run_select(stmt),
         };
         // Any error inside a transaction block aborts it (PostgreSQL 25P02): the
-        // block stays Failed (carrying its ctx, so the writer lock and xid stay
-        // held) until COMMIT/ROLLBACK releases them. Autocommit errors leave us
-        // Idle (the statement was its own transaction).
+        // block stays Failed (carrying its ctx, so the xid and any row locks it
+        // holds stay held) until COMMIT/ROLLBACK releases them. Autocommit errors
+        // leave us Idle (the statement was its own transaction).
         if result.is_err()
             && let TxnState::InTransaction(ctx) = std::mem::replace(&mut self.state, TxnState::Idle)
         {
@@ -91,7 +99,7 @@ impl SqlSession {
     }
 
     /// Record an aborted transaction's outcome (clog Aborted + deregister) and
-    /// release its writer lock. Shared by ROLLBACK and COMMIT-of-failed.
+    /// release its row locks. Shared by ROLLBACK and COMMIT-of-failed.
     fn abort_ctx(&self, ctx: TxnCtx) -> Result<(), ExecError> {
         if let Some(xid) = ctx.xid {
             // Best-effort abort record; the versions are already invisible
@@ -104,9 +112,10 @@ impl SqlSession {
             // re-seeds the ProcArray empty and the rows stay invisible (no clog
             // Committed), so a phantom running xid must not be stranded here.
             self.procarray.finish(xid);
+            // Free every row this transaction locked, waking any blocked writers.
+            self.lockmgr.release_all(xid);
             r?;
         }
-        drop(ctx.writer_guard);
         Ok(())
     }
 
@@ -125,7 +134,6 @@ impl SqlSession {
             xid: None,
             snapshot,
             repeatable_read: rr,
-            writer_guard: None,
         });
         Ok(QueryResult::Command {
             tag: "BEGIN".into(),
@@ -142,9 +150,10 @@ impl SqlSession {
                         .kv
                         .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Committed)]);
                     self.procarray.finish(xid);
+                    // Free every row this transaction locked, waking waiters.
+                    self.lockmgr.release_all(xid);
                     r?;
                 }
-                drop(ctx.writer_guard); // release the writer lock (if held)
                 Ok(QueryResult::Command {
                     tag: "COMMIT".into(),
                 })
@@ -193,25 +202,19 @@ impl SqlSession {
         }
     }
 
-    async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        // DDL is non-transactional: it writes through immediately. If the open
-        // transaction already holds the writer lock (it has written), run under
-        // that guard — re-acquiring the non-reentrant writer mutex from the same
-        // task would deadlock. Otherwise take a short-lived guard.
-        let already_held =
-            matches!(&self.state, TxnState::InTransaction(c) if c.writer_guard.is_some());
-        if already_held {
-            crate::exec::execute_ddl(&*self.kv, stmt)
-        } else {
-            let _guard = self.writer_lock.clone().lock_owned().await;
-            crate::exec::execute_ddl(&*self.kv, stmt)
-        }
+    fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        // DDL is non-transactional: it writes through immediately. Serialize DDL
+        // among DDLs (so concurrent CREATE TABLE doesn't race next_table_id) with
+        // a short-lived catalog lock; it does NOT serialize DML. `execute_ddl` is
+        // sync, so the std mutex is never held across an await.
+        let _g = self.catalog_lock.lock().expect("catalog lock");
+        crate::exec::execute_ddl(&*self.kv, stmt)
     }
 
     async fn run_write(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         match &self.state {
             TxnState::InTransaction(_) => {
-                self.ensure_write_xid().await?;
+                self.ensure_write_xid()?;
                 // RC refreshes the read snapshot used by UPDATE/DELETE's scan.
                 let refresh =
                     matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
@@ -221,54 +224,72 @@ impl SqlSession {
                         c.snapshot = s;
                     }
                 }
-                let (snapshot, xid) = match &self.state {
-                    TxnState::InTransaction(c) => (c.snapshot.clone(), c.xid.expect("xid set")),
+                let (snapshot, xid, repeatable_read) = match &self.state {
+                    TxnState::InTransaction(c) => (
+                        c.snapshot.clone(),
+                        c.xid.expect("xid set"),
+                        c.repeatable_read,
+                    ),
                     _ => unreachable!(),
                 };
                 let kv = Arc::clone(&self.kv);
                 // An error here propagates to run_one, which transitions the
-                // block to Failed (keeping the lock + xid until COMMIT/ROLLBACK).
-                let (result, mut ops) = crate::exec::execute_write(&*kv, &snapshot, xid, stmt)?;
-                // Persist next_xid with the statement's writes (no clog entry —
-                // the txn commits later).
-                ops.push(kv::WriteOp::Put {
-                    key: kv::key::next_xid_key(),
-                    value: self.procarray.next_xid().to_be_bytes().to_vec(),
-                });
+                // block to Failed (keeping the xid + row locks until
+                // COMMIT/ROLLBACK, which calls release_all). ProcArray already
+                // persisted next_xid eagerly, so no next_xid op; the txn commits
+                // later, so no clog op.
+                let (result, ops) = crate::exec::execute_write(
+                    &*kv,
+                    &self.procarray,
+                    &self.lockmgr,
+                    &self.seq,
+                    &snapshot,
+                    xid,
+                    repeatable_read,
+                    stmt,
+                )
+                .await?;
                 self.kv.write_batch(&ops)?;
                 Ok(result)
             }
             TxnState::Idle => {
-                // Autocommit: acquire the lock, allocate an xid, execute, and
-                // commit in one atomic batch (versions + next_xid + clog).
-                let guard = self.writer_lock.clone().lock_owned().await;
+                // Autocommit: allocate an xid, execute (taking row locks), and
+                // commit in one atomic batch (versions + clog). No global writer
+                // lock; next_xid was persisted eagerly by begin_write.
                 let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
                 let kv = Arc::clone(&self.kv);
-                let outcome = crate::exec::execute_write(&*kv, &snapshot, xid, stmt);
+                let outcome = crate::exec::execute_write(
+                    &*kv,
+                    &self.procarray,
+                    &self.lockmgr,
+                    &self.seq,
+                    &snapshot,
+                    xid,
+                    false,
+                    stmt,
+                )
+                .await;
                 let (result, mut ops) = match outcome {
                     Ok(v) => v,
                     Err(e) => {
                         // Autocommit error: abort and stay Idle. Record the abort
-                        // (best-effort) and deregister; the lock drops with guard.
+                        // (best-effort), deregister, and free this xid's row locks.
                         let _ = self
                             .kv
                             .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)]);
                         self.procarray.finish(xid);
-                        drop(guard);
+                        self.lockmgr.release_all(xid);
                         return Err(e);
                     }
                 };
-                ops.push(kv::WriteOp::Put {
-                    key: kv::key::next_xid_key(),
-                    value: self.procarray.next_xid().to_be_bytes().to_vec(),
-                });
                 ops.push(mvcc::clog::put_op(xid, XidStatus::Committed));
-                // Deregister xid BEFORE propagating any write error so the xid
-                // never stays stuck in the running set on a commit-batch failure.
+                // Deregister xid and free its row locks BEFORE propagating any
+                // write error so neither the running set nor the lock table is
+                // left holding a finished xid on a commit-batch failure.
                 let r = self.kv.write_batch(&ops);
                 self.procarray.finish(xid);
-                drop(guard);
+                self.lockmgr.release_all(xid);
                 r?;
                 Ok(result)
             }
@@ -276,18 +297,16 @@ impl SqlSession {
         }
     }
 
-    /// On a transaction's first write: acquire the writer lock and allocate the
-    /// xid (idempotent on later writes).
-    async fn ensure_write_xid(&mut self) -> Result<(), ExecError> {
+    /// On a transaction's first write: allocate the xid (idempotent on later
+    /// writes). No lock — concurrency is row-level via the RowLockManager.
+    fn ensure_write_xid(&mut self) -> Result<(), ExecError> {
         let needs = matches!(&self.state, TxnState::InTransaction(c) if c.xid.is_none());
         if !needs {
             return Ok(());
         }
-        let guard = self.writer_lock.clone().lock_owned().await;
         let xid = self.procarray.begin_write()?;
         if let TxnState::InTransaction(c) = &mut self.state {
             c.xid = Some(xid);
-            c.writer_guard = Some(guard);
         }
         Ok(())
     }
@@ -295,9 +314,10 @@ impl SqlSession {
 
 impl Drop for SqlSession {
     /// A connection dropped mid-transaction (client disconnect) must not leak
-    /// its xid in the ProcArray. Deregister it so it stops pinning snapshots'
-    /// xmin. The writer lock releases on its own when `writer_guard` drops; the
-    /// uncommitted versions stay invisible (no clog Committed entry).
+    /// its xid in the ProcArray, nor leave its row locks held forever (which
+    /// would hang any writer blocked on them). Deregister the xid so it stops
+    /// pinning snapshots' xmin, and free its row locks. The uncommitted versions
+    /// stay invisible (no clog Committed entry).
     fn drop(&mut self) {
         let xid = match &self.state {
             TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => ctx.xid,
@@ -305,6 +325,7 @@ impl Drop for SqlSession {
         };
         if let Some(xid) = xid {
             self.procarray.finish(xid);
+            self.lockmgr.release_all(xid);
         }
     }
 }

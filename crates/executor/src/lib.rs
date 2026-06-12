@@ -1,7 +1,9 @@
 //! executor: turns parsed SQL into catalog/KV operations and implements the
 //! pgwire `Engine` trait. SP5 swaps SP4's commit_ts MVCC for PostgreSQL's
-//! xid/clog/snapshot model with uncommitted versions on disk; writers stay
-//! serialized behind a transaction-scoped async writer lock.
+//! xid/clog/snapshot model with uncommitted versions on disk. SP6 removes the
+//! global writer lock: writers run concurrently, serialized only at the row
+//! level via the `RowLockManager`, with rowid allocation via the
+//! `SequenceManager` and DDL serialized behind a small catalog lock.
 
 mod error;
 mod eval;
@@ -16,22 +18,26 @@ use std::sync::Arc;
 
 use kv::{FjallKv, Kv, MemKv};
 use pgwire::engine::Engine;
-use tokio::sync::Mutex;
 
 pub use error::ExecError;
 pub use session::SqlSession;
 
+use crate::lockmgr::RowLockManager;
 use crate::procarray::ProcArray;
+use crate::seq::SequenceManager;
 
 /// The SQL engine over a durable (or in-memory) KV store. Catalog, sequences,
-/// the xid counter, and the clog live in the KV store. The async writer mutex
-/// serializes writing transactions engine-wide (SP5 keeps writers serialized;
-/// SP6 replaces this lock with row-level concurrency). The `ProcArray` is shared
-/// so every connection's snapshots see the same running-transaction set.
+/// the xid counter, and the clog live in the KV store. Writers run concurrently
+/// (SP6): row-level conflicts serialize through the `RowLockManager`, rowid
+/// allocation goes through the `SequenceManager`, and DDL serializes among DDLs
+/// behind `catalog_lock`. The `ProcArray` is shared so every connection's
+/// snapshots see the same running-transaction set.
 pub struct SqlEngine {
     pub(crate) kv: Arc<dyn Kv>,
-    pub(crate) writer_lock: Arc<Mutex<()>>,
     pub(crate) procarray: Arc<ProcArray>,
+    pub(crate) seq: Arc<SequenceManager>,
+    pub(crate) lockmgr: Arc<RowLockManager>,
+    pub(crate) catalog_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for SqlEngine {
@@ -55,8 +61,10 @@ impl SqlEngine {
         let procarray = Arc::new(ProcArray::open(Arc::clone(&kv))?);
         Ok(Self {
             kv,
-            writer_lock: Arc::new(Mutex::new(())),
             procarray,
+            seq: Arc::new(SequenceManager::new()),
+            lockmgr: Arc::new(RowLockManager::new()),
+            catalog_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 }
@@ -67,8 +75,10 @@ impl Engine for SqlEngine {
     fn connect(&self) -> SqlSession {
         SqlSession::new(
             Arc::clone(&self.kv),
-            Arc::clone(&self.writer_lock),
             Arc::clone(&self.procarray),
+            Arc::clone(&self.seq),
+            Arc::clone(&self.lockmgr),
+            Arc::clone(&self.catalog_lock),
         )
     }
 }

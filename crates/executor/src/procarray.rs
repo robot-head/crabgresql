@@ -65,8 +65,11 @@ impl ProcArray {
         Ok(xid)
     }
 
-    /// The durable next-xid value to persist (one past the highest allocated).
-    pub fn next_xid(&self) -> u64 {
+    /// The durable next-xid value (one past the highest allocated). `begin_write`
+    /// persists this eagerly, so callers no longer batch it with their writes;
+    /// retained as a test accessor that proves the counter advanced.
+    #[cfg(test)]
+    pub(crate) fn next_xid(&self) -> u64 {
         self.inner.lock().expect("procarray").next_xid
     }
 

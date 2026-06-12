@@ -25,8 +25,9 @@ pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError>
 }
 
 /// DDL (CREATE/DROP TABLE) writes through to the store. The session holds the
-/// writer lock around this call. Non-DDL is unreachable here (routed via
-/// `run_one`) but handled defensively to keep the match total.
+/// catalog lock around this call (serializing DDL among DDLs). Non-DDL is
+/// unreachable here (routed via `run_one`) but handled defensively to keep the
+/// match total.
 pub(crate) fn execute_ddl(kv: &dyn Kv, stmt: &Statement) -> Result<QueryResult, ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
@@ -67,15 +68,25 @@ fn resolve_targets(t: &Table, columns: &Option<Vec<String>>) -> Result<Vec<usize
     }
 }
 
-/// The write path (INSERT/UPDATE/DELETE). Builds the version/seq write ops
-/// tagged with the transaction's `xid` and returns them WITHOUT writing — the
-/// session assembles the final batch (next_xid, and clog for autocommit) and
-/// writes once. Reads inside UPDATE/DELETE resolve via `satisfies_mvcc` with the
-/// txn's own xid (read-your-writes).
-pub(crate) fn execute_write(
+/// The write path (INSERT/UPDATE/DELETE) with concurrent writers (SP6). Builds
+/// the version write ops tagged with the transaction's `xid` and returns them
+/// WITHOUT writing — the session assembles the final batch (clog for autocommit)
+/// and writes once. INSERT allocates rowids via the `SequenceManager` (which
+/// persists the sequence durably itself). UPDATE/DELETE lock each candidate row
+/// exclusively via the `RowLockManager` (blocking until granted, or 40P01 on a
+/// deadlock), then re-check the row's current state under EvalPlanQual: a
+/// concurrent committed change is a 40001 under REPEATABLE READ, or a re-find
+/// under READ COMMITTED. Reads resolve via `satisfies_mvcc` with the txn's own
+/// xid (read-your-writes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_write(
     kv: &dyn Kv,
+    procarray: &crate::procarray::ProcArray,
+    lockmgr: &crate::lockmgr::RowLockManager,
+    seq: &crate::seq::SequenceManager,
     snapshot: &mvcc::visibility::Snapshot,
     xid: u64,
+    repeatable_read: bool,
     stmt: &Statement,
 ) -> Result<(QueryResult, Vec<kv::WriteOp>), ExecError> {
     let mut ops: Vec<kv::WriteOp> = Vec::new();
@@ -95,9 +106,11 @@ pub(crate) fn execute_write(
             }
             let t = catalog::get_table(kv, table)?;
             let target_idx = resolve_targets(&t, columns)?;
-            let start = read_seq_kv(kv, t.id)?;
-            let mut rowid = start;
-            for row_exprs in rows {
+            // Reserve a contiguous block of rowids atomically (the SequenceManager
+            // persists the new next-rowid durably itself — no seq Put in ops).
+            let n_rows = rows.len() as u64;
+            let start = seq.alloc(kv, t.id, n_rows)?;
+            for (rowid, row_exprs) in (start..).zip(rows.iter()) {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(
                         "INSERT has the wrong number of expressions for the target columns".into(),
@@ -113,16 +126,10 @@ pub(crate) fn execute_write(
                     key: mvcc::version::version_key_xid(t.id, rowid, xid),
                     value: mvcc::version::encode_tuple(xid, mvcc::xid::INVALID_XID, &full),
                 });
-                rowid += 1;
             }
-            let n = rowid - start;
-            ops.push(kv::WriteOp::Put {
-                key: kv::key::seq_key(t.id),
-                value: rowid.to_be_bytes().to_vec(),
-            });
             Ok((
                 QueryResult::Command {
-                    tag: format!("INSERT 0 {n}"),
+                    tag: format!("INSERT 0 {n_rows}"),
                 },
                 ops,
             ))
@@ -143,16 +150,31 @@ pub(crate) fn execute_write(
                 })
                 .collect::<Result<_, _>>()?;
             let mut n: u64 = 0;
-            for (rowid, xmin, row) in scan_live(kv, snapshot, Some(xid), &t)? {
-                if !row_matches(filter.as_ref(), Some(&t), &row)? {
-                    continue;
+            for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
+                // Block until we hold the row exclusively (40P01 on deadlock).
+                match lockmgr
+                    .acquire(t.id, rowid, crate::lockmgr::LockMode::Exclusive, xid)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(()) => return Err(ExecError::Deadlock),
                 }
-                let mut next = row.clone();
+                // EvalPlanQual: re-read this row under the lock and decide what to
+                // operate on (40001 under RR if changed since our snapshot).
+                let Some((cur_xmin, cur_row)) =
+                    eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+                else {
+                    continue; // deleted by a concurrent committed txn — skip
+                };
+                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                    continue; // no longer matches the WHERE clause
+                }
+                let mut next = cur_row.clone();
                 for (idx, expr) in &targets {
-                    let v = crate::eval::eval(expr, Some(&t), &row)?;
+                    let v = crate::eval::eval(expr, Some(&t), &cur_row)?;
                     next[*idx] = coerce(v, t.columns[*idx].ty)?;
                 }
-                if xmin == xid {
+                if cur_xmin == xid {
                     // Updating my own uncommitted version: overwrite in place
                     // (last-write-wins within the txn; no new tuple, xmax stays
                     // invalid). PostgreSQL uses cmin/cmax here; we have no command
@@ -164,8 +186,8 @@ pub(crate) fn execute_write(
                 } else {
                     // Supersede a committed version: stamp its xmax, write a new tuple.
                     ops.push(kv::WriteOp::Put {
-                        key: mvcc::version::version_key_xid(t.id, rowid, xmin),
-                        value: mvcc::version::encode_tuple(xmin, xid, &row),
+                        key: mvcc::version::version_key_xid(t.id, rowid, cur_xmin),
+                        value: mvcc::version::encode_tuple(cur_xmin, xid, &cur_row),
                     });
                     ops.push(kv::WriteOp::Put {
                         key: mvcc::version::version_key_xid(t.id, rowid, xid),
@@ -184,15 +206,38 @@ pub(crate) fn execute_write(
         Statement::Delete { table, filter } => {
             let t = catalog::get_table(kv, table)?;
             let mut n: u64 = 0;
-            for (rowid, xmin, row) in scan_live(kv, snapshot, Some(xid), &t)? {
-                if !row_matches(filter.as_ref(), Some(&t), &row)? {
-                    continue;
+            for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
+                // Block until we hold the row exclusively (40P01 on deadlock).
+                match lockmgr
+                    .acquire(t.id, rowid, crate::lockmgr::LockMode::Exclusive, xid)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(()) => return Err(ExecError::Deadlock),
                 }
-                // Set xmax = my xid on the matched version (keep its row bytes).
-                ops.push(kv::WriteOp::Put {
-                    key: mvcc::version::version_key_xid(t.id, rowid, xmin),
-                    value: mvcc::version::encode_tuple(xmin, xid, &row),
-                });
+                let Some((cur_xmin, cur_row)) =
+                    eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+                else {
+                    continue; // already deleted by a concurrent committed txn
+                };
+                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                    continue; // no longer matches the WHERE clause
+                }
+                if cur_xmin == xid {
+                    // Deleting my own uncommitted version: PostgreSQL stamps
+                    // xmax=xid so it is invisible to me. version_key is the same
+                    // key; overwrite it with xmax set.
+                    ops.push(kv::WriteOp::Put {
+                        key: mvcc::version::version_key_xid(t.id, rowid, xid),
+                        value: mvcc::version::encode_tuple(xid, xid, &cur_row),
+                    });
+                } else {
+                    // Set xmax = my xid on the matched version (keep its row bytes).
+                    ops.push(kv::WriteOp::Put {
+                        key: mvcc::version::version_key_xid(t.id, rowid, cur_xmin),
+                        value: mvcc::version::encode_tuple(cur_xmin, xid, &cur_row),
+                    });
+                }
                 n += 1;
             }
             Ok((
@@ -204,6 +249,75 @@ pub(crate) fn execute_write(
         }
         _ => Err(ExecError::Unsupported("not a write statement".into())),
     }
+}
+
+/// Was `xid` settled (committed or aborted) before `snapshot` was taken? True
+/// iff `xid` was neither still running at, nor started after, the snapshot —
+/// mirroring the negation of `Snapshot::is_running`.
+fn snapshot_can_see(snapshot: &mvcc::visibility::Snapshot, xid: u64) -> bool {
+    xid < snapshot.xmax && !snapshot.xip.contains(&xid)
+}
+
+/// Find the single version of `rowid` visible to `snap` (with own-xid
+/// read-your-writes) among already-decoded `versions`. Mirrors `scan_live`'s
+/// per-version `satisfies_mvcc` check, but over one rowid's versions.
+fn find_visible_one(
+    kv: &dyn Kv,
+    snap: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    versions: &[(u64, u64, Vec<pgtypes::Datum>)],
+) -> Result<Option<(u64, Vec<pgtypes::Datum>)>, ExecError> {
+    let mut visible: Option<(u64, Vec<pgtypes::Datum>)> = None;
+    for (xmin, xmax, row) in versions {
+        if mvcc::visibility::satisfies_mvcc(*xmin, *xmax, snap, own, |x| mvcc::clog::get(kv, x))? {
+            visible = Some((*xmin, row.clone())); // MVCC invariant: at most one
+        }
+    }
+    Ok(visible)
+}
+
+/// After locking the row, re-read its current versions. Returns the version to
+/// operate on, or None to skip. Under REPEATABLE READ, a row changed by a txn
+/// that committed after our snapshot is a serialization failure (40001). Under
+/// READ COMMITTED, re-find the latest live version (a fresh snapshot).
+fn eval_plan_qual(
+    kv: &dyn Kv,
+    procarray: &crate::procarray::ProcArray,
+    snapshot: &mvcc::visibility::Snapshot, // the txn snapshot (RR) used to detect "changed since"
+    table: &catalog::Table,
+    rowid: u64,
+    xid: u64,
+    repeatable_read: bool,
+) -> Result<Option<(u64, Vec<pgtypes::Datum>)>, ExecError> {
+    // Re-scan just this rowid's versions from disk.
+    let prefix = kv::key::row_key(table.id, rowid);
+    let scanned = kv.scan_prefix(&prefix)?;
+    let mut versions: Vec<(u64, u64, Vec<pgtypes::Datum>)> = Vec::with_capacity(scanned.len());
+    for (_k, v) in &scanned {
+        let (xmn, xmx, row) = mvcc::version::decode_tuple(v)?;
+        versions.push((xmn, xmx, row));
+    }
+    // Is the row's latest committed version deleted/superseded by a transaction
+    // NOT visible to our txn snapshot (committed AFTER it), other than ourselves?
+    let changed_since_snapshot = versions.iter().any(|&(_xmn, xmx, _)| {
+        xmx != mvcc::xid::INVALID_XID
+            && xmx != xid
+            && matches!(
+                mvcc::clog::get(kv, xmx),
+                Ok(mvcc::clog::XidStatus::Committed)
+            )
+            && !snapshot_can_see(snapshot, xmx)
+    });
+    if changed_since_snapshot {
+        if repeatable_read {
+            return Err(ExecError::SerializationFailure);
+        }
+        // READ COMMITTED: re-find the latest live version under a FRESH snapshot.
+        let fresh = procarray.snapshot();
+        return find_visible_one(kv, &fresh, Some(xid), &versions);
+    }
+    // No concurrent committed change: find the version visible to our snapshot.
+    find_visible_one(kv, snapshot, Some(xid), &versions)
 }
 
 /// Coerce an evaluated value into a target column type (assignment context).
