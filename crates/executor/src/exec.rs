@@ -419,17 +419,76 @@ pub(crate) fn execute_read(
         None => vec![vec![]],
     };
 
-    // Resolve the projection into (field, expr) pairs.
-    let (fields, out_exprs) = resolve_projection(&s.projection, table.as_ref())?;
-
-    // Filter, keeping each surviving source row for ORDER BY evaluation.
+    // Filter.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
-        let keep = row_matches(s.filter.as_ref(), table.as_ref(), row)?;
-        if keep {
+        if row_matches(s.filter.as_ref(), table.as_ref(), row)? {
             kept.push(row.clone());
         }
     }
+
+    project_order_limit(s, table.as_ref(), kept)
+}
+
+/// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
+/// row before rechecking it via EvalPlanQual (same semantics as UPDATE/DELETE).
+/// The snapshot and xid must already be established by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_read_locking(
+    kv: &dyn Kv,
+    procarray: &crate::procarray::ProcArray,
+    lockmgr: &crate::lockmgr::RowLockManager,
+    snapshot: &mvcc::visibility::Snapshot,
+    xid: u64,
+    repeatable_read: bool,
+    mode: crate::lockmgr::LockMode,
+    s: &SelectStmt,
+) -> Result<QueryResult, ExecError> {
+    // FOR UPDATE/SHARE requires a FROM clause — there are no rows to lock
+    // in a FROM-less SELECT.
+    let table_name = s
+        .from
+        .as_ref()
+        .ok_or_else(|| ExecError::Unsupported("FOR UPDATE/SHARE requires a FROM clause".into()))?;
+    let t = catalog::get_table(kv, table_name)?;
+
+    // Scan visible rows, then lock and EvalPlanQual-recheck each one.
+    let mut kept: Vec<Vec<Datum>> = Vec::new();
+    for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
+        // Block until we hold the row in `mode` (40P01 on deadlock).
+        lockmgr
+            .acquire(t.id, rowid, mode, xid)
+            .await
+            .map_err(|()| ExecError::Deadlock)?;
+
+        // EvalPlanQual: re-read the row under the lock (40001 under RR if
+        // changed since our snapshot; RC re-finds the latest live version).
+        let Some((_cur_xmin, cur_row)) =
+            eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+        else {
+            continue; // deleted by a concurrent committed txn — skip
+        };
+
+        // Re-apply the WHERE filter against the (possibly newer) row.
+        if !row_matches(s.filter.as_ref(), Some(&t), &cur_row)? {
+            continue; // no longer matches
+        }
+        kept.push(cur_row);
+    }
+
+    project_order_limit(s, Some(&t), kept)
+}
+
+/// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
+/// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
+/// and `execute_read_locking` to avoid duplication.
+fn project_order_limit(
+    s: &SelectStmt,
+    table: Option<&Table>,
+    mut kept: Vec<Vec<Datum>>,
+) -> Result<QueryResult, ExecError> {
+    // Resolve the projection into (field, expr) pairs.
+    let (fields, out_exprs) = resolve_projection(&s.projection, table)?;
 
     // ORDER BY: sort by evaluated order keys (over the source row).
     if !s.order_by.is_empty() {
@@ -438,7 +497,7 @@ pub(crate) fn execute_read(
         for row in kept {
             let mut keys = Vec::with_capacity(s.order_by.len());
             for item in &s.order_by {
-                keys.push(crate::eval::eval(&item.expr, table.as_ref(), &row)?);
+                keys.push(crate::eval::eval(&item.expr, table, &row)?);
             }
             keyed.push((keys, row));
         }
@@ -457,7 +516,7 @@ pub(crate) fn execute_read(
     for row in &kept {
         let mut cells = Vec::with_capacity(out_exprs.len());
         for e in &out_exprs {
-            let d = crate::eval::eval(e, table.as_ref(), row)?;
+            let d = crate::eval::eval(e, table, row)?;
             cells.push(datum_to_cell(&d));
         }
         out_rows.push(cells);
@@ -938,5 +997,39 @@ mod tests {
         run(&engine, "CREATE TABLE t (id int4)").await;
         let r = &run(&engine, "SELECT id FROM t").await[0];
         assert_eq!(rows_of(r).len(), 0);
+    }
+
+    fn tag_of(r: &QueryResult) -> String {
+        match r {
+            QueryResult::Command { tag } => tag.clone(),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_for_update_returns_rows() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1),(2),(3)").await;
+        let r = &run(
+            &engine,
+            "SELECT id FROM t WHERE id > 1 ORDER BY id FOR UPDATE",
+        )
+        .await[0];
+        assert_eq!(rows_of(r).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn for_update_in_txn_then_commit_releases() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let mut s = engine.connect();
+        run_s(&mut s, "BEGIN").await;
+        run_s(&mut s, "SELECT id FROM t FOR UPDATE").await; // takes a lock
+        run_s(&mut s, "COMMIT").await; // must release; no hang
+        // a fresh autocommit update of the same row must not block
+        let r = run(&engine, "UPDATE t SET id = 9 WHERE id = 1").await;
+        assert_eq!(tag_of(&r[0]), "UPDATE 1");
     }
 }

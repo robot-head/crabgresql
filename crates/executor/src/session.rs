@@ -11,7 +11,7 @@ use std::sync::Arc;
 use kv::Kv;
 use mvcc::clog::XidStatus;
 use mvcc::visibility::Snapshot;
-use pgparser::ast::{IsolationLevel, Statement};
+use pgparser::ast::{IsolationLevel, RowLockStrength, Statement};
 use pgwire::engine::{FieldDescription, QueryResult, Session, TxStatus};
 use pgwire::error::PgError;
 
@@ -84,6 +84,7 @@ impl SqlSession {
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
+            Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
             Statement::Select(_) => self.run_select(stmt),
         };
         // Any error inside a transaction block aborts it (PostgreSQL 25P02): the
@@ -184,6 +185,84 @@ impl SqlSession {
     fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let (snapshot, own) = self.read_context()?;
         crate::exec::execute_read(&*self.kv, &snapshot, own, stmt)
+    }
+
+    /// Locking SELECT (FOR UPDATE / FOR SHARE). Allocates an xid if none is
+    /// active, takes row locks, EvalPlanQual-rechecks each row, and returns
+    /// the surviving rows. Autocommit: finish + release_all at statement end
+    /// (success and error). In-txn: locks persist until COMMIT/ROLLBACK.
+    async fn run_select_locking(
+        &mut self,
+        s: &pgparser::ast::SelectStmt,
+    ) -> Result<QueryResult, ExecError> {
+        let mode = match s.locking {
+            Some(RowLockStrength::ForUpdate) => crate::lockmgr::LockMode::Exclusive,
+            Some(RowLockStrength::ForShare) => crate::lockmgr::LockMode::Shared,
+            None => unreachable!("run_one only routes here when locking.is_some()"),
+        };
+
+        match &self.state {
+            TxnState::InTransaction(_) => {
+                // Allocate an xid if the txn has not done a write yet (a FOR
+                // UPDATE in a read-only txn still needs one, like PG).
+                self.ensure_write_xid()?;
+                // RC: re-snapshot before each statement.
+                let refresh =
+                    matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
+                if refresh {
+                    let snap = self.procarray.snapshot();
+                    if let TxnState::InTransaction(c) = &mut self.state {
+                        c.snapshot = snap;
+                    }
+                }
+                let (snapshot, xid, repeatable_read) = match &self.state {
+                    TxnState::InTransaction(c) => (
+                        c.snapshot.clone(),
+                        c.xid.expect("xid set by ensure_write_xid"),
+                        c.repeatable_read,
+                    ),
+                    _ => unreachable!(),
+                };
+                let kv = Arc::clone(&self.kv);
+                // Errors propagate to run_one which transitions to Failed,
+                // keeping the xid + locks until COMMIT/ROLLBACK.
+                crate::exec::execute_read_locking(
+                    &*kv,
+                    &self.procarray,
+                    &self.lockmgr,
+                    &snapshot,
+                    xid,
+                    repeatable_read,
+                    mode,
+                    s,
+                )
+                .await
+            }
+            TxnState::Idle => {
+                // Autocommit: allocate an xid, run the locking SELECT, then
+                // immediately release the locks (implicit txn ends at statement
+                // end — there is no open block to hold them).
+                let xid = self.procarray.begin_write()?;
+                let snapshot = self.procarray.snapshot();
+                let kv = Arc::clone(&self.kv);
+                let result = crate::exec::execute_read_locking(
+                    &*kv,
+                    &self.procarray,
+                    &self.lockmgr,
+                    &snapshot,
+                    xid,
+                    false, // autocommit is always READ COMMITTED
+                    mode,
+                    s,
+                )
+                .await;
+                // Release regardless of success or error.
+                self.procarray.finish(xid);
+                self.lockmgr.release_all(xid);
+                result
+            }
+            TxnState::Failed(_) => unreachable!("guarded in run_one"),
+        }
     }
 
     /// The snapshot + own-xid a read should use. Autocommit: a fresh snapshot,
