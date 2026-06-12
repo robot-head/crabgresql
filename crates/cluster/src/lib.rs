@@ -8,3 +8,8 @@ mod network;
 mod node;
 mod committer;
 mod cluster;
+
+pub use cluster::Cluster;
+pub use network::Switchboard;
+pub use node::Node;
+pub use types::{TypeConfig, WriteBatch};

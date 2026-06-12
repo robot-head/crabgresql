@@ -19,5 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+kv = { workspace = true }
+tokio = { workspace = true }
 stateright = { workspace = true }
 proptest = { workspace = true }
