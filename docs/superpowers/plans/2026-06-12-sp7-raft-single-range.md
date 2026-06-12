@@ -610,13 +610,13 @@ git commit -m "test(cluster): deterministic fault-injection scenarios (catch-up,
 
 ---
 
-### Task 5: `Committer` write seam in the executor (pure refactor)
+### Task 5: `Committer` write seam in the executor (data/clog + DDL routing)
 
 **Files:**
 - Create: `crates/executor/src/commit.rs`
-- Modify: `crates/executor/src/lib.rs`, `crates/executor/src/session.rs`
+- Modify: `crates/executor/src/lib.rs`, `crates/executor/src/session.rs`, `crates/executor/src/exec.rs`
 
-Introduce the async write seam and route the session's **data/clog** batches through it. The local impl is `kv.write_batch`, so behavior is identical and all 224 tests pass. Counter persists are still self-handled by `ProcArray`/`SequenceManager` in this task (folding lands in Task 6).
+Introduce the async write seam and route the session's **data/clog AND DDL** batches through it. The local impl is `kv.write_batch`, so behavior is identical and all 224 tests pass. Counter persists for DML (`next_xid`/`seq`) are still self-handled by `ProcArray`/`SequenceManager` in this task (folding lands in Task 6); DDL is routed here because its catalog + `next_table_id` writes must replicate too (else a created table would not survive failover).
 
 - [ ] **Step 1: the trait + local impl.** `crates/executor/src/commit.rs`:
 
@@ -675,10 +675,33 @@ Pass `Arc::clone(&self.committer)` into `SqlSession::new` in `connect`.
 
   Keep the `procarray.finish` / `lockmgr.release_all` ordering exactly as today (deregister before propagating a commit error). `Drop` stays sync (no committer call — a dropped session's uncommitted writes are already invisible).
 
+- [ ] **Step 3b: route DDL through the committer.** DDL (`CREATE TABLE`/`DROP TABLE`) currently writes catalog entries + `next_table_id` straight to `self.kv` inside `execute_ddl`. In replicated mode that would bypass Raft, so a created table would exist only on the leader and vanish on failover. Fix:
+
+  1. **`execute_ddl` returns ops instead of writing.** In `crates/executor/src/exec.rs`, change the signature to `pub(crate) fn execute_ddl(kv: &dyn Kv, stmt: &Statement) -> Result<(QueryResult, Vec<WriteOp>), ExecError>`. It still *reads* `kv` (to look up existing catalog entries and the current `next_table_id`) but **collects** the catalog Put/Delete + the `next_table_id` Put into a `Vec<WriteOp>` and returns them instead of calling `kv.write_batch`/`kv.put` directly.
+
+  2. **`catalog_lock` becomes a `tokio::sync::Mutex<()>`** (was `std::sync::Mutex<()>`) in both `SqlEngine` (`crates/executor/src/lib.rs`) and `SqlSession` (`crates/executor/src/session.rs`), so it can be held across the async commit. Update the `Arc::new(std::sync::Mutex::new(()))` constructions accordingly.
+
+  3. **`run_ddl` becomes async and holds the lock across the commit** so DDL serializes globally through the leader (making `next_table_id` a correctly-ordered last-writer-wins counter — no max-merge needed, unlike the concurrent DML counters):
+
+```rust
+async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+    // Hold the catalog lock across the commit so concurrent DDL serializes:
+    // next_table_id is read, bumped, and durably committed atomically.
+    let _g = self.catalog_lock.lock().await;
+    let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt)?;
+    self.committer.commit(ops).await?;
+    Ok(result)
+}
+```
+
+  Update the `run_one` arm that calls `run_ddl` to `.await` it. (It is already in an async fn.) Note: `tokio::sync::Mutex` is held across `.await` here deliberately — that is allowed (it is a tokio async mutex, not a `std::sync` one); the forbidden pattern is holding a `std::sync` guard across await.
+
+  4. **Document the DDL serialization** in a comment on `run_ddl`: all DDL funnels through the leader's `catalog_lock` held across the Raft commit, so DDL is globally serialized (low throughput, fine for D1); concurrent-DDL optimization is a later slice.
+
 - [ ] **Step 4: regression gate.**
 
 Run: `cargo test -p executor`
-Expected: all existing executor tests PASS (the local committer is exactly `kv.write_batch`).
+Expected: all existing executor tests PASS (the local committer is exactly `kv.write_batch`; DDL produces the same KV effect, just routed through the committer).
 Run: `cargo test --workspace`
 Expected: all 224 tests PASS.
 
