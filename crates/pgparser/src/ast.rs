@@ -46,6 +46,12 @@ pub struct ColumnDef {
     pub ty: ColumnType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockStrength {
+    ForUpdate,
+    ForShare,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub projection: Vec<SelectItem>,
@@ -53,6 +59,7 @@ pub struct SelectStmt {
     pub filter: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<i64>,
+    pub locking: Option<RowLockStrength>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

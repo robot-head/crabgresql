@@ -424,12 +424,27 @@ impl Parser {
         } else {
             None
         };
+        let locking = if self.eat_keyword(Keyword::For) {
+            if self.eat_keyword(Keyword::Update) {
+                Some(crate::ast::RowLockStrength::ForUpdate)
+            } else if self.eat_keyword(Keyword::Share) {
+                Some(crate::ast::RowLockStrength::ForShare)
+            } else {
+                return Err(ParseError::new(
+                    "expected UPDATE or SHARE after FOR",
+                    self.peek_pos(),
+                ));
+            }
+        } else {
+            None
+        };
         Ok(Statement::Select(SelectStmt {
             projection,
             from,
             filter,
             order_by,
             limit,
+            locking,
         }))
     }
 
@@ -623,6 +638,23 @@ mod tests {
                 assert!(filter.is_some());
             }
             other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_select_for_update_and_share() {
+        use crate::ast::RowLockStrength;
+        match one("SELECT id FROM t FOR UPDATE") {
+            Statement::Select(s) => assert_eq!(s.locking, Some(RowLockStrength::ForUpdate)),
+            other => panic!("expected Select, got {other:?}"),
+        }
+        match one("SELECT id FROM t WHERE id > 1 FOR SHARE") {
+            Statement::Select(s) => assert_eq!(s.locking, Some(RowLockStrength::ForShare)),
+            other => panic!("expected Select, got {other:?}"),
+        }
+        match one("SELECT id FROM t") {
+            Statement::Select(s) => assert_eq!(s.locking, None),
+            other => panic!("expected Select, got {other:?}"),
         }
     }
 

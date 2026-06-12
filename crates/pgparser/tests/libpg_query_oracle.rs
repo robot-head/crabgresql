@@ -29,6 +29,9 @@ const ACCEPTED: &[&str] = &[
     "UPDATE t SET a = 1, b = 2",
     "DELETE FROM t WHERE id > 3",
     "DELETE FROM t",
+    // SP6: row-level locking
+    "SELECT id FROM t FOR UPDATE",
+    "SELECT id FROM t WHERE id > 1 FOR SHARE",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.

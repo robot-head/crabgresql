@@ -63,6 +63,9 @@ pub enum Keyword {
     Read,
     Committed,
     Repeatable,
+    // SP6: row-level locking
+    For,
+    Share,
 }
 
 impl Keyword {
@@ -105,6 +108,9 @@ impl Keyword {
             "read" => Keyword::Read,
             "committed" => Keyword::Committed,
             "repeatable" => Keyword::Repeatable,
+            // SP6: row-level locking
+            "for" => Keyword::For,
+            "share" => Keyword::Share,
             _ => return None,
         })
     }
