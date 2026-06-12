@@ -1317,6 +1317,7 @@ dependencies = [
  "proptest",
  "tempfile",
  "thiserror 2.0.18",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1491,6 +1492,7 @@ dependencies = [
  "pgtypes",
  "proptest",
  "thiserror 2.0.18",
+ "zerocopy",
 ]
 
 [[package]]
