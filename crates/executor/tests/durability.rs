@@ -64,6 +64,60 @@ async fn data_schema_and_rowid_survive_reopen() {
 }
 
 #[tokio::test]
+async fn committed_transaction_survives_reopen() {
+    let dir = tempfile::tempdir().expect("tmp");
+    {
+        let engine = SqlEngine::open(dir.path()).expect("open");
+        engine
+            .connect()
+            .simple_query("CREATE TABLE t (id int4, name text)")
+            .await
+            .expect("create");
+        // Use the same session for the transaction so state is kept.
+        let mut s = engine.connect();
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("INSERT INTO t VALUES (1,'a'),(2,'b')")
+            .await
+            .expect("insert");
+        s.simple_query("UPDATE t SET name = 'z' WHERE id = 2")
+            .await
+            .expect("update");
+        s.simple_query("COMMIT").await.expect("commit");
+    } // drop closes the store
+
+    let engine = SqlEngine::open(dir.path()).expect("reopen");
+    let got = rows(&engine, "SELECT name FROM t ORDER BY id").await;
+    assert_eq!(
+        got.iter().map(|r| text(&r[0])).collect::<Vec<_>>(),
+        vec![Some("a".into()), Some("z".into())]
+    );
+}
+
+#[tokio::test]
+async fn rolled_back_transaction_leaves_nothing() {
+    let dir = tempfile::tempdir().expect("tmp");
+    {
+        let engine = SqlEngine::open(dir.path()).expect("open");
+        engine
+            .connect()
+            .simple_query("CREATE TABLE t (id int4)")
+            .await
+            .expect("create");
+        let mut s = engine.connect();
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("INSERT INTO t VALUES (1),(2),(3)")
+            .await
+            .expect("insert");
+        s.simple_query("ROLLBACK").await.expect("rollback");
+    }
+
+    let engine = SqlEngine::open(dir.path()).expect("reopen");
+    // Table exists (DDL is non-transactional) but holds no rows.
+    let got = rows(&engine, "SELECT id FROM t").await;
+    assert!(got.is_empty(), "rolled-back rows must not survive a reopen");
+}
+
+#[tokio::test]
 async fn drop_and_recreate_survive_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
