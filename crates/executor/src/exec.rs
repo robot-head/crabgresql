@@ -150,8 +150,14 @@ pub(crate) async fn execute_write(
                 })
                 .collect::<Result<_, _>>()?;
             let mut n: u64 = 0;
-            for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
-                // Block until we hold the row exclusively (40P01 on deadlock).
+            for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+                // 1. Filter on the snapshot-visible row FIRST — do not lock rows
+                //    that don't match the WHERE clause (avoids over-locking and
+                //    restores row-level write concurrency for different rows).
+                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                    continue;
+                }
+                // 2. Lock only matching candidates.
                 match lockmgr
                     .acquire(t.id, rowid, crate::lockmgr::LockMode::Exclusive, xid)
                     .await
@@ -159,13 +165,15 @@ pub(crate) async fn execute_write(
                     Ok(()) => {}
                     Err(()) => return Err(ExecError::Deadlock),
                 }
-                // EvalPlanQual: re-read this row under the lock and decide what to
-                // operate on (40001 under RR if changed since our snapshot).
+                // 3. EvalPlanQual: re-read this row under the lock and decide what to
+                //    operate on (40001 under RR if changed since our snapshot).
                 let Some((cur_xmin, cur_row)) =
                     eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
                 else {
                     continue; // deleted by a concurrent committed txn — skip
                 };
+                // 4. Re-check the filter on the (possibly re-found) current row —
+                //    under READ COMMITTED the row may have changed since the scan.
                 if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
@@ -206,8 +214,13 @@ pub(crate) async fn execute_write(
         Statement::Delete { table, filter } => {
             let t = catalog::get_table(kv, table)?;
             let mut n: u64 = 0;
-            for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
-                // Block until we hold the row exclusively (40P01 on deadlock).
+            for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+                // 1. Filter on the snapshot-visible row FIRST — do not lock rows
+                //    that don't match the WHERE clause.
+                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                    continue;
+                }
+                // 2. Lock only matching candidates.
                 match lockmgr
                     .acquire(t.id, rowid, crate::lockmgr::LockMode::Exclusive, xid)
                     .await
@@ -215,11 +228,13 @@ pub(crate) async fn execute_write(
                     Ok(()) => {}
                     Err(()) => return Err(ExecError::Deadlock),
                 }
+                // 3. EvalPlanQual: re-read this row under the lock.
                 let Some((cur_xmin, cur_row)) =
                     eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
                 else {
                     continue; // already deleted by a concurrent committed txn
                 };
+                // 4. Re-check filter on the (possibly re-found) current row.
                 if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
@@ -454,22 +469,29 @@ pub(crate) async fn execute_read_locking(
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
-    for (rowid, _xmin, _row) in scan_live(kv, snapshot, Some(xid), &t)? {
-        // Block until we hold the row in `mode` (40P01 on deadlock).
+    for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+        // 1. Filter on the snapshot-visible row FIRST — only lock rows that
+        //    match the WHERE clause (a FOR UPDATE/SHARE with no WHERE still
+        //    locks all rows because row_matches(None, ..) returns true).
+        if !row_matches(s.filter.as_ref(), Some(&t), &scanned_row)? {
+            continue;
+        }
+
+        // 2. Lock only matching candidates (40P01 on deadlock).
         lockmgr
             .acquire(t.id, rowid, mode, xid)
             .await
             .map_err(|()| ExecError::Deadlock)?;
 
-        // EvalPlanQual: re-read the row under the lock (40001 under RR if
-        // changed since our snapshot; RC re-finds the latest live version).
+        // 3. EvalPlanQual: re-read the row under the lock (40001 under RR if
+        //    changed since our snapshot; RC re-finds the latest live version).
         let Some((_cur_xmin, cur_row)) =
             eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
         else {
             continue; // deleted by a concurrent committed txn — skip
         };
 
-        // Re-apply the WHERE filter against the (possibly newer) row.
+        // 4. Re-apply the WHERE filter against the (possibly newer) row.
         if !row_matches(s.filter.as_ref(), Some(&t), &cur_row)? {
             continue; // no longer matches
         }

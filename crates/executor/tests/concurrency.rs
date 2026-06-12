@@ -241,53 +241,51 @@ async fn blocker_abort_lets_waiter_proceed() {
     );
 }
 
-/// Updates on different rows must not block each other: both transactions
-/// proceed concurrently, both commit, and both new values are visible.
+/// Updates on different rows must not block each other.
+///
+/// Proof of non-blocking: T1 opens a transaction, updates row 1, and then
+/// deliberately stays open (does NOT commit). While T1 is still holding the
+/// lock on row 1, T2 updates row 2 and commits — and must finish within a
+/// short timeout. If the WHERE filter were applied after locking (the bug),
+/// T1's UPDATE would lock ALL rows (including row 2), and T2 would block here
+/// indefinitely, causing the timeout to fire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn different_rows_run_concurrently() {
     let engine = Arc::new(SqlEngine::new());
     {
         let mut s = engine.connect();
         run(&mut s, "CREATE TABLE t (id int4, v text)").await;
-        run(&mut s, "INSERT INTO t VALUES (1,'a')").await;
-        run(&mut s, "INSERT INTO t VALUES (2,'b')").await;
+        run(&mut s, "INSERT INTO t VALUES (1,'a'),(2,'b')").await;
     }
 
-    // These touch different rows → no conflict; both must complete without blocking.
-    let e1 = Arc::clone(&engine);
-    let h1 = tokio::spawn(async move {
-        let mut s = e1.connect();
-        run(&mut s, "BEGIN").await;
-        run(&mut s, "UPDATE t SET v='x' WHERE id=1").await;
-        run(&mut s, "COMMIT").await;
-    });
+    // T1: BEGIN + UPDATE id=1, then stay open (hold the row 1 lock).
+    let mut t1 = engine.connect();
+    run(&mut t1, "BEGIN").await;
+    run(&mut t1, "UPDATE t SET v='x' WHERE id=1").await;
 
+    // T2: update a DIFFERENT row; must complete WITHOUT waiting for T1.
     let e2 = Arc::clone(&engine);
-    let h2 = tokio::spawn(async move {
+    let t2 = tokio::spawn(async move {
         let mut s = e2.connect();
         run(&mut s, "BEGIN").await;
         run(&mut s, "UPDATE t SET v='y' WHERE id=2").await;
         run(&mut s, "COMMIT").await;
     });
 
-    // Neither should hang; 10 s timeout is a regression guard.
-    tokio::time::timeout(Duration::from_secs(10), h1)
+    // T2 must finish well within 5 s while T1 is still open. Without the fix
+    // (filter before lock), T1 would hold row 2's lock and this times out.
+    tokio::time::timeout(Duration::from_secs(5), t2)
         .await
-        .expect("t1 did not hang")
-        .expect("t1 join");
-    tokio::time::timeout(Duration::from_secs(10), h2)
-        .await
-        .expect("t2 did not hang")
+        .expect("T2 must not block on T1 (different rows — filter must precede lock)")
         .expect("t2 join");
+
+    // Now commit T1 and verify both writes are durable.
+    run(&mut t1, "COMMIT").await;
 
     let mut s = engine.connect();
     assert_eq!(
-        col0(&run(&mut s, "SELECT v FROM t WHERE id=1").await[0]),
-        vec![Some("x".into())]
-    );
-    assert_eq!(
-        col0(&run(&mut s, "SELECT v FROM t WHERE id=2").await[0]),
-        vec![Some("y".into())]
+        col0(&run(&mut s, "SELECT v FROM t ORDER BY id").await[0]),
+        vec![Some("x".into()), Some("y".into())]
     );
 }
 
