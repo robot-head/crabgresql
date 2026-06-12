@@ -1,15 +1,38 @@
 //! Per-statement execution.
 
 use bytes::Bytes;
-use catalog::{Column, Table};
+use catalog::{Column, Table, TableId};
+use kv::Kv;
 use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 
 use crate::SqlSession;
 use crate::error::ExecError;
+use crate::session::{Pending, TxnCtx};
 
-pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryResult, ExecError> {
+/// Read a table's durable next-rowid (1 if unset). Single source of truth for
+/// the sequence read; `SqlSession::read_seq` delegates here.
+pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError> {
+    match kv.get(&kv::key::seq_key(table))? {
+        Some(b) => {
+            let arr: [u8; 8] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| kv::KvError::CorruptRow("sequence is not u64".into()))?;
+            Ok(u64::from_be_bytes(arr))
+        }
+        None => Ok(1),
+    }
+}
+
+/// DDL (CREATE/DROP TABLE) is its own immediate critical section: it takes the
+/// write_lock itself and writes through to the store. Non-DDL is unreachable
+/// here (routed via `run_one`) but handled defensively to keep the match total.
+pub(crate) fn execute_ddl(
+    session: &SqlSession,
+    stmt: &Statement,
+) -> Result<QueryResult, ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
             let cols = columns
@@ -32,6 +55,21 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                 tag: "DROP TABLE".into(),
             })
         }
+        _ => Err(ExecError::Unsupported("not a DDL statement".into())),
+    }
+}
+
+/// DML (INSERT/SELECT, plus UPDATE/DELETE in Task 6). Reads and writes go
+/// through the transaction's `ctx`: writes buffer into `ctx.writes`/`ctx.seq`
+/// (flushed at COMMIT by the caller) and reads overlay the write-set on top of
+/// the visible store snapshot. This function NEVER takes the write_lock — the
+/// caller decides locking (autocommit holds it; in-txn DML does not).
+pub(crate) fn execute_dml(
+    kv: &dyn Kv,
+    ctx: &mut TxnCtx,
+    stmt: &Statement,
+) -> Result<QueryResult, ExecError> {
+    match stmt {
         Statement::Insert {
             table,
             columns,
@@ -42,13 +80,7 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     tag: "INSERT 0 0".into(),
                 });
             }
-            // Acquire the write lock BEFORE reading the schema so the full
-            // read-modify-write (get_table → read_seq → read_commit_ts →
-            // write_batch) is atomic with respect to concurrent DDL and
-            // INSERTs.  execute() is a sync fn with no .await, so a
-            // std::sync::Mutex guard is safe here — never held across an await.
-            let _guard = session.write_lock.lock().expect("write lock");
-            let t = catalog::get_table(&*session.kv, table)?;
+            let t = catalog::get_table(kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
                     .iter()
@@ -59,10 +91,10 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let new_ts = session.read_commit_ts()? + 1;
-            let start = session.read_seq(t.id)?;
+            // Allocate rowids from the write-set's per-table counter, seeded
+            // from the durable next-rowid the first time this txn touches it.
+            let start = *ctx.seq.entry(t.id).or_insert(read_seq_kv(kv, t.id)?);
             let mut rowid = start;
-            let mut ops: Vec<kv::WriteOp> = Vec::new();
             for row_exprs in rows {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(
@@ -75,33 +107,23 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     let v = crate::eval::eval(expr, None, &[])?;
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
-                ops.push(kv::WriteOp::Put {
-                    key: mvcc::version_key(t.id, rowid, new_ts),
-                    value: mvcc::encode_version(false, &full),
-                });
+                ctx.writes.insert(
+                    (t.id, rowid),
+                    Pending::Row(mvcc::encode_version(false, &full)),
+                );
                 rowid += 1;
             }
             let n = rowid - start;
-            ops.push(kv::WriteOp::Put {
-                key: kv::key::seq_key(t.id),
-                value: rowid.to_be_bytes().to_vec(),
-            });
-            ops.push(kv::WriteOp::Put {
-                key: kv::key::commit_ts_key(),
-                value: new_ts.to_be_bytes().to_vec(),
-            });
-            session.kv.write_batch(&ops)?;
+            // Advance the txn-local sequence to the new next-rowid.
+            ctx.seq.insert(t.id, rowid);
             Ok(QueryResult::Command {
                 tag: format!("INSERT 0 {n}"),
             })
         }
-        Statement::Select(s) => exec_select(session, s),
-        // SP4 stubs — real implementations land in Tasks 5 and 6.
-        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => Err(
-            ExecError::Unsupported("transaction control lands in Task 5".into()),
-        ),
+        Statement::Select(s) => exec_select(kv, ctx, s),
         Statement::Update { .. } => Err(ExecError::Unsupported("UPDATE lands in Task 6".into())),
         Statement::Delete { .. } => Err(ExecError::Unsupported("DELETE lands in Task 6".into())),
+        _ => Err(ExecError::Unsupported("not a DML statement".into())),
     }
 }
 
@@ -128,39 +150,69 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
     })
 }
 
-fn scan_live_rows(
-    session: &SqlSession,
+/// Scan a table's live rows under the txn snapshot, overlaying the write-set
+/// (read-your-writes). Returns `(rowid, row)` pairs sorted by rowid so the
+/// buffered writes interleave deterministically with the store rows.
+pub(crate) fn scan_live_rows(
+    kv: &dyn Kv,
+    ctx: &TxnCtx,
     table: &catalog::Table,
-) -> Result<Vec<Vec<pgtypes::Datum>>, ExecError> {
-    let snapshot = mvcc::Snapshot(session.read_commit_ts()?);
-    let scanned = session.kv.scan_prefix(&kv::key::table_prefix(table.id))?;
-    let mut out = Vec::new();
+) -> Result<Vec<(u64, Vec<pgtypes::Datum>)>, ExecError> {
+    let snapshot = mvcc::Snapshot(ctx.snapshot);
+    let scanned = kv.scan_prefix(&kv::key::table_prefix(table.id))?;
+    let mut out: Vec<(u64, Vec<pgtypes::Datum>)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut i = 0;
     while i < scanned.len() {
         let prefix = mvcc::version::row_prefix_of(&scanned[i].0)?.to_vec();
+        let rowid = kv::key::rowid_of(table.id, &prefix)?;
         let mut versions: Vec<(u64, &[u8])> = Vec::new();
         while i < scanned.len() && mvcc::version::row_prefix_of(&scanned[i].0)? == prefix.as_slice()
         {
-            let ts = mvcc::version::ts_of_key(&scanned[i].0)?;
-            versions.push((ts, scanned[i].1.as_slice()));
+            versions.push((
+                mvcc::version::ts_of_key(&scanned[i].0)?,
+                scanned[i].1.as_slice(),
+            ));
             i += 1;
         }
-        if let Some(row) = mvcc::visible_version(snapshot, versions)? {
-            out.push(row);
+        seen.insert(rowid);
+        match ctx.writes.get(&(table.id, rowid)) {
+            Some(Pending::Tombstone) => {}
+            Some(Pending::Row(v)) => out.push((rowid, mvcc::decode_version(v)?.1)),
+            None => {
+                if let Some(row) = mvcc::visible_version(snapshot, versions)? {
+                    out.push((rowid, row));
+                }
+            }
         }
     }
+    // Rows created in this txn that have no store version yet. A Tombstone for
+    // a not-yet-stored rowid (created then deleted in this txn) surfaces nothing.
+    for ((t, rowid), pending) in &ctx.writes {
+        if *t != table.id || seen.contains(rowid) {
+            continue;
+        }
+        if let Pending::Row(v) = pending {
+            out.push((*rowid, mvcc::decode_version(v)?.1));
+        }
+    }
+    out.sort_by_key(|(rowid, _)| *rowid);
     Ok(out)
 }
 
-fn exec_select(session: &SqlSession, s: &SelectStmt) -> Result<QueryResult, ExecError> {
+fn exec_select(kv: &dyn Kv, ctx: &TxnCtx, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(&*session.kv, name)?),
+        Some(name) => Some(catalog::get_table(kv, name)?),
         None => None,
     };
 
-    // Source rows: scan the table, or a single empty row for FROM-less SELECT.
+    // Source rows: scan the table (dropping the rowid for projection), or a
+    // single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => scan_live_rows(session, t)?,
+        Some(t) => scan_live_rows(kv, ctx, t)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect(),
         None => vec![vec![]],
     };
 
