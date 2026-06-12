@@ -48,7 +48,8 @@ pub struct SqlSession {
     procarray: Arc<ProcArray>,
     seq: Arc<SequenceManager>,
     lockmgr: Arc<RowLockManager>,
-    catalog_lock: Arc<std::sync::Mutex<()>>,
+    catalog_lock: Arc<tokio::sync::Mutex<()>>,
+    committer: Arc<dyn crate::commit::Committer>,
     state: TxnState,
 }
 
@@ -58,7 +59,8 @@ impl SqlSession {
         procarray: Arc<ProcArray>,
         seq: Arc<SequenceManager>,
         lockmgr: Arc<RowLockManager>,
-        catalog_lock: Arc<std::sync::Mutex<()>>,
+        catalog_lock: Arc<tokio::sync::Mutex<()>>,
+        committer: Arc<dyn crate::commit::Committer>,
     ) -> Self {
         Self {
             kv,
@@ -66,6 +68,7 @@ impl SqlSession {
             seq,
             lockmgr,
             catalog_lock,
+            committer,
             state: TxnState::Idle,
         }
     }
@@ -78,9 +81,9 @@ impl SqlSession {
         }
         let result = match stmt {
             Statement::Begin { isolation } => self.begin(*isolation),
-            Statement::Commit => self.commit_cmd(),
-            Statement::Rollback => self.rollback_cmd(),
-            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt),
+            Statement::Commit => self.commit_cmd().await,
+            Statement::Rollback => self.rollback_cmd().await,
+            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
@@ -101,14 +104,15 @@ impl SqlSession {
 
     /// Record an aborted transaction's outcome (clog Aborted + deregister) and
     /// release its row locks. Shared by ROLLBACK and COMMIT-of-failed.
-    fn abort_ctx(&self, ctx: TxnCtx) -> Result<(), ExecError> {
+    async fn abort_ctx(&self, ctx: TxnCtx) -> Result<(), ExecError> {
         if let Some(xid) = ctx.xid {
             // Best-effort abort record; the versions are already invisible
             // (in-progress in no future snapshot once deregistered), so even if
             // this write is lost the rows never become visible.
             let r = self
-                .kv
-                .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)]);
+                .committer
+                .commit(vec![mvcc::clog::put_op(xid, XidStatus::Aborted)])
+                .await;
             // Deregister even if the abort record failed to write: restart
             // re-seeds the ProcArray empty and the rows stay invisible (no clog
             // Committed), so a phantom running xid must not be stranded here.
@@ -141,15 +145,16 @@ impl SqlSession {
         })
     }
 
-    fn commit_cmd(&mut self) -> Result<QueryResult, ExecError> {
+    async fn commit_cmd(&mut self) -> Result<QueryResult, ExecError> {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::InTransaction(ctx) => {
                 if let Some(xid) = ctx.xid {
                     // Record the commit. Deregister xid BEFORE propagating any
                     // write error so the xid never stays stuck in the running set.
                     let r = self
-                        .kv
-                        .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Committed)]);
+                        .committer
+                        .commit(vec![mvcc::clog::put_op(xid, XidStatus::Committed)])
+                        .await;
                     self.procarray.finish(xid);
                     // Free every row this transaction locked, waking waiters.
                     self.lockmgr.release_all(xid);
@@ -161,7 +166,7 @@ impl SqlSession {
             }
             // COMMIT of a failed transaction behaves as a ROLLBACK.
             TxnState::Failed(ctx) => {
-                self.abort_ctx(ctx)?;
+                self.abort_ctx(ctx).await?;
                 Ok(QueryResult::Command {
                     tag: "ROLLBACK".into(),
                 })
@@ -172,9 +177,9 @@ impl SqlSession {
         }
     }
 
-    fn rollback_cmd(&mut self) -> Result<QueryResult, ExecError> {
+    async fn rollback_cmd(&mut self) -> Result<QueryResult, ExecError> {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
-            TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => self.abort_ctx(ctx)?,
+            TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => self.abort_ctx(ctx).await?,
             TxnState::Idle => {}
         }
         Ok(QueryResult::Command {
@@ -281,13 +286,17 @@ impl SqlSession {
         }
     }
 
-    fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        // DDL is non-transactional: it writes through immediately. Serialize DDL
-        // among DDLs (so concurrent CREATE TABLE doesn't race next_table_id) with
-        // a short-lived catalog lock; it does NOT serialize DML. `execute_ddl` is
-        // sync, so the std mutex is never held across an await.
-        let _g = self.catalog_lock.lock().expect("catalog lock");
-        crate::exec::execute_ddl(&*self.kv, stmt)
+    /// DDL is non-transactional and writes through immediately. All DDL funnels
+    /// through the leader's catalog_lock held ACROSS the Raft commit, so DDL is
+    /// globally serialized (next_table_id read+bump+commit is atomic; low
+    /// throughput, fine for D1 — concurrent-DDL optimization is a later slice).
+    /// The tokio Mutex is intentionally held across .await (allowed: it is an
+    /// async mutex).
+    async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        let _g = self.catalog_lock.lock().await;
+        let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt)?;
+        self.committer.commit(ops).await?;
+        Ok(result)
     }
 
     async fn run_write(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
@@ -328,7 +337,7 @@ impl SqlSession {
                     stmt,
                 )
                 .await?;
-                self.kv.write_batch(&ops)?;
+                self.committer.commit(ops).await?;
                 Ok(result)
             }
             TxnState::Idle => {
@@ -355,8 +364,9 @@ impl SqlSession {
                         // Autocommit error: abort and stay Idle. Record the abort
                         // (best-effort), deregister, and free this xid's row locks.
                         let _ = self
-                            .kv
-                            .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)]);
+                            .committer
+                            .commit(vec![mvcc::clog::put_op(xid, XidStatus::Aborted)])
+                            .await;
                         self.procarray.finish(xid);
                         self.lockmgr.release_all(xid);
                         return Err(e);
@@ -366,7 +376,7 @@ impl SqlSession {
                 // Deregister xid and free its row locks BEFORE propagating any
                 // write error so neither the running set nor the lock table is
                 // left holding a finished xid on a commit-batch failure.
-                let r = self.kv.write_batch(&ops);
+                let r = self.committer.commit(ops).await;
                 self.procarray.finish(xid);
                 self.lockmgr.release_all(xid);
                 r?;

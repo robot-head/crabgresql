@@ -5,6 +5,7 @@
 //! level via the `RowLockManager`, with rowid allocation via the
 //! `SequenceManager` and DDL serialized behind a small catalog lock.
 
+mod commit;
 mod error;
 mod eval;
 mod exec;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use kv::{FjallKv, Kv, MemKv};
 use pgwire::engine::Engine;
 
+pub use commit::{Committer, LocalCommitter};
 pub use error::ExecError;
 pub use session::SqlSession;
 
@@ -37,7 +39,8 @@ pub struct SqlEngine {
     pub(crate) procarray: Arc<ProcArray>,
     pub(crate) seq: Arc<SequenceManager>,
     pub(crate) lockmgr: Arc<RowLockManager>,
-    pub(crate) catalog_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) catalog_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) committer: Arc<dyn crate::commit::Committer>,
 }
 
 impl Default for SqlEngine {
@@ -59,12 +62,17 @@ impl SqlEngine {
 
     pub fn with_kv(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
         let procarray = Arc::new(ProcArray::open(Arc::clone(&kv))?);
+        let committer: Arc<dyn crate::commit::Committer> =
+            Arc::new(crate::commit::LocalCommitter {
+                kv: Arc::clone(&kv),
+            });
         Ok(Self {
             kv,
             procarray,
             seq: Arc::new(SequenceManager::new()),
             lockmgr: Arc::new(RowLockManager::new()),
-            catalog_lock: Arc::new(std::sync::Mutex::new(())),
+            catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
+            committer,
         })
     }
 }
@@ -79,6 +87,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.seq),
             Arc::clone(&self.lockmgr),
             Arc::clone(&self.catalog_lock),
+            Arc::clone(&self.committer),
         )
     }
 }
