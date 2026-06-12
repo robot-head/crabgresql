@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use kv::Kv;
 use mvcc::visibility::Snapshot;
+use zerocopy::byteorder::big_endian::U64;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::error::ExecError;
 
@@ -29,11 +31,9 @@ impl ProcArray {
     pub fn open(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
         let next_xid = match kv.get(&kv::key::next_xid_key())? {
             Some(b) => {
-                let a: [u8; 8] = b
-                    .as_slice()
-                    .try_into()
+                let (v, _) = U64::read_from_prefix(b.as_slice())
                     .map_err(|_| kv::KvError::CorruptRow("next_xid is not u64".into()))?;
-                u64::from_be_bytes(a)
+                v.get()
             }
             None => 1,
         };
@@ -58,7 +58,7 @@ impl ProcArray {
         // commit batches land out of order.
         self.kv.write_batch(&[kv::WriteOp::Put {
             key: kv::key::next_xid_key(),
-            value: new_next.to_be_bytes().to_vec(),
+            value: U64::new(new_next).as_bytes().to_vec(),
         }])?;
         g.next_xid = new_next;
         g.running.insert(xid);

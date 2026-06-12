@@ -17,6 +17,7 @@ pgparser.workspace = true
 pgwire.workspace = true
 bytes.workspace = true
 tokio.workspace = true
+zerocopy.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

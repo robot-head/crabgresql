@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use kv::Kv;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
 
@@ -40,7 +42,7 @@ impl SequenceManager {
         // the durable counter is monotonic even under concurrent allocators.
         kv.write_batch(&[kv::WriteOp::Put {
             key: kv::key::seq_key(table),
-            value: new_next.to_be_bytes().to_vec(),
+            value: U64::new(new_next).as_bytes().to_vec(),
         }])?;
         g.insert(table, new_next);
         Ok(next)

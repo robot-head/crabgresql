@@ -6,6 +6,8 @@ use kv::Kv;
 use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
+use zerocopy::FromBytes;
+use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
 
@@ -14,11 +16,9 @@ use crate::error::ExecError;
 pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError> {
     match kv.get(&kv::key::seq_key(table))? {
         Some(b) => {
-            let arr: [u8; 8] = b
-                .as_slice()
-                .try_into()
+            let (v, _) = U64::read_from_prefix(b.as_slice())
                 .map_err(|_| kv::KvError::CorruptRow("sequence is not u64".into()))?;
-            Ok(u64::from_be_bytes(arr))
+            Ok(v.get())
         }
         None => Ok(1),
     }
