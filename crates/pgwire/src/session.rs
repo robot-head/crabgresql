@@ -376,7 +376,7 @@ fn bad_proto() -> std::io::Error {
 }
 
 fn server_nonce() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::distr::Alphanumeric;
     rand::rng()
         .sample_iter(&Alphanumeric)
