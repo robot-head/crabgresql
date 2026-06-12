@@ -42,7 +42,6 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
             // atomic with respect to other concurrent INSERTs.  execute() is
             // a sync fn with no .await, so a std::sync::Mutex guard is safe
             // here — it is never held across an await point.
-            let _guard = session.write_lock.lock().expect("write lock");
             let t = catalog::get_table(&*session.kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
@@ -54,7 +53,10 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let mut rowid = session.read_seq(t.id)?;
+            let _guard = session.write_lock.lock().expect("write lock");
+            let new_ts = session.read_commit_ts()? + 1;
+            let start = session.read_seq(t.id)?;
+            let mut rowid = start;
             let mut ops: Vec<kv::WriteOp> = Vec::new();
             for row_exprs in rows {
                 if row_exprs.len() != target_idx.len() {
@@ -69,15 +71,19 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
                 ops.push(kv::WriteOp::Put {
-                    key: kv::key::row_key(t.id, rowid),
-                    value: kv::rowenc::encode_row(&full),
+                    key: mvcc::version_key(t.id, rowid, new_ts),
+                    value: mvcc::encode_version(false, &full),
                 });
                 rowid += 1;
             }
-            let n = ops.len() as u64;
+            let n = rowid - start;
             ops.push(kv::WriteOp::Put {
                 key: kv::key::seq_key(t.id),
                 value: rowid.to_be_bytes().to_vec(),
+            });
+            ops.push(kv::WriteOp::Put {
+                key: kv::key::commit_ts_key(),
+                value: new_ts.to_be_bytes().to_vec(),
             });
             session.kv.write_batch(&ops)?;
             Ok(QueryResult::Command {
@@ -117,6 +123,30 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
     })
 }
 
+fn scan_live_rows(
+    session: &SqlSession,
+    table: &catalog::Table,
+) -> Result<Vec<Vec<pgtypes::Datum>>, ExecError> {
+    let snapshot = mvcc::Snapshot(session.read_commit_ts()?);
+    let scanned = session.kv.scan_prefix(&kv::key::table_prefix(table.id))?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < scanned.len() {
+        let prefix = mvcc::version::row_prefix_of(&scanned[i].0)?.to_vec();
+        let mut versions: Vec<(u64, &[u8])> = Vec::new();
+        while i < scanned.len() && mvcc::version::row_prefix_of(&scanned[i].0)? == prefix.as_slice()
+        {
+            let ts = mvcc::version::ts_of_key(&scanned[i].0)?;
+            versions.push((ts, scanned[i].1.as_slice()));
+            i += 1;
+        }
+        if let Some(row) = mvcc::visible_version(snapshot, versions)? {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 fn exec_select(session: &SqlSession, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
         Some(name) => Some(catalog::get_table(&*session.kv, name)?),
@@ -125,13 +155,7 @@ fn exec_select(session: &SqlSession, s: &SelectStmt) -> Result<QueryResult, Exec
 
     // Source rows: scan the table, or a single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => {
-            let scanned = session.kv.scan_prefix(&kv::key::table_prefix(t.id))?;
-            scanned
-                .into_iter()
-                .map(|(_, v)| kv::rowenc::decode_row(&v))
-                .collect::<Result<_, _>>()?
-        }
+        Some(t) => scan_live_rows(session, t)?,
         None => vec![vec![]],
     };
 
@@ -465,6 +489,15 @@ mod tests {
                 tag: "INSERT 0 1".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn insert_writes_a_versioned_row_visible_to_select() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let r = &run(&engine, "SELECT id FROM t").await[0];
+        assert_eq!(rows_of(r).len(), 1);
     }
 
     #[tokio::test]

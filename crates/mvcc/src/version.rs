@@ -26,6 +26,23 @@ pub fn commit_ts_of(table_id: u32, rowid: u64, key: &[u8]) -> Result<u64, KvErro
     Ok(u64::MAX - u64::from_be_bytes(suffix))
 }
 
+/// The row-key prefix of a version key (everything but the 8-byte ts suffix).
+pub fn row_prefix_of(key: &[u8]) -> Result<&[u8], KvError> {
+    if key.len() < 8 {
+        return Err(KvError::CorruptRow("version key too short".into()));
+    }
+    Ok(&key[..key.len() - 8])
+}
+
+/// The commit_ts encoded in a version key's 8-byte suffix.
+pub fn ts_of_key(key: &[u8]) -> Result<u64, KvError> {
+    if key.len() < 8 {
+        return Err(KvError::CorruptRow("version key too short".into()));
+    }
+    let suffix: [u8; 8] = key[key.len() - 8..].try_into().expect("8 bytes");
+    Ok(u64::MAX - u64::from_be_bytes(suffix))
+}
+
 const V_ROW: u8 = 1;
 const V_TOMBSTONE: u8 = 2;
 
@@ -56,6 +73,29 @@ mod tests {
     use super::*;
     use pgtypes::Datum;
     use proptest::prelude::*;
+
+    #[test]
+    fn row_prefix_of_strips_ts_suffix() {
+        let k = version_key(7, 42, 5);
+        let expected = kv::key::row_key(7, 42);
+        assert_eq!(row_prefix_of(&k).expect("valid key"), expected.as_slice());
+    }
+
+    #[test]
+    fn ts_of_key_roundtrips() {
+        let k = version_key(7, 42, 5);
+        assert_eq!(ts_of_key(&k).expect("valid key"), 5);
+    }
+
+    #[test]
+    fn row_prefix_of_rejects_too_short() {
+        assert!(row_prefix_of(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn ts_of_key_rejects_too_short() {
+        assert!(ts_of_key(&[0u8; 4]).is_err());
+    }
 
     #[test]
     fn version_key_prefix_is_the_rowid_row_key() {

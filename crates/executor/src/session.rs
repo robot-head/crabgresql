@@ -23,7 +23,21 @@ impl SqlSession {
         Self { kv, write_lock }
     }
 
-    /// Read a table's durable next-rowid (1 if unset). (Moved from SqlEngine.)
+    /// Read the global commit timestamp (0 if unset).
+    pub(crate) fn read_commit_ts(&self) -> Result<u64, ExecError> {
+        match self.kv.get(&kv::key::commit_ts_key())? {
+            Some(b) => {
+                let arr: [u8; 8] = b
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| kv::KvError::CorruptRow("commit_ts is not u64".into()))?;
+                Ok(u64::from_be_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Read a table's durable next-rowid (1 if unset).
     pub(crate) fn read_seq(&self, table: TableId) -> Result<u64, ExecError> {
         match self.kv.get(&kv::key::seq_key(table))? {
             Some(b) => {

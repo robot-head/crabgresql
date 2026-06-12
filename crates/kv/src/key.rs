@@ -54,6 +54,13 @@ pub fn meta_next_table_id_key() -> Vec<u8> {
     k
 }
 
+/// Key for the global commit-timestamp clock: `/0/meta/commit_ts`.
+pub fn commit_ts_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"commit_ts");
+    k
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;

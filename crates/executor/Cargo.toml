@@ -11,6 +11,7 @@ workspace = true
 thiserror.workspace = true
 pgtypes.workspace = true
 kv.workspace = true
+mvcc.workspace = true
 catalog.workspace = true
 pgparser.workspace = true
 pgwire.workspace = true
