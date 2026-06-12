@@ -185,11 +185,89 @@ impl Parser {
             Token::Keyword(Keyword::Drop) => self.drop_table(),
             Token::Keyword(Keyword::Insert) => self.insert(),
             Token::Keyword(Keyword::Select) => self.select(),
+            // SP4: transaction control
+            Token::Keyword(Keyword::Begin) | Token::Keyword(Keyword::Start) => self.begin(),
+            Token::Keyword(Keyword::Commit) | Token::Keyword(Keyword::End) => {
+                self.bump();
+                Ok(crate::ast::Statement::Commit)
+            }
+            Token::Keyword(Keyword::Rollback) | Token::Keyword(Keyword::Abort) => {
+                self.bump();
+                Ok(crate::ast::Statement::Rollback)
+            }
+            // SP4: DML
+            Token::Keyword(Keyword::Update) => self.update(),
+            Token::Keyword(Keyword::Delete) => self.delete(),
             other => Err(ParseError::new(
                 format!("unexpected statement start {other:?}"),
                 self.peek_pos(),
             )),
         }
+    }
+
+    fn begin(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{IsolationLevel, Statement};
+        self.bump(); // BEGIN or START
+        self.eat_keyword(Keyword::Transaction); // optional
+        let isolation = if self.eat_keyword(Keyword::Isolation) {
+            self.expect(&Token::Keyword(Keyword::Level))?;
+            if self.eat_keyword(Keyword::Repeatable) {
+                self.expect(&Token::Keyword(Keyword::Read))?;
+                Some(IsolationLevel::RepeatableRead)
+            } else if self.eat_keyword(Keyword::Read) {
+                self.expect(&Token::Keyword(Keyword::Committed))?;
+                Some(IsolationLevel::ReadCommitted)
+            } else {
+                return Err(ParseError::new(
+                    "expected REPEATABLE READ or READ COMMITTED",
+                    self.peek_pos(),
+                ));
+            }
+        } else {
+            None
+        };
+        Ok(Statement::Begin { isolation })
+    }
+
+    fn update(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Update))?;
+        let table = self.expect_ident()?;
+        self.expect(&Token::Keyword(Keyword::Set))?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.expr(0)?;
+            assignments.push((col, value));
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        let filter = if self.eat_keyword(Keyword::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        Ok(Statement::Update {
+            table,
+            assignments,
+            filter,
+        })
+    }
+
+    fn delete(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Delete))?;
+        self.expect(&Token::Keyword(Keyword::From))?;
+        let table = self.expect_ident()?;
+        let filter = if self.eat_keyword(Keyword::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete { table, filter })
     }
 
     fn create_table(&mut self) -> Result<crate::ast::Statement, ParseError> {
@@ -383,7 +461,7 @@ pub fn parse(sql: &str) -> Result<Vec<crate::ast::Statement>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinaryOp, Expr, UnaryOp};
+    use crate::ast::{BinaryOp, Expr, IsolationLevel, UnaryOp};
     use crate::ast::{ColumnDef, SelectItem, Statement};
     use pgtypes::ColumnType;
 
@@ -483,6 +561,71 @@ mod tests {
     #[test]
     fn trailing_garbage_is_error() {
         assert!(parse("SELECT 1 foo bar").is_err());
+    }
+
+    #[test]
+    fn parses_begin_variants() {
+        assert_eq!(one("BEGIN"), Statement::Begin { isolation: None });
+        assert_eq!(
+            one("START TRANSACTION"),
+            Statement::Begin { isolation: None }
+        );
+        assert_eq!(
+            one("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::RepeatableRead)
+            }
+        );
+        assert_eq!(
+            one("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::ReadCommitted)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_commit_rollback_aliases() {
+        assert_eq!(one("COMMIT"), Statement::Commit);
+        assert_eq!(one("END"), Statement::Commit);
+        assert_eq!(one("ROLLBACK"), Statement::Rollback);
+        assert_eq!(one("ABORT"), Statement::Rollback);
+    }
+
+    #[test]
+    fn parses_update() {
+        match one("UPDATE t SET a = 1, b = a + 2 WHERE id = 5") {
+            Statement::Update {
+                table,
+                assignments,
+                filter,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(assignments.len(), 2);
+                assert_eq!(assignments[0].0, "a");
+                assert_eq!(assignments[1].0, "b");
+                assert!(filter.is_some());
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete() {
+        match one("DELETE FROM t WHERE id > 3") {
+            Statement::Delete { table, filter } => {
+                assert_eq!(table, "t");
+                assert!(filter.is_some());
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+        assert_eq!(
+            one("DELETE FROM t"),
+            Statement::Delete {
+                table: "t".into(),
+                filter: None
+            }
+        );
     }
 
     fn expr(sql: &str) -> Expr {

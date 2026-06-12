@@ -17,6 +17,27 @@ pub enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select(SelectStmt),
+    Begin {
+        isolation: Option<IsolationLevel>,
+    },
+    Commit,
+    Rollback,
+    Update {
+        table: String,
+        assignments: Vec<(String, Expr)>,
+        filter: Option<Expr>,
+    },
+    Delete {
+        table: String,
+        filter: Option<Expr>,
+    },
+}
+
+/// Transaction isolation levels supported by SP4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

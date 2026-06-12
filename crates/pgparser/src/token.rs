@@ -47,6 +47,22 @@ pub enum Keyword {
     False,
     Null,
     As,
+    // SP4: transaction control + DML
+    Begin,
+    Start,
+    Transaction,
+    Commit,
+    End,
+    Rollback,
+    Abort,
+    Update,
+    Set,
+    Delete,
+    Isolation,
+    Level,
+    Read,
+    Committed,
+    Repeatable,
 }
 
 impl Keyword {
@@ -73,6 +89,22 @@ impl Keyword {
             "false" => Keyword::False,
             "null" => Keyword::Null,
             "as" => Keyword::As,
+            // SP4: transaction control + DML
+            "begin" => Keyword::Begin,
+            "start" => Keyword::Start,
+            "transaction" => Keyword::Transaction,
+            "commit" => Keyword::Commit,
+            "end" => Keyword::End,
+            "rollback" => Keyword::Rollback,
+            "abort" => Keyword::Abort,
+            "update" => Keyword::Update,
+            "set" => Keyword::Set,
+            "delete" => Keyword::Delete,
+            "isolation" => Keyword::Isolation,
+            "level" => Keyword::Level,
+            "read" => Keyword::Read,
+            "committed" => Keyword::Committed,
+            "repeatable" => Keyword::Repeatable,
             _ => return None,
         })
     }

@@ -85,6 +85,12 @@ pub(crate) fn execute(engine: &SqlEngine, stmt: &Statement) -> Result<QueryResul
             })
         }
         Statement::Select(s) => exec_select(engine, s),
+        // SP4 stubs — real implementations land in Tasks 5 and 6.
+        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => Err(
+            ExecError::Unsupported("transaction control lands in Task 5".into()),
+        ),
+        Statement::Update { .. } => Err(ExecError::Unsupported("UPDATE lands in Task 6".into())),
+        Statement::Delete { .. } => Err(ExecError::Unsupported("DELETE lands in Task 6".into())),
     }
 }
 
