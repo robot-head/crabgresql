@@ -27,21 +27,31 @@ pub struct Node {
 }
 
 impl Node {
-    /// Build a node (not yet a cluster member). `sb` is the shared transport;
-    /// the node registers its Raft handle with it so peers can reach it.
+    /// The default Raft config: short timers so in-process elections are fast and
+    /// deterministic under the multi-thread test runtime.
+    pub fn default_config() -> openraft::Config {
+        openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            ..Default::default()
+        }
+    }
+
+    /// Build a node (not yet a cluster member) with the default config. `sb` is
+    /// the shared transport; the node registers its Raft handle so peers can
+    /// reach it.
     pub async fn start(id: NodeId, sb: Switchboard) -> Self {
-        let config = Arc::new(
-            openraft::Config {
-                // Short timers keep in-process elections fast and deterministic
-                // under the multi-thread test runtime.
-                heartbeat_interval: 50,
-                election_timeout_min: 150,
-                election_timeout_max: 300,
-                ..Default::default()
-            }
-            .validate()
-            .expect("valid raft config"),
-        );
+        Self::start_with_config(id, sb, Self::default_config()).await
+    }
+
+    /// Build a node with an explicit Raft `config`. Lets tests pass an aggressive
+    /// snapshot policy (see [`Cluster::new_with_snapshotting`]) so a far-behind
+    /// follower must be repaired by an installed snapshot rather than log replay.
+    ///
+    /// [`Cluster::new_with_snapshotting`]: crate::cluster::Cluster::new_with_snapshotting
+    pub async fn start_with_config(id: NodeId, sb: Switchboard, config: openraft::Config) -> Self {
+        let config = Arc::new(config.validate().expect("valid raft config"));
 
         let log = Arc::new(LogStore::default());
         let sm = Arc::new(StateMachineStore::default());
