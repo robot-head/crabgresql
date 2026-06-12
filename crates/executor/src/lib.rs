@@ -28,6 +28,16 @@ use crate::lockmgr::RowLockManager;
 use crate::procarray::ProcArray;
 use crate::seq::SequenceManager;
 
+/// Whether the counter managers (`ProcArray`, `SequenceManager`) persist their
+/// counters themselves (`Durable` — the local/single-node path) or fold the
+/// counter advance into the commit batch for the replicated state machine to
+/// max-merge (`Replicated` — the Raft path, reseeded on leadership change).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistMode {
+    Durable,
+    Replicated,
+}
+
 /// The SQL engine over a durable (or in-memory) KV store. Catalog, sequences,
 /// the xid counter, and the clog live in the KV store. Writers run concurrently
 /// (SP6): row-level conflicts serialize through the `RowLockManager`, rowid
@@ -41,6 +51,7 @@ pub struct SqlEngine {
     pub(crate) lockmgr: Arc<RowLockManager>,
     pub(crate) catalog_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) committer: Arc<dyn crate::commit::Committer>,
+    pub(crate) persist_mode: PersistMode,
 }
 
 impl Default for SqlEngine {
@@ -61,7 +72,7 @@ impl SqlEngine {
     }
 
     pub fn with_kv(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
-        let procarray = Arc::new(ProcArray::open(Arc::clone(&kv))?);
+        let procarray = Arc::new(ProcArray::open(Arc::clone(&kv), PersistMode::Durable)?);
         let committer: Arc<dyn crate::commit::Committer> =
             Arc::new(crate::commit::LocalCommitter {
                 kv: Arc::clone(&kv),
@@ -69,10 +80,11 @@ impl SqlEngine {
         Ok(Self {
             kv,
             procarray,
-            seq: Arc::new(SequenceManager::new()),
+            seq: Arc::new(SequenceManager::new(PersistMode::Durable)),
             lockmgr: Arc::new(RowLockManager::new()),
             catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             committer,
+            persist_mode: PersistMode::Durable,
         })
     }
 }
@@ -88,6 +100,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.lockmgr),
             Arc::clone(&self.catalog_lock),
             Arc::clone(&self.committer),
+            self.persist_mode,
         )
     }
 }

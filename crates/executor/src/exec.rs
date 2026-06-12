@@ -118,10 +118,15 @@ pub(crate) async fn execute_write(
             }
             let t = catalog::get_table(kv, table)?;
             let target_idx = resolve_targets(&t, columns)?;
-            // Reserve a contiguous block of rowids atomically (the SequenceManager
-            // persists the new next-rowid durably itself — no seq Put in ops).
+            // Reserve a contiguous block of rowids atomically. In Durable mode the
+            // SequenceManager persists the new next-rowid itself (seq_op is None).
+            // In Replicated mode it returns the seq Put for us to fold into this
+            // same commit batch (max-merged by the replicated state machine).
             let n_rows = rows.len() as u64;
-            let start = seq.alloc(kv, t.id, n_rows)?;
+            let (start, seq_op) = seq.alloc(kv, t.id, n_rows)?;
+            if let Some(op) = seq_op {
+                ops.push(op);
+            }
             for (rowid, row_exprs) in (start..).zip(rows.iter()) {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(

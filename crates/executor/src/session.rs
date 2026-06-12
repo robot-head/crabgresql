@@ -50,6 +50,7 @@ pub struct SqlSession {
     lockmgr: Arc<RowLockManager>,
     catalog_lock: Arc<tokio::sync::Mutex<()>>,
     committer: Arc<dyn crate::commit::Committer>,
+    persist_mode: crate::PersistMode,
     state: TxnState,
 }
 
@@ -61,6 +62,7 @@ impl SqlSession {
         lockmgr: Arc<RowLockManager>,
         catalog_lock: Arc<tokio::sync::Mutex<()>>,
         committer: Arc<dyn crate::commit::Committer>,
+        persist_mode: crate::PersistMode,
     ) -> Self {
         Self {
             kv,
@@ -69,6 +71,7 @@ impl SqlSession {
             lockmgr,
             catalog_lock,
             committer,
+            persist_mode,
             state: TxnState::Idle,
         }
     }
@@ -323,10 +326,12 @@ impl SqlSession {
                 let kv = Arc::clone(&self.kv);
                 // An error here propagates to run_one, which transitions the
                 // block to Failed (keeping the xid + row locks until
-                // COMMIT/ROLLBACK, which calls release_all). ProcArray already
-                // persisted next_xid eagerly, so no next_xid op; the txn commits
-                // later, so no clog op.
-                let (result, ops) = crate::exec::execute_write(
+                // COMMIT/ROLLBACK, which calls release_all). In Durable mode
+                // ProcArray persisted next_xid eagerly, so no next_xid op; the
+                // txn commits later, so no clog op. In Replicated mode we fold the
+                // next_xid op into this batch (the state machine max-merges it;
+                // re-folding on a later write in the same txn is harmless).
+                let (result, mut ops) = crate::exec::execute_write(
                     &*kv,
                     &self.procarray,
                     &self.lockmgr,
@@ -337,6 +342,9 @@ impl SqlSession {
                     stmt,
                 )
                 .await?;
+                if self.persist_mode == crate::PersistMode::Replicated {
+                    ops.push(self.procarray.next_xid_op());
+                }
                 self.committer.commit(ops).await?;
                 Ok(result)
             }
@@ -373,6 +381,12 @@ impl SqlSession {
                     }
                 };
                 ops.push(mvcc::clog::put_op(xid, XidStatus::Committed));
+                // In Replicated mode, fold the next_xid advance into the same
+                // batch as the rows + clog (the state machine max-merges it); in
+                // Durable mode begin_write already persisted it eagerly.
+                if self.persist_mode == crate::PersistMode::Replicated {
+                    ops.push(self.procarray.next_xid_op());
+                }
                 // Deregister xid and free its row locks BEFORE propagating any
                 // write error so neither the running set nor the lock table is
                 // left holding a finished xid on a commit-batch failure.

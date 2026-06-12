@@ -9,41 +9,63 @@ use std::sync::Mutex;
 
 use kv::Kv;
 
+use crate::PersistMode;
 use crate::error::ExecError;
 
 pub(crate) struct SequenceManager {
     inner: Mutex<HashMap<catalog::TableId, u64>>,
+    mode: PersistMode,
 }
 
 impl SequenceManager {
-    pub fn new() -> Self {
+    pub fn new(mode: PersistMode) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            mode,
         }
     }
 
-    /// Reserve `count` consecutive rowids for `table` and return the first.
-    /// Persists the new next-rowid durably before returning so it cannot regress.
+    /// Reserve `count` consecutive rowids for `table` and return the first, plus
+    /// the seq `WriteOp`. In `Durable` mode the new next-rowid is persisted here
+    /// (under the lock, before returning, so the durable counter cannot regress)
+    /// and the op is returned as `None`. In `Replicated` mode nothing is
+    /// persisted here: the op is returned as `Some(op)` for the caller to fold
+    /// into the same commit batch as the inserted rows (max-merged by the state
+    /// machine), and `reseed_from_applied` re-seeds on leadership change.
     pub fn alloc(
         &self,
         kv: &dyn Kv,
         table: catalog::TableId,
         count: u64,
-    ) -> Result<u64, ExecError> {
+    ) -> Result<(u64, Option<kv::WriteOp>), ExecError> {
         let mut g = self.inner.lock().expect("seqmgr");
         let next = match g.get(&table) {
             Some(&n) => n,
             None => crate::exec::read_seq_kv(kv, table)?, // seed once from disk
         };
         let new_next = next + count;
-        // Persist BEFORE releasing the lock and BEFORE handing out the rowid, so
-        // the durable counter is monotonic even under concurrent allocators.
-        kv.write_batch(&[kv::WriteOp::Put {
+        let op = kv::WriteOp::Put {
             key: kv::key::seq_key(table),
             value: new_next.to_be_bytes().to_vec(),
-        }])?;
+        };
+        let folded = match self.mode {
+            // Persist BEFORE releasing the lock and BEFORE handing out the rowid,
+            // so the durable counter is monotonic even under concurrent allocators.
+            PersistMode::Durable => {
+                kv.write_batch(std::slice::from_ref(&op))?;
+                None
+            }
+            PersistMode::Replicated => Some(op),
+        };
         g.insert(table, new_next);
-        Ok(next)
+        Ok((next, folded))
+    }
+
+    /// On leadership change, clear the cache so the next alloc re-seeds from the
+    /// applied store (counters seed lazily via `read_seq_kv` on first use).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reseed_from_applied(&self) {
+        self.inner.lock().expect("seqmgr").clear();
     }
 }
 
@@ -56,23 +78,37 @@ mod tests {
     #[test]
     fn allocates_distinct_increasing_rowids() {
         let kv: Arc<dyn kv::Kv> = Arc::new(MemKv::new());
-        let seq = SequenceManager::new();
-        assert_eq!(seq.alloc(&*kv, 7, 3).expect("alloc"), 1); // rows 1,2,3
-        assert_eq!(seq.alloc(&*kv, 7, 2).expect("alloc"), 4); // rows 4,5
-        assert_eq!(seq.alloc(&*kv, 8, 1).expect("alloc"), 1); // a different table is independent
+        let seq = SequenceManager::new(PersistMode::Durable);
+        let (start, _op) = seq.alloc(&*kv, 7, 3).expect("alloc");
+        assert_eq!(start, 1); // rows 1,2,3
+        let (start, _op) = seq.alloc(&*kv, 7, 2).expect("alloc");
+        assert_eq!(start, 4); // rows 4,5
+        let (start, _op) = seq.alloc(&*kv, 8, 1).expect("alloc");
+        assert_eq!(start, 1); // a different table is independent
+    }
+
+    #[test]
+    fn durable_alloc_self_persists_and_returns_no_op() {
+        let kv: Arc<dyn kv::Kv> = Arc::new(MemKv::new());
+        let seq = SequenceManager::new(PersistMode::Durable);
+        let (start, op) = seq.alloc(&*kv, 7, 3).expect("alloc");
+        assert_eq!(start, 1);
+        assert!(op.is_none(), "Durable mode self-persists, folds nothing");
+        // The counter is durable (persisted under the lock by alloc itself).
+        assert_eq!(
+            kv.get(&kv::key::seq_key(7)).expect("get"),
+            Some(4u64.to_be_bytes().to_vec())
+        );
     }
 
     #[test]
     fn durable_seq_is_monotonic_and_seeds_a_fresh_manager() {
         let kv: Arc<dyn kv::Kv> = Arc::new(MemKv::new());
-        let seq = SequenceManager::new();
+        let seq = SequenceManager::new(PersistMode::Durable);
         seq.alloc(&*kv, 7, 5).expect("alloc"); // consumes 1..=5, persists next=6
-        let seq2 = SequenceManager::new(); // simulate restart
-        assert_eq!(
-            seq2.alloc(&*kv, 7, 1).expect("alloc"),
-            6,
-            "must not reuse 1..=5"
-        );
+        let seq2 = SequenceManager::new(PersistMode::Durable); // simulate restart
+        let (start, _op) = seq2.alloc(&*kv, 7, 1).expect("alloc");
+        assert_eq!(start, 6, "must not reuse 1..=5");
     }
 
     #[test]
@@ -83,7 +119,43 @@ mod tests {
             value: 42u64.to_be_bytes().to_vec(),
         }])
         .expect("seed");
-        let seq = SequenceManager::new();
-        assert_eq!(seq.alloc(&*kv, 7, 1).expect("alloc"), 42);
+        let seq = SequenceManager::new(PersistMode::Durable);
+        let (start, _op) = seq.alloc(&*kv, 7, 1).expect("alloc");
+        assert_eq!(start, 42);
+    }
+
+    #[test]
+    fn replicated_alloc_folds_op_and_does_not_persist_and_reseed_clears_cache() {
+        let kv: Arc<dyn kv::Kv> = Arc::new(MemKv::new());
+        let seq = SequenceManager::new(PersistMode::Replicated);
+        // Replicated alloc returns the op to fold and persists nothing itself.
+        let (start, op) = seq.alloc(&*kv, 7, 3).expect("alloc");
+        assert_eq!(start, 1);
+        let op = op.expect("Replicated mode folds the seq op via the batch");
+        assert_eq!(
+            op,
+            kv::WriteOp::Put {
+                key: kv::key::seq_key(7),
+                value: 4u64.to_be_bytes().to_vec(),
+            }
+        );
+        assert!(
+            kv.get(&kv::key::seq_key(7)).expect("get").is_none(),
+            "Replicated mode must not self-persist the seq counter"
+        );
+        // Next alloc continues from the in-memory cache (4), still no persist.
+        let (start, _op) = seq.alloc(&*kv, 7, 1).expect("alloc");
+        assert_eq!(start, 4);
+        // Simulate the applied store advancing (via Raft) to next-rowid=50, then
+        // becoming leader: reseed clears the cache so the next alloc re-seeds from
+        // the applied store via read_seq_kv.
+        kv.write_batch(&[kv::WriteOp::Put {
+            key: kv::key::seq_key(7),
+            value: 50u64.to_be_bytes().to_vec(),
+        }])
+        .expect("apply");
+        seq.reseed_from_applied();
+        let (start, _op) = seq.alloc(&*kv, 7, 1).expect("alloc");
+        assert_eq!(start, 50, "reseed re-seeds from the applied store");
     }
 }

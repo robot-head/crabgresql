@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use kv::Kv;
 use mvcc::visibility::Snapshot;
 
+use crate::PersistMode;
 use crate::error::ExecError;
 
 struct Inner {
@@ -21,12 +22,13 @@ struct Inner {
 pub(crate) struct ProcArray {
     inner: Mutex<Inner>,
     kv: Arc<dyn Kv>,
+    mode: PersistMode,
 }
 
 impl ProcArray {
     /// Seed the next-xid counter from the durable key (default 1 — real xids
     /// start at 1; 0 is the invalid sentinel).
-    pub fn open(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
+    pub fn open(kv: Arc<dyn Kv>, mode: PersistMode) -> Result<Self, ExecError> {
         let next_xid = match kv.get(&kv::key::next_xid_key())? {
             Some(b) => {
                 let a: [u8; 8] = b
@@ -43,26 +45,57 @@ impl ProcArray {
                 running: BTreeSet::new(),
             }),
             kv,
+            mode,
         })
     }
 
-    /// Allocate the next xid and register it as running. Persists the bumped
-    /// counter durably under the lock so it advances monotonically — a restart
-    /// never reuses an xid even when concurrent commit batches land out of order.
+    /// Allocate the next xid and register it as running. In `Durable` mode,
+    /// persists the bumped counter durably under the lock so it advances
+    /// monotonically — a restart never reuses an xid even when concurrent commit
+    /// batches land out of order. In `Replicated` mode, the counter is NOT
+    /// persisted here: the session folds `next_xid_op()` into the same commit
+    /// batch as the write that triggered it (max-merged by the state machine),
+    /// and `reseed_from_applied` lifts the counter on leadership change.
     pub fn begin_write(&self) -> Result<u64, ExecError> {
         let mut g = self.inner.lock().expect("procarray");
         let xid = g.next_xid;
         let new_next = xid + 1;
-        // Persist the bumped counter durably under the lock so it advances
-        // monotonically — a restart never reuses an xid even when concurrent
-        // commit batches land out of order.
-        self.kv.write_batch(&[kv::WriteOp::Put {
-            key: kv::key::next_xid_key(),
-            value: new_next.to_be_bytes().to_vec(),
-        }])?;
+        if self.mode == PersistMode::Durable {
+            self.kv.write_batch(&[kv::WriteOp::Put {
+                key: kv::key::next_xid_key(),
+                value: new_next.to_be_bytes().to_vec(),
+            }])?;
+        }
         g.next_xid = new_next;
         g.running.insert(xid);
         Ok(xid)
+    }
+
+    /// Reseed the in-memory counter from the applied store (called when this node
+    /// becomes leader, so it never hands out an xid the old leader already used).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reseed_from_applied(&self) -> Result<(), ExecError> {
+        let durable = match self.kv.get(&kv::key::next_xid_key())? {
+            Some(b) => u64::from_be_bytes(
+                b.as_slice()
+                    .try_into()
+                    .map_err(|_| kv::KvError::CorruptRow("next_xid not u64".into()))?,
+            ),
+            None => 1,
+        };
+        let mut g = self.inner.lock().expect("procarray");
+        g.next_xid = g.next_xid.max(durable.max(1));
+        Ok(())
+    }
+
+    /// The WriteOp recording the current next_xid (folded into the commit batch in
+    /// Replicated mode).
+    pub fn next_xid_op(&self) -> kv::WriteOp {
+        let next = self.inner.lock().expect("procarray").next_xid;
+        kv::WriteOp::Put {
+            key: kv::key::next_xid_key(),
+            value: next.to_be_bytes().to_vec(),
+        }
     }
 
     /// The durable next-xid value (one past the highest allocated). `begin_write`
@@ -104,7 +137,7 @@ mod tests {
 
     #[test]
     fn fresh_store_starts_at_xid_one() {
-        let pa = ProcArray::open(Arc::new(MemKv::new())).expect("open");
+        let pa = ProcArray::open(Arc::new(MemKv::new()), PersistMode::Durable).expect("open");
         let s = pa.snapshot();
         assert_eq!(s.xmax, 1);
         assert!(s.xip.is_empty());
@@ -112,7 +145,7 @@ mod tests {
 
     #[test]
     fn allocate_registers_running_and_snapshot_excludes_committed() {
-        let pa = ProcArray::open(Arc::new(MemKv::new())).expect("open");
+        let pa = ProcArray::open(Arc::new(MemKv::new()), PersistMode::Durable).expect("open");
         let x1 = pa.begin_write().expect("begin_write");
         let x2 = pa.begin_write().expect("begin_write");
         assert_eq!((x1, x2), (1, 2));
@@ -133,17 +166,38 @@ mod tests {
             value: 42u64.to_be_bytes().to_vec(),
         }])
         .expect("seed");
-        let pa = ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>).expect("open");
+        let pa =
+            ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>, PersistMode::Durable).expect("open");
         assert_eq!(pa.begin_write().expect("begin_write"), 42);
         assert_eq!(pa.next_xid(), 43);
 
         // Prove monotonic persist: a fresh ProcArray on the same kv should pick
         // up the durable counter (43) and return 43 as its first xid.
-        let pa2 = ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>).expect("open2");
+        let pa2 =
+            ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>, PersistMode::Durable).expect("open2");
         assert_eq!(
             pa2.begin_write().expect("begin_write2"),
             43,
             "durable counter must have advanced to 43"
+        );
+    }
+
+    #[test]
+    fn replicated_begin_write_does_not_persist_but_reseed_lifts_counter() {
+        let kv = Arc::new(MemKv::new());
+        let pa =
+            ProcArray::open(Arc::clone(&kv) as Arc<dyn Kv>, PersistMode::Replicated).expect("open");
+        assert_eq!(pa.begin_write().expect("bw"), 1);
+        // Nothing persisted (replicated mode folds via the batch, not here).
+        assert!(kv.get(&kv::key::next_xid_key()).expect("get").is_none());
+        // Simulate the applied store advancing to 50 (via Raft), then becoming leader.
+        kv.put(kv::key::next_xid_key(), 50u64.to_be_bytes().to_vec())
+            .expect("put");
+        pa.reseed_from_applied().expect("reseed");
+        assert_eq!(
+            pa.begin_write().expect("bw"),
+            50,
+            "reseed lifts the counter above applied"
         );
     }
 }
