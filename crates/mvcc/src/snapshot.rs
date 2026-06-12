@@ -72,4 +72,26 @@ mod tests {
         );
         assert_eq!(v.expect("no decode error"), None);
     }
+
+    #[test]
+    fn snapshot_equality_boundary_is_inclusive() {
+        // Snapshot(200): ts=201 is above snapshot (skipped), ts=200 is exactly
+        // at snapshot (must be visible), ts=100 is below and must not be
+        // returned.  The payload at ts=200 is a distinct value so the assertion
+        // is unambiguous.
+        let versions = [
+            ver(201, false, vec![Datum::Int4(201)]),
+            ver(200, false, vec![Datum::Int4(200)]),
+            ver(100, false, vec![Datum::Int4(100)]),
+        ];
+        let v = visible_version(
+            Snapshot(200),
+            versions.iter().map(|(t, b)| (*t, b.as_slice())),
+        );
+        assert_eq!(
+            v.expect("no decode error"),
+            Some(vec![Datum::Int4(200)]),
+            "ts=200 row must be visible at Snapshot(200)"
+        );
+    }
 }

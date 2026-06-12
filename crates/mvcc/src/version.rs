@@ -85,7 +85,10 @@ mod tests {
     fn version_value_roundtrip_row_and_tombstone() {
         let row = vec![Datum::Int4(1), Datum::Text("a".into())];
         let bytes = encode_version(false, &row);
-        assert_eq!(decode_version(&bytes).expect("live row roundtrip"), (false, row));
+        assert_eq!(
+            decode_version(&bytes).expect("live row roundtrip"),
+            (false, row)
+        );
         let tomb = encode_version(true, &[]);
         let (deleted, cols) = decode_version(&tomb).expect("tombstone roundtrip");
         assert!(deleted);
@@ -96,6 +99,31 @@ mod tests {
     fn decode_version_rejects_corrupt() {
         assert!(decode_version(&[]).is_err());
         assert!(decode_version(&[99]).is_err()); // bad version byte
+    }
+
+    #[test]
+    fn commit_ts_of_rejects_malformed_keys() {
+        // Missing 8-byte suffix: passing the bare row key (no ts suffix) must fail.
+        assert!(
+            commit_ts_of(7, 42, &kv::key::row_key(7, 42)).is_err(),
+            "row key without ts suffix must be rejected"
+        );
+        // Wrong rowid: prefix is for rowid 42 but we claim rowid 99.
+        assert!(
+            commit_ts_of(7, 99, &version_key(7, 42, 100)).is_err(),
+            "version key for rowid 42 must be rejected when rowid 99 is expected"
+        );
+    }
+
+    #[test]
+    fn tombstone_discards_row_payload() {
+        // Encoding a tombstone with a non-empty row must produce a value that
+        // decodes back as deleted=true with no columns, proving the payload is
+        // intentionally dropped on DELETE.
+        let bytes = encode_version(true, &[Datum::Int4(1), Datum::Text("x".into())]);
+        let (deleted, cols) = decode_version(&bytes).expect("tombstone decode");
+        assert!(deleted, "tombstone flag must be set");
+        assert!(cols.is_empty(), "tombstone must carry no column data");
     }
 
     proptest! {
