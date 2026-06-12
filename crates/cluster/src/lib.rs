@@ -10,6 +10,7 @@ mod store;
 mod types;
 
 pub use cluster::Cluster;
+pub use committer::RaftCommitter;
 pub use network::Switchboard;
 pub use node::Node;
 pub use types::{TypeConfig, WriteBatch};

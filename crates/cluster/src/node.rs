@@ -66,4 +66,27 @@ impl Node {
         sb.register(id, raft.clone());
         Node { id, raft, sm_kv }
     }
+
+    /// Build a replicated `SqlEngine` over this node's applied state machine plus
+    /// a Raft committer. Reads hit `sm_kv` (the applied store); writes propose
+    /// through `raft` (committed == applied to a majority).
+    ///
+    /// The caller MUST call [`executor::SqlEngine::reseed_counters`] on the
+    /// returned engine after this node (re-)acquires leadership and before
+    /// issuing SQL on it, so the xid/sequence counters never regress below what
+    /// a previous leader already handed out. (An automatic reseed via a
+    /// metrics-subscription on leadership change is deferred to D2.)
+    ///
+    /// Each call builds a fresh engine (its own `ProcArray`/`RowLockManager`).
+    /// To share row locks and the running-transaction set across sessions, call
+    /// this once, wrap the engine in an `Arc`, and `connect()` it repeatedly.
+    pub fn engine(&self) -> executor::SqlEngine {
+        executor::SqlEngine::replicated(
+            self.sm_kv.clone() as Arc<dyn kv::Kv>,
+            Arc::new(crate::committer::RaftCommitter {
+                raft: self.raft.clone(),
+            }),
+        )
+        .expect("replicated engine")
+    }
 }

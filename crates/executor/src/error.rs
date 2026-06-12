@@ -28,6 +28,11 @@ pub enum ExecError {
     SerializationFailure,
     /// A deadlock was detected and this transaction was chosen as the victim (40P01).
     Deadlock,
+    /// The write hit a node that is not the Raft leader; the client should retry.
+    NotLeader,
+    /// The write could not reach a majority (partition/timeout); no partial state
+    /// was applied; the client should retry.
+    Unavailable,
 }
 
 impl ExecError {
@@ -58,6 +63,10 @@ impl ExecError {
                 "could not serialize access due to concurrent update",
             ),
             ExecError::Deadlock => PgError::error("40P01", "deadlock detected"),
+            ExecError::NotLeader => {
+                PgError::error("40001", "could not complete: not the leader, retry")
+            }
+            ExecError::Unavailable => PgError::error("08006", "connection failure: no quorum"),
         }
     }
 }

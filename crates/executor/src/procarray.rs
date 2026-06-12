@@ -73,7 +73,6 @@ impl ProcArray {
 
     /// Reseed the in-memory counter from the applied store (called when this node
     /// becomes leader, so it never hands out an xid the old leader already used).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reseed_from_applied(&self) -> Result<(), ExecError> {
         let durable = match self.kv.get(&kv::key::next_xid_key())? {
             Some(b) => u64::from_be_bytes(

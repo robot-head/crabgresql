@@ -540,6 +540,7 @@ dependencies = [
  "executor",
  "kv",
  "openraft",
+ "pgwire",
  "proptest",
  "serde",
  "serde_json",

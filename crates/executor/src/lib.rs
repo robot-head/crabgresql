@@ -87,6 +87,35 @@ impl SqlEngine {
             persist_mode: PersistMode::Durable,
         })
     }
+
+    /// Build an engine whose reads come from `sm_kv` (the applied state machine)
+    /// and whose writes are proposed through `committer` (a RaftCommitter). Uses
+    /// the Replicated persist mode so counters fold into the proposed batch.
+    pub fn replicated(
+        sm_kv: Arc<dyn Kv>,
+        committer: Arc<dyn crate::commit::Committer>,
+    ) -> Result<Self, ExecError> {
+        let procarray = Arc::new(ProcArray::open(
+            Arc::clone(&sm_kv),
+            PersistMode::Replicated,
+        )?);
+        Ok(Self {
+            kv: sm_kv,
+            procarray,
+            seq: Arc::new(SequenceManager::new(PersistMode::Replicated)),
+            lockmgr: Arc::new(RowLockManager::new()),
+            catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
+            committer,
+            persist_mode: PersistMode::Replicated,
+        })
+    }
+
+    /// Reseed counters from the applied store (call when this node becomes leader).
+    pub fn reseed_counters(&self) -> Result<(), ExecError> {
+        self.procarray.reseed_from_applied()?;
+        self.seq.reseed_from_applied();
+        Ok(())
+    }
 }
 
 impl Engine for SqlEngine {

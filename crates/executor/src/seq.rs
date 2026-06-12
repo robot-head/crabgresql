@@ -63,7 +63,6 @@ impl SequenceManager {
 
     /// On leadership change, clear the cache so the next alloc re-seeds from the
     /// applied store (counters seed lazily via `read_seq_kv` on first use).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reseed_from_applied(&self) {
         self.inner.lock().expect("seqmgr").clear();
     }
