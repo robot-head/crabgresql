@@ -97,9 +97,14 @@ impl SqlSession {
             // Best-effort abort record; the versions are already invisible
             // (in-progress in no future snapshot once deregistered), so even if
             // this write is lost the rows never become visible.
-            self.kv
-                .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)])?;
+            let r = self
+                .kv
+                .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Aborted)]);
+            // Deregister even if the abort record failed to write: restart
+            // re-seeds the ProcArray empty and the rows stay invisible (no clog
+            // Committed), so a phantom running xid must not be stranded here.
             self.procarray.finish(xid);
+            r?;
         }
         drop(ctx.writer_guard);
         Ok(())
