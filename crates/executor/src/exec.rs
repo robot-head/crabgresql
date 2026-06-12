@@ -12,7 +12,7 @@ use crate::error::ExecError;
 use crate::session::{Pending, TxnCtx};
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
-/// the sequence read; `SqlSession::read_seq` delegates here.
+/// the sequence read.
 pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError> {
     match kv.get(&kv::key::seq_key(table))? {
         Some(b) => {
@@ -121,8 +121,55 @@ pub(crate) fn execute_dml(
             })
         }
         Statement::Select(s) => exec_select(kv, ctx, s),
-        Statement::Update { .. } => Err(ExecError::Unsupported("UPDATE lands in Task 6".into())),
-        Statement::Delete { .. } => Err(ExecError::Unsupported("DELETE lands in Task 6".into())),
+        Statement::Update {
+            table,
+            assignments,
+            filter,
+        } => {
+            let t = catalog::get_table(kv, table)?;
+            // Resolve each assignment's target column index up front (42703 on miss).
+            let targets: Vec<(usize, &Expr)> = assignments
+                .iter()
+                .map(|(col, expr)| {
+                    t.column_index(col)
+                        .map(|idx| (idx, expr))
+                        .ok_or_else(|| ExecError::UndefinedColumn(col.clone()))
+                })
+                .collect::<Result<_, _>>()?;
+            let mut n: u64 = 0;
+            for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
+                if !row_matches(filter.as_ref(), &t, &row)? {
+                    continue;
+                }
+                let mut next = row.clone();
+                for (idx, expr) in &targets {
+                    let v = crate::eval::eval(expr, Some(&t), &row)?;
+                    next[*idx] = coerce(v, t.columns[*idx].ty)?;
+                }
+                ctx.writes.insert(
+                    (t.id, rowid),
+                    Pending::Row(mvcc::encode_version(false, &next)),
+                );
+                n += 1;
+            }
+            Ok(QueryResult::Command {
+                tag: format!("UPDATE {n}"),
+            })
+        }
+        Statement::Delete { table, filter } => {
+            let t = catalog::get_table(kv, table)?;
+            let mut n: u64 = 0;
+            for (rowid, row) in scan_live_rows(kv, ctx, &t)? {
+                if !row_matches(filter.as_ref(), &t, &row)? {
+                    continue;
+                }
+                ctx.writes.insert((t.id, rowid), Pending::Tombstone);
+                n += 1;
+            }
+            Ok(QueryResult::Command {
+                tag: format!("DELETE {n}"),
+            })
+        }
         _ => Err(ExecError::Unsupported("not a DML statement".into())),
     }
 }
@@ -200,6 +247,24 @@ pub(crate) fn scan_live_rows(
     Ok(out)
 }
 
+/// Evaluate an optional WHERE predicate against a row (NULL => false, like SELECT).
+fn row_matches(
+    filter: Option<&Expr>,
+    table: &catalog::Table,
+    row: &[pgtypes::Datum],
+) -> Result<bool, ExecError> {
+    match filter {
+        None => Ok(true),
+        Some(f) => match crate::eval::eval(f, Some(table), row)? {
+            pgtypes::Datum::Bool(b) => Ok(b),
+            pgtypes::Datum::Null => Ok(false),
+            _ => Err(ExecError::TypeMismatch(
+                "argument of WHERE must be type boolean".into(),
+            )),
+        },
+    }
+}
+
 fn exec_select(kv: &dyn Kv, ctx: &TxnCtx, s: &SelectStmt) -> Result<QueryResult, ExecError> {
     let table: Option<Table> = match &s.from {
         Some(name) => Some(catalog::get_table(kv, name)?),
@@ -222,17 +287,11 @@ fn exec_select(kv: &dyn Kv, ctx: &TxnCtx, s: &SelectStmt) -> Result<QueryResult,
     // Filter, keeping each surviving source row for ORDER BY evaluation.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
-        let keep = match &s.filter {
+        let keep = match table.as_ref() {
+            Some(t) => row_matches(s.filter.as_ref(), t, row)?,
+            // FROM-less SELECT: no table context; WHERE is not supported here
+            // (the parser doesn't produce it), so treat as always-true.
             None => true,
-            Some(f) => match crate::eval::eval(f, table.as_ref(), row)? {
-                Datum::Bool(b) => b,
-                Datum::Null => false,
-                _ => {
-                    return Err(ExecError::TypeMismatch(
-                        "argument of WHERE must be type boolean".into(),
-                    ));
-                }
-            },
         };
         if keep {
             kept.push(row.clone());

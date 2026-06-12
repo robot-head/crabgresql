@@ -22,7 +22,6 @@ pub(crate) enum Pending {
     /// A delete: the row is invisible to this txn and tombstoned at COMMIT.
     /// Constructed by UPDATE/DELETE in Task 6; the read/flush paths already
     /// handle it so the overlay and commit are complete now.
-    #[allow(dead_code)]
     Tombstone,
 }
 
