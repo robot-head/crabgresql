@@ -37,11 +37,17 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
             columns,
             rows,
         } => {
-            // Acquire the write lock BEFORE reading the sequence so the
-            // read-modify-write (read_seq → write_batch with bumped seq) is
-            // atomic with respect to other concurrent INSERTs.  execute() is
-            // a sync fn with no .await, so a std::sync::Mutex guard is safe
-            // here — it is never held across an await point.
+            if rows.is_empty() {
+                return Ok(QueryResult::Command {
+                    tag: "INSERT 0 0".into(),
+                });
+            }
+            // Acquire the write lock BEFORE reading the schema so the full
+            // read-modify-write (get_table → read_seq → read_commit_ts →
+            // write_batch) is atomic with respect to concurrent DDL and
+            // INSERTs.  execute() is a sync fn with no .await, so a
+            // std::sync::Mutex guard is safe here — never held across an await.
+            let _guard = session.write_lock.lock().expect("write lock");
             let t = catalog::get_table(&*session.kv, table)?;
             let target_idx: Vec<usize> = match columns {
                 Some(cols) => cols
@@ -53,7 +59,6 @@ pub(crate) fn execute(session: &SqlSession, stmt: &Statement) -> Result<QueryRes
                     .collect::<Result<_, _>>()?,
                 None => (0..t.columns.len()).collect(),
             };
-            let _guard = session.write_lock.lock().expect("write lock");
             let new_ts = session.read_commit_ts()? + 1;
             let start = session.read_seq(t.id)?;
             let mut rowid = start;
@@ -617,5 +622,23 @@ mod tests {
             .await
             .expect("describe");
         assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_inserts_are_both_visible() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        run(&engine, "INSERT INTO t VALUES (2)").await;
+        let r = &run(&engine, "SELECT id FROM t ORDER BY id").await[0];
+        assert_eq!(rows_of(r).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn select_on_empty_table_sees_no_rows() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        let r = &run(&engine, "SELECT id FROM t").await[0];
+        assert_eq!(rows_of(r).len(), 0);
     }
 }
