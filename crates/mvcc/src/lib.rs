@@ -3,6 +3,7 @@
 //! visibility. The durable store holds only committed versions (SP4); the
 //! commit-status log (clog) arrives with concurrent writers in SP5.
 
+pub mod clog;
 pub mod snapshot;
 pub mod version;
 

@@ -61,6 +61,20 @@ pub fn commit_ts_key() -> Vec<u8> {
     k
 }
 
+/// Key for the global next-transaction-id counter: `/0/meta/next_xid`.
+pub fn next_xid_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"next_xid");
+    k
+}
+
+/// Key for a transaction's commit-status-log entry: `/0/clog/<xid>`.
+pub fn clog_key(xid: u64) -> Vec<u8> {
+    let mut k = system_prefix("clog");
+    k.extend_from_slice(&xid.to_be_bytes());
+    k
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;
@@ -130,5 +144,20 @@ mod tests {
         // User rows use table_id >= 1; system keys use table_id 0.
         assert!(!catalog_key("t").starts_with(&table_prefix(1)));
         assert!(!seq_key(1).starts_with(&table_prefix(1)));
+    }
+
+    #[test]
+    fn xid_and_clog_keys_are_under_table_zero_and_distinct() {
+        let zero = {
+            let mut k = Vec::new();
+            crate::keyenc::put_u32(&mut k, 0);
+            k
+        };
+        assert!(next_xid_key().starts_with(&zero));
+        assert!(clog_key(5).starts_with(&zero));
+        assert_ne!(clog_key(5), clog_key(6));
+        assert_ne!(next_xid_key(), meta_next_table_id_key());
+        // clog keys sort by xid (order-preserving big-endian suffix).
+        assert!(clog_key(5) < clog_key(6));
     }
 }
