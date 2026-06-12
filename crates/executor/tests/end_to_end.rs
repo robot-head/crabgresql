@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use executor::SqlEngine;
 use pgwire::session::SessionConfig;
@@ -172,4 +173,59 @@ async fn parameterized_query_is_unsupported_0a000() {
         .expect("session survives");
     let v: i32 = rows[0].get(0);
     assert_eq!(v, 1);
+}
+
+/// Wire-protocol version of the blocking UPDATE test.
+///
+/// conn1 opens a transaction and locks a row via UPDATE; conn2's UPDATE on
+/// the same row blocks over the wire. After conn1 commits, conn2 completes
+/// and reports exactly 1 affected row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_concurrent_update_blocks_then_succeeds() {
+    // Each connection needs its own port/engine so they share the same engine.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let engine = Arc::new(SqlEngine::new());
+    tokio::spawn(pgwire::server::serve(
+        listener,
+        Arc::clone(&engine),
+        Arc::new(pgwire::session::SessionConfig::trust()),
+    ));
+
+    let conn1 = connect(port).await;
+    let conn2 = connect(port).await;
+
+    // Set up the table.
+    conn1
+        .batch_execute("CREATE TABLE t (id int4, v text)")
+        .await
+        .expect("create");
+    conn1
+        .batch_execute("INSERT INTO t VALUES (1,'orig')")
+        .await
+        .expect("insert");
+
+    // T1: open a transaction and lock row 1.
+    conn1
+        .batch_execute("BEGIN; UPDATE t SET v='a' WHERE id=1")
+        .await
+        .expect("t1 begin+update");
+
+    // T2: issue an UPDATE that will block.
+    let t2 = tokio::spawn(async move {
+        conn2
+            .execute("UPDATE t SET v='b' WHERE id=1", &[])
+            .await
+            .expect("t2 update")
+    });
+
+    // let T2 reach the blocking acquire
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    conn1.batch_execute("COMMIT").await.expect("t1 commit");
+
+    let affected = tokio::time::timeout(Duration::from_secs(10), t2)
+        .await
+        .expect("t2 did not hang")
+        .expect("t2 join");
+    assert_eq!(affected, 1, "t2 must have updated exactly 1 row");
 }
