@@ -1,3 +1,24 @@
+[advisories]
+# Each ignore below is a PRE-EXISTING advisory (not introduced by any feature
+# slice) that we accept with rationale. Revisit when upstream releases a fix.
+ignore = [
+    # --- rustls-webpki 0.102.8, pinned transitively by rustls-rustcrypto 0.0.2-alpha
+    # (our PURE-RUST TLS provider; latest published release is still that alpha, which
+    # requires rustls-webpki ^0.102, so we cannot move to the patched 0.103.x yet).
+    # All four concern X.509 name-constraint validation and CRL parsing/matching.
+    # crabgresql's TLS is server-side only: it presents a server certificate and does
+    # NOT verify client certificates or process CRLs, so these code paths are not
+    # reachable. Tracked for removal once rustls-rustcrypto bumps rustls-webpki.
+    { id = "RUSTSEC-2026-0049", reason = "webpki CRL distribution-point matching; no CRL path in crabgresql server TLS" },
+    { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints; no client-cert verification in crabgresql" },
+    { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints; no client-cert verification in crabgresql" },
+    { id = "RUSTSEC-2026-0104", reason = "webpki CRL parse panic; no CRL path in crabgresql server TLS" },
+    # --- dev-dependency-only (test drivers: sqlx, tokio-postgres). NOT in the shipped tree.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack; only via sqlx-mysql dev-dependency, never shipped" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive dev-dependency only" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dev-dependency only" },
+]
+
 [licenses]
 allow = [
     "PostgreSQL",
