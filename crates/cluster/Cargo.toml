@@ -10,7 +10,7 @@ workspace = true
 [dependencies]
 kv = { workspace = true }
 executor = { workspace = true }
-openraft = { workspace = true }
+openraft = { workspace = true, features = ["storage-v2"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
