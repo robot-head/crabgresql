@@ -6,6 +6,7 @@
 mod error;
 mod eval;
 mod exec;
+mod lockmgr;
 mod procarray;
 mod seq;
 mod session;
