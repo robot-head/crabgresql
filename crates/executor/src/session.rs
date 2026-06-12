@@ -131,10 +131,13 @@ impl SqlSession {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::InTransaction(ctx) => {
                 if let Some(xid) = ctx.xid {
-                    // Record the commit, then release the lock and deregister.
-                    self.kv
-                        .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Committed)])?;
+                    // Record the commit. Deregister xid BEFORE propagating any
+                    // write error so the xid never stays stuck in the running set.
+                    let r = self
+                        .kv
+                        .write_batch(&[mvcc::clog::put_op(xid, XidStatus::Committed)]);
                     self.procarray.finish(xid);
+                    r?;
                 }
                 drop(ctx.writer_guard); // release the writer lock (if held)
                 Ok(QueryResult::Command {
@@ -186,9 +189,18 @@ impl SqlSession {
     }
 
     async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        // DDL is non-transactional: it auto-commits under a short-lived lock.
-        let _guard = self.writer_lock.clone().lock_owned().await;
-        crate::exec::execute_ddl(&*self.kv, stmt)
+        // DDL is non-transactional: it writes through immediately. If the open
+        // transaction already holds the writer lock (it has written), run under
+        // that guard — re-acquiring the non-reentrant writer mutex from the same
+        // task would deadlock. Otherwise take a short-lived guard.
+        let already_held =
+            matches!(&self.state, TxnState::InTransaction(c) if c.writer_guard.is_some());
+        if already_held {
+            crate::exec::execute_ddl(&*self.kv, stmt)
+        } else {
+            let _guard = self.writer_lock.clone().lock_owned().await;
+            crate::exec::execute_ddl(&*self.kv, stmt)
+        }
     }
 
     async fn run_write(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
@@ -247,9 +259,12 @@ impl SqlSession {
                     value: self.procarray.next_xid().to_be_bytes().to_vec(),
                 });
                 ops.push(mvcc::clog::put_op(xid, XidStatus::Committed));
-                self.kv.write_batch(&ops)?;
+                // Deregister xid BEFORE propagating any write error so the xid
+                // never stays stuck in the running set on a commit-batch failure.
+                let r = self.kv.write_batch(&ops);
                 self.procarray.finish(xid);
                 drop(guard);
+                r?;
                 Ok(result)
             }
             TxnState::Failed(_) => unreachable!("guarded in run_one"),
