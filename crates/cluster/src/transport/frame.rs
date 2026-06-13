@@ -15,6 +15,9 @@ where
 {
     let bytes =
         postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if bytes.len() > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
     w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     w.write_all(&bytes).await?;
     w.flush().await?;
