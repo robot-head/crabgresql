@@ -150,6 +150,12 @@ fn write_json<T: serde::Serialize>(
     Ok(())
 }
 
+/// Map an arbitrary error into a state-machine `StorageError` (write path).
+#[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
+fn sm_write_err<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
+    StorageError::from(StorageIOError::write_state_machine(e))
+}
+
 /// Highest stored log entry's `log_id`. Keys are big-endian sorted, so the
 /// last key in the `log/` prefix is the highest index — read only it (O(1)).
 #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
@@ -486,6 +492,9 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
         // keyspace `get` would miss a value still pending in `batch`, so the
         // same counter key appearing twice (or once already in the batch) must
         // fold against this map, not just the durable value.
+        // On first encounter the durable on-disk value seeds the entry; every later
+        // encounter of the same key in this batch folds against the accumulated
+        // in-memory max, never against the now-stale disk value.
         let mut counters: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut new_membership = meta.last_membership.clone();
         let mut last_id = meta.last_applied;
@@ -525,23 +534,20 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
             res.push(());
         }
 
-        fn sm<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
-            StorageError::from(StorageIOError::write_state_machine(e))
-        }
         batch.insert(
             &self.raft,
             SM_APPLIED_KEY,
-            serde_json::to_vec(&last_id).map_err(|e| sm(&e))?,
+            serde_json::to_vec(&last_id).map_err(|e| sm_write_err(&e))?,
         );
         batch.insert(
             &self.raft,
             SM_MEMBERSHIP_KEY,
-            serde_json::to_vec(&new_membership).map_err(|e| sm(&e))?,
+            serde_json::to_vec(&new_membership).map_err(|e| sm_write_err(&e))?,
         );
         // ONE batch (data ops + counters + last_applied + membership) and ONE
         // fsync: data and metadata advance atomically and durably.
-        batch.commit().map_err(|e| sm(&e))?;
-        self.db.persist(PersistMode::SyncAll).map_err(|e| sm(&e))?;
+        batch.commit().map_err(|e| sm_write_err(&e))?;
+        self.db.persist(PersistMode::SyncAll).map_err(|e| sm_write_err(&e))?;
 
         meta.last_applied = last_id;
         meta.last_membership = new_membership;
@@ -573,10 +579,6 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
         let payload: SnapshotPayload = serde_json::from_slice(&stored.data)
             .map_err(|e| StorageIOError::read_snapshot(Some(stored.meta.signature()), &e))?;
 
-        fn sm<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
-            StorageError::from(StorageIOError::write_state_machine(e))
-        }
-
         // A snapshot is authoritative: clear the whole `data` keyspace and
         // overwrite (NOT max-merge), then set the sm/* metadata — all in ONE
         // batch + ONE fsync so the install is atomic and durable.
@@ -594,15 +596,15 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
         batch.insert(
             &self.raft,
             SM_APPLIED_KEY,
-            serde_json::to_vec(&meta.last_log_id).map_err(|e| sm(&e))?,
+            serde_json::to_vec(&meta.last_log_id).map_err(|e| sm_write_err(&e))?,
         );
         batch.insert(
             &self.raft,
             SM_MEMBERSHIP_KEY,
-            serde_json::to_vec(&meta.last_membership).map_err(|e| sm(&e))?,
+            serde_json::to_vec(&meta.last_membership).map_err(|e| sm_write_err(&e))?,
         );
-        batch.commit().map_err(|e| sm(&e))?;
-        self.db.persist(PersistMode::SyncAll).map_err(|e| sm(&e))?;
+        batch.commit().map_err(|e| sm_write_err(&e))?;
+        self.db.persist(PersistMode::SyncAll).map_err(|e| sm_write_err(&e))?;
 
         {
             let mut sm_meta = self.meta.write().await;
@@ -932,6 +934,8 @@ mod tests {
         let dst_dir = temp();
         let dst_store = NodeStore::open(dst_dir.path()).expect("dst open");
         let mut dst = DurableStateMachineStore::open(&dst_store).expect("dst sm");
+        // Seed junk directly into the keyspace (bypassing the Raft apply path) to
+        // simulate pre-existing state that install_snapshot must authoritatively clear.
         dst.sm_kv()
             .put(kv::key::row_key(9, 9), b"junk".to_vec())
             .expect("put junk");
