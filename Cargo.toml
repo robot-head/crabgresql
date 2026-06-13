@@ -33,6 +33,7 @@ unwrap_used = "warn"
 pgwire = { path = "crates/pgwire" }
 pgtypes = { path = "crates/pgtypes" }
 kv = { path = "crates/kv" }
+fjall = "3.1.5"
 mvcc = { path = "crates/mvcc" }
 catalog = { path = "crates/catalog" }
 pgparser = { path = "crates/pgparser" }
@@ -63,3 +64,4 @@ openraft = { version = "0.9", features = ["serde"] }
 async-trait = "0.1"
 stateright = "0.31"
 zerocopy = { version = "0.8", features = ["derive"] }
+tempfile = "3"

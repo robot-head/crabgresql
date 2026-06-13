@@ -4,6 +4,7 @@
 
 mod cluster;
 mod committer;
+mod durable;
 mod network;
 mod node;
 mod store;
