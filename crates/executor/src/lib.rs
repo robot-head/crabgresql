@@ -11,6 +11,7 @@ mod eval;
 mod exec;
 mod lockmgr;
 mod procarray;
+mod read_gate;
 mod seq;
 mod session;
 
@@ -22,6 +23,7 @@ use pgwire::engine::Engine;
 
 pub use commit::{Committer, LocalCommitter};
 pub use error::ExecError;
+pub use read_gate::{Linearizer, LocalLinearizer};
 pub use session::SqlSession;
 
 use crate::lockmgr::RowLockManager;
@@ -51,6 +53,7 @@ pub struct SqlEngine {
     pub(crate) lockmgr: Arc<RowLockManager>,
     pub(crate) catalog_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) committer: Arc<dyn crate::commit::Committer>,
+    pub(crate) linearizer: Arc<dyn crate::read_gate::Linearizer>,
     pub(crate) persist_mode: PersistMode,
 }
 
@@ -84,6 +87,7 @@ impl SqlEngine {
             lockmgr: Arc::new(RowLockManager::new()),
             catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             committer,
+            linearizer: Arc::new(crate::read_gate::LocalLinearizer),
             persist_mode: PersistMode::Durable,
         })
     }
@@ -94,11 +98,9 @@ impl SqlEngine {
     pub fn replicated(
         sm_kv: Arc<dyn Kv>,
         committer: Arc<dyn crate::commit::Committer>,
+        linearizer: Arc<dyn crate::read_gate::Linearizer>,
     ) -> Result<Self, ExecError> {
-        let procarray = Arc::new(ProcArray::open(
-            Arc::clone(&sm_kv),
-            PersistMode::Replicated,
-        )?);
+        let procarray = Arc::new(ProcArray::open(Arc::clone(&sm_kv), PersistMode::Replicated)?);
         Ok(Self {
             kv: sm_kv,
             procarray,
@@ -106,6 +108,7 @@ impl SqlEngine {
             lockmgr: Arc::new(RowLockManager::new()),
             catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             committer,
+            linearizer,
             persist_mode: PersistMode::Replicated,
         })
     }
@@ -129,6 +132,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.lockmgr),
             Arc::clone(&self.catalog_lock),
             Arc::clone(&self.committer),
+            Arc::clone(&self.linearizer),
             self.persist_mode,
         )
     }

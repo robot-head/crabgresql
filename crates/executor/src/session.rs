@@ -50,11 +50,16 @@ pub struct SqlSession {
     lockmgr: Arc<RowLockManager>,
     catalog_lock: Arc<tokio::sync::Mutex<()>>,
     committer: Arc<dyn crate::commit::Committer>,
+    linearizer: Arc<dyn crate::read_gate::Linearizer>,
     persist_mode: crate::PersistMode,
     state: TxnState,
 }
 
 impl SqlSession {
+    // Threads the engine's shared handles (kv, procarray, seq, lockmgr, catalog
+    // lock, committer, linearizer) plus persist mode into a per-connection
+    // session; the count is inherent to the seam, not a smell.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         kv: Arc<dyn Kv>,
         procarray: Arc<ProcArray>,
@@ -62,6 +67,7 @@ impl SqlSession {
         lockmgr: Arc<RowLockManager>,
         catalog_lock: Arc<tokio::sync::Mutex<()>>,
         committer: Arc<dyn crate::commit::Committer>,
+        linearizer: Arc<dyn crate::read_gate::Linearizer>,
         persist_mode: crate::PersistMode,
     ) -> Self {
         Self {
@@ -71,6 +77,7 @@ impl SqlSession {
             lockmgr,
             catalog_lock,
             committer,
+            linearizer,
             persist_mode,
             state: TxnState::Idle,
         }
@@ -83,7 +90,7 @@ impl SqlSession {
             return Err(ExecError::InFailedTransaction);
         }
         let result = match stmt {
-            Statement::Begin { isolation } => self.begin(*isolation),
+            Statement::Begin { isolation } => self.begin(*isolation).await,
             Statement::Commit => self.commit_cmd().await,
             Statement::Rollback => self.rollback_cmd().await,
             Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
@@ -91,7 +98,7 @@ impl SqlSession {
                 self.run_write(stmt).await
             }
             Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
-            Statement::Select(_) => self.run_select(stmt),
+            Statement::Select(_) => self.run_select(stmt).await,
         };
         // Any error inside a transaction block aborts it (PostgreSQL 25P02): the
         // block stays Failed (carrying its ctx, so the xid and any row locks it
@@ -127,7 +134,7 @@ impl SqlSession {
         Ok(())
     }
 
-    fn begin(&mut self, isolation: Option<IsolationLevel>) -> Result<QueryResult, ExecError> {
+    async fn begin(&mut self, isolation: Option<IsolationLevel>) -> Result<QueryResult, ExecError> {
         if matches!(self.state, TxnState::InTransaction(_)) {
             // BEGIN inside a block is a no-op (PostgreSQL warns and keeps going).
             return Ok(QueryResult::Command {
@@ -135,8 +142,12 @@ impl SqlSession {
             });
         }
         let rr = matches!(isolation, Some(IsolationLevel::RepeatableRead));
-        // RR fixes its snapshot at BEGIN; RC leaves a placeholder refreshed per
-        // statement. Either way we capture the current running set now.
+        // RR reuses this snapshot for the whole txn, so confirm a linearizable read
+        // point BEFORE taking it. RC re-snapshots (and re-gates) per statement, so
+        // it leaves a placeholder here and is not gated at BEGIN.
+        if rr {
+            self.linearizer.ensure_readable().await?;
+        }
         let snapshot = self.procarray.snapshot();
         self.state = TxnState::InTransaction(TxnCtx {
             xid: None,
@@ -201,8 +212,8 @@ impl SqlSession {
         })
     }
 
-    fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        let (snapshot, own) = self.read_context()?;
+    async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        let (snapshot, own) = self.read_context().await?;
         crate::exec::execute_read(&*self.kv, &snapshot, own, stmt)
     }
 
@@ -222,6 +233,12 @@ impl SqlSession {
 
         match &self.state {
             TxnState::InTransaction(_) => {
+                // RC re-snapshots per statement → gate now, before any local work.
+                // RR reuses the snapshot fixed and gated at BEGIN.
+                if matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read) {
+                    let lin = Arc::clone(&self.linearizer);
+                    lin.ensure_readable().await?;
+                }
                 // Allocate an xid if the txn has not done a write yet (a FOR
                 // UPDATE in a read-only txn still needs one, like PG).
                 self.ensure_write_xid()?;
@@ -258,6 +275,10 @@ impl SqlSession {
                 .await
             }
             TxnState::Idle => {
+                // Autocommit read takes a fresh snapshot → gate before any local
+                // work (xid allocation, snapshot).
+                let lin = Arc::clone(&self.linearizer);
+                lin.ensure_readable().await?;
                 // Autocommit: allocate an xid, run the locking SELECT, then
                 // immediately release the locks (implicit txn ends at statement
                 // end — there is no open block to hold them).
@@ -286,17 +307,47 @@ impl SqlSession {
 
     /// The snapshot + own-xid a read should use. Autocommit: a fresh snapshot,
     /// no own xid. In a txn: RC re-snapshots per statement, RR reuses its
-    /// snapshot; own xid is the txn's (Some after its first write).
-    fn read_context(&mut self) -> Result<(Snapshot, Option<u64>), ExecError> {
-        match &mut self.state {
-            TxnState::Idle => Ok((self.procarray.snapshot(), None)),
-            TxnState::InTransaction(ctx) => {
-                if !ctx.repeatable_read {
-                    ctx.snapshot = self.procarray.snapshot();
+    /// snapshot; own xid is the txn's (Some after its first write). Gates before
+    /// establishing a fresh snapshot (autocommit + RC); RR was gated at BEGIN.
+    async fn read_context(&mut self) -> Result<(Snapshot, Option<u64>), ExecError> {
+        enum Plan {
+            Auto,
+            RcRefresh,
+            RrReuse,
+        }
+        // Decide the plan under a short borrow, then release it before awaiting
+        // the gate (no `self` borrow held across the await).
+        let plan = match &self.state {
+            TxnState::Idle => Plan::Auto,
+            TxnState::InTransaction(c) => {
+                if c.repeatable_read {
+                    Plan::RrReuse
+                } else {
+                    Plan::RcRefresh
                 }
-                Ok((ctx.snapshot.clone(), ctx.xid))
             }
             TxnState::Failed(_) => unreachable!("guarded in run_one"),
+        };
+        match plan {
+            Plan::Auto => {
+                self.linearizer.ensure_readable().await?;
+                Ok((self.procarray.snapshot(), None))
+            }
+            Plan::RcRefresh => {
+                self.linearizer.ensure_readable().await?;
+                let snap = self.procarray.snapshot();
+                match &mut self.state {
+                    TxnState::InTransaction(c) => {
+                        c.snapshot = snap.clone();
+                        Ok((snap, c.xid))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Plan::RrReuse => match &self.state {
+                TxnState::InTransaction(c) => Ok((c.snapshot.clone(), c.xid)),
+                _ => unreachable!(),
+            },
         }
     }
 

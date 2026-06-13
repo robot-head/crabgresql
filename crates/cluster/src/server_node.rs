@@ -93,8 +93,12 @@ impl ServerNode {
 
         // One shared replicated engine; reseed its counters on the leadership edge.
         let engine = Arc::new(
-            SqlEngine::replicated(sm_kv, Arc::new(RaftCommitter { raft: raft.clone() }))
-                .expect("replicated engine"),
+            SqlEngine::replicated(
+                sm_kv,
+                Arc::new(RaftCommitter { raft: raft.clone() }),
+                Arc::new(executor::LocalLinearizer),
+            )
+            .expect("replicated engine"),
         );
         tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
 

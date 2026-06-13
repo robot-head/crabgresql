@@ -1,0 +1,100 @@
+//! D5: the read gate (`Linearizer`) rejects reads on a deposed leader and admits
+//! them on a healthy one; writes are never gated (they go through the committer).
+use std::sync::Arc;
+
+use executor::{Committer, ExecError, Linearizer, SqlEngine};
+use kv::{Kv, MemKv, WriteOp};
+use pgwire::engine::{Engine, QueryResult, Session};
+
+/// Commits straight to a shared in-memory KV (stands in for RaftCommitter).
+struct MemCommitter {
+    kv: Arc<dyn Kv>,
+}
+#[async_trait::async_trait]
+impl Committer for MemCommitter {
+    async fn commit(&self, ops: Vec<WriteOp>) -> Result<(), ExecError> {
+        self.kv.write_batch(&ops)?;
+        Ok(())
+    }
+}
+
+/// A read gate that always rejects — a deposed/partitioned leader.
+struct DeposedLeader;
+#[async_trait::async_trait]
+impl Linearizer for DeposedLeader {
+    async fn ensure_readable(&self) -> Result<(), ExecError> {
+        Err(ExecError::NotLeader)
+    }
+}
+
+/// A read gate that always admits — a healthy leader.
+struct HealthyLeader;
+#[async_trait::async_trait]
+impl Linearizer for HealthyLeader {
+    async fn ensure_readable(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+fn engine(linearizer: Arc<dyn Linearizer>) -> SqlEngine {
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    SqlEngine::replicated(
+        Arc::clone(&kv),
+        Arc::new(MemCommitter { kv: Arc::clone(&kv) }),
+        linearizer,
+    )
+    .expect("replicated engine")
+}
+
+#[tokio::test]
+async fn deposed_leader_rejects_autocommit_read_with_40001() {
+    let mut s = engine(Arc::new(DeposedLeader)).connect();
+    // DDL + writes are NOT gated (they go through the committer) → succeed.
+    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
+    // The read IS gated → rejected with the retryable 40001, no rows.
+    let err = s
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect_err("read must be rejected on a deposed leader");
+    assert_eq!(err.code, "40001", "deposed-leader read maps to retryable 40001");
+}
+
+#[tokio::test]
+async fn deposed_leader_gates_read_committed_in_txn_select_not_begin() {
+    let mut s = engine(Arc::new(DeposedLeader)).connect();
+    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    // Plain BEGIN is READ COMMITTED → its placeholder snapshot is refreshed per
+    // statement, so BEGIN itself is NOT gated.
+    s.simple_query("BEGIN").await.expect("plain begin is not gated");
+    let err = s
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect_err("RC in-txn select is gated");
+    assert_eq!(err.code, "40001");
+    s.simple_query("ROLLBACK").await.ok();
+}
+
+#[tokio::test]
+async fn deposed_leader_gates_repeatable_read_at_begin() {
+    let mut s = engine(Arc::new(DeposedLeader)).connect();
+    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    // REPEATABLE READ fixes its snapshot at BEGIN, so the gate fires at BEGIN.
+    let err = s
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect_err("RR begin is gated");
+    assert_eq!(err.code, "40001");
+}
+
+#[tokio::test]
+async fn healthy_leader_admits_reads() {
+    let mut s = engine(Arc::new(HealthyLeader)).connect();
+    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
+    let res = s.simple_query("SELECT id FROM t").await.expect("read admitted");
+    match &res[0] {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
