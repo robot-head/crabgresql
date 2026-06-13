@@ -98,3 +98,24 @@ async fn healthy_leader_admits_reads() {
         other => panic!("expected Rows, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn healthy_leader_admits_repeatable_read_in_txn() {
+    let mut s = engine(Arc::new(HealthyLeader)).connect();
+    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
+    // RR gates at BEGIN; a healthy leader admits, and the in-txn SELECT reuses the
+    // begin-gated snapshot (exercises the admit path through the fixed-snapshot branch).
+    s.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("rr begin admitted");
+    let res = s
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect("in-txn read admitted");
+    match &res[0] {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    s.simple_query("COMMIT").await.expect("commit");
+}

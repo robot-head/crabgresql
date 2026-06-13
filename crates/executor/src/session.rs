@@ -233,18 +233,17 @@ impl SqlSession {
 
         match &self.state {
             TxnState::InTransaction(_) => {
-                // RC re-snapshots per statement → gate now, before any local work.
-                // RR reuses the snapshot fixed and gated at BEGIN.
-                if matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read) {
-                    let lin = Arc::clone(&self.linearizer);
-                    lin.ensure_readable().await?;
+                // RC re-snapshots (and re-gates) per statement; RR reuses the
+                // snapshot fixed and gated at BEGIN. Gate iff we re-snapshot.
+                let refresh =
+                    matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
+                if refresh {
+                    // Gate before any local work (xid allocation, snapshot).
+                    self.linearizer.ensure_readable().await?;
                 }
                 // Allocate an xid if the txn has not done a write yet (a FOR
                 // UPDATE in a read-only txn still needs one, like PG).
                 self.ensure_write_xid()?;
-                // RC: re-snapshot before each statement.
-                let refresh =
-                    matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
                 if refresh {
                     let snap = self.procarray.snapshot();
                     if let TxnState::InTransaction(c) = &mut self.state {
@@ -277,8 +276,7 @@ impl SqlSession {
             TxnState::Idle => {
                 // Autocommit read takes a fresh snapshot → gate before any local
                 // work (xid allocation, snapshot).
-                let lin = Arc::clone(&self.linearizer);
-                lin.ensure_readable().await?;
+                self.linearizer.ensure_readable().await?;
                 // Autocommit: allocate an xid, run the locking SELECT, then
                 // immediately release the locks (implicit txn ends at statement
                 // end — there is no open block to hold them).
