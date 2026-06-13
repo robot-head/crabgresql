@@ -8,6 +8,7 @@ mod durable;
 mod network;
 mod node;
 mod store;
+pub mod transport;
 mod types;
 
 pub use cluster::Cluster;
