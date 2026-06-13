@@ -81,18 +81,27 @@ must avoid cross-key write-skew: each transaction appends a globally-unique valu
 
 ```sql
 BEGIN;
-INSERT INTO appends(key, seq, val) VALUES (:k, nextval, :v);
-SELECT val FROM appends WHERE key = :k ORDER BY seq;
+INSERT INTO appends(key, val) VALUES (:k, :v);
+SELECT val FROM appends WHERE key = :k;
 COMMIT;
 ```
 
-`seq` comes from the engine's monotonic sequence, so the list order is Raft's total
-order. Because all writes flow through one Raft log and a single key has no
-write-skew, such a history *is* strict-serializable — so the check **should pass**,
-and any replication / routing / MVCC violation (notably a stale read) shows up as a
-hole in an observed list. (Exact SQL — sequence vs serial column — is an
-implementation detail for the plan; the requirement is a per-key total order
-readable as an ordered list.)
+**Ordering mechanism (verified against the engine).** crabgresql has **no** SQL
+`SERIAL`/`SEQUENCE`/`nextval`. Instead, every INSERT is assigned a monotonic
+internal **rowid** by the `SequenceManager`, allocated on the leader at execution
+time — i.e. in commit order — and rows are stored kv-sorted by `row_key(table, rowid)`.
+A table scan (`scan_live` → `kv.scan_prefix(table_prefix)`) therefore returns rows in
+rowid order, so the unordered `SELECT val FROM appends WHERE key = :k` yields key
+`:k`'s appends **in commit order** with no sequence column and no `ORDER BY`. That
+commit order is the leader's serialization of the Raft log, so the read returns the
+list in its true applied order; the test's stateright reference object treats that
+read order as the linearization order. (The list order thus depends on the engine's
+rowid-ordered scan — the actual storage behavior the test exercises.)
+
+Because all writes flow through one Raft log and a single key has no write-skew, such
+a history *is* strict-serializable — so the check **should pass**, and any
+replication / routing / MVCC violation (notably a stale read) shows up as a hole in
+an observed list.
 
 **Indeterminate outcomes** are handled as the register test does: an indeterminate
 COMMIT → the append is recorded as an invoke-with-no-return (in-flight; the tester
