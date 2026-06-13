@@ -94,15 +94,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
-        with: { tool: cargo-fuzz }
+      # Build cargo-fuzz from source so it targets the gnu host. The prebuilt
+      # (cargo-binstall) artifact is musl, which makes cargo-fuzz default the
+      # build to x86_64-unknown-linux-musl — no std + sanitizer-incompatible.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
       - name: Build all fuzz targets
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Smoke-run each target (bounded)
         run: |
           for t in parse_sql wire_decode decode_row decode_key; do
             echo "::group::fuzz $t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=20 -rss_limit_mb=4096
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=20 -rss_limit_mb=4096
             echo "::endgroup::"
           done
 

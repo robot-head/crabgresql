@@ -19,10 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
-        with: { tool: cargo-fuzz }
+      # Build cargo-fuzz from source so it targets the gnu host (the prebuilt is
+      # musl → no std + sanitizer-incompatible default target).
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
       - name: Fuzz ${{ matrix.target }} (5 min)
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v7
