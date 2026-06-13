@@ -150,20 +150,21 @@ fn write_json<T: serde::Serialize>(
     Ok(())
 }
 
-/// Highest stored log entry's `log_id`, by scanning `log/` (BE keys sort by
-/// index, so the last entry is the highest).
+/// Highest stored log entry's `log_id`. Keys are big-endian sorted, so the
+/// last key in the `log/` prefix is the highest index — read only it (O(1)).
 #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
 fn highest_log_id(ks: &fjall::Keyspace) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-    let mut last = None;
-    for guard in ks.prefix(LOG_PREFIX) {
+    // `fjall::Iter` implements `DoubleEndedIterator`, so `next_back` seeks
+    // directly to the last entry without scanning earlier keys.
+    if let Some(guard) = ks.prefix(LOG_PREFIX).next_back() {
         let (_k, v) = guard
             .into_inner()
             .map_err(|e| StorageIOError::read_logs(&e))?;
         let entry: Entry<TypeConfig> =
             serde_json::from_slice(&v).map_err(|e| StorageIOError::read_logs(&e))?;
-        last = Some(entry.log_id);
+        return Ok(Some(entry.log_id));
     }
-    Ok(last)
+    Ok(None)
 }
 
 impl RaftLogReader<TypeConfig> for Arc<DurableLogStore> {
@@ -299,11 +300,13 @@ impl RaftLogStorage<TypeConfig> for Arc<DurableLogStore> {
                 keys.push(k.to_vec());
             }
         }
+        let purged_bytes =
+            serde_json::to_vec(&Some(log_id)).map_err(|e| StorageIOError::write_logs(&e))?;
         let mut batch = self.db.batch();
         for k in &keys {
             batch.remove(&self.ks, k.as_slice());
         }
-        write_json(&self.ks, PURGED_KEY, &Some(log_id))?;
+        batch.insert(&self.ks, PURGED_KEY, purged_bytes);
         batch.commit().map_err(|e| StorageIOError::write_logs(&e))?;
         {
             let mut cache = self.cache.write().await;
