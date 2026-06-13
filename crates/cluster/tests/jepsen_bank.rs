@@ -216,17 +216,50 @@ async fn run_bank_workload(accounts: i64, procs: usize, ops: usize) -> (Vec<Hist
     // reach a majority of {leader, other-follower} to commit — without moving the
     // leader, so the workload's engine stays valid and the test is deterministic.
     let followers: Vec<u64> = (0..3u64).filter(|&n| n != leader).collect();
+    let lraft = c.node(leader).raft.clone();
     let nemesis_cluster = Arc::clone(&c);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let nemesis_stop = Arc::clone(&stop);
     let nemesis = tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut i = 0usize;
-        while !nemesis_stop.load(std::sync::atomic::Ordering::Relaxed) {
+        while !nemesis_stop.load(Relaxed) {
             let victim = followers[i % followers.len()];
+            // Pause the victim and wait (event-based) for the leader to commit
+            // progress while it is down — the leader keeps quorum via {leader, other
+            // follower}. Bounded; if the workload has finished the wait times out and
+            // the loop re-checks stop. No fixed sleep.
+            let before = lraft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
             nemesis_cluster.pause(victim);
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = lraft
+                .wait(Some(Duration::from_secs(2)))
+                .metrics(
+                    move |m| m.last_applied.map(|l| l.index).unwrap_or(0) > before,
+                    "progress committed under fault",
+                )
+                .await;
+            // Resume and wait for the victim to catch up before perturbing again, so
+            // the fault cadence is paced on real replication progress, not the clock.
             nemesis_cluster.resume(victim);
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            let target = lraft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
+            let vraft = nemesis_cluster.node(victim).raft.clone();
+            let _ = vraft
+                .wait(Some(Duration::from_secs(2)))
+                .metrics(
+                    move |m| m.last_applied.map(|l| l.index).unwrap_or(0) >= target,
+                    "victim caught up before next fault",
+                )
+                .await;
             i += 1;
         }
         // Always leave the cluster healthy for the final read.
@@ -603,13 +636,29 @@ async fn bank_conserves_total_under_crash_restart() {
 /// invoke with NO matching return, which the tester treats as an in-flight op it
 /// may place anywhere or omit — the honest modeling of an unknown outcome.
 async fn run_register_workload() -> (Vec<HistEntry>, bool) {
-    // Long election timers (see `Cluster::new_stable_leader`): this test's
-    // linearizability premise requires the leader to stay fixed. Under a
-    // CPU-starved coverage run the default aggressive timers can miss heartbeats
-    // and trigger a spurious election, moving the leader and producing a stale
-    // read on the old leader (the documented D5 gap) — a false positive here.
+    // The linearizability premise requires the leader to stay FIXED for the whole
+    // run (an ungated stale read on a *deposed* leader is the documented D5 gap, out
+    // of scope here). Stable timers (`new_stable_leader`) make a spurious election
+    // rare, but under an extremely CPU-starved coverage run one can still occur.
+    // Rather than sleep-and-hope, make the test DETERMINISTIC: if the leader's term
+    // advanced during a run (i.e. an election happened), discard that run and retry
+    // on a fresh cluster. Converges; no `sleep`.
+    const ATTEMPTS: usize = 10;
+    for _ in 0..ATTEMPTS {
+        if let Some(result) = try_register_run().await {
+            return result;
+        }
+    }
+    panic!("could not complete a register run with a fixed leader within {ATTEMPTS} attempts");
+}
+
+/// One register run over a fresh cluster. Returns `None` if a spurious election
+/// moved the leader mid-run (the linearizability premise was void), so the caller
+/// retries — keeping the test deterministic without relying on timing.
+async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
     let c = Arc::new(cluster::Cluster::new_stable_leader(3).await);
     let leader = c.wait_for_leader().await;
+    let term0 = c.node(leader).raft.metrics().borrow().current_term;
     let engine = Arc::new(c.node(leader).engine());
     engine.reseed_counters().expect("reseed");
 
@@ -624,17 +673,49 @@ async fn run_register_workload() -> (Vec<HistEntry>, bool) {
             .expect("seed");
     }
 
-    // Light nemesis: pause/resume one follower throughout (leader fixed).
+    // Sleep-free follower-fault nemesis: pause a follower, wait (event-based) for the
+    // workload to commit progress on the leader while it is down, resume, then wait
+    // for the follower to catch up before the next fault. Paced on real progress,
+    // never the clock; the leader keeps quorum throughout (leader + other follower).
     let follower = (0..3u64).find(|&n| n != leader).expect("a follower");
+    let lraft = c.node(leader).raft.clone();
+    let fraft = c.node(follower).raft.clone();
     let nemesis_cluster = Arc::clone(&c);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let nemesis_stop = Arc::clone(&stop);
     let nemesis = tokio::spawn(async move {
-        while !nemesis_stop.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::sync::atomic::Ordering::Relaxed;
+        while !nemesis_stop.load(Relaxed) {
+            let before = lraft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
             nemesis_cluster.pause(follower);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for the workload to make progress under the fault (bounded; if the
+            // workload has finished, the wait times out and the loop re-checks stop).
+            let _ = lraft
+                .wait(Some(Duration::from_secs(2)))
+                .metrics(
+                    move |m| m.last_applied.map(|l| l.index).unwrap_or(0) > before,
+                    "progress committed under fault",
+                )
+                .await;
             nemesis_cluster.resume(follower);
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            let target = lraft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
+            let _ = fraft
+                .wait(Some(Duration::from_secs(2)))
+                .metrics(
+                    move |m| m.last_applied.map(|l| l.index).unwrap_or(0) >= target,
+                    "follower caught up before next fault",
+                )
+                .await;
         }
         nemesis_cluster.heal();
     });
@@ -703,6 +784,19 @@ async fn run_register_workload() -> (Vec<HistEntry>, bool) {
     nemesis.await.expect("nemesis joined");
     c.heal();
 
+    // Did the leader stay fixed for the whole run? If its term advanced or it is no
+    // longer leader, a spurious election happened mid-run and the linearizability
+    // premise (no ungated stale read on a deposed leader) was void — discard this
+    // run so the caller retries on a fresh cluster. This is what makes the test
+    // deterministic instead of timing-dependent.
+    {
+        let m = c.node(leader).raft.metrics();
+        let m = m.borrow();
+        if m.current_term != term0 || m.current_leader != Some(leader) {
+            return None;
+        }
+    }
+
     // Flatten for the returned history (process order is preserved within each
     // thread, which is all the checker requires).
     let history: Vec<HistEntry> = by_process.iter().flatten().cloned().collect();
@@ -742,7 +836,7 @@ async fn run_register_workload() -> (Vec<HistEntry>, bool) {
         }
     }
 
-    (history, tester.is_consistent())
+    Some((history, tester.is_consistent()))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

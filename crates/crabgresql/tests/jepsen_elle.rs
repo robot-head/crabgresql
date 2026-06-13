@@ -128,6 +128,12 @@ fn ev_seq(e: &Event) -> u64 {
 struct Recorder {
     events: Arc<Mutex<Vec<Event>>>,
     seq: Arc<AtomicU64>,
+    /// Count of committed transactions (one per `Event::Return`). A monotonic
+    /// workload-progress signal the fault nemesis paces on instead of a clock.
+    commits: Arc<AtomicU64>,
+    /// Notified on every commit so a waiter wakes the instant progress happens —
+    /// no poll-sleep. See [`Recorder::wait_for_commit_after`].
+    progress: Arc<tokio::sync::Notify>,
 }
 
 impl Recorder {
@@ -136,7 +142,41 @@ impl Recorder {
     }
 
     fn push(&self, e: Event) {
+        let committed = matches!(e, Event::Return { .. });
         self.events.lock().expect("recorder lock").push(e);
+        if committed {
+            // Bump the counter BEFORE notifying so a waiter that wakes always sees
+            // the advanced count (no lost-wakeup window).
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            self.progress.notify_waiters();
+        }
+    }
+
+    fn committed(&self) -> u64 {
+        self.commits.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the committed-transaction count exceeds `baseline`, or `done`
+    /// reports the workload finished, bounded by `timeout`. Event-driven: each
+    /// commit notifies, so this returns the instant real progress happens rather
+    /// than after a fixed "stable window". The `notified()` future is registered
+    /// *before* re-checking the count, so a commit racing the check cannot be lost.
+    async fn wait_for_commit_after(
+        &self,
+        baseline: u64,
+        timeout: Duration,
+        done: impl Fn() -> bool,
+    ) {
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.progress.notified();
+                if self.committed() > baseline || done() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
     }
 
     fn take_sorted(&self) -> Vec<Event> {
@@ -501,14 +541,21 @@ async fn list_append_is_strict_serializable_under_follower_faults() {
                 c.control(id, ControlRequest::Heal).await;
             }
         }
-        // Stable window between faults. Under D5 every in-txn read does a ReadIndex
-        // quorum round-trip (plus apply-wait), so a gated append needs an
-        // uninterrupted window to commit; the cluster keeps quorum throughout
-        // (only a single follower is ever faulted), so appends started here
-        // complete. Without this the nemesis re-faults before a gated append
-        // finishes — on a CPU-starved CI runner (worse under llvm-cov coverage)
-        // that starved the workload to ~1 commit and tripped the progress gate.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Pace the next fault on real workload progress, not the clock. Under D5
+        // every in-txn read does a ReadIndex quorum round-trip (plus apply-wait), so
+        // a gated append needs an uninterrupted window to commit; the cluster keeps
+        // quorum throughout (only a single follower is ever faulted), so an append
+        // started in this window completes. We wait (event-driven) for at least one
+        // more commit before re-faulting rather than guessing a stable-window
+        // duration — on a CPU-starved CI runner a fixed sleep either flaked (re-
+        // faulted mid-append, starving the workload to ~1 commit) or wasted time.
+        // Bounded so a genuinely stuck workload fails fast; returns early once all
+        // workers are done (the trailing MIN_ROUNDS faults need no progress).
+        let baseline = rec.committed();
+        rec.wait_for_commit_after(baseline, Duration::from_secs(20), || {
+            workers.iter().all(|w| w.is_finished())
+        })
+        .await;
         round += 1;
     }
     for w in workers {
