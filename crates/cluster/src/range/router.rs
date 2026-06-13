@@ -120,20 +120,32 @@ impl RangeRouter {
             // Autocommit: route each statement independently to its target range
             // (table-bearing -> its range; otherwise range 0).
             Pin::None => self.run_on(pinning.unwrap_or(0), stmt).await,
-            // First table-bearing statement of the txn pins it (even to range 0).
+            // The first table-bearing statement of the txn pins it to that
+            // statement's range — even range 0. Thereafter a table-bearing
+            // statement on a *different* range is rejected (the `Pin::Range` arm
+            // below, SQLSTATE 0A000), so a txn whose first DML is on range 0 is
+            // correctly held single-range.
+            //
+            // KNOWN D3a LIMITATION (no data-integrity or durability impact; full
+            // cross-range / 2PC semantics are deferred to D3b): if a txn opened
+            // with BEGIN runs only range-0 work (DDL / FROM-less SELECT) — staying
+            // `Pin::Open` — and then its first *table-bearing* statement lands on a
+            // NON-range-0 range, the BEGIN executed only on range 0's `SqlSession`,
+            // so the data range's session is still `TxnState::Idle`. That DML
+            // therefore runs through `run_write`'s AUTOCOMMIT branch (commits at
+            // once in a single Raft batch) instead of being held until COMMIT, and
+            // a later ROLLBACK on that range is a no-op (the row already committed).
+            // The row still commits atomically and durably through the correct
+            // range's consensus — only cross-range transactionality is loose. This
+            // mirrors existing behavior: DDL is already non-transactional
+            // (`run_ddl`) and a FROM-less SELECT carries no transactional payload.
             Pin::Open => {
                 let exec = match pinning {
                     Some(r) => {
                         self.pin = Pin::Range(r);
                         r
                     }
-                    // DDL / FROM-less SELECT: run on range 0, stay unpinned. D3a
-                    // limitation: if such a txn later pins to a data range, that
-                    // statement runs auto-committed on the data range's session
-                    // (which never saw this BEGIN). It still commits durably and
-                    // atomically through that range's Raft; only cross-range
-                    // transactionality is loose. D3b tightens this.
-                    None => 0,
+                    None => 0, // DDL / FROM-less SELECT: run on range 0, stay unpinned.
                 };
                 self.run_on(exec, stmt).await
             }
