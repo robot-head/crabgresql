@@ -6,6 +6,7 @@ pub mod addr;
 mod cluster;
 mod committer;
 mod durable;
+mod linearizer;
 mod network;
 mod node;
 pub mod route;
@@ -16,6 +17,7 @@ mod types;
 
 pub use cluster::Cluster;
 pub use committer::RaftCommitter;
+pub use linearizer::RaftLinearizer;
 pub use network::Switchboard;
 pub use node::Node;
 pub use types::{TypeConfig, WriteBatch};

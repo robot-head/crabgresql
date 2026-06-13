@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::committer::RaftCommitter;
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
+use crate::linearizer::RaftLinearizer;
 use crate::transport::client::TcpRaftNetwork;
 use crate::transport::partition::PartitionState;
 use crate::transport::server::{ShutdownSignal, serve_node_protocol};
@@ -93,8 +94,12 @@ impl ServerNode {
 
         // One shared replicated engine; reseed its counters on the leadership edge.
         let engine = Arc::new(
-            SqlEngine::replicated(sm_kv, Arc::new(RaftCommitter { raft: raft.clone() }))
-                .expect("replicated engine"),
+            SqlEngine::replicated(
+                sm_kv,
+                Arc::new(RaftCommitter { raft: raft.clone() }),
+                Arc::new(RaftLinearizer { raft: raft.clone() }),
+            )
+            .expect("replicated engine"),
         );
         tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
 

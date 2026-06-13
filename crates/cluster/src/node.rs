@@ -122,6 +122,9 @@ impl Node {
             Arc::new(crate::committer::RaftCommitter {
                 raft: self.raft.clone(),
             }),
+            Arc::new(crate::linearizer::RaftLinearizer {
+                raft: self.raft.clone(),
+            }),
         )
         .expect("replicated engine")
     }
