@@ -7,6 +7,7 @@ mod committer;
 mod durable;
 mod network;
 mod node;
+pub mod server_node;
 mod store;
 pub mod transport;
 mod types;
