@@ -100,9 +100,17 @@ async fn isolating_leader_elects_new_leader_no_xid_reuse() {
     .await
     .expect("seed");
 
+    // Capture the seed's log index so we can wait for the new leader to APPLY it
+    // before reading sm_kv. Election gives the new leader the committed entry in
+    // its log, but apply lags the leadership signal — a bare read raced under the
+    // slower llvm-cov instrumented run.
+    let commit_idx = c.node(l0).raft.metrics().borrow().last_log_index;
     c.isolate(l0);
     let l1 = c.wait_for_leader_excluding(l0).await;
     assert_ne!(l1, l0, "a different node must lead after isolation");
+    if let Some(idx) = commit_idx {
+        applied_to(c.node(l1), idx).await;
+    }
 
     // The new leader's applied next_xid is still >= 10 (durable through Raft).
     let v = c
