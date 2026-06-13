@@ -202,7 +202,10 @@ async fn runtime_join_then_leave() {
 
     // Spawn a 4th node (id 3), add it as a learner, then promote it into the group.
     c.add_node(3).await;
-    let addr3 = c.nodes[3].node_addr.clone();
+    // Pack node|sql into the learner's BasicNode.addr so leader-routing can resolve
+    // its SQL port if it ever becomes leader (a bare node addr would make
+    // sql_addr_part return None → a follower would drop the routed client).
+    let addr3 = cluster::addr::pack(&c.nodes[3].node_addr, &c.nodes[3].sql_addr);
     assert_ctl_ok(c.control(leader, harness::ctl_add_learner(3, addr3)).await);
     assert_ctl_ok(
         c.control(leader, harness::ctl_change_membership(vec![0, 1, 2, 3]))
