@@ -75,52 +75,101 @@ impl MultiRangeCluster {
         self.groups[0].nodes[leader as usize].sm_kv.clone()
     }
 
-    /// Block until `range` has a stable leader; return its node id. A node counts
-    /// as leader only if it both reports `state == Leader` and names itself as
-    /// `current_leader`, so a stranded ex-leader's stale view isn't trusted.
+    /// Await a stable, self-confirming leader for `range` and return its id, using
+    /// openraft's event-based `wait` (no polling/sleep). Races a `wait` per replica
+    /// for "this node reports `state == Leader` and names itself `current_leader`"
+    /// and returns the first to satisfy it. Self-confirmation (not just some node's
+    /// `current_leader` view) is essential: a just-resumed ex-leader transiently
+    /// still names *itself* leader, so a naive `current_leader.is_some()` read can
+    /// return a stale id during churn. Bounded per replica so a stuck group fails
+    /// the test instead of hanging.
     pub async fn wait_for_leader(&self, range: RangeId) -> NodeId {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            for node in &self.groups[range as usize].nodes {
-                let m = node.raft.metrics().borrow().clone();
-                if m.state == ServerState::Leader && m.current_leader == Some(m.id) {
-                    return m.id;
-                }
+        let mut set = tokio::task::JoinSet::new();
+        for node in &self.groups[range as usize].nodes {
+            // A paused node's metrics are frozen, so it still self-reports `Leader`;
+            // routing a write to it would block forever. Never treat it as leader.
+            if self.sb.is_paused(node.id) {
+                continue;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "range {range} elected no leader"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let raft = node.raft.clone();
+            let id = node.id;
+            set.spawn(async move {
+                raft.wait(Some(Duration::from_secs(10)))
+                    .metrics(
+                        move |m| m.state == ServerState::Leader && m.current_leader == Some(id),
+                        "self-confirmed leader",
+                    )
+                    .await
+                    .map(|_| id)
+                    .ok()
+            });
         }
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(id)) = res {
+                return id; // remaining waiters are aborted when `set` drops
+            }
+        }
+        panic!("no node self-confirmed as leader for range {range} within the bound");
     }
 
-    /// Block until `range` has a stable leader that is **not** `old`, returning its
-    /// id. Mirrors the single-range `Cluster::wait_for_leader_excluding`: a *paused*
-    /// node still reports itself `state == Leader` in its own metrics (pausing only
-    /// drops its RPCs — openraft never tells it to step down), and the naive
-    /// [`wait_for_leader`] scans node ids in order and would return that stale
-    /// ex-leader. After pausing/isolating `old`, this is the correct probe for "the
-    /// surviving majority re-elected someone else": it requires a node `id != old`
-    /// that both reports `Leader` and names itself, ignoring `old` entirely. Bounded
-    /// so a stuck group fails the test instead of hanging.
+    /// Await a leader for `range` that is **not** `old`, returning its id, using
+    /// openraft's event-based `wait`. A *paused* node still reports itself `Leader`
+    /// in its own metrics (pausing only drops its RPCs — openraft never tells it to
+    /// step down), so after pausing/isolating `old` we must probe a node OTHER than
+    /// `old` and wait until it observes a leader `l != old`. A probe stranded with
+    /// `old` in the minority would time out, so we try the next probe. Bounded so a
+    /// stuck group fails the test, never hangs. Mirrors the single-range
+    /// `Cluster::wait_for_leader_excluding`.
     pub async fn wait_for_leader_excluding(&self, range: RangeId, old: NodeId) -> NodeId {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            for node in &self.groups[range as usize].nodes {
-                if node.id == old {
-                    continue;
-                }
-                let m = node.raft.metrics().borrow().clone();
-                if m.state == ServerState::Leader && m.current_leader == Some(m.id) && m.id != old {
-                    return m.id;
-                }
+        let nodes = &self.groups[range as usize].nodes;
+        for probe in 0..nodes.len() as u64 {
+            if probe == old {
+                continue;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "range {range} elected no leader excluding {old}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let observed = nodes[probe as usize]
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |m| m.current_leader.is_some_and(|l| l != old),
+                    "new leader excluding old",
+                )
+                .await;
+            if let Ok(m) = observed
+                && let Some(l) = m.current_leader.filter(|&l| l != old)
+            {
+                return l;
+            }
+        }
+        panic!("no new leader (excluding {old}) for range {range} within the bound");
+    }
+
+    /// Await every replica of `range` applying up to the leader's current applied
+    /// index — i.e. the latest committed write is visible on every node — using
+    /// openraft's event-based `wait` (no polling/sleep). Bounded per node. Lets a
+    /// test assert on follower stores deterministically instead of racing apply.
+    pub async fn wait_for_replication(&self, range: RangeId) {
+        let leader = self.wait_for_leader(range).await;
+        let target = self.groups[range as usize].nodes[leader as usize]
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for node in &self.groups[range as usize].nodes {
+            // A paused node can't apply; don't wait on it (the caller resumes it
+            // before relying on its store).
+            if self.sb.is_paused(node.id) {
+                continue;
+            }
+            node.raft
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |m| m.last_applied.map(|l| l.index).unwrap_or(0) >= target,
+                    "follower caught up to leader's applied index",
+                )
+                .await
+                .expect("replication within bound");
         }
     }
 

@@ -117,6 +117,18 @@ impl Switchboard {
         }
     }
 
+    /// True if `id` is currently paused (crashed). Test harnesses use this to avoid
+    /// resolving a *paused* node as a range leader: a paused node's Raft metrics are
+    /// frozen, so it still self-reports `Leader`, and a write routed to it would
+    /// block forever (it can neither commit nor step down).
+    pub fn is_paused(&self, id: NodeId) -> bool {
+        self.faults
+            .lock()
+            .expect("switchboard faults")
+            .paused
+            .contains(&id)
+    }
+
     /// True if an RPC from `from` to `to` should be dropped: either endpoint is
     /// paused, or the link between them is cut.
     fn blocked(&self, from: NodeId, to: NodeId) -> bool {
