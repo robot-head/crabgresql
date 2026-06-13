@@ -1,16 +1,17 @@
 //! One replica: a Raft instance plus its applied state-machine store.
 //!
 //! A `Node` is built but not yet a cluster member — [`Cluster`] initializes the
-//! voting group separately. The `sm_kv` handle is the same `Arc<MemKv>` the
+//! voting group separately. The `sm_kv` handle is a shared `Arc<dyn kv::Kv>` the
 //! state machine applies committed writes into, so tests (and later the SQL
-//! engine) can read replicated state directly.
+//! engine) can read replicated state directly. For in-memory nodes it wraps a
+//! `MemKv`; for durable nodes it is a `KeyspaceKv` over the fjall `data`
+//! keyspace.
 //!
 //! [`Cluster`]: crate::cluster::Cluster
 
 use std::sync::Arc;
 
-use kv::MemKv;
-
+use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
 use crate::network::Switchboard;
 use crate::store::{LogStore, StateMachineStore};
 use crate::types::{NodeId, TypeConfig};
@@ -22,8 +23,13 @@ pub struct Node {
     /// The openraft handle used to propose writes and inspect metrics.
     pub raft: openraft::Raft<TypeConfig>,
     /// Shared, committed application state (the same `Arc` the state machine
-    /// applies into). Cloning is cheap and reflects applied writes live.
-    pub sm_kv: Arc<MemKv>,
+    /// applies into). Cloning is cheap and reflects applied writes live. For
+    /// in-memory nodes this wraps a `MemKv`; for durable nodes it is a
+    /// `KeyspaceKv` over the fjall `data` keyspace.
+    pub sm_kv: Arc<dyn kv::Kv>,
+    /// Persistence directory for durable nodes (`Some`), or `None` for
+    /// in-memory nodes. Used by `Cluster::restart` to reopen the node.
+    pub dir: Option<std::path::PathBuf>,
 }
 
 impl Node {
@@ -55,7 +61,7 @@ impl Node {
 
         let log = Arc::new(LogStore::default());
         let sm = Arc::new(StateMachineStore::default());
-        let sm_kv = sm.sm_kv();
+        let sm_kv = sm.sm_kv() as Arc<dyn kv::Kv>;
 
         // The split-storage traits are implemented for `Arc<LogStore>` and
         // `Arc<StateMachineStore>`, which is exactly what `Raft::new` wants.
@@ -64,7 +70,37 @@ impl Node {
             .expect("raft::new");
 
         sb.register(id, raft.clone());
-        Node { id, raft, sm_kv }
+        Node {
+            id,
+            raft,
+            sm_kv,
+            dir: None,
+        }
+    }
+
+    /// Build a durable node whose log + state machine persist under `dir`. Reopening
+    /// `dir` after a drop recovers the node (fjall journal replay + openraft resume).
+    pub async fn start_durable(
+        id: NodeId,
+        sb: Switchboard,
+        dir: std::path::PathBuf,
+        config: openraft::Config,
+    ) -> Self {
+        let config = Arc::new(config.validate().expect("valid raft config"));
+        let store = NodeStore::open(&dir).expect("open node store");
+        let log = DurableLogStore::open(&store).expect("durable log");
+        let sm = DurableStateMachineStore::open(&store).expect("durable sm");
+        let sm_kv = sm.sm_kv();
+        let raft = openraft::Raft::new(id, config, sb.for_node(id), log, sm)
+            .await
+            .expect("raft::new");
+        sb.register(id, raft.clone());
+        Node {
+            id,
+            raft,
+            sm_kv,
+            dir: Some(dir),
+        }
     }
 
     /// Build a replicated `SqlEngine` over this node's applied state machine plus
@@ -82,7 +118,7 @@ impl Node {
     /// this once, wrap the engine in an `Arc`, and `connect()` it repeatedly.
     pub fn engine(&self) -> executor::SqlEngine {
         executor::SqlEngine::replicated(
-            self.sm_kv.clone() as Arc<dyn kv::Kv>,
+            self.sm_kv.clone(),
             Arc::new(crate::committer::RaftCommitter {
                 raft: self.raft.clone(),
             }),

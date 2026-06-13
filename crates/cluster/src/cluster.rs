@@ -2,6 +2,7 @@
 //! and inject faults via the Switchboard.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use openraft::{BasicNode, ServerState, SnapshotPolicy};
@@ -43,6 +44,21 @@ impl Cluster {
         Self::build(n, config).await
     }
 
+    /// Like [`Cluster::new`], but with long election timers so a CPU-starved run
+    /// (e.g. coverage instrumentation on a small CI runner) cannot miss heartbeats
+    /// and trigger a spurious election that moves the leader. Leader-stability-
+    /// sensitive tests (the register linearizability check, whose fixed-leader
+    /// premise a leader change would void) use this instead of [`Cluster::new`].
+    pub async fn new_stable_leader(n: u64) -> Self {
+        let config = openraft::Config {
+            heartbeat_interval: 300,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
+            ..Default::default()
+        };
+        Self::build(n, config).await
+    }
+
     /// Build `n` nodes with the given Raft `config` and initialize the group.
     async fn build(n: u64, config: openraft::Config) -> Self {
         let sb = Switchboard::new();
@@ -56,9 +72,60 @@ impl Cluster {
         Self { nodes, sb }
     }
 
+    /// Build `n` durable nodes under `base_dir/node-<id>` and initialize the group.
+    pub async fn durable(n: u64, base_dir: &Path) -> Self {
+        let sb = Switchboard::new();
+        let mut nodes = Vec::new();
+        for id in 0..n {
+            let dir = base_dir.join(format!("node-{id}"));
+            std::fs::create_dir_all(&dir).expect("mkdir node");
+            nodes.push(Node::start_durable(id, sb.clone(), dir, Node::default_config()).await);
+        }
+        let members: BTreeMap<NodeId, BasicNode> =
+            (0..n).map(|id| (id, BasicNode::default())).collect();
+        nodes[0].raft.initialize(members).await.expect("initialize");
+        Self { nodes, sb }
+    }
+
     /// Borrow the node with the given id.
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id as usize]
+    }
+
+    /// Restart node `id`: fully shut down and DROP the old replica (closing its
+    /// fjall `Database` so the on-disk lock is released), then reopen from its dir
+    /// (journal replay + openraft resume) and re-register. Models a clean bounce.
+    ///
+    /// The drop-before-reopen ordering is mandatory: fjall locks the data directory,
+    /// so two `Database` handles on the same path cannot coexist. We `shutdown()` the
+    /// core (joining the core task, which synchronously drops the log-store `Database`
+    /// Arc), `deregister` the switchboard's handle, and drop the old `Node` (dropping
+    /// `sm_kv`'s `Database` Arc). The state-machine `Database` Arc is released slightly
+    /// later: openraft's SM-worker task is not joined by `shutdown()`, so it drops its
+    /// Arc asynchronously once its command channel closes (a microsecond-scale,
+    /// I/O-free path). What actually guarantees the reopen succeeds is fjall's lock
+    /// acquisition, which retries (3×100ms) when `<dir>/.lock` is still held — a window
+    /// that dwarfs the worker-drop latency, so by reopen time the lock is free.
+    ///
+    /// Panics if `id` is an in-memory node (no `dir`).
+    pub async fn restart(&mut self, id: NodeId) {
+        let i = id as usize;
+        let dir = self.nodes[i].dir.clone().expect("durable node has a dir");
+        // Take ownership of the old node out of the vec (remove+insert at the same
+        // index preserves order and keeps `nodes[id]` stable).
+        let old = self.nodes.remove(i);
+        old.raft.shutdown().await.ok(); // join the core; releases the log-store Arc
+        self.sb.deregister(id); // drop the switchboard's (now-dead) handle
+        drop(old); // drop sm_kv's Database Arc (SM-worker Arc drops just after)
+        let new = Node::start_durable(id, self.sb.clone(), dir, Node::default_config()).await;
+        self.nodes.insert(i, new);
+    }
+
+    /// Crash + restart node `id`. In-process we cannot truly kill mid-fsync; fjall's
+    /// fsync-before-ack plus journal replay give the same guarantee as power loss for
+    /// already-acked writes, so the nemesis form reduces to a hard reopen.
+    pub async fn crash_restart(&mut self, id: NodeId) {
+        self.restart(id).await;
     }
 
     /// Await a stable leader and return its id. Bounded so a stuck group fails

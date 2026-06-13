@@ -9,5 +9,5 @@ pub mod rowenc;
 pub mod store;
 
 pub use error::KvError;
-pub use fjall_store::FjallKv;
+pub use fjall_store::{FjallKv, KeyspaceKv};
 pub use store::{Kv, MemKv, WriteOp};

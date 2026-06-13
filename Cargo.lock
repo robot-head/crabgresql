@@ -539,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "executor",
+ "fjall",
  "kv",
  "openraft",
  "pgwire",
@@ -546,6 +547,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stateright",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
