@@ -366,6 +366,18 @@ async fn append_txn(
         let _ = client.simple_query("ROLLBACK").await;
         return false;
     }
+    // Serialize concurrent same-key appends so the workload is strict-serializable
+    // under snapshot isolation (without this, two concurrent appends can each
+    // snapshot-miss the other — a real SI anomaly the checker correctly flags).
+    if !stmt(
+        client,
+        &format!("SELECT key FROM anchor WHERE key = {key} FOR UPDATE"),
+    )
+    .await
+    {
+        let _ = client.simple_query("ROLLBACK").await;
+        return false;
+    }
     if !stmt(
         client,
         &format!("INSERT INTO appends(key, val) VALUES ({key}, {val})"),
@@ -423,7 +435,17 @@ async fn list_append_is_strict_serializable_under_follower_faults() {
         setup
             .simple_query("CREATE TABLE appends (key int8, val int8)")
             .await
-            .expect("create");
+            .expect("create appends");
+        setup
+            .simple_query("CREATE TABLE anchor (key int8)")
+            .await
+            .expect("create anchor");
+        for k in 0..KEYS {
+            setup
+                .simple_query(&format!("INSERT INTO anchor VALUES ({k})"))
+                .await
+                .expect("seed anchor");
+        }
     }
     let rec = Recorder::default();
     let n_nodes = c.len();
@@ -572,6 +594,15 @@ async fn leader_failover_surfaces_stale_read_d5_gap() {
                 .simple_query("CREATE TABLE appends (key int8, val int8)")
                 .await
                 .expect("create");
+            // anchor table required by append_txn's FOR UPDATE per-key lock.
+            setup
+                .simple_query("CREATE TABLE anchor (key int8)")
+                .await
+                .expect("create anchor");
+            setup
+                .simple_query(&format!("INSERT INTO anchor VALUES ({KEY})"))
+                .await
+                .expect("seed anchor");
         }
         let v1 = 1;
         let ok1 = append_txn(&c.pg(l).await, &rec, 0, KEY, v1).await;
