@@ -5,10 +5,26 @@ use executor::SqlEngine;
 use pgwire::session::SessionConfig;
 use tokio::net::TcpListener;
 
-/// crabgresql node binary. SP1: serves the stub engine.
+/// crabgresql — a replicated PostgreSQL-wire-compatible database.
 #[derive(Parser, Debug)]
 #[command(version)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Run a replicated durable Raft node.
+    Node(NodeArgs),
+}
+
+/// Arguments for the default serve mode (no subcommand).
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:5433")]
     listen: String,
@@ -32,6 +48,34 @@ struct Args {
     /// Directory for durable storage. Absent → ephemeral in-memory engine.
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for the `node` subcommand.
+#[derive(clap::Args, Debug)]
+struct NodeArgs {
+    /// This node's Raft id.
+    #[arg(long)]
+    id: u64,
+
+    /// host:port the node-protocol listener binds (Raft RPCs + control).
+    #[arg(long)]
+    node_addr: String,
+
+    /// host:port the pgwire SQL listener binds.
+    #[arg(long)]
+    sql_addr: String,
+
+    /// Directory for this node's durable store.
+    #[arg(long)]
+    data_dir: std::path::PathBuf,
+
+    /// Repeatable: id@host:port for every member (including self).
+    #[arg(long = "peer", value_name = "ID@ADDR")]
+    peers: Vec<String>,
+
+    /// When set, this node initializes the voting group once every peer is up.
+    #[arg(long)]
+    bootstrap: bool,
 }
 
 fn tls_acceptor(
@@ -60,7 +104,14 @@ async fn main() -> std::io::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Node(args)) => run_node(args).await,
+        None => run_serve(cli.serve).await,
+    }
+}
+
+async fn run_serve(args: ServeArgs) -> std::io::Result<()> {
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("crabgresql listening on {}", args.listen);
     let tls = match (&args.tls_cert, &args.tls_key) {
@@ -78,7 +129,56 @@ async fn main() -> std::io::Result<()> {
     pgwire::server::serve_tls(listener, engine, Arc::new(session_config), tls).await
 }
 
-fn build_session_config(args: &Args) -> std::io::Result<SessionConfig> {
+async fn run_node(a: NodeArgs) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let peers: Vec<(u64, String)> = a
+        .peers
+        .iter()
+        .map(|s| {
+            s.split_once('@')
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("--peer {s:?}: expected ID@ADDR (e.g. 1@127.0.0.1:7001)"),
+                    )
+                })
+                .and_then(|(id_str, addr)| {
+                    id_str
+                        .parse::<u64>()
+                        .map_err(|e| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("--peer {s:?}: id is not a u64: {e}"),
+                            )
+                        })
+                        .map(|id| (id, addr.to_string()))
+                })
+        })
+        .collect::<std::io::Result<_>>()?;
+
+    tracing::info!(
+        id = a.id,
+        node_addr = %a.node_addr,
+        sql_addr = %a.sql_addr,
+        "crabgresql node starting"
+    );
+
+    let cfg = cluster::server_node::NodeConfig {
+        id: a.id,
+        node_addr: a.node_addr,
+        sql_addr: a.sql_addr,
+        data_dir: a.data_dir,
+        peers,
+        bootstrap: a.bootstrap,
+    };
+
+    let node = cluster::server_node::ServerNode::start(cfg).await?;
+    node.shutdown.wait().await;
+    Ok(())
+}
+
+fn build_session_config(args: &ServeArgs) -> std::io::Result<SessionConfig> {
     use std::io::{Error, ErrorKind};
     match args.auth.as_str() {
         "trust" => Ok(SessionConfig::trust()),
