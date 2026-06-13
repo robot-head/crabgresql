@@ -53,6 +53,20 @@ fn rowcount(r: &QueryResult) -> usize {
     }
 }
 
+/// After a failover, wait for `node` (the new leader) to APPLY up to `idx` — the
+/// pre-failover leader's last log index, captured before isolation. Winning the
+/// election places the committed entries in the new leader's log, but apply lags
+/// the leadership signal, so reading `sm_kv` immediately races (it did on CI).
+async fn wait_applied(node: &cluster::Node, idx: Option<u64>) {
+    if let Some(i) = idx {
+        node.raft
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(i), "new leader applied pre-failover commits")
+            .await
+            .expect("apply catch-up");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (a) CRUD over Raft matches single-node
 // ---------------------------------------------------------------------------
@@ -101,9 +115,11 @@ async fn committed_data_survives_leader_failover() {
     }
 
     // Kill the leader; a surviving-majority node must take over.
+    let commit_idx = c.node(l0).raft.metrics().borrow().last_log_index;
     c.isolate(l0);
     let l1 = c.wait_for_leader_excluding(l0).await;
     assert_ne!(l1, l0, "a new, different leader took over");
+    wait_applied(c.node(l1), commit_idx).await;
 
     let e = c.node(l1).engine();
     e.reseed_counters().expect("reseed");
@@ -253,10 +269,15 @@ async fn committed_for_update_bumps_next_xid_across_failover() {
         "leader's applied next_xid ({x_l0}) did not advance past the committed FOR UPDATE xid ({for_update_xid})"
     );
 
-    // Fail the leader over; a surviving-majority node takes over.
+    // Fail the leader over; a surviving-majority node takes over. Capture the
+    // commit's log index first so we can wait for the new leader to APPLY it
+    // before reading sm_kv (election gives it the entry; apply lags — this read
+    // raced on CI otherwise).
+    let commit_idx = c.node(l0).raft.metrics().borrow().last_log_index;
     c.isolate(l0);
     let l1 = c.wait_for_leader_excluding(l0).await;
     assert_ne!(l1, l0, "a new, different leader took over");
+    wait_applied(c.node(l1), commit_idx).await;
 
     // The committed FOR-UPDATE txn's next_xid bump replicated to the new leader,
     // so its applied next_xid is strictly above the committed xid — that xid can
