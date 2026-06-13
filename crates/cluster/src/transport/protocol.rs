@@ -1,4 +1,4 @@
-//! Wire protocol: Raft RPC envelopes + a control channel, all postcard-serializable.
+//! Wire protocol: Raft RPC envelopes + a control channel, all JSON-serializable.
 use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
