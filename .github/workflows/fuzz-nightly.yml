@@ -1,0 +1,32 @@
+name: fuzz-nightly
+
+# Extended fuzzing on a schedule (the PR gate only smoke-runs each target for a
+# few seconds — see ci.yml `fuzz-smoke`). Each target runs ~5 minutes here, and
+# any libFuzzer crash input is uploaded for triage.
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, 04:17 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (extended)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_sql, wire_decode, decode_row, decode_key]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-fuzz }
+      - name: Fuzz ${{ matrix.target }} (5 min)
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
