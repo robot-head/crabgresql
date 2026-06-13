@@ -481,3 +481,170 @@ async fn list_append_is_strict_serializable_under_follower_faults() {
         "list-append history must be strict-serializable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 4 — Scenario B (leader-failover gap-finder) + EDN artifact
+// ---------------------------------------------------------------------------
+
+/// A single-key read transaction (BEGIN; SELECT; COMMIT). Records Invoke(Read) +
+/// Return(list). Used for the stale read in the gap-finder.
+async fn read_txn(
+    client: &tokio_postgres::Client,
+    rec: &Recorder,
+    process: usize,
+    key: i64,
+) -> Vec<i64> {
+    let inv = rec.next_seq();
+    rec.push(Event::Invoke {
+        process,
+        key,
+        seq: inv,
+        op: ListOp::Read,
+    });
+    let msgs = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.simple_query(&format!("SELECT val FROM appends WHERE key = {key}")),
+    )
+    .await
+    .expect("read not timed out")
+    .expect("read ok");
+    let list = list_from(&msgs);
+    let ret = rec.next_seq();
+    rec.push(Event::Return {
+        process,
+        key,
+        seq: ret,
+        ret: ListRet(list.clone()),
+    });
+    list
+}
+
+/// Scenario B — deliberately surface a STALE READ across a leader failover and
+/// prove the strict-serializability checker FLAGS it. This documents the **D5
+/// gap**: a deposed-but-not-yet-stepped-down leader L (long election timers, so
+/// it still self-reports `state==Leader` for ~1–2s after isolation) serves a
+/// LOCAL read from its stale state. In that window the majority elects L', an
+/// append v2 commits on L' (acked), and a read connected DIRECTLY to L (the
+/// harness→L SQL connection isn't subject to the app-layer Raft partition) is
+/// served locally by L → returns `[1]`, missing v2. The history
+/// `{append 1 ok→[1]; append 2 ok→[1,2]; read→[1]}` is non-serializable (the
+/// read, after v2 acked, missed v2) → the checker flags it.
+///
+/// When D5 (read-index/leases) lands, the stale read disappears and this
+/// assertion flips — a TDD handoff (see the assert message).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_failover_surfaces_stale_read_d5_gap() {
+    use cluster::transport::protocol::ControlRequest;
+    const KEY: i64 = 7;
+    // The gap is a timing window (a deposed leader serving a stale local read
+    // before it steps down). Try a bounded number of times to hit it.
+    const ATTEMPTS: usize = 15;
+    for attempt in 0..ATTEMPTS {
+        let c = harness::Cluster::spawn(3).await;
+        let l = c.wait_for_leader().await;
+        let rec = Recorder::default();
+        // Seed: create the table + append 1 to KEY via the leader (process 0).
+        {
+            let setup = c.pg(l).await;
+            setup
+                .simple_query("CREATE TABLE appends (key int8, val int8)")
+                .await
+                .expect("create");
+        }
+        let v1 = 1;
+        let ok1 = append_txn(&c.pg(l).await, &rec, 0, KEY, v1).await;
+        assert!(ok1, "seed append must commit");
+        // Isolate the leader L; the majority elects L'.
+        let others: Vec<u64> = (0..3u64).filter(|&i| i != l).collect();
+        c.control(l, ControlRequest::SetPartition(others.clone()))
+            .await;
+        for &o in &others {
+            c.control(o, ControlRequest::SetPartition(vec![l])).await;
+        }
+        // Wait (bounded) for a NEW leader among the survivors.
+        let neu = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let mut found = None;
+                for &o in &others {
+                    if let Some(st) = c.status(o).await
+                        && st.current_leader.is_some_and(|x| x != l)
+                    {
+                        found = st.current_leader;
+                    }
+                }
+                if let Some(x) = found {
+                    break x;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break l; // no failover; retry attempt
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        if neu == l {
+            // failover didn't happen in time; heal and retry
+            for id in 0..3u64 {
+                c.control(id, ControlRequest::Heal).await;
+            }
+            continue;
+        }
+        // Commit append 2 via the new leader L' (process 1). Routed: connect to a
+        // survivor; it proxies to L'.
+        let ok2 = append_txn(&c.pg(neu).await, &rec, 1, KEY, 2).await;
+        if !ok2 {
+            for id in 0..3u64 {
+                c.control(id, ControlRequest::Heal).await;
+            }
+            continue; // couldn't commit on L' in time; retry
+        }
+        // Pre-read check: only read L if it STILL self-reports itself as leader
+        // (the deposed-but-not-stepped-down window). If L already stepped down,
+        // a direct connection would route/proxy to L' and observe the fresh
+        // value — not the gap we want — so skip to the next attempt without
+        // burning the read on a guaranteed-fresh value.
+        let l_still_leader = matches!(
+            c.status(l).await,
+            Some(st) if st.current_leader == Some(l)
+        );
+        if !l_still_leader {
+            for id in 0..3u64 {
+                c.control(id, ControlRequest::Heal).await;
+            }
+            continue;
+        }
+        // Within L's lease window, read KEY DIRECTLY from the deposed-but-not-yet-
+        // stepped-down L (process 2). L still self-reports leader, so serve_routed
+        // serves locally from L's stale state — observing [1], missing the acked 2.
+        let stale = read_txn(&c.pg(l).await, &rec, 2, KEY).await;
+        eprintln!(
+            "attempt {attempt}: L={l} L'={neu} direct-read(L) = {stale:?}; \
+             L self-report at read = {:?}",
+            c.status(l).await.and_then(|st| st.current_leader)
+        );
+        // Heal regardless.
+        for id in 0..3u64 {
+            c.control(id, ControlRequest::Heal).await;
+        }
+        if stale == vec![1] {
+            // Got the stale read. The checker MUST flag the violation (the read
+            // missed the acked append 2) — this documents the D5 gap.
+            let events = rec.take_sorted();
+            assert!(
+                !all_keys_consistent(&events),
+                "stale read [1] after acked append 2 must be a serializability violation (D5 gap); \
+                 if this FAILS because the read was fresh, D5 may be fixed — flip to assert(all_keys_consistent)"
+            );
+            // Emit the EDN artifact for offline real-Elle cross-validation.
+            let edn = history_to_elle_edn(&events);
+            let path = std::env::temp_dir().join("crabgresql-sp11-d5-gap.edn");
+            std::fs::write(&path, edn).expect("write edn");
+            eprintln!("wrote Elle EDN history to {}", path.display());
+            return; // success: gap surfaced + flagged
+        }
+        // Read wasn't stale (L already stepped down, or routed to L'): retry.
+    }
+    panic!(
+        "could not surface a stale read within the {ATTEMPTS}-attempt budget (the D5 window is timing-bound)"
+    );
+}
