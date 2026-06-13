@@ -20,10 +20,6 @@ pub struct TcpNode {
     pub id: NodeId,
     pub addr: String,
     pub raft: openraft::Raft<TypeConfig>,
-    // `partition` is wired into the server; toggled via SetPartition/Heal control
-    // requests rather than being read directly from this struct by tests.
-    #[allow(dead_code)]
-    pub partition: PartitionState,
 }
 
 pub struct TcpCluster {
@@ -75,7 +71,6 @@ impl TcpCluster {
                 id,
                 addr: addrs[id as usize].clone(),
                 raft,
-                partition,
             });
         }
         let members: BTreeMap<NodeId, BasicNode> = (0..n)
