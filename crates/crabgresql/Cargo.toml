@@ -20,3 +20,11 @@ rustls.workspace = true
 rustls-rustcrypto.workspace = true
 rustls-pemfile.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+cluster.workspace = true
+tokio-postgres.workspace = true
+tempfile.workspace = true
+# The multi-process harness spawns node children via tokio::process, which the
+# workspace tokio feature set doesn't include; enable it here for the test crate.
+tokio = { workspace = true, features = ["process"] }
