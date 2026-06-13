@@ -1,0 +1,28 @@
+[package]
+name = "cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kv = { workspace = true }
+executor = { workspace = true }
+openraft = { workspace = true, features = ["storage-v2"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+kv = { workspace = true }
+executor = { workspace = true }
+pgwire = { workspace = true }
+tokio = { workspace = true }
+stateright = { workspace = true }
+proptest = { workspace = true }

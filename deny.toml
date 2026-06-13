@@ -47,10 +47,13 @@ deny = [
     { crate = "openssl-sys" },
     # cc is permitted ONLY as the build tool for the libpg_query parser oracle
     # (pg_query crate, behind pgparser's dev-only `oracle` feature — never in the
-    # shipped binary). CI runs cargo-deny with --all-features, which enables that
-    # feature; check-no-native.sh independently verifies the SHIPPED tree is pure
-    # Rust. cc remains banned in any other dependency context.
-    { crate = "cc", wrappers = ["pg_query"] },
+    # shipped binary), AND via iana-time-zone-haiku, which openraft 0.9 pulls in
+    # transitively (openraft -> chrono -> iana-time-zone -> iana-time-zone-haiku).
+    # That last crate is gated to `cfg(target_os = "haiku")`, so its `cc` build
+    # script never runs on any platform crabgresql ships to (Linux/macOS/Windows);
+    # check-no-native.sh independently verifies the SHIPPED host tree is pure Rust.
+    # cc remains banned in any other dependency context.
+    { crate = "cc", wrappers = ["pg_query", "iana-time-zone-haiku"] },
     { crate = "cmake" },
     { crate = "pkg-config" },
     { crate = "libz-sys" },

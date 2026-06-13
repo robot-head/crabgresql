@@ -57,13 +57,16 @@ impl CatalogError {
     }
 }
 
-/// Create a table: allocate a TableId, persist the schema, init the sequence —
-/// all in one atomic batch. Caller serializes concurrent DDL.
-pub fn create_table(
+/// Build the write batch for creating a table (schema + sequence init +
+/// next_table_id bump) WITHOUT writing — caller persists the ops. Returns the
+/// allocated TableId alongside the batch. Used by the executor so DDL writes can
+/// be routed through the durable-write seam (and replicated). Validation
+/// (duplicate-table check, next_table_id read) is identical to `create_table`.
+pub fn create_table_ops(
     kv: &dyn Kv,
     name: &str,
     columns: Vec<Column>,
-) -> Result<TableId, CatalogError> {
+) -> Result<(TableId, Vec<WriteOp>), CatalogError> {
     if kv.get(&key::catalog_key(name))?.is_some() {
         return Err(CatalogError::DuplicateTable(name.to_string()));
     }
@@ -82,6 +85,17 @@ pub fn create_table(
             value: U32::new(next + 1).as_bytes().to_vec(),
         },
     ];
+    Ok((next, batch))
+}
+
+/// Create a table: allocate a TableId, persist the schema, init the sequence —
+/// all in one atomic batch. Caller serializes concurrent DDL.
+pub fn create_table(
+    kv: &dyn Kv,
+    name: &str,
+    columns: Vec<Column>,
+) -> Result<TableId, CatalogError> {
+    let (next, batch) = create_table_ops(kv, name, columns)?;
     kv.write_batch(&batch)?;
     Ok(next)
 }
@@ -99,9 +113,11 @@ pub fn get_table(kv: &dyn Kv, name: &str) -> Result<Table, CatalogError> {
     })
 }
 
-/// Drop a table: delete the catalog entry, the sequence, and all its rows — one
-/// atomic batch.
-pub fn drop_table(kv: &dyn Kv, name: &str) -> Result<(), CatalogError> {
+/// Build the write batch for dropping a table (catalog entry + sequence + every
+/// row) WITHOUT writing — caller persists the ops. Errors (42P01 on a missing
+/// table) are identical to `drop_table`. Used by the executor to route DDL
+/// writes through the durable-write seam.
+pub fn drop_table_ops(kv: &dyn Kv, name: &str) -> Result<Vec<WriteOp>, CatalogError> {
     let table = get_table(kv, name)?;
     let mut ops = vec![
         WriteOp::Delete {
@@ -114,6 +130,13 @@ pub fn drop_table(kv: &dyn Kv, name: &str) -> Result<(), CatalogError> {
     for (row_key, _) in kv.scan_prefix(&key::table_prefix(table.id))? {
         ops.push(WriteOp::Delete { key: row_key });
     }
+    Ok(ops)
+}
+
+/// Drop a table: delete the catalog entry, the sequence, and all its rows — one
+/// atomic batch.
+pub fn drop_table(kv: &dyn Kv, name: &str) -> Result<(), CatalogError> {
+    let ops = drop_table_ops(kv, name)?;
     kv.write_batch(&ops)?;
     Ok(())
 }

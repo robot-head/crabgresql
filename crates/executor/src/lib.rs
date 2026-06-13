@@ -5,6 +5,7 @@
 //! level via the `RowLockManager`, with rowid allocation via the
 //! `SequenceManager` and DDL serialized behind a small catalog lock.
 
+mod commit;
 mod error;
 mod eval;
 mod exec;
@@ -19,12 +20,23 @@ use std::sync::Arc;
 use kv::{FjallKv, Kv, MemKv};
 use pgwire::engine::Engine;
 
+pub use commit::{Committer, LocalCommitter};
 pub use error::ExecError;
 pub use session::SqlSession;
 
 use crate::lockmgr::RowLockManager;
 use crate::procarray::ProcArray;
 use crate::seq::SequenceManager;
+
+/// Whether the counter managers (`ProcArray`, `SequenceManager`) persist their
+/// counters themselves (`Durable` — the local/single-node path) or fold the
+/// counter advance into the commit batch for the replicated state machine to
+/// max-merge (`Replicated` — the Raft path, reseeded on leadership change).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistMode {
+    Durable,
+    Replicated,
+}
 
 /// The SQL engine over a durable (or in-memory) KV store. Catalog, sequences,
 /// the xid counter, and the clog live in the KV store. Writers run concurrently
@@ -37,7 +49,9 @@ pub struct SqlEngine {
     pub(crate) procarray: Arc<ProcArray>,
     pub(crate) seq: Arc<SequenceManager>,
     pub(crate) lockmgr: Arc<RowLockManager>,
-    pub(crate) catalog_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) catalog_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) committer: Arc<dyn crate::commit::Committer>,
+    pub(crate) persist_mode: PersistMode,
 }
 
 impl Default for SqlEngine {
@@ -58,14 +72,49 @@ impl SqlEngine {
     }
 
     pub fn with_kv(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
-        let procarray = Arc::new(ProcArray::open(Arc::clone(&kv))?);
+        let procarray = Arc::new(ProcArray::open(Arc::clone(&kv), PersistMode::Durable)?);
+        let committer: Arc<dyn crate::commit::Committer> =
+            Arc::new(crate::commit::LocalCommitter {
+                kv: Arc::clone(&kv),
+            });
         Ok(Self {
             kv,
             procarray,
-            seq: Arc::new(SequenceManager::new()),
+            seq: Arc::new(SequenceManager::new(PersistMode::Durable)),
             lockmgr: Arc::new(RowLockManager::new()),
-            catalog_lock: Arc::new(std::sync::Mutex::new(())),
+            catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
+            committer,
+            persist_mode: PersistMode::Durable,
         })
+    }
+
+    /// Build an engine whose reads come from `sm_kv` (the applied state machine)
+    /// and whose writes are proposed through `committer` (a RaftCommitter). Uses
+    /// the Replicated persist mode so counters fold into the proposed batch.
+    pub fn replicated(
+        sm_kv: Arc<dyn Kv>,
+        committer: Arc<dyn crate::commit::Committer>,
+    ) -> Result<Self, ExecError> {
+        let procarray = Arc::new(ProcArray::open(
+            Arc::clone(&sm_kv),
+            PersistMode::Replicated,
+        )?);
+        Ok(Self {
+            kv: sm_kv,
+            procarray,
+            seq: Arc::new(SequenceManager::new(PersistMode::Replicated)),
+            lockmgr: Arc::new(RowLockManager::new()),
+            catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
+            committer,
+            persist_mode: PersistMode::Replicated,
+        })
+    }
+
+    /// Reseed counters from the applied store (call when this node becomes leader).
+    pub fn reseed_counters(&self) -> Result<(), ExecError> {
+        self.procarray.reseed_from_applied()?;
+        self.seq.reseed_from_applied();
+        Ok(())
     }
 }
 
@@ -79,6 +128,8 @@ impl Engine for SqlEngine {
             Arc::clone(&self.seq),
             Arc::clone(&self.lockmgr),
             Arc::clone(&self.catalog_lock),
+            Arc::clone(&self.committer),
+            self.persist_mode,
         )
     }
 }

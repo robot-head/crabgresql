@@ -3,6 +3,11 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# Minimal default GITHUB_TOKEN permissions for every job; clippy-sarif overrides
+# with the security-events write it needs to upload SARIF.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -77,9 +82,66 @@ jobs:
             parity.json
             parity.md
 
+  property:
+    name: Property tests (proptest, high case count)
+    runs-on: ubuntu-latest
+    env:
+      # 4x the proptest default (256) so the property suite is a real gate.
+      PROPTEST_CASES: "1024"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p kv -p pgparser -p pgwire -p pgtypes -p mvcc -p catalog
+
+  fuzz-smoke:
+    name: Fuzz smoke (cargo-fuzz, bounded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-binstall }
+      # The cargo-fuzz prebuilt is musl; on its own it would default the fuzz
+      # build to x86_64-unknown-linux-musl (no std installed + sanitizer is
+      # incompatible with static libc). The explicit --target below overrides
+      # that, so the fast prebuilt builds for the gnu host correctly.
+      - name: Install cargo-fuzz (prebuilt)
+        run: cargo binstall -y cargo-fuzz
+      - name: Build all fuzz targets
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+      - name: Smoke-run each target (bounded)
+        run: |
+          for t in parse_sql wire_decode decode_row decode_key; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=20 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
+  clippy-sarif:
+    name: Clippy (SARIF code scanning)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - run: cargo install clippy-sarif sarif-fmt
+      - name: Run clippy → SARIF
+        run: cargo clippy --all-features --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
+        continue-on-error: true
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: rust-clippy-results.sarif
+          wait-for-processing: true
+        continue-on-error: true
+
   pr-gate:
     runs-on: ubuntu-latest
-    needs: [check, coverage, conformance]
+    needs: [check, coverage, conformance, property, fuzz-smoke, clippy-sarif]
     if: always()
     steps:
       - name: All jobs passed

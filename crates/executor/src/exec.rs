@@ -24,11 +24,17 @@ pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError>
     }
 }
 
-/// DDL (CREATE/DROP TABLE) writes through to the store. The session holds the
-/// catalog lock around this call (serializing DDL among DDLs). Non-DDL is
-/// unreachable here (routed via `run_one`) but handled defensively to keep the
-/// match total.
-pub(crate) fn execute_ddl(kv: &dyn Kv, stmt: &Statement) -> Result<QueryResult, ExecError> {
+/// DDL (CREATE/DROP TABLE) reads the catalog and builds its write batch WITHOUT
+/// persisting it — the session routes the returned ops through the durable-write
+/// seam (so DDL replicates too). The session holds the catalog lock across the
+/// read+commit (serializing DDL globally). Non-DDL is unreachable here (routed
+/// via `run_one`) but handled defensively to keep the match total. Validation
+/// (42P07 on duplicate, 42P01 on a missing drop) is unchanged — only the write
+/// destination moved.
+pub(crate) fn execute_ddl(
+    kv: &dyn Kv,
+    stmt: &Statement,
+) -> Result<(QueryResult, Vec<kv::WriteOp>), ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
             let cols = columns
@@ -38,16 +44,22 @@ pub(crate) fn execute_ddl(kv: &dyn Kv, stmt: &Statement) -> Result<QueryResult, 
                     ty: c.ty,
                 })
                 .collect();
-            catalog::create_table(kv, name, cols)?;
-            Ok(QueryResult::Command {
-                tag: "CREATE TABLE".into(),
-            })
+            let (_id, ops) = catalog::create_table_ops(kv, name, cols)?;
+            Ok((
+                QueryResult::Command {
+                    tag: "CREATE TABLE".into(),
+                },
+                ops,
+            ))
         }
         Statement::DropTable { name } => {
-            catalog::drop_table(kv, name)?;
-            Ok(QueryResult::Command {
-                tag: "DROP TABLE".into(),
-            })
+            let ops = catalog::drop_table_ops(kv, name)?;
+            Ok((
+                QueryResult::Command {
+                    tag: "DROP TABLE".into(),
+                },
+                ops,
+            ))
         }
         _ => Err(ExecError::Unsupported("not a DDL statement".into())),
     }
@@ -106,10 +118,15 @@ pub(crate) async fn execute_write(
             }
             let t = catalog::get_table(kv, table)?;
             let target_idx = resolve_targets(&t, columns)?;
-            // Reserve a contiguous block of rowids atomically (the SequenceManager
-            // persists the new next-rowid durably itself — no seq Put in ops).
+            // Reserve a contiguous block of rowids atomically. In Durable mode the
+            // SequenceManager persists the new next-rowid itself (seq_op is None).
+            // In Replicated mode it returns the seq Put for us to fold into this
+            // same commit batch (max-merged by the replicated state machine).
             let n_rows = rows.len() as u64;
-            let start = seq.alloc(kv, t.id, n_rows)?;
+            let (start, seq_op) = seq.alloc(kv, t.id, n_rows)?;
+            if let Some(op) = seq_op {
+                ops.push(op);
+            }
             for (rowid, row_exprs) in (start..).zip(rows.iter()) {
                 if row_exprs.len() != target_idx.len() {
                     return Err(ExecError::TypeMismatch(

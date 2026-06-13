@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use crate::KvError;
 
 /// One mutation in an atomic batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
