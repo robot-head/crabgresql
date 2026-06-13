@@ -123,3 +123,18 @@ Transactions: `BEGIN`/`COMMIT` are tracked per connection; all DML in a txn must
 - **Dynamic range descriptors / meta range** — D3b (D3a uses a static `RangeMap`).
 - **Range splits / rebalancing** — D4 and beyond.
 - **Data sharding across nodes** (non-co-located placement) — later sub-slice.
+
+## Traceability (implemented)
+
+| # | Criterion | Verified by |
+|---|---|---|
+| 1 | `RangeMap` maps table_ids to contiguous table-aligned ranges (binary search, boundaries) | `cluster::range::map::tests` (`one_range_covers_all_tables`, `boundaries_partition_table_ids_contiguously`, `boundaries_must_be_sorted_and_nonzero`) |
+| 2 | N co-located in-process Raft groups come up; each range elects a leader independently | `range::cluster::tests::every_range_elects_a_leader` |
+| 3 | A single-table write/read routes to and is served from its range only | `tests/multirange.rs::rows_land_only_in_their_table_range` (asserts per-range `sm_kv` contents on every node) |
+| 4 | DDL writes the catalog to range 0; DML resolves schema from range 0 and rows from the data range | `range::router::tests::create_in_range0_insert_routes_to_data_range_select_reads_back` |
+| 5 | Per-range failover independence: killing range R's leader re-elects R while range S keeps serving | `tests/multirange.rs::killing_one_range_leader_does_not_stop_another_range` (uses `wait_for_leader_excluding`) |
+| 6 | A sharded workload (tables across ≥2 ranges) is per-range consistent under follower faults | `tests/multirange.rs::sharded_list_append_is_per_range_consistent_under_follower_faults` (1s stable-window nemesis, exactly-once appends) |
+| 7 | A transaction spanning ranges is rejected (single statements are never cross-range) | `range::router::tests::a_transaction_may_not_span_ranges` (SQLSTATE `0A000`) |
+| 8 | No new shipped dependency; `#![forbid(unsafe_code)]`; full gauntlet green | `cargo deny` + workspace clippy/test (only dev/internal deps — `catalog`/`pgparser` — added to the `cluster` crate) |
+
+**Note (D3b):** a transaction that starts with range-0 no-table work (DDL / FROM-less SELECT) and later pins to a data range runs that statement auto-committed on the data range (it still commits durably and atomically through that range's Raft; only cross-range transactionality is loose). Documented in `router.rs`; tightened in D3b.
