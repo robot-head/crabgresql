@@ -167,11 +167,26 @@ pub async fn serve_tls<E: Engine>(
         let tls = tls.clone();
         // TODO(config-era): connection cap (Semaphore) and pre-auth read timeout — slowloris guard. Deliberately deferred in SP1.
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, engine, config, registry, tls).await {
+            if let Err(e) = serve_conn(stream, engine, config, registry, tls).await {
                 tracing::debug!("connection from {peer} ended: {e}");
             }
         });
     }
+}
+
+/// Serve a SINGLE already-accepted connection (the per-connection body of
+/// [`serve_tls`]). Exposed so a front-end router (the cluster's leader-routing
+/// layer) can serve a leader-local connection itself. `registry` is shared
+/// across a server's connections so a Postgres CancelRequest on a separate
+/// connection can find its target.
+pub async fn serve_conn<E: Engine>(
+    stream: TcpStream,
+    engine: Arc<E>,
+    config: Arc<SessionConfig>,
+    registry: Arc<CancelRegistry>,
+    tls: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
+    handle_conn(stream, engine, config, registry, tls).await
 }
 
 async fn handle_conn<E: Engine>(
