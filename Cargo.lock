@@ -550,6 +550,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "zerocopy",
 ]
@@ -633,13 +634,16 @@ name = "crabgresql"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cluster",
  "executor",
  "pgwire",
  "rand 0.10.1",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",
+ "tempfile",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",

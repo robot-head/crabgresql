@@ -12,6 +12,7 @@ kv = { workspace = true }
 fjall = { workspace = true }
 executor = { workspace = true }
 openraft = { workspace = true, features = ["storage-v2"] }
+pgwire = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -23,8 +24,8 @@ zerocopy = { workspace = true }
 [dev-dependencies]
 kv = { workspace = true }
 executor = { workspace = true }
-pgwire = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 stateright = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
