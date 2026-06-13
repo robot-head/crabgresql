@@ -324,6 +324,309 @@ impl RaftLogStorage<TypeConfig> for Arc<DurableLogStore> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Durable state machine
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::io::Cursor;
+
+use kv::{Kv, WriteOp};
+use openraft::storage::{RaftStateMachine, Snapshot};
+use openraft::{
+    BasicNode, EntryPayload, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta, StoredMembership,
+};
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::big_endian::U64;
+
+use crate::store::{SnapshotPayload, StateMachineMeta, StoredSnapshot, is_counter_key, u64_be};
+use crate::types::WriteBatch;
+
+/// Durable Raft state machine over the `data` keyspace (application KV) and the
+/// `raft` keyspace (`sm/last_applied`, `sm/last_membership`) of a shared
+/// `Database`. Mirrors the in-memory [`crate::store::StateMachineStore`], but
+/// every `apply` commits its data ops **and** the advanced `last_applied` /
+/// membership in ONE cross-keyspace fjall batch followed by ONE fsync, so data
+/// and metadata can never diverge across a crash. Replay is safe because every
+/// op is idempotent: puts/deletes are last-writer-wins and counter keys
+/// max-merge.
+pub struct DurableStateMachineStore {
+    db: Arc<Database>,
+    /// The `data` keyspace — application KV content (written via raw batch on
+    /// apply, read via `data_kv` for max-merge lookups and snapshots).
+    data: fjall::Keyspace,
+    /// The `raft` keyspace — holds `SM_APPLIED_KEY` / `SM_MEMBERSHIP_KEY`.
+    raft: fjall::Keyspace,
+    /// `Kv` view over `data`, shared with the SQL engine for committed reads.
+    data_kv: Arc<KeyspaceKv>,
+    /// Cached `last_applied` / `last_membership`, the durable truth mirrored.
+    meta: RwLock<StateMachineMeta>,
+    /// Monotonic snapshot index for unique snapshot ids.
+    snapshot_idx: RwLock<u64>,
+    /// The last snapshot built or installed (in-memory cache; the authoritative
+    /// data lives in the `data` keyspace).
+    current_snapshot: RwLock<Option<StoredSnapshot>>,
+}
+
+impl std::fmt::Debug for DurableStateMachineStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableStateMachineStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DurableStateMachineStore {
+    /// Open the durable state machine over `store`, reconstructing the
+    /// `last_applied` / `last_membership` cache from the `raft` keyspace (fjall
+    /// already replayed its journal on open). An absent `SM_APPLIED_KEY` means a
+    /// never-applied state machine (`last_applied = None`).
+    #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
+    pub fn open(store: &NodeStore) -> Result<Arc<Self>, StorageError<NodeId>> {
+        // `SM_APPLIED_KEY` stores `Option<LogId>`; `read_json::<Option<LogId>>`
+        // therefore yields `Option<Option<LogId>>` — an absent key flattens to
+        // `None` last_applied.
+        let last_applied: Option<LogId<NodeId>> =
+            read_json::<Option<LogId<NodeId>>>(&store.raft, SM_APPLIED_KEY)?.unwrap_or(None);
+        let last_membership: StoredMembership<NodeId, BasicNode> =
+            read_json(&store.raft, SM_MEMBERSHIP_KEY)?.unwrap_or_default();
+        let meta = StateMachineMeta {
+            last_applied,
+            last_membership,
+        };
+        Ok(Arc::new(Self {
+            db: store.db.clone(),
+            data: store.data.clone(),
+            raft: store.raft.clone(),
+            data_kv: store.data_kv(),
+            meta: RwLock::new(meta),
+            snapshot_idx: RwLock::new(0),
+            current_snapshot: RwLock::new(None),
+        }))
+    }
+
+    /// The shared application-data store (the `data` keyspace as a `Kv`).
+    /// Cloning the `Arc` lets the SQL engine read committed state directly.
+    pub fn sm_kv(&self) -> Arc<dyn Kv> {
+        self.data_kv.clone()
+    }
+}
+
+impl RaftSnapshotBuilder<TypeConfig> for Arc<DurableStateMachineStore> {
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+        let (last_applied, last_membership) = {
+            let meta = self.meta.read().await;
+            (meta.last_applied, meta.last_membership.clone())
+        };
+
+        // Snapshot the full `data` keyspace contents.
+        let kv = self
+            .data_kv
+            .scan_prefix(&[])
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+        let payload = SnapshotPayload {
+            last_applied,
+            last_membership: last_membership.clone(),
+            kv,
+        };
+        let data =
+            serde_json::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+        let snapshot_idx = {
+            let mut idx = self.snapshot_idx.write().await;
+            *idx += 1;
+            *idx
+        };
+        let snapshot_id = if let Some(last) = last_applied {
+            format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx)
+        } else {
+            format!("--{snapshot_idx}")
+        };
+
+        let meta = SnapshotMeta {
+            last_log_id: last_applied,
+            last_membership,
+            snapshot_id,
+        };
+
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: data.clone(),
+        };
+        *self.current_snapshot.write().await = Some(stored);
+
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data)),
+        })
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
+        let meta = self.meta.read().await;
+        Ok((meta.last_applied, meta.last_membership.clone()))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, entries))]
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<()>, StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+    {
+        let mut meta = self.meta.write().await;
+        let mut res = Vec::new();
+        let mut batch = self.db.batch();
+        // Running max for every counter key touched in THIS apply. A bare
+        // keyspace `get` would miss a value still pending in `batch`, so the
+        // same counter key appearing twice (or once already in the batch) must
+        // fold against this map, not just the durable value.
+        let mut counters: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut new_membership = meta.last_membership.clone();
+        let mut last_id = meta.last_applied;
+
+        for entry in entries {
+            last_id = Some(entry.log_id);
+            match entry.payload {
+                EntryPayload::Blank => {}
+                EntryPayload::Normal(WriteBatch(ref ops)) => {
+                    for op in ops {
+                        match op {
+                            WriteOp::Put { key, value } if is_counter_key(key) => {
+                                let incoming = u64_be(value);
+                                // Max across this apply() AND the durable value.
+                                let cur = match counters.get(key) {
+                                    Some(&c) => c,
+                                    None => self
+                                        .data
+                                        .get(key)
+                                        .map_err(|e| StorageIOError::write_state_machine(&e))?
+                                        .map(|b| u64_be(&b))
+                                        .unwrap_or(0),
+                                };
+                                let merged = cur.max(incoming);
+                                counters.insert(key.clone(), merged);
+                                batch.insert(&self.data, key, U64::new(merged).as_bytes());
+                            }
+                            WriteOp::Put { key, value } => batch.insert(&self.data, key, value),
+                            WriteOp::Delete { key } => batch.remove(&self.data, key),
+                        }
+                    }
+                }
+                EntryPayload::Membership(ref mem) => {
+                    new_membership = StoredMembership::new(last_id, mem.clone());
+                }
+            }
+            res.push(());
+        }
+
+        fn sm<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
+            StorageError::from(StorageIOError::write_state_machine(e))
+        }
+        batch.insert(
+            &self.raft,
+            SM_APPLIED_KEY,
+            serde_json::to_vec(&last_id).map_err(|e| sm(&e))?,
+        );
+        batch.insert(
+            &self.raft,
+            SM_MEMBERSHIP_KEY,
+            serde_json::to_vec(&new_membership).map_err(|e| sm(&e))?,
+        );
+        // ONE batch (data ops + counters + last_applied + membership) and ONE
+        // fsync: data and metadata advance atomically and durably.
+        batch.commit().map_err(|e| sm(&e))?;
+        self.db.persist(PersistMode::SyncAll).map_err(|e| sm(&e))?;
+
+        meta.last_applied = last_id;
+        meta.last_membership = new_membership;
+        Ok(res)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<NodeId>> {
+        Ok(Box::new(Cursor::new(Vec::new())))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, snapshot))]
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: snapshot.into_inner(),
+        };
+
+        let payload: SnapshotPayload = serde_json::from_slice(&stored.data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(stored.meta.signature()), &e))?;
+
+        fn sm<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
+            StorageError::from(StorageIOError::write_state_machine(e))
+        }
+
+        // A snapshot is authoritative: clear the whole `data` keyspace and
+        // overwrite (NOT max-merge), then set the sm/* metadata — all in ONE
+        // batch + ONE fsync so the install is atomic and durable.
+        let existing = self
+            .data_kv
+            .scan_prefix(&[])
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut batch = self.db.batch();
+        for (k, _) in &existing {
+            batch.remove(&self.data, k.as_slice());
+        }
+        for (k, v) in &payload.kv {
+            batch.insert(&self.data, k.as_slice(), v.as_slice());
+        }
+        batch.insert(
+            &self.raft,
+            SM_APPLIED_KEY,
+            serde_json::to_vec(&meta.last_log_id).map_err(|e| sm(&e))?,
+        );
+        batch.insert(
+            &self.raft,
+            SM_MEMBERSHIP_KEY,
+            serde_json::to_vec(&meta.last_membership).map_err(|e| sm(&e))?,
+        );
+        batch.commit().map_err(|e| sm(&e))?;
+        self.db.persist(PersistMode::SyncAll).map_err(|e| sm(&e))?;
+
+        {
+            let mut sm_meta = self.meta.write().await;
+            sm_meta.last_applied = meta.last_log_id;
+            sm_meta.last_membership = meta.last_membership.clone();
+        }
+        *self.current_snapshot.write().await = Some(stored);
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+        match &*self.current_snapshot.read().await {
+            Some(snapshot) => Ok(Some(Snapshot {
+                meta: snapshot.meta.clone(),
+                snapshot: Box::new(Cursor::new(snapshot.data.clone())),
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use openraft::storage::RaftLogStorageExt;
@@ -446,5 +749,218 @@ mod tests {
         let state = log.get_log_state().await.expect("state");
         assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(2));
         assert_eq!(state.last_log_id.map(|l| l.index), Some(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable state machine
+    // -----------------------------------------------------------------------
+
+    use openraft::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
+
+    /// Build an `EntryPayload::Normal(WriteBatch(ops))` at `index` and apply it
+    /// to `sm`. The SM's `apply` takes `&mut self` on `Arc<…>`, so we clone the
+    /// `Arc` and call `apply` through a mutable binding of that clone.
+    async fn apply_normal(sm: &Arc<DurableStateMachineStore>, index: u64, ops: Vec<WriteOp>) {
+        let entry = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Normal(WriteBatch(ops)),
+        };
+        let mut sm = sm.clone();
+        sm.apply([entry]).await.expect("apply");
+    }
+
+    /// openraft's storage conformance suite over the durable log + state machine.
+    /// Each `build()` gets a fresh tempdir; the builder keeps the dirs alive for
+    /// the suite's lifetime so the on-disk databases are not reaped mid-test.
+    #[derive(Default)]
+    struct DurableStoreBuilder {
+        tmp: std::sync::Mutex<Vec<tempfile::TempDir>>,
+    }
+
+    impl
+        openraft::testing::StoreBuilder<
+            TypeConfig,
+            Arc<DurableLogStore>,
+            Arc<DurableStateMachineStore>,
+            (),
+        > for DurableStoreBuilder
+    {
+        async fn build(
+            &self,
+        ) -> Result<((), Arc<DurableLogStore>, Arc<DurableStateMachineStore>), StorageError<NodeId>>
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store =
+                NodeStore::open(dir.path()).map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let log = DurableLogStore::open(&store)?;
+            let sm = DurableStateMachineStore::open(&store)?;
+            self.tmp.lock().expect("tmp").push(dir);
+            Ok(((), log, sm))
+        }
+    }
+
+    /// openraft's own storage conformance suite — the authoritative gate for the
+    /// durable log + state machine.
+    #[test]
+    #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
+    fn durable_storage_suite() -> Result<(), StorageError<NodeId>> {
+        openraft::testing::Suite::test_all(DurableStoreBuilder::default())
+    }
+
+    /// Apply a plain row plus a counter key, drop everything, reopen, and assert
+    /// the data AND `last_applied` survived together (atomic apply + fsync).
+    #[tokio::test]
+    async fn apply_is_atomic_and_survives_reopen() {
+        let dir = temp();
+        let row = kv::key::row_key(1, 1);
+        let xid = kv::key::next_xid_key();
+        {
+            let store = NodeStore::open(dir.path()).expect("open");
+            let sm = DurableStateMachineStore::open(&store).expect("sm open");
+            apply_normal(
+                &sm,
+                7,
+                vec![
+                    WriteOp::Put {
+                        key: row.clone(),
+                        value: b"hello".to_vec(),
+                    },
+                    WriteOp::Put {
+                        key: xid.clone(),
+                        value: 42u64.to_be_bytes().to_vec(),
+                    },
+                ],
+            )
+            .await;
+            // Dropped here — must have fsynced before apply returned.
+        }
+        let store = NodeStore::open(dir.path()).expect("reopen");
+        let mut sm = DurableStateMachineStore::open(&store).expect("sm reopen");
+
+        assert_eq!(
+            sm.sm_kv().get(&row).expect("get row"),
+            Some(b"hello".to_vec()),
+            "row data must survive reopen"
+        );
+        assert_eq!(
+            sm.sm_kv().get(&xid).expect("get xid").map(|b| u64_be(&b)),
+            Some(42),
+            "counter value must survive reopen"
+        );
+        let (last_applied, _) = sm.applied_state().await.expect("applied_state");
+        assert_eq!(
+            last_applied.map(|l| l.index),
+            Some(7),
+            "last_applied must advance with the data it committed"
+        );
+    }
+
+    /// A counter key appearing twice in one `apply` must max-merge against both
+    /// the pending batch value and the durable value (never regress).
+    #[tokio::test]
+    async fn apply_counter_max_merges_same_key_twice_in_one_batch() {
+        let dir = temp();
+        let store = NodeStore::open(dir.path()).expect("open");
+        let sm = DurableStateMachineStore::open(&store).expect("sm open");
+        let k = kv::key::next_xid_key();
+        // Two puts to the same counter key in ONE apply, higher then lower.
+        apply_normal(
+            &sm,
+            1,
+            vec![
+                WriteOp::Put {
+                    key: k.clone(),
+                    value: 9u64.to_be_bytes().to_vec(),
+                },
+                WriteOp::Put {
+                    key: k.clone(),
+                    value: 4u64.to_be_bytes().to_vec(),
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            sm.sm_kv().get(&k).expect("get").map(|b| u64_be(&b)),
+            Some(9),
+            "same-key-twice must fold to the max, not the last write"
+        );
+        // A later apply with a still-lower value also must not regress.
+        apply_normal(
+            &sm,
+            2,
+            vec![WriteOp::Put {
+                key: k.clone(),
+                value: 3u64.to_be_bytes().to_vec(),
+            }],
+        )
+        .await;
+        assert_eq!(
+            sm.sm_kv().get(&k).expect("get").map(|b| u64_be(&b)),
+            Some(9),
+            "max-merge against the durable value must not regress"
+        );
+    }
+
+    /// Build a snapshot from one durable SM, install it into a fresh one with
+    /// pre-existing junk, and assert the data round-trips exactly (overwrite).
+    #[tokio::test]
+    async fn snapshot_round_trip_overwrites() {
+        let src_dir = temp();
+        let src_store = NodeStore::open(src_dir.path()).expect("src open");
+        let mut src = DurableStateMachineStore::open(&src_store).expect("src sm");
+        apply_normal(
+            &src,
+            1,
+            vec![
+                WriteOp::Put {
+                    key: kv::key::row_key(1, 1),
+                    value: b"hello".to_vec(),
+                },
+                WriteOp::Put {
+                    key: kv::key::next_xid_key(),
+                    value: 42u64.to_be_bytes().to_vec(),
+                },
+            ],
+        )
+        .await;
+        let expected = src.sm_kv().scan_prefix(&[]).expect("scan");
+
+        let snapshot = src.build_snapshot().await.expect("build snapshot");
+
+        // Fresh store with pre-existing junk that must be overwritten.
+        let dst_dir = temp();
+        let dst_store = NodeStore::open(dst_dir.path()).expect("dst open");
+        let mut dst = DurableStateMachineStore::open(&dst_store).expect("dst sm");
+        dst.sm_kv()
+            .put(kv::key::row_key(9, 9), b"junk".to_vec())
+            .expect("put junk");
+        dst.install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        let got = dst.sm_kv().scan_prefix(&[]).expect("scan");
+        assert_eq!(got, expected, "snapshot must reproduce KV exactly");
+        assert_eq!(
+            dst.sm_kv().get(&kv::key::row_key(9, 9)).expect("get"),
+            None,
+            "install_snapshot must clear prior state"
+        );
+        // Metadata advanced to the snapshot's last_log_id.
+        let (last_applied, _) = dst.applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, snapshot.meta.last_log_id);
+
+        // Install survives reopen (data + metadata both durable).
+        drop(dst);
+        drop(dst_store);
+        let dst_store = NodeStore::open(dst_dir.path()).expect("dst reopen");
+        let mut dst = DurableStateMachineStore::open(&dst_store).expect("dst sm reopen");
+        assert_eq!(
+            dst.sm_kv().scan_prefix(&[]).expect("scan"),
+            expected,
+            "installed snapshot must survive reopen"
+        );
+        let (last_applied, _) = dst.applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, snapshot.meta.last_log_id);
     }
 }

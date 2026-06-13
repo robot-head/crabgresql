@@ -60,7 +60,7 @@ fn apply_op(kv: &MemKv, op: &WriteOp) {
 }
 
 /// True for `/0/meta/next_xid` and any `/0/seq/<table>` key.
-fn is_counter_key(key: &[u8]) -> bool {
+pub(crate) fn is_counter_key(key: &[u8]) -> bool {
     key == kv::key::next_xid_key().as_slice() || is_seq_key(key)
 }
 
@@ -76,7 +76,7 @@ fn is_seq_key(key: &[u8]) -> bool {
 /// Counter keys are written only by our own code, always exactly 8 bytes, so a
 /// malformed value is unreachable by construction — hence `expect` rather than a
 /// fallible signature threading an error that can never occur on the apply path.
-fn u64_be(b: &[u8]) -> u64 {
+pub(crate) fn u64_be(b: &[u8]) -> u64 {
     U64::read_from_prefix(b)
         .expect("counter value is an 8-byte big-endian u64")
         .0
@@ -90,25 +90,25 @@ fn u64_be(b: &[u8]) -> u64 {
 /// The serialized form of a state-machine snapshot: the full KV contents plus
 /// the metadata openraft needs to resume.
 #[derive(Serialize, Deserialize, Debug, Default)]
-struct SnapshotPayload {
-    last_applied: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
+pub(crate) struct SnapshotPayload {
+    pub(crate) last_applied: Option<LogId<NodeId>>,
+    pub(crate) last_membership: StoredMembership<NodeId, BasicNode>,
     /// All `(key, value)` pairs of the state-machine KV at snapshot time.
-    kv: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) kv: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A stored snapshot: openraft metadata plus the serialized [`SnapshotPayload`].
 #[derive(Debug, Clone)]
-struct StoredSnapshot {
-    meta: SnapshotMeta<NodeId, BasicNode>,
-    data: Vec<u8>,
+pub(crate) struct StoredSnapshot {
+    pub(crate) meta: SnapshotMeta<NodeId, BasicNode>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Metadata tracked alongside the shared KV (which holds the application data).
 #[derive(Debug, Default)]
-struct StateMachineMeta {
-    last_applied: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
+pub(crate) struct StateMachineMeta {
+    pub(crate) last_applied: Option<LogId<NodeId>>,
+    pub(crate) last_membership: StoredMembership<NodeId, BasicNode>,
 }
 
 /// The Raft state machine for the single range. The application data lives in a
