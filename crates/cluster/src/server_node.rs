@@ -17,6 +17,7 @@ use openraft::{BasicNode, ServerState};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::committer::RaftCommitter;
+use crate::linearizer::RaftLinearizer;
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
 use crate::transport::client::TcpRaftNetwork;
 use crate::transport::partition::PartitionState;
@@ -96,7 +97,7 @@ impl ServerNode {
             SqlEngine::replicated(
                 sm_kv,
                 Arc::new(RaftCommitter { raft: raft.clone() }),
-                Arc::new(executor::LocalLinearizer),
+                Arc::new(RaftLinearizer { raft: raft.clone() }),
             )
             .expect("replicated engine"),
         );
