@@ -31,7 +31,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetwork {
         TcpConn {
             from: self.from,
             target,
-            addr: node.addr.clone(),
+            addr: crate::addr::node_dial_addr(&node.addr).to_string(),
             partition: self.partition.clone(),
             stream: None,
         }
