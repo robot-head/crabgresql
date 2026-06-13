@@ -603,7 +603,12 @@ async fn bank_conserves_total_under_crash_restart() {
 /// invoke with NO matching return, which the tester treats as an in-flight op it
 /// may place anywhere or omit — the honest modeling of an unknown outcome.
 async fn run_register_workload() -> (Vec<HistEntry>, bool) {
-    let c = Arc::new(cluster::Cluster::new(3).await);
+    // Long election timers (see `Cluster::new_stable_leader`): this test's
+    // linearizability premise requires the leader to stay fixed. Under a
+    // CPU-starved coverage run the default aggressive timers can miss heartbeats
+    // and trigger a spurious election, moving the leader and producing a stale
+    // read on the old leader (the documented D5 gap) — a false positive here.
+    let c = Arc::new(cluster::Cluster::new_stable_leader(3).await);
     let leader = c.wait_for_leader().await;
     let engine = Arc::new(c.node(leader).engine());
     engine.reseed_counters().expect("reseed");

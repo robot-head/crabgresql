@@ -20,11 +20,7 @@ pub struct NodeStore {
 impl NodeStore {
     /// Open (or recover) a node store at `dir`. fjall journal-replays on open.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, kv::KvError> {
-        let db = Arc::new(
-            Database::builder(dir)
-                .open()
-                .map_err(|e| kv::KvError::Io(e.to_string()))?,
-        );
+        let db = Arc::new(open_database_with_retry(dir.as_ref())?);
         let data = db
             .keyspace("data", KeyspaceCreateOptions::default)
             .map_err(|e| kv::KvError::Io(e.to_string()))?;
@@ -37,6 +33,30 @@ impl NodeStore {
     /// A `Kv` view over the `data` keyspace for the SQL engine + SM reads.
     pub fn data_kv(&self) -> Arc<KeyspaceKv> {
         Arc::new(KeyspaceKv::new(self.db.clone(), self.data.clone()))
+    }
+}
+
+/// Open the fjall database at `dir`, retrying briefly on `Error::Locked`.
+///
+/// Reopening a node directory immediately after dropping the previous instance
+/// (a restart) can transiently fail to acquire fjall's exclusive directory lock:
+/// openraft's state-machine worker task is NOT joined by `Raft::shutdown()`, so
+/// it releases its `Database` handle — and thus the on-disk lock — a moment later,
+/// asynchronously. fjall's own open retries the lock only ~300ms; under a heavily
+/// loaded runner (e.g. coverage instrumentation on a 2-core CI box) that window
+/// can be too short and the reopen fails with `Locked`. Retry for a bounded
+/// window so a clean restart is deterministic, while a genuinely stuck lock still
+/// fails fast rather than hanging.
+fn open_database_with_retry(dir: &Path) -> Result<Database, kv::KvError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match Database::builder(dir).open() {
+            Ok(db) => return Ok(db),
+            Err(fjall::Error::Locked) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(kv::KvError::Io(e.to_string())),
+        }
     }
 }
 

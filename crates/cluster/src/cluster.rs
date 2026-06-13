@@ -44,6 +44,21 @@ impl Cluster {
         Self::build(n, config).await
     }
 
+    /// Like [`Cluster::new`], but with long election timers so a CPU-starved run
+    /// (e.g. coverage instrumentation on a small CI runner) cannot miss heartbeats
+    /// and trigger a spurious election that moves the leader. Leader-stability-
+    /// sensitive tests (the register linearizability check, whose fixed-leader
+    /// premise a leader change would void) use this instead of [`Cluster::new`].
+    pub async fn new_stable_leader(n: u64) -> Self {
+        let config = openraft::Config {
+            heartbeat_interval: 300,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
+            ..Default::default()
+        };
+        Self::build(n, config).await
+    }
+
     /// Build `n` nodes with the given Raft `config` and initialize the group.
     async fn build(n: u64, config: openraft::Config) -> Self {
         let sb = Switchboard::new();
