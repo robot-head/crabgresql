@@ -29,6 +29,36 @@ async fn bringup_elects_leader_and_serves_sql() {
 }
 
 // ---------------------------------------------------------------------------
+// (0b) Client on a follower is transparently routed to the leader.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_on_follower_is_routed_to_leader() {
+    let c = harness::Cluster::spawn(3).await;
+    let leader = c.wait_for_leader().await;
+    let follower = (0..3u64).find(|&i| i != leader).expect("a follower");
+    // Connect to the FOLLOWER's SQL port — the proxy routes us to the leader.
+    let client = c.pg(follower).await;
+    client
+        .simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    client
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
+    let rows = client
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect("select");
+    let n = rows
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(n, 1, "SQL on a follower works (proxied to the leader)");
+}
+
+// ---------------------------------------------------------------------------
 // Shared SQL helpers over tokio-postgres `simple_query`.
 // ---------------------------------------------------------------------------
 

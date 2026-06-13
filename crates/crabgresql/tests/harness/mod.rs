@@ -52,7 +52,7 @@ impl Cluster {
         }
         let peers_arg: Vec<String> = info
             .iter()
-            .map(|(id, na, _)| format!("{id}@{na}"))
+            .map(|(id, na, sa)| format!("{id}@{na}|{sa}"))
             .collect();
         let mut nodes = Vec::new();
         for (id, node_addr, sql_addr) in &info {

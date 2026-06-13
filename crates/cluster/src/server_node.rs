@@ -98,14 +98,14 @@ impl ServerNode {
         );
         tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
 
-        // pgwire SQL listener. Reuse the binary's one-call serve path (trust auth,
-        // no TLS) rather than reimplementing the protocol.
+        // pgwire SQL listener with leader routing: serves locally when this node
+        // is the leader, else byte-proxies to the leader's pgwire port.
         let sql_listener = TcpListener::bind(&cfg.sql_addr).await?;
-        tokio::spawn(pgwire::server::serve_tls(
+        tokio::spawn(crate::route::serve_routed(
             sql_listener,
+            raft.clone(),
             engine.clone(),
             Arc::new(pgwire::session::SessionConfig::trust()),
-            None,
         ));
 
         if cfg.bootstrap {
@@ -145,8 +145,11 @@ async fn reseed_on_leadership(raft: openraft::Raft<TypeConfig>, engine: Arc<SqlE
 /// the `initialize` error is ignored.
 async fn bootstrap(raft: openraft::Raft<TypeConfig>, peers: Vec<(NodeId, String)>) {
     for (_, addr) in &peers {
+        // `addr` may be packed as "node_addr|sql_addr"; connect only to the
+        // node-protocol half so the TCP dial resolves.
+        let dial = crate::addr::node_dial_addr(addr);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while TcpStream::connect(addr).await.is_err() {
+        while TcpStream::connect(dial).await.is_err() {
             if tokio::time::Instant::now() >= deadline {
                 return;
             }
