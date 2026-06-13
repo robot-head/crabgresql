@@ -127,7 +127,13 @@ impl RangeRouter {
                         self.pin = Pin::Range(r);
                         r
                     }
-                    None => 0, // DDL / FROM-less SELECT: run on range 0, stay unpinned.
+                    // DDL / FROM-less SELECT: run on range 0, stay unpinned. D3a
+                    // limitation: if such a txn later pins to a data range, that
+                    // statement runs auto-committed on the data range's session
+                    // (which never saw this BEGIN). It still commits durably and
+                    // atomically through that range's Raft; only cross-range
+                    // transactionality is loose. D3b tightens this.
+                    None => 0,
                 };
                 self.run_on(exec, stmt).await
             }
