@@ -9,18 +9,19 @@ use openraft::BasicNode;
 use tokio::net::TcpListener;
 
 use super::client::TcpRaftNetwork;
+use super::frame::{read_msg, write_msg};
 use super::partition::PartitionState;
+use super::protocol::{ControlRequest, ControlResponse, NodeRequest, NodeResponse, NodeStatus};
 use super::server::{ShutdownSignal, serve_node_protocol};
 use crate::store::{LogStore, StateMachineStore};
 use crate::types::{NodeId, TypeConfig, WriteBatch};
 
 pub struct TcpNode {
     pub id: NodeId,
-    // `addr`/`partition` are read by the control + partition tests added in Task 4
-    // (`control`/`status` dial `addr`; the partition test toggles via the server).
-    #[allow(dead_code)]
     pub addr: String,
     pub raft: openraft::Raft<TypeConfig>,
+    // `partition` is wired into the server; toggled via SetPartition/Heal control
+    // requests rather than being read directly from this struct by tests.
     #[allow(dead_code)]
     pub partition: PartitionState,
 }
@@ -110,6 +111,29 @@ impl TcpCluster {
     }
 }
 
+impl TcpCluster {
+    /// Send one control request to node `id` over its node-addr.
+    pub async fn control(&self, id: NodeId, req: ControlRequest) -> ControlResponse {
+        let mut s = tokio::net::TcpStream::connect(&self.nodes[id as usize].addr)
+            .await
+            .expect("connect");
+        write_msg(&mut s, &NodeRequest::Control(req))
+            .await
+            .expect("write");
+        match read_msg::<_, NodeResponse>(&mut s).await.expect("read") {
+            NodeResponse::Control(r) => r,
+            _ => panic!("expected control response"),
+        }
+    }
+
+    pub async fn status(&self, id: NodeId) -> NodeStatus {
+        match self.control(id, ControlRequest::GetStatus).await {
+            ControlResponse::Status(s) => s,
+            o => panic!("{o:?}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn elects_leader_and_replicates_over_tcp() {
     let c = TcpCluster::new(3).await;
@@ -132,4 +156,49 @@ async fn elects_leader_and_replicates_over_tcp() {
             .await
             .expect("apply");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_status_reports_leader() {
+    let c = TcpCluster::new(3).await;
+    let leader = c.wait_for_leader().await;
+    let st = c.status(leader).await;
+    assert_eq!(st.current_leader, Some(leader));
+    assert_eq!(st.members.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn minority_partition_then_heal_over_tcp() {
+    let c = TcpCluster::new(3).await;
+    let leader = c.wait_for_leader().await;
+    // Isolate a follower (minority = 1 node); the leader stays in the majority
+    // (2 nodes) so it can still commit with quorum.
+    let minority = (0..3u64).find(|&i| i != leader).expect("follower");
+    // Bidirectional cut: minority blocks both others, and both others block minority.
+    let others: Vec<u64> = (0..3u64).filter(|&i| i != minority).collect();
+    c.control(minority, ControlRequest::SetPartition(others.clone()))
+        .await;
+    for &o in &others {
+        c.control(o, ControlRequest::SetPartition(vec![minority]))
+            .await;
+    }
+    // The majority (leader + one other follower) still commits.
+    let l = c.leader().expect("leader");
+    l.raft
+        .client_write(WriteBatch(vec![kv::WriteOp::Put {
+            key: kv::key::row_key(2, 2),
+            value: b"w".to_vec(),
+        }]))
+        .await
+        .expect("majority commits under partition");
+    // Heal: remove all partitions so the minority can catch up.
+    for id in 0..3u64 {
+        c.control(id, ControlRequest::Heal).await;
+    }
+    c.nodes[minority as usize]
+        .raft
+        .wait(Some(Duration::from_secs(10)))
+        .applied_index_at_least(Some(2), "minority catches up")
+        .await
+        .expect("catch up");
 }
