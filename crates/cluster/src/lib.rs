@@ -9,6 +9,7 @@ mod durable;
 mod linearizer;
 mod network;
 mod node;
+pub mod range;
 pub mod route;
 pub mod server_node;
 mod store;

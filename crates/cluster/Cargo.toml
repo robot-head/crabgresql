@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+catalog = { workspace = true }
 kv = { workspace = true }
 fjall = { workspace = true }
 executor = { workspace = true }
