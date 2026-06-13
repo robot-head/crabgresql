@@ -38,7 +38,7 @@ jobs:
       # hit; bump the key suffix to force a tool refresh.
       - name: Cache cargo-llvm-cov
         id: cache-llvm-cov
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-llvm-cov
           key: tool-cargo-llvm-cov-${{ runner.os }}-1
@@ -123,7 +123,7 @@ jobs:
         with: { tool: cargo-binstall }
       - name: Cache cargo-fuzz
         id: cache-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: tool-cargo-fuzz-${{ runner.os }}-1
