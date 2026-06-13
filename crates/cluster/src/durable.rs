@@ -547,7 +547,9 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
         // ONE batch (data ops + counters + last_applied + membership) and ONE
         // fsync: data and metadata advance atomically and durably.
         batch.commit().map_err(|e| sm_write_err(&e))?;
-        self.db.persist(PersistMode::SyncAll).map_err(|e| sm_write_err(&e))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| sm_write_err(&e))?;
 
         meta.last_applied = last_id;
         meta.last_membership = new_membership;
@@ -604,7 +606,9 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
             serde_json::to_vec(&meta.last_membership).map_err(|e| sm_write_err(&e))?,
         );
         batch.commit().map_err(|e| sm_write_err(&e))?;
-        self.db.persist(PersistMode::SyncAll).map_err(|e| sm_write_err(&e))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| sm_write_err(&e))?;
 
         {
             let mut sm_meta = self.meta.write().await;

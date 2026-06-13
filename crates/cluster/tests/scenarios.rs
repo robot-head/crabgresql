@@ -5,7 +5,6 @@
 use std::time::Duration;
 
 use cluster::Cluster;
-use kv::Kv;
 
 /// Wait (bounded) until `node` has applied at least up to log index `idx`. Never
 /// sleeps: a stuck replica fails the test fast instead of hanging.

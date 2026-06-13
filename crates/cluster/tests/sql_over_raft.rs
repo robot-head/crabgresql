@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use executor::SqlSession;
-use kv::Kv;
 use pgwire::engine::{Cell, Engine, QueryResult, Session};
 
 // ---------------------------------------------------------------------------
