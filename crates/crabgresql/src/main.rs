@@ -69,8 +69,8 @@ struct NodeArgs {
     #[arg(long)]
     data_dir: std::path::PathBuf,
 
-    /// Repeatable: id@host:port for every member (including self).
-    #[arg(long = "peer", value_name = "ID@ADDR")]
+    /// Repeatable: id@node_addr|sql_addr for every member (including self).
+    #[arg(long = "peer", value_name = "ID@NODE_ADDR|SQL_ADDR")]
     peers: Vec<String>,
 
     /// When set, this node initializes the voting group once every peer is up.
