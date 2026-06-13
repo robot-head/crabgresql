@@ -501,6 +501,14 @@ async fn list_append_is_strict_serializable_under_follower_faults() {
                 c.control(id, ControlRequest::Heal).await;
             }
         }
+        // Stable window between faults. Under D5 every in-txn read does a ReadIndex
+        // quorum round-trip (plus apply-wait), so a gated append needs an
+        // uninterrupted window to commit; the cluster keeps quorum throughout
+        // (only a single follower is ever faulted), so appends started here
+        // complete. Without this the nemesis re-faults before a gated append
+        // finishes — on a CPU-starved CI runner (worse under llvm-cov coverage)
+        // that starved the workload to ~1 commit and tripped the progress gate.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         round += 1;
     }
     for w in workers {
