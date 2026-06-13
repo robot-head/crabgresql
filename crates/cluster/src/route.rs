@@ -70,9 +70,18 @@ async fn route_one(
                 let _ = serve_conn(stream, engine, config, registry, None).await;
                 return;
             }
-            Some(_) => {
+            Some(l) => {
                 if let Some(addr) = leader_sql {
                     proxy(stream, &addr).await;
+                } else {
+                    // Leader known but its membership addr has no `|sql` half —
+                    // unreachable in production (bootstrap and add_learner both
+                    // pack `node|sql`), but drop with a diagnostic rather than
+                    // silently if a caller ever registers an un-packed addr.
+                    tracing::warn!(
+                        leader = l,
+                        "leader has no SQL address in membership; dropping client"
+                    );
                 }
                 return;
             }
