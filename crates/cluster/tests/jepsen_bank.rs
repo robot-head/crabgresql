@@ -294,6 +294,10 @@ async fn run_bank_workload(accounts: i64, procs: usize, ops: usize) -> (Vec<Hist
 /// restarts FOLLOWERS one at a time (leader fixed so the shared engine stays
 /// valid). After the workload, the WHOLE set is power-cycled once, then the final
 /// total is read. Returns (history, final_total, seeded_total).
+///
+/// The nemesis is inline (not spawned) because `crash_restart` takes `&mut self`
+/// on `Cluster`, which cannot be wrapped in `Arc` the way the sibling
+/// `run_bank_workload` does for its pause/resume nemesis.
 async fn run_durable_bank(
     base_dir: &std::path::Path,
     accounts: i64,
@@ -303,7 +307,7 @@ async fn run_durable_bank(
     const SEED: i64 = 100;
     let seeded_total = accounts * SEED;
 
-    let mut c = cluster::Cluster::durable(3, base_dir).await; // OWNED + mut
+    let mut c = cluster::Cluster::durable(3, base_dir).await; // owned + mut: crash_restart(&mut self) is called inline by the nemesis below
     let leader = c.wait_for_leader().await;
     let engine = Arc::new(c.node(leader).engine());
     engine.reseed_counters().expect("reseed");
@@ -321,14 +325,11 @@ async fn run_durable_bank(
         }
     }
 
-    // Spawn workers (they hold ONLY Arc<engine>; never a cluster ref). Each
-    // decrements `remaining` when done so the inline nemesis knows when to stop.
+    // Spawn workers (they hold ONLY Arc<engine>; never a cluster ref).
     let followers: Vec<u64> = (0..3u64).filter(|&n| n != leader).collect();
-    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(procs));
     let mut workers = Vec::new();
     for process in 0..procs {
         let engine = Arc::clone(&engine);
-        let remaining = Arc::clone(&remaining);
         workers.push(tokio::spawn(async move {
             let mut history: Vec<HistEntry> = Vec::new();
             let mut rng = Lcg::new(0x9E3779B9_u64.wrapping_mul(process as u64 + 1));
@@ -342,18 +343,18 @@ async fn run_durable_bank(
                 let amt = 1 + (rng.next() % 20) as i64;
                 history.push(do_transfer(&engine, &mut s, from, to, amt, process).await);
             }
-            remaining.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             history
         }));
     }
 
-    // INLINE crash nemesis (main task owns `c`): crash+restart a follower at a
-    // time, round-robin, until every worker has finished (with a small floor so at
-    // least a few crashes happen even if the workload is quick). NO fixed sleeps —
-    // each crash_restart does real shutdown+fsync+reopen I/O, which paces the loop.
+    // Crash+restart a follower at a time, round-robin, until every worker task has
+    // finished — `is_finished()` is true whether a worker completes OR panics, so a
+    // worker panic surfaces at the join below instead of hanging this loop. A small
+    // MIN_RESTARTS floor guarantees a few crashes even if the workload is quick. No
+    // fixed sleeps: each crash_restart's real shutdown+fsync+reopen I/O paces the loop.
     let mut restarts = 0usize;
     const MIN_RESTARTS: usize = 4;
-    while remaining.load(std::sync::atomic::Ordering::Relaxed) > 0 || restarts < MIN_RESTARTS {
+    while !workers.iter().all(|w| w.is_finished()) || restarts < MIN_RESTARTS {
         let victim = followers[restarts % followers.len()];
         c.crash_restart(victim).await;
         restarts += 1;
