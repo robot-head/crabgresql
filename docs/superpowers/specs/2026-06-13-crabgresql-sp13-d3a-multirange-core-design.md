@@ -63,7 +63,7 @@ Each range is a **separate** `sm_kv` (an independent store), not a disjoint slic
 
 ### 2. `MultiRangeCluster` — N co-located in-process Raft groups (`crates/cluster/src/range/cluster.rs`, new)
 
-Builds N independent Raft groups over one shared `Switchboard`. Each range gets its own `sm_kv` + `SqlEngine` (constructed via `SqlEngine::replicated(sm_kv, RaftCommitter{range_raft}, RaftLinearizer{range_raft})` — so each range has the SP12 linearizable-read gate and its own MVCC domain). The cluster exposes, per range, that range's current **leader engine** (analogous to SP7's `Cluster::leader()`), so the router/harness can execute against the right leader.
+Builds N independent Raft groups over one shared `Switchboard`. Each range gets its own `sm_kv` + `SqlEngine` (constructed via `SqlEngine::replicated(catalog_kv, sm_kv, RaftCommitter{range_raft}, RaftLinearizer{range_raft})`, where `catalog_kv` is range 0's `sm_kv` — so each range has the SP12 linearizable-read gate and its own MVCC domain, and resolves schemas from range 0). The cluster exposes, per range, that range's current **leader engine** (analogous to SP7's `Cluster::leader()`), so the router/harness can execute against the right leader.
 
 **Required `Switchboard` extension (range-aware routing).** Today the `Switchboard` registers Raft handles by `NodeId` (one group: `HashMap<NodeId, Raft>`). With N co-located groups, each node runs N Raft instances, so handle routing must demultiplex by **`(RangeId, NodeId)`**: `register(range, node, raft)`, `for_node(range, from) -> NodeFactory{range, from}`, and `Conn` resolves the target by `(range, target_node)`. **Faults stay node-scoped** (`pause`/`cut` keyed by `NodeId`) — a crashed/partitioned node realistically takes all its co-located range replicas with it; that is sufficient to demonstrate per-range failover independence (pause the node leading range R; range S, led by a different node, keeps quorum and serves). Range-scoped partitions are a possible later refinement, not needed for D3a.
 
@@ -71,17 +71,17 @@ Concretely this is N parallel instances of the existing single-range bring-up ke
 
 ### 3. Executor change — resolve schema once, execute rows against the data range
 
-Today `execute_read`/`execute_write`/`execute_read_locking`/`describe` call `catalog::get_table(kv, name)` against the *same* kv that holds rows. D3a separates the two: the router resolves the `catalog::Table` from **range 0's catalog**, and these functions take the resolved **`&Table`** (or `Option<&Table>` for read/describe) instead of looking it up internally. Row reads/writes still use the data range's kv. DDL is unchanged (runs wholly on range 0).
+Today `execute_read`/`execute_write`/`execute_read_locking`/`describe` call `catalog::get_table(kv, name)` against the *same* kv that holds rows. D3a separates the two with a **`catalog_kv` seam**: each function gains a `catalog_kv: &dyn Kv` parameter used only for the `get_table` lookup, while rows/seq/clog stay on the data `kv`. `SqlEngine`/`SqlSession` hold a `catalog_kv` handle. For a single-range engine `catalog_kv == kv` (behavior-preserving); a multi-range **data** engine points `catalog_kv` at **range 0's** `sm_kv` (co-located, locally readable). DDL is unchanged (runs wholly on range 0).
 
-This is the only change to existing execution logic; it's mechanical (hoist the lookup to the caller) and keeps each data range's row access against its own kv while schema comes from range 0.
+This is the only change to existing execution logic, and it's mechanical and behavior-preserving — the existing executor suite is the regression gate.
 
 ### 4. `RangeRouter` / multi-range session entry point (`crates/cluster/src/range/router.rs`, new)
 
 The per-connection entry point that owns the `RangeMap` and per-range leader-engine handles. For each statement:
 
 - **`CREATE TABLE` / `DROP TABLE`** → range 0's session (`execute_ddl` as today).
-- **Single-table DML** → parse the target table; resolve `Table` (name→id→schema) from range 0's catalog; `RangeMap::range_for_table(id)` → `RangeId`; execute the row op on that range's leader session, passing the resolved `&Table`.
-- **Multi-table / cross-range** (a join, a multi-table txn, a statement whose tables map to >1 range) → `Err(ExecError::Unsupported("cross-range queries/transactions are not supported yet (D3b)"))`.
+- **Single-table DML** → the target table is resolved from range 0's catalog (name→id→schema); `RangeMap::range_for_table(id)` → `RangeId`; the row op executes on that range's leader session, with `catalog_kv` pointed at range 0 for any schema lookup.
+- **Cross-range transaction** (a txn whose statements map to >1 range) → `Err(ExecError::Unsupported(…D3b…))`. Note a *single* statement is never cross-range: the grammar has no joins and every DML carries one `table`.
 
 Transactions: `BEGIN`/`COMMIT` are tracked per connection; all DML in a txn must map to the **same** range (the first DML pins the txn's range; a later statement on a different range errors). This keeps a transaction within one range's MVCC/Raft group.
 
@@ -102,7 +102,7 @@ Transactions: `BEGIN`/`COMMIT` are tracked per connection; all DML in a txn must
 | 4 | DDL writes the catalog to range 0; DML resolves schema from range 0 and rows from the data range. | end-to-end create-then-insert-then-select across ranges |
 | 5 | **Per-range failover independence**: killing range R's leader re-elects R and resumes, while range S (different leader) keeps serving. | failover test toggling one range's leader |
 | 6 | A sharded workload (tables across ≥2 ranges) is per-range consistent under follower faults. | list-append/bank workload across ranges (D5 nemesis stable-window applied) |
-| 7 | Cross-range / multi-table statements are rejected with the deferred-feature error. | negative test (a 2-table join / a txn spanning ranges) |
+| 7 | A transaction spanning ranges is rejected with the deferred-feature error. (A *single* statement is inherently single-table — the grammar has no joins — so it is never cross-range.) | negative test: a txn whose 2nd statement targets another range returns `Unsupported` |
 | 8 | No new dependency; `#![forbid(unsafe_code)]`; full gauntlet green. | `cargo deny` + workspace clippy/test |
 
 ## Test plan
@@ -112,7 +112,7 @@ Transactions: `BEGIN`/`COMMIT` are tracked per connection; all DML in a txn must
 3. **Routing** — create tables that fall in different ranges; INSERT into each; assert rows land in the correct range's `sm_kv` and are absent from others; SELECT returns them.
 4. **Per-range failover** — with range R and range S led by *different* nodes (elections are independent; the test waits for/selects this condition), pause the node leading range R. Assert range R re-elects among the surviving nodes and a subsequent op on R commits, while range S — still led by an unpaused node and holding quorum — commits throughout. Heal, and confirm R is fully back.
 5. **Sharded consistency** — the SP11 list-append workload spread over tables in ≥2 ranges, follower-fault nemesis with a stable window (per the D5 lesson), checked per-range strict-serializable.
-6. **Cross-range rejection** — a multi-table `SELECT … JOIN …` and a txn whose second statement targets another range both return `Unsupported`.
+6. **Cross-range rejection** — a transaction whose second statement targets another range returns `Unsupported`. (Single statements can't be cross-range: the grammar has no joins and every DML carries one table.)
 7. **Gauntlet** — `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo deny`; `check-no-native`; success-criteria traceability.
 
 ## Non-goals (explicit)
