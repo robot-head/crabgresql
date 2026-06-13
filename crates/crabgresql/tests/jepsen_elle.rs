@@ -89,18 +89,31 @@ fn checker_rejects_a_stale_read_history() {
 /// One recorded linearizability event. `seq` is a global real-time order (an
 /// invoke is stamped when the txn BEGINs; a return when it COMMITs), so replaying
 /// events in `seq` order reconstructs the real-time interleaving the tester needs.
+///
+/// `txn` is a unique id per transaction (= the invoke's seq).  An Invoke and its
+/// matching Return share the same `txn`.  Using `txn` (rather than `process`) as
+/// the linearizability-tester thread id prevents a stranded in-flight invoke (from
+/// an indeterminate txn that never committed) from colliding with the same worker's
+/// next transaction.
+///
+/// `Return::process` and `Return::key` are metadata fields retained for debug
+/// output; they are not pattern-matched by the checker (which uses `txn` for
+/// pairing) but are set by the workload functions so they appear in {:?} traces.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 enum Event {
     Invoke {
         process: usize,
         key: i64,
         seq: u64,
+        txn: u64,
         op: ListOp,
     },
     Return {
         process: usize,
         key: i64,
         seq: u64,
+        txn: u64,
         ret: ListRet,
     },
 }
@@ -148,25 +161,22 @@ fn all_keys_consistent(events: &[Event]) -> bool {
 }
 
 fn key_consistent(events: &[Event], key: i64) -> bool {
-    let mut t: LinearizabilityTester<usize, AppendList> =
+    // Key by `txn` (unique per transaction) rather than `process` (worker id).
+    // A stranded Invoke from an indeterminate txn occupies its own unique thread
+    // id and can never collide with the same worker's subsequent transaction.
+    let mut t: LinearizabilityTester<u64, AppendList> =
         LinearizabilityTester::new(AppendList::default());
     for e in events {
         match e {
             Event::Invoke {
-                process,
-                key: ek,
-                op,
-                ..
+                txn, key: ek, op, ..
             } if *ek == key => {
-                t.on_invoke(*process, op.clone()).expect("on_invoke");
+                t.on_invoke(*txn, op.clone()).expect("on_invoke");
             }
             Event::Return {
-                process,
-                key: ek,
-                ret,
-                ..
+                txn, key: ek, ret, ..
             } if *ek == key => {
-                t.on_return(*process, ret.clone()).expect("on_return");
+                t.on_return(*txn, ret.clone()).expect("on_return");
             }
             _ => {}
         }
@@ -176,37 +186,41 @@ fn key_consistent(events: &[Event], key: i64) -> bool {
 
 /// Emit a jepsen/elle `:list-append` history in EDN format.
 ///
-/// For each `Invoke` event, finds the next unused `Return` with the same
-/// `(process, key)` in seq order.  Committed operations get `:type :ok`;
-/// invokes with no matching return get `:type :info` (indeterminate).
+/// For each `Invoke` event, finds the `Return` that shares the same `txn` id.
+/// Committed operations get `:type :ok`; invokes with no matching return (i.e.
+/// indeterminate/stranded transactions) get `:type :info`.
 fn history_to_elle_edn(events: &[Event]) -> String {
-    let mut used = vec![false; events.len()];
+    use std::collections::HashMap;
+
+    // Build a lookup: txn id → Return event (there is at most one per txn).
+    let returns: HashMap<u64, &Event> = events
+        .iter()
+        .filter_map(|e| {
+            if let Event::Return { txn, .. } = e {
+                Some((*txn, e))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut out = String::new();
 
-    for (i, e) in events.iter().enumerate() {
-        let (inv_process, inv_key, inv_op) = match e {
+    for e in events {
+        let (inv_process, inv_key, inv_txn, inv_op) = match e {
             Event::Invoke {
-                process, key, op, ..
-            } => (*process, *key, op),
+                process,
+                key,
+                txn,
+                op,
+                ..
+            } => (*process, *key, *txn, op),
             Event::Return { .. } => continue,
         };
 
-        // Find the next unused Return for this (process, key).
-        let ret_idx = events
-            .iter()
-            .enumerate()
-            .skip(i + 1)
-            .find(|(j, ev)| {
-                !used[*j]
-                    && matches!(ev, Event::Return { process, key, .. }
-                        if *process == inv_process && *key == inv_key)
-            })
-            .map(|(j, _)| j);
-
-        match ret_idx {
-            Some(j) => {
-                used[j] = true;
-                let ret = match &events[j] {
+        match returns.get(&inv_txn) {
+            Some(ret_ev) => {
+                let ret = match ret_ev {
                     Event::Return { ret, .. } => ret,
                     _ => unreachable!(),
                 };
@@ -229,7 +243,7 @@ fn history_to_elle_edn(events: &[Event]) -> String {
                 .expect("write");
             }
             None => {
-                // Indeterminate — no matching return.
+                // Indeterminate — stranded invoke with no matching return.
                 let value = match inv_op {
                     ListOp::AppendRead(v) => format!("[[:append {inv_key} {v}]]"),
                     ListOp::Read => "[]".to_owned(),
@@ -258,6 +272,7 @@ fn edn_format_round_trips_a_small_history() {
         process: 0,
         key: 1,
         seq: s0,
+        txn: s0,
         op: ListOp::AppendRead(5),
     });
     let s1 = r.next_seq();
@@ -265,6 +280,7 @@ fn edn_format_round_trips_a_small_history() {
         process: 0,
         key: 1,
         seq: s1,
+        txn: s0,
         ret: ListRet(vec![5]),
     });
     let edn = history_to_elle_edn(&r.take_sorted());
@@ -280,18 +296,20 @@ fn edn_format_round_trips_a_small_history() {
 fn all_keys_consistent_accepts_a_valid_event_history() {
     let r = Recorder::default();
     for (p, v, list) in [(0usize, 1i64, vec![1i64]), (1, 2, vec![1, 2])] {
-        let s = r.next_seq();
+        let inv = r.next_seq();
         r.push(Event::Invoke {
             process: p,
             key: 9,
-            seq: s,
+            seq: inv,
+            txn: inv,
             op: ListOp::AppendRead(v),
         });
-        let s = r.next_seq();
+        let ret = r.next_seq();
         r.push(Event::Return {
             process: p,
             key: 9,
-            seq: s,
+            seq: ret,
+            txn: inv,
             ret: ListRet(list),
         });
     }
@@ -335,6 +353,7 @@ async fn append_txn(
         process,
         key,
         seq: inv,
+        txn: inv,
         op: ListOp::AppendRead(val),
     });
     async fn stmt(client: &tokio_postgres::Client, sql: &str) -> bool {
@@ -374,6 +393,7 @@ async fn append_txn(
             process,
             key,
             seq: ret,
+            txn: inv,
             ret: ListRet(list),
         });
         true
@@ -499,6 +519,7 @@ async fn read_txn(
         process,
         key,
         seq: inv,
+        txn: inv,
         op: ListOp::Read,
     });
     let msgs = tokio::time::timeout(
@@ -514,6 +535,7 @@ async fn read_txn(
         process,
         key,
         seq: ret,
+        txn: inv,
         ret: ListRet(list.clone()),
     });
     list
