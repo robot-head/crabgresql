@@ -35,7 +35,6 @@ impl NodeStore {
     }
 
     /// A `Kv` view over the `data` keyspace for the SQL engine + SM reads.
-    #[allow(dead_code)] // consumed by Task 3 (durable state machine).
     pub fn data_kv(&self) -> Arc<KeyspaceKv> {
         Arc::new(KeyspaceKv::new(self.db.clone(), self.data.clone()))
     }
@@ -60,9 +59,7 @@ const LOG_PREFIX: &[u8] = b"log/";
 const VOTE_KEY: &[u8] = b"vote";
 const COMMITTED_KEY: &[u8] = b"committed";
 const PURGED_KEY: &[u8] = b"last_purged";
-#[allow(dead_code)] // consumed by Task 3 (durable state machine).
 pub(crate) const SM_APPLIED_KEY: &[u8] = b"sm/last_applied";
-#[allow(dead_code)] // consumed by Task 3 (durable state machine).
 pub(crate) const SM_MEMBERSHIP_KEY: &[u8] = b"sm/last_membership";
 
 // ---------------------------------------------------------------------------
@@ -217,7 +214,11 @@ impl RaftLogStorage<TypeConfig> for Arc<DurableLogStore> {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        read_json(&self.ks, COMMITTED_KEY)
+        // `save_committed` persists the `Option<LogId>` directly, so a stored
+        // `None` is `null` on disk. Read it back as `Option<Option<LogId>>` and
+        // flatten: an absent key and a stored `null` both yield `None` — symmetric
+        // with the write path and with how `open` reloads `sm/last_applied`.
+        Ok(read_json::<Option<LogId<NodeId>>>(&self.ks, COMMITTED_KEY)?.flatten())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
