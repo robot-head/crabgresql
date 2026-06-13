@@ -543,6 +543,7 @@ dependencies = [
  "fjall",
  "kv",
  "openraft",
+ "pgparser",
  "pgwire",
  "proptest",
  "serde",

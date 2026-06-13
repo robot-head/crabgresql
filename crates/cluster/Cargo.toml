@@ -12,6 +12,7 @@ catalog = { workspace = true }
 kv = { workspace = true }
 fjall = { workspace = true }
 executor = { workspace = true }
+pgparser = { workspace = true }
 openraft = { workspace = true, features = ["storage-v2"] }
 pgwire = { workspace = true }
 tokio = { workspace = true }

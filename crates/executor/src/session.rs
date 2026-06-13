@@ -88,6 +88,11 @@ impl SqlSession {
         }
     }
 
+    /// Execute one already-parsed statement (the router parses once, then routes).
+    pub async fn run(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        self.run_one(stmt).await
+    }
+
     async fn run_one(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         if matches!(self.state, TxnState::Failed(_))
             && !matches!(stmt, Statement::Commit | Statement::Rollback)

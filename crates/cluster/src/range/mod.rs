@@ -3,6 +3,8 @@
 
 pub mod cluster;
 pub mod map;
+pub mod router;
 
 pub use cluster::MultiRangeCluster;
 pub use map::{RangeId, RangeMap};
+pub use router::RangeRouter;
