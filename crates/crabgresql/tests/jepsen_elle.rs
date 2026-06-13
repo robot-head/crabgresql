@@ -597,7 +597,7 @@ async fn leader_failover_read_is_linearizable() {
     // a bounded number of times. The D5 assertions below are deterministic once
     // the failover is established.
     const ATTEMPTS: usize = 15;
-    for _attempt in 0..ATTEMPTS {
+    for attempt in 0..ATTEMPTS {
         let c = harness::Cluster::spawn(3).await;
         let l = c.wait_for_leader().await;
         let rec = Recorder::default();
@@ -647,6 +647,7 @@ async fn leader_failover_read_is_linearizable() {
             }
         };
         if neu == l {
+            eprintln!("attempt {attempt}: no new leader elected within the window; retrying");
             for id in 0..3u64 {
                 c.control(id, ControlRequest::Heal).await;
             }
@@ -655,6 +656,7 @@ async fn leader_failover_read_is_linearizable() {
         // Commit append 2 via the new leader L' (process 1).
         let ok2 = append_txn(&c.pg(neu).await, &rec, 1, KEY, 2).await;
         if !ok2 {
+            eprintln!("attempt {attempt}: append 2 did not commit on L'={neu}; retrying");
             for id in 0..3u64 {
                 c.control(id, ControlRequest::Heal).await;
             }
@@ -662,13 +664,17 @@ async fn leader_failover_read_is_linearizable() {
         }
         // (1) The deposed leader must NOT serve a stale read. Read DIRECTLY from L
         // (the harness→L SQL connection isn't subject to the Raft partition): the
-        // gate rejects it (None) or proxies to L' (fresh) — never the stale [1].
+        // gate either rejects the read (None) or proxies it to L' (fresh [1,2]) —
+        // it must never serve a stale or partial value from L's local state.
         let direct = try_read(&c.pg(l).await, KEY).await;
-        assert_ne!(
-            direct,
-            Some(vec![1]),
-            "deposed leader served a stale read [1] — the D5 ReadIndex gate failed"
-        );
+        match &direct {
+            None => {} // gate rejected the read — no stale data served
+            Some(v) => assert_eq!(
+                *v,
+                vec![1, 2],
+                "deposed-leader read must be rejected or fresh [1,2], never stale/partial: {direct:?}"
+            ),
+        }
         // (2) A routed read observes the fresh, linearizable value (recorded).
         let fresh = read_txn(&c.pg(neu).await, &rec, 2, KEY).await;
         assert_eq!(fresh, vec![1, 2], "routed read after failover must be fresh");
