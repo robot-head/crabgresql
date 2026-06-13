@@ -395,6 +395,182 @@ async fn bank_conserves_under_crash_and_partition_nemesis() {
 }
 
 // ---------------------------------------------------------------------------
+// (4b) Bank conservation — same nemesis, but clients connect to RANDOM nodes
+//      (round-robin, advancing on failure) to exercise leader routing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bank_conserves_with_random_node_clients() {
+    const ACCOUNTS: i64 = 4;
+    const SEED: i64 = 100;
+    const PROCS: usize = 2;
+    const OPS: usize = 6;
+    const MIN_ROUNDS: usize = 3;
+    let seeded_total = ACCOUNTS * SEED;
+
+    let mut c = Cluster::spawn(3).await;
+    // FIXED leader: the nemesis only ever faults a FOLLOWER, so the leader
+    // always keeps a 2/3 quorum and can commit.  Workers connect to RANDOM
+    // nodes (round-robin) — exercising the proxy under the same faults.
+    let leader = c.wait_for_leader().await;
+    let followers: Vec<u64> = (0..3u64).filter(|&i| i != leader).collect();
+    let n_nodes = c.len();
+
+    // Seed the accounts via pg_try loop (leader is up, so some node routes us).
+    {
+        let mut seed_idx: usize = 0;
+        let setup = loop {
+            if let Some(cl) = c.pg_try(seed_idx).await {
+                break cl;
+            }
+            seed_idx = seed_idx.wrapping_add(1) % n_nodes;
+        };
+        setup
+            .simple_query("CREATE TABLE accounts (id int8, bal int8)")
+            .await
+            .expect("create accounts");
+        for id in 0..ACCOUNTS {
+            setup
+                .simple_query(&format!("INSERT INTO accounts VALUES ({id}, {SEED})"))
+                .await
+                .expect("seed account");
+        }
+    }
+
+    // Workers cannot borrow `c` (main task holds &mut for the nemesis), so we
+    // clone all sql_addrs upfront and inline the pg_try connect logic.
+    let sql_addrs: Vec<String> = c.nodes.iter().map(|n| n.sql_addr.clone()).collect();
+
+    let mut workers = Vec::new();
+    for process in 0..PROCS {
+        let addrs = sql_addrs.clone();
+        workers.push(tokio::spawn(async move {
+            let mut rng = Lcg::new(0x9E37_79B9_u64.wrapping_mul(process as u64 + 1));
+            let mut committed = 0usize;
+            // Each worker starts at a different offset so they spread across nodes.
+            let mut idx = process;
+            for _ in 0..OPS {
+                let from = (rng.next() % ACCOUNTS as u64) as i64;
+                let mut to = (rng.next() % ACCOUNTS as u64) as i64;
+                if to == from {
+                    to = (to + 1) % ACCOUNTS;
+                }
+                let amt = 1 + (rng.next() % 20) as i64;
+
+                // Try nodes in round-robin until one accepts or we've tried all.
+                // Advance idx so the next op starts from a different node.
+                let client = {
+                    let mut found = None;
+                    for attempt in 0..addrs.len() {
+                        let addr = &addrs[(idx + attempt) % addrs.len()];
+                        let port = addr.rsplit(':').next().expect("port");
+                        let cs = format!("host=127.0.0.1 port={port} user=postgres");
+                        if let Ok(Ok((cl, conn))) = tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            tokio_postgres::connect(&cs, tokio_postgres::NoTls),
+                        )
+                        .await
+                        {
+                            tokio::spawn(conn);
+                            // Advance past this node so the next op tries the next one.
+                            idx = (idx + attempt + 1) % addrs.len();
+                            found = Some(cl);
+                            break;
+                        }
+                    }
+                    found
+                };
+
+                let client = match client {
+                    Some(cl) => cl,
+                    None => {
+                        // All nodes unreachable for this op — indeterminate, keep going.
+                        idx = idx.wrapping_add(1) % addrs.len();
+                        continue;
+                    }
+                };
+
+                if transfer(&client, from, to, amt).await {
+                    committed += 1;
+                } else {
+                    // Transfer failed; nudge idx so next op tries a different node.
+                    idx = idx.wrapping_add(1) % addrs.len();
+                }
+            }
+            committed
+        }));
+    }
+
+    // Nemesis: identical to the original — FOLLOWERS ONLY, one fault at a time,
+    // the leader is never touched so quorum is always maintained.
+    let mut round = 0usize;
+    while !workers.iter().all(|w| w.is_finished()) || round < MIN_ROUNDS {
+        let victim = followers[round % followers.len()];
+        if round.is_multiple_of(2) {
+            c.kill(victim).await;
+            c.respawn(victim);
+        } else {
+            let others: Vec<u64> = (0..3u64).filter(|&i| i != victim).collect();
+            let _ = c
+                .control(
+                    victim,
+                    cluster::transport::protocol::ControlRequest::SetPartition(others.clone()),
+                )
+                .await;
+            for &o in &others {
+                let _ = c
+                    .control(
+                        o,
+                        cluster::transport::protocol::ControlRequest::SetPartition(vec![victim]),
+                    )
+                    .await;
+            }
+            for id in 0..3u64 {
+                let _ = c
+                    .control(id, cluster::transport::protocol::ControlRequest::Heal)
+                    .await;
+            }
+        }
+        round += 1;
+    }
+
+    // Join workers; sum their committed counts.
+    let mut total_committed = 0usize;
+    for w in workers {
+        total_committed += w.await.expect("worker joined");
+    }
+
+    // Heal everything and let the cluster settle.
+    for id in 0..3u64 {
+        let _ = c
+            .control(id, cluster::transport::protocol::ControlRequest::Heal)
+            .await;
+    }
+    let _final_leader = c.wait_for_leader().await;
+
+    // read_total via pg_try loop — some node accepts after heal.
+    let final_client = {
+        let mut idx = 0usize;
+        loop {
+            if let Some(cl) = c.pg_try(idx).await {
+                break cl;
+            }
+            idx = idx.wrapping_add(1) % n_nodes;
+        }
+    };
+    let final_total = read_total(&final_client, ACCOUNTS).await;
+
+    assert_eq!(
+        final_total, seeded_total,
+        "no acked transfer lost with random-node clients (got {final_total}, want {seeded_total})"
+    );
+    assert!(
+        total_committed > 0,
+        "workload must commit at least one transfer (non-vacuous)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (5a) Every node in a 3-node cluster serves SQL — directly or via proxy.
 // ---------------------------------------------------------------------------
 

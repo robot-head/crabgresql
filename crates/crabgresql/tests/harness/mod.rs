@@ -133,6 +133,36 @@ impl Cluster {
         &self.nodes[id as usize].sql_addr
     }
 
+    /// Number of nodes in the cluster (for round-robin client placement).
+    // A test cluster is never empty, so `is_empty` would be unreachable noise.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Connect a tokio-postgres client to node `id % len` (deterministic round-robin
+    /// so workers spread connections across all nodes, exercising the proxy on
+    /// followers). Returns `None` if that node is unreachable (killed/partitioned),
+    /// so the caller can advance to the next node.
+    pub async fn pg_try(&self, id: usize) -> Option<tokio_postgres::Client> {
+        let node = id % self.nodes.len();
+        let addr = &self.nodes[node].sql_addr;
+        let port = addr.rsplit(':').next()?;
+        let cs = format!("host=127.0.0.1 port={port} user=postgres");
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio_postgres::connect(&cs, tokio_postgres::NoTls),
+        )
+        .await
+        {
+            Ok(Ok((client, conn))) => {
+                tokio::spawn(conn);
+                Some(client)
+            }
+            _ => None,
+        }
+    }
+
     /// Open a tokio-postgres client to node `id`'s SQL port.
     pub async fn pg(&self, id: u64) -> tokio_postgres::Client {
         let addr = self.sql_addr(id);
