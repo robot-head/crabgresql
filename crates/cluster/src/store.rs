@@ -24,6 +24,8 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use zerocopy::byteorder::big_endian::U64;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::types::{NodeId, TypeConfig, WriteBatch};
 
@@ -45,7 +47,7 @@ fn apply_op(kv: &MemKv, op: &WriteOp) {
                 .map(|b| u64_be(&b))
                 .unwrap_or(0);
             let merged = existing.max(incoming);
-            kv.put(key.clone(), merged.to_be_bytes().to_vec())
+            kv.put(key.clone(), U64::new(merged).as_bytes().to_vec())
                 .expect("memkv put");
         }
         WriteOp::Put { key, value } => {
@@ -69,9 +71,16 @@ fn is_seq_key(key: &[u8]) -> bool {
     key.len() == prefix.len() && key[..plen] == prefix[..plen]
 }
 
+/// Decode a counter value: a fixed-layout big-endian `u64`, length-checked by
+/// `zerocopy` (the same encoding the executor's `next_xid`/`seq` paths write).
+/// Counter keys are written only by our own code, always exactly 8 bytes, so a
+/// malformed value is unreachable by construction — hence `expect` rather than a
+/// fallible signature threading an error that can never occur on the apply path.
 fn u64_be(b: &[u8]) -> u64 {
-    let a: [u8; 8] = b.try_into().expect("counter value is u64");
-    u64::from_be_bytes(a)
+    U64::read_from_prefix(b)
+        .expect("counter value is an 8-byte big-endian u64")
+        .0
+        .get()
 }
 
 // ---------------------------------------------------------------------------
