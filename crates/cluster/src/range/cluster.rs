@@ -64,9 +64,15 @@ impl MultiRangeCluster {
         &self.sb
     }
 
-    /// Range 0's applied catalog store (every data range resolves schema from it).
-    pub fn catalog_kv(&self) -> Arc<dyn Kv> {
-        self.groups[0].nodes[0].sm_kv.clone()
+    /// Range 0's **leader** applied catalog store — every range resolves table
+    /// schemas from it. Pinned to the current leader (not a fixed node) because a
+    /// just-committed `CREATE TABLE` is guaranteed applied on range 0's *leader*
+    /// before it returns; a follower's store can lag and transiently surface
+    /// `UndefinedTable` for a table resolution that races the apply. Resolved
+    /// once at `RangeRouter::connect`, like the per-range leader engines.
+    pub async fn catalog_kv(&self) -> Arc<dyn Kv> {
+        let leader = self.wait_for_leader(0).await;
+        self.groups[0].nodes[leader as usize].sm_kv.clone()
     }
 
     /// Block until `range` has a stable leader; return its node id. A node counts
@@ -124,7 +130,7 @@ impl MultiRangeCluster {
         let leader = self.wait_for_leader(range).await;
         let node = &self.groups[range as usize].nodes[leader as usize];
         let engine = SqlEngine::replicated(
-            self.catalog_kv(),
+            self.catalog_kv().await,
             node.sm_kv.clone(),
             Arc::new(RaftCommitter {
                 raft: node.raft.clone(),

@@ -37,7 +37,7 @@ Everything below D3a in that table is **out of scope** for this slice.
 ### 1. `RangeMap` — key→range addressing (`crates/cluster/src/range/map.rs`, new)
 
 ```rust
-pub struct RangeId(pub u32);
+pub type RangeId = u32; // alias, matching the codebase's NodeId/TableId convention
 
 /// A static, table-aligned partition of the key space into N contiguous spans.
 /// `boundaries` are sorted table_id split points; range i covers

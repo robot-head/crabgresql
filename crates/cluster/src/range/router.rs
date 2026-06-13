@@ -51,7 +51,7 @@ impl RangeRouter {
             pin: Pin::None,
             map: c.range_map().clone(),
             engines,
-            catalog_kv: c.catalog_kv(),
+            catalog_kv: c.catalog_kv().await,
         }
     }
 
