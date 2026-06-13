@@ -25,7 +25,6 @@ postcard = { workspace = true }
 [dev-dependencies]
 kv = { workspace = true }
 executor = { workspace = true }
-pgwire = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 stateright = { workspace = true }
