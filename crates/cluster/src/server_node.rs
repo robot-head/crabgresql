@@ -93,8 +93,10 @@ impl ServerNode {
         ));
 
         // One shared replicated engine; reseed its counters on the leadership edge.
+        // Single-range: catalog and data are the same applied store.
         let engine = Arc::new(
             SqlEngine::replicated(
+                sm_kv.clone(),
                 sm_kv,
                 Arc::new(RaftCommitter { raft: raft.clone() }),
                 Arc::new(RaftLinearizer { raft: raft.clone() }),

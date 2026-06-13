@@ -131,6 +131,8 @@ impl Node {
     /// this once, wrap the engine in an `Arc`, and `connect()` it repeatedly.
     pub fn engine(&self) -> executor::SqlEngine {
         executor::SqlEngine::replicated(
+            // Single-range: catalog and data are the same applied store.
+            self.sm_kv.clone(),
             self.sm_kv.clone(),
             Arc::new(crate::committer::RaftCommitter {
                 raft: self.raft.clone(),

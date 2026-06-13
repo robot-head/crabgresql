@@ -39,6 +39,8 @@ impl Linearizer for HealthyLeader {
 fn engine(linearizer: Arc<dyn Linearizer>) -> SqlEngine {
     let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
     SqlEngine::replicated(
+        // Single-range test: catalog and data share one store.
+        Arc::clone(&kv),
         Arc::clone(&kv),
         Arc::new(MemCommitter {
             kv: Arc::clone(&kv),

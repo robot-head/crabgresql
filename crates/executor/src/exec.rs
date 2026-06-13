@@ -92,6 +92,7 @@ fn resolve_targets(t: &Table, columns: &Option<Vec<String>>) -> Result<Vec<usize
 /// xid (read-your-writes).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_write(
+    catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     procarray: &crate::procarray::ProcArray,
     lockmgr: &crate::lockmgr::RowLockManager,
@@ -116,7 +117,7 @@ pub(crate) async fn execute_write(
                     ops,
                 ));
             }
-            let t = catalog::get_table(kv, table)?;
+            let t = catalog::get_table(catalog_kv, table)?;
             let target_idx = resolve_targets(&t, columns)?;
             // Reserve a contiguous block of rowids atomically. In Durable mode the
             // SequenceManager persists the new next-rowid itself (seq_op is None).
@@ -156,7 +157,7 @@ pub(crate) async fn execute_write(
             assignments,
             filter,
         } => {
-            let t = catalog::get_table(kv, table)?;
+            let t = catalog::get_table(catalog_kv, table)?;
             // Resolve each assignment's target column index up front (42703 on miss).
             let targets: Vec<(usize, &Expr)> = assignments
                 .iter()
@@ -229,7 +230,7 @@ pub(crate) async fn execute_write(
             ))
         }
         Statement::Delete { table, filter } => {
-            let t = catalog::get_table(kv, table)?;
+            let t = catalog::get_table(catalog_kv, table)?;
             let mut n: u64 = 0;
             for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
@@ -428,6 +429,7 @@ fn row_matches(
 }
 
 pub(crate) fn execute_read(
+    catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
@@ -437,7 +439,7 @@ pub(crate) fn execute_read(
         return Err(ExecError::Unsupported("not a SELECT".into()));
     };
     let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(kv, name)?),
+        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
         None => None,
     };
 
@@ -467,6 +469,7 @@ pub(crate) fn execute_read(
 /// The snapshot and xid must already be established by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_read_locking(
+    catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     procarray: &crate::procarray::ProcArray,
     lockmgr: &crate::lockmgr::RowLockManager,
@@ -482,7 +485,7 @@ pub(crate) async fn execute_read_locking(
         .from
         .as_ref()
         .ok_or_else(|| ExecError::Unsupported("FOR UPDATE/SHARE requires a FROM clause".into()))?;
-    let t = catalog::get_table(kv, table_name)?;
+    let t = catalog::get_table(catalog_kv, table_name)?;
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
@@ -680,8 +683,13 @@ fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
     Ordering::Equal
 }
 
+// `describe` only resolves the SELECT's row description from the catalog (no
+// rows are scanned), so the data store `_kv` is unused here. It is kept in the
+// signature for uniformity with the other three executor entry points (all take
+// `catalog_kv, kv, …`) so the session's call sites stay consistent.
 pub(crate) fn describe(
-    kv: &dyn Kv,
+    catalog_kv: &dyn Kv,
+    _kv: &dyn Kv,
     sql: &str,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
@@ -690,7 +698,7 @@ pub(crate) fn describe(
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let table = match &s.from {
-        Some(name) => Some(catalog::get_table(kv, name)?),
+        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
         None => None,
     };
     let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
