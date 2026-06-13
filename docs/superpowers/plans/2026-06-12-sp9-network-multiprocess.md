@@ -6,7 +6,9 @@
 
 **Architecture:** A hand-rolled, length-prefixed, postcard-encoded TCP protocol implements openraft's `RaftNetwork`/`RaftNetworkFactory` (parallel to the retained in-process `Switchboard`). One framed protocol per node carries both Raft RPCs and a control channel (status / partition toggle / membership / shutdown); pgwire SQL is a separate port. A `ServerNode` ties durable storage (SP8) + openraft-over-TCP + the listeners + one shared replicated `SqlEngine` + a reseed-on-leadership task together; the `crabgresql` binary gains a `node` subcommand. A harness in the binary's package spawns/kills/respawns real processes and drives SQL via tokio-postgres.
 
-**Tech Stack:** Rust 2024, openraft 0.9 (serde feature), fjall (durable storage from SP8), tokio (TCP + process), postcard (wire encoding), tokio-postgres + tempfile (test harness). Pure-Rust, `#![forbid(unsafe_code)]`.
+**Tech Stack:** Rust 2024, openraft 0.9 (serde feature), fjall (durable storage from SP8), tokio (TCP + process), serde_json (wire encoding), tokio-postgres + tempfile (test harness). Pure-Rust, `#![forbid(unsafe_code)]`.
+
+> **Implementation note (post-execution):** the wire codec shipped as **serde_json** (length-prefixed JSON), not postcard. Postcard pulled the unmaintained `atomic-polyfill` via heapless (RUSTSEC-2023-0089, failing `cargo-deny`); serde_json is already a `cluster` dependency (the on-disk codec for openraft types in `durable.rs`) and adds no new crate. Task 1 below still shows the original postcard sketch — substitute `serde_json::to_vec`/`serde_json::from_slice` in `frame.rs` and drop the `postcard` dep (see commit `84e8e47`). Framing (u32-BE length prefix + `MAX_FRAME` guard) is unchanged.
 
 **Spec:** `docs/superpowers/specs/2026-06-12-crabgresql-sp9-network-multiprocess-design.md`
 

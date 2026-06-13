@@ -1,7 +1,8 @@
 # crabgresql SP9: Real network transport + multi-process nodes (distribution slice D2b)
 
 **Date:** 2026-06-12
-**Status:** Approved
+**Status:** Approved (implemented)
+**Implementation note:** the wire codec shipped as **serde_json** (length-prefixed JSON), not postcard — postcard pulled the unmaintained `atomic-polyfill` via heapless (RUSTSEC-2023-0089), and serde_json is already the on-disk codec for openraft types in `durable.rs` and adds no new dependency. References to "postcard" / `tokio-util` below are superseded by serde_json (see commit `84e8e47`); the framing (u32-BE length prefix + `MAX_FRAME` guard) is unchanged.
 **Program spec:** `docs/superpowers/specs/2026-06-11-crabgresql-program-and-wire-protocol-design.md`
 **Predecessors:** SP1 (wire), SP2 (vertical slice), SP3 (durable storage), SP4 (transactions), SP5 (PG-faithful MVCC), SP6 (concurrent writers), SP7 (single-range Raft, in-memory / D1), SP8 (durable Raft storage + restart recovery / D2a) — all merged.
 
