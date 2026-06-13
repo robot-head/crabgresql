@@ -52,6 +52,16 @@ impl Switchboard {
             .insert(id, raft);
     }
 
+    /// Drop a node's registered Raft handle (used on restart so the old handle —
+    /// and the fjall Database it transitively keeps alive — is released before the
+    /// node is reopened from disk).
+    pub fn deregister(&self, id: NodeId) {
+        self.handles
+            .lock()
+            .expect("switchboard handles")
+            .remove(&id);
+    }
+
     /// Pause (crash) a node: it drops every RPC it would send or receive.
     pub fn pause(&self, id: NodeId) {
         self.faults
