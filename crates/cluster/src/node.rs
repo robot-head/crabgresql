@@ -13,12 +13,17 @@ use std::sync::Arc;
 
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
 use crate::network::Switchboard;
+use crate::range::RangeId;
 use crate::store::{LogStore, StateMachineStore};
 use crate::types::{NodeId, TypeConfig};
 
 /// A single Raft replica: its `Raft` handle and a handle to the applied state.
 pub struct Node {
-    /// This node's id within the single range.
+    /// The range (Raft group) this replica belongs to. The single-range
+    /// [`Cluster`] uses range 0; a multi-range cluster runs one `Node` per
+    /// `(range, id)`.
+    pub range: RangeId,
+    /// This node's id within its range.
     pub id: NodeId,
     /// The openraft handle used to propose writes and inspect metrics.
     pub raft: openraft::Raft<TypeConfig>,
@@ -44,11 +49,11 @@ impl Node {
         }
     }
 
-    /// Build a node (not yet a cluster member) with the default config. `sb` is
-    /// the shared transport; the node registers its Raft handle so peers can
-    /// reach it.
-    pub async fn start(id: NodeId, sb: Switchboard) -> Self {
-        Self::start_with_config(id, sb, Self::default_config()).await
+    /// Build a node (not yet a cluster member) for `range` with the default
+    /// config. `sb` is the shared transport; the node registers its Raft handle
+    /// under `(range, id)` so peers in the same range can reach it.
+    pub async fn start(range: RangeId, id: NodeId, sb: Switchboard) -> Self {
+        Self::start_with_config(range, id, sb, Self::default_config()).await
     }
 
     /// Build a node with an explicit Raft `config`. Lets tests pass an aggressive
@@ -56,7 +61,12 @@ impl Node {
     /// follower must be repaired by an installed snapshot rather than log replay.
     ///
     /// [`Cluster::new_with_snapshotting`]: crate::cluster::Cluster::new_with_snapshotting
-    pub async fn start_with_config(id: NodeId, sb: Switchboard, config: openraft::Config) -> Self {
+    pub async fn start_with_config(
+        range: RangeId,
+        id: NodeId,
+        sb: Switchboard,
+        config: openraft::Config,
+    ) -> Self {
         let config = Arc::new(config.validate().expect("valid raft config"));
 
         let log = Arc::new(LogStore::default());
@@ -65,12 +75,13 @@ impl Node {
 
         // The split-storage traits are implemented for `Arc<LogStore>` and
         // `Arc<StateMachineStore>`, which is exactly what `Raft::new` wants.
-        let raft = openraft::Raft::new(id, config, sb.for_node(id), log, sm)
+        let raft = openraft::Raft::new(id, config, sb.for_node(range, id), log, sm)
             .await
             .expect("raft::new");
 
-        sb.register(id, raft.clone());
+        sb.register(range, id, raft.clone());
         Node {
+            range,
             id,
             raft,
             sm_kv,
@@ -81,6 +92,7 @@ impl Node {
     /// Build a durable node whose log + state machine persist under `dir`. Reopening
     /// `dir` after a drop recovers the node (fjall journal replay + openraft resume).
     pub async fn start_durable(
+        range: RangeId,
         id: NodeId,
         sb: Switchboard,
         dir: std::path::PathBuf,
@@ -91,11 +103,12 @@ impl Node {
         let log = DurableLogStore::open(&store).expect("durable log");
         let sm = DurableStateMachineStore::open(&store).expect("durable sm");
         let sm_kv = sm.sm_kv();
-        let raft = openraft::Raft::new(id, config, sb.for_node(id), log, sm)
+        let raft = openraft::Raft::new(id, config, sb.for_node(range, id), log, sm)
             .await
             .expect("raft::new");
-        sb.register(id, raft.clone());
+        sb.register(range, id, raft.clone());
         Node {
+            range,
             id,
             raft,
             sm_kv,

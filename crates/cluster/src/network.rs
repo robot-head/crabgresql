@@ -19,7 +19,12 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
+use crate::range::RangeId;
 use crate::types::{NodeId, TypeConfig};
+
+/// The Raft handle registry: one openraft handle per `(range, node)`, so N
+/// co-located groups coexist. Aliased to keep the [`Switchboard`] field legible.
+type Handles = HashMap<(RangeId, NodeId), openraft::Raft<TypeConfig>>;
 
 /// Mutable fault state shared by every client minted from a [`Switchboard`].
 #[derive(Default)]
@@ -30,11 +35,16 @@ struct Faults {
     cuts: HashSet<(NodeId, NodeId)>,
 }
 
-/// Shared registry of node Raft handles plus mutable fault state. Cloning is
-/// cheap (it shares the underlying `Arc`s), so every node and client holds one.
+/// Shared registry of Raft handles plus mutable fault state. Cloning is cheap
+/// (it shares the underlying `Arc`s), so every node and client holds one.
+///
+/// Handles are keyed by `(RangeId, NodeId)` so N co-located Raft groups (one per
+/// range) coexist in one process; the single-range cluster lives at range 0.
+/// Faults remain node-scoped: pausing or cutting a node affects every range it
+/// co-locates (a realistic crash/partition of the whole node).
 #[derive(Clone, Default)]
 pub struct Switchboard {
-    handles: Arc<Mutex<HashMap<NodeId, openraft::Raft<TypeConfig>>>>,
+    handles: Arc<Mutex<Handles>>,
     faults: Arc<Mutex<Faults>>,
 }
 
@@ -44,22 +54,22 @@ impl Switchboard {
         Self::default()
     }
 
-    /// Register a node's Raft handle so peers can route RPCs to it.
-    pub fn register(&self, id: NodeId, raft: openraft::Raft<TypeConfig>) {
+    /// Register a node's Raft handle for `range` so peers can route RPCs to it.
+    pub fn register(&self, range: RangeId, id: NodeId, raft: openraft::Raft<TypeConfig>) {
         self.handles
             .lock()
             .expect("switchboard handles")
-            .insert(id, raft);
+            .insert((range, id), raft);
     }
 
-    /// Drop a node's registered Raft handle (used on restart so the old handle —
-    /// and the fjall Database it transitively keeps alive — is released before the
-    /// node is reopened from disk).
-    pub fn deregister(&self, id: NodeId) {
+    /// Drop a node's registered Raft handle for `range` (used on restart so the
+    /// old handle — and the fjall Database it transitively keeps alive — is
+    /// released before the node is reopened from disk).
+    pub fn deregister(&self, range: RangeId, id: NodeId) {
         self.handles
             .lock()
             .expect("switchboard handles")
-            .remove(&id);
+            .remove(&(range, id));
     }
 
     /// Pause (crash) a node: it drops every RPC it would send or receive.
@@ -96,10 +106,13 @@ impl Switchboard {
         f.paused.clear();
     }
 
-    /// Per-node network factory carrying the owning node's id as `from`.
-    pub fn for_node(&self, from: NodeId) -> NodeFactory {
+    /// Per-node network factory for `range`, carrying the owning node's id as
+    /// `from`. The minted clients route to handles registered under the same
+    /// `range`, so co-located groups never cross-talk.
+    pub fn for_node(&self, range: RangeId, from: NodeId) -> NodeFactory {
         NodeFactory {
             sb: self.clone(),
+            range,
             from,
         }
     }
@@ -111,13 +124,13 @@ impl Switchboard {
         f.paused.contains(&from) || f.paused.contains(&to) || f.cuts.contains(&norm(from, to))
     }
 
-    /// Clone the target's Raft handle out of the registry. Returns an owned
-    /// handle so the caller never holds the mutex across an `.await`.
-    fn handle(&self, to: NodeId) -> Option<openraft::Raft<TypeConfig>> {
+    /// Clone the target's Raft handle for `range` out of the registry. Returns an
+    /// owned handle so the caller never holds the mutex across an `.await`.
+    fn handle(&self, range: RangeId, to: NodeId) -> Option<openraft::Raft<TypeConfig>> {
         self.handles
             .lock()
             .expect("switchboard handles")
-            .get(&to)
+            .get(&(range, to))
             .cloned()
     }
 }
@@ -132,12 +145,15 @@ fn norm(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
 #[derive(Clone)]
 pub struct NodeFactory {
     sb: Switchboard,
+    range: RangeId,
     from: NodeId,
 }
 
-/// A network client from `from` to `target`, routing through the Switchboard.
+/// A network client from `from` to `target` within `range`, routing through the
+/// Switchboard.
 pub struct Conn {
     sb: Switchboard,
+    range: RangeId,
     from: NodeId,
     target: NodeId,
 }
@@ -163,7 +179,7 @@ impl Conn {
         if self.sb.blocked(self.from, self.target) {
             return None;
         }
-        self.sb.handle(self.target)
+        self.sb.handle(self.range, self.target)
     }
 }
 
@@ -173,6 +189,7 @@ impl RaftNetworkFactory<TypeConfig> for NodeFactory {
     async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
         Conn {
             sb: self.sb.clone(),
+            range: self.range,
             from: self.from,
             target,
         }
