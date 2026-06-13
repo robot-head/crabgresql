@@ -2,11 +2,9 @@
 //! control protocol + SQL, injects crashes/partitions.
 //!
 //! This is a shared test-support module: it exposes the full harness API
-//! (kill/respawn/wait_applied/…) for every scenario in `multiprocess.rs`. The
-//! bring-up scenario alone doesn't touch the fault-injection surface, so the
-//! module-level allow keeps the build warning-free until the crash/membership/
-//! nemesis scenarios exercise the rest.
-#![allow(dead_code)]
+//! (kill/respawn/wait_applied/add_node/…) used by the scenarios in
+//! `multiprocess.rs` — the crash-recovery, runtime-membership, and
+//! crash+partition bank-nemesis tests exercise the whole surface.
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -165,6 +163,40 @@ impl Cluster {
             false,
         );
     }
+
+    /// Spawn a brand-new node `id` (fresh ports + data dir under the shared
+    /// TempDir) with the SAME peer list, bootstrap=false. It is not yet a Raft
+    /// member — it is reachable so the leader can `AddLearner` it and replicate
+    /// over TCP. Pushes a `ProcNode` to `self.nodes` (expects `id == nodes.len()`).
+    pub async fn add_node(&mut self, id: u64) {
+        assert_eq!(
+            id as usize,
+            self.nodes.len(),
+            "add_node expects the next contiguous id"
+        );
+        let node_addr = format!("127.0.0.1:{}", free_port().await);
+        let sql_addr = format!("127.0.0.1:{}", free_port().await);
+        let dir = self._tmp.path().join(format!("node-{id}"));
+        std::fs::create_dir_all(&dir).expect("create node dir");
+        let child = spawn_node(id, &node_addr, &sql_addr, &dir, &self.peers_arg, false);
+        self.nodes.push(ProcNode {
+            id,
+            node_addr,
+            sql_addr,
+            dir,
+            child,
+        });
+    }
+}
+
+/// Convenience: an `AddLearner` control request.
+pub fn ctl_add_learner(id: u64, addr: String) -> ControlRequest {
+    ControlRequest::AddLearner { id, addr }
+}
+
+/// Convenience: a `ChangeMembership` control request.
+pub fn ctl_change_membership(ids: Vec<u64>) -> ControlRequest {
+    ControlRequest::ChangeMembership(ids)
 }
 
 fn spawn_node(
