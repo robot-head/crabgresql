@@ -3,7 +3,7 @@
 //! faults*, with every operation recorded into a history that is then checked
 //! for a safety property.
 //!
-//! Two workloads live here:
+//! Three workloads live here:
 //!
 //! 1. **Bank conservation** (`bank_conserves_total_under_nemesis`, the primary
 //!    deliverable). N accounts are seeded so the total `T = N * seed` is known.
@@ -28,6 +28,19 @@
 //!    perturbs a follower the leader never changes, so this is a genuine
 //!    linearizable path (no stale cross-failover reads, which D1 does not
 //!    guarantee — that is the documented D5 gap).
+//!
+//! 3. **Durable bank conservation under crash/restart**
+//!    (`bank_conserves_total_under_crash_restart`, the SP8 deliverable). The same
+//!    bank workload, but on a **durable** (fjall-backed) cluster while a nemesis
+//!    **crashes and restarts followers** — one at a time so the leader keeps a
+//!    majority — mid-run. The leader is held fixed (the shared engine pins its
+//!    on-disk `Database`, whose dir fjall locks exclusively), so the nemesis only
+//!    ever bounces followers. After the workload the WHOLE set is power-cycled
+//!    once (drop the engine to free the leader's lock, then crash+restart every
+//!    node), the leader is re-resolved, and the final total is read from a fresh
+//!    engine. The invariant is the SP8 durability claim: no acknowledged transfer
+//!    is lost across crash/restart or a full-set power loss — the bank total is
+//!    conserved because every acked COMMIT was fsync'd and survives journal replay.
 //!
 //! The history recorder (`HistEntry` / `OpKind` / `Outcome`) is a plain
 //! `Vec<HistEntry>` carrying a process id, an op, and an outcome — enough to
@@ -275,6 +288,105 @@ async fn run_bank_workload(accounts: i64, procs: usize, ops: usize) -> (Vec<Hist
     (history, final_total, seeded_total)
 }
 
+/// Like `run_bank_workload` but on a DURABLE cluster with a crash+restart nemesis.
+/// `accounts` accounts seeded to SEED (total = accounts*SEED). `procs` processes
+/// each do `ops` transfers against the fixed leader while the main task crashes &
+/// restarts FOLLOWERS one at a time (leader fixed so the shared engine stays
+/// valid). After the workload, the WHOLE set is power-cycled once, then the final
+/// total is read. Returns (history, final_total, seeded_total).
+async fn run_durable_bank(
+    base_dir: &std::path::Path,
+    accounts: i64,
+    procs: usize,
+    ops: usize,
+) -> (Vec<HistEntry>, i64, i64) {
+    const SEED: i64 = 100;
+    let seeded_total = accounts * SEED;
+
+    let mut c = cluster::Cluster::durable(3, base_dir).await; // OWNED + mut
+    let leader = c.wait_for_leader().await;
+    let engine = Arc::new(c.node(leader).engine());
+    engine.reseed_counters().expect("reseed");
+
+    // Seed accounts (same as run_bank_workload).
+    {
+        let mut s = engine.connect();
+        s.simple_query("CREATE TABLE accounts (id int8, bal int8)")
+            .await
+            .expect("create");
+        for id in 0..accounts {
+            s.simple_query(&format!("INSERT INTO accounts VALUES ({id}, {SEED})"))
+                .await
+                .expect("seed");
+        }
+    }
+
+    // Spawn workers (they hold ONLY Arc<engine>; never a cluster ref). Each
+    // decrements `remaining` when done so the inline nemesis knows when to stop.
+    let followers: Vec<u64> = (0..3u64).filter(|&n| n != leader).collect();
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(procs));
+    let mut workers = Vec::new();
+    for process in 0..procs {
+        let engine = Arc::clone(&engine);
+        let remaining = Arc::clone(&remaining);
+        workers.push(tokio::spawn(async move {
+            let mut history: Vec<HistEntry> = Vec::new();
+            let mut rng = Lcg::new(0x9E3779B9_u64.wrapping_mul(process as u64 + 1));
+            let mut s = engine.connect();
+            for _ in 0..ops {
+                let from = (rng.next() % accounts as u64) as i64;
+                let mut to = (rng.next() % accounts as u64) as i64;
+                if to == from {
+                    to = (to + 1) % accounts;
+                }
+                let amt = 1 + (rng.next() % 20) as i64;
+                history.push(do_transfer(&engine, &mut s, from, to, amt, process).await);
+            }
+            remaining.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            history
+        }));
+    }
+
+    // INLINE crash nemesis (main task owns `c`): crash+restart a follower at a
+    // time, round-robin, until every worker has finished (with a small floor so at
+    // least a few crashes happen even if the workload is quick). NO fixed sleeps —
+    // each crash_restart does real shutdown+fsync+reopen I/O, which paces the loop.
+    let mut restarts = 0usize;
+    const MIN_RESTARTS: usize = 4;
+    while remaining.load(std::sync::atomic::Ordering::Relaxed) > 0 || restarts < MIN_RESTARTS {
+        let victim = followers[restarts % followers.len()];
+        c.crash_restart(victim).await;
+        restarts += 1;
+    }
+
+    // Join workers (their Arc<engine> clones drop here).
+    let mut history: Vec<HistEntry> = Vec::new();
+    for w in workers {
+        history.extend(w.await.expect("worker joined"));
+    }
+
+    // Whole-set power-cycle barrier: drop the workload engine FIRST so the leader's
+    // dir lock is free, then crash+restart EVERY node, re-resolve the leader, and
+    // rebuild a fresh engine for the authoritative final read. Proves the seeded +
+    // transferred state survives a full power loss of all replicas.
+    drop(engine);
+    for id in 0..3u64 {
+        c.crash_restart(id).await;
+    }
+    let final_leader = c.wait_for_leader().await;
+    let final_engine = c.node(final_leader).engine();
+    final_engine.reseed_counters().expect("reseed");
+    let mut s = final_engine.connect();
+    let final_total = read_total(&mut s, accounts).await;
+    history.push(HistEntry {
+        process: usize::MAX,
+        op: OpKind::ReadTotal,
+        outcome: Outcome::ok_total(final_total),
+    });
+
+    (history, final_total, seeded_total)
+}
+
 /// Perform one transfer transaction and return its recorded history entry.
 ///
 /// Reads `from`'s balance first and skips (records `Fail`) if it would overdraw.
@@ -428,6 +540,41 @@ async fn bank_conserves_total_under_nemesis() {
         })
         .count();
     assert!(committed > 0, "workload must commit at least one transfer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bank_conserves_total_under_crash_restart() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (history, final_total, seeded) = run_durable_bank(
+        dir.path(),
+        /*accounts*/ 4,
+        /*procs*/ 3,
+        /*ops*/ 12,
+    )
+    .await;
+
+    assert_eq!(
+        final_total, seeded,
+        "no acked transfer lost across crash/restart + full-set power-cycle"
+    );
+
+    // Every observed ReadTotal equals the invariant.
+    for e in &history {
+        if let (OpKind::ReadTotal, Outcome::Ok { total: Some(t), .. }) = (&e.op, &e.outcome) {
+            assert_eq!(*t, seeded, "every observed total equals the invariant");
+        }
+    }
+    // Non-vacuous: at least one transfer actually committed.
+    let committed = history
+        .iter()
+        .filter(|e| {
+            matches!(e.op, OpKind::Transfer { .. }) && matches!(e.outcome, Outcome::Ok { .. })
+        })
+        .count();
+    assert!(
+        committed > 0,
+        "workload must commit at least one transfer (non-vacuous)"
+    );
 }
 
 // ---------------------------------------------------------------------------
