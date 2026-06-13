@@ -1,6 +1,4 @@
 mod harness;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harness::Cluster;
@@ -274,11 +272,9 @@ async fn bank_conserves_under_crash_and_partition_nemesis() {
     // or fail. Each statement is bounded by a 10s timeout; any error/timeout rolls
     // back (best-effort) and counts the transfer as indeterminate (NOT committed).
     let leader_sql = c.sql_addr(leader).to_string();
-    let remaining = Arc::new(AtomicUsize::new(PROCS));
     let mut workers = Vec::new();
     for process in 0..PROCS {
         let sql_addr = leader_sql.clone();
-        let remaining = Arc::clone(&remaining);
         workers.push(tokio::spawn(async move {
             let port = sql_addr.rsplit(':').next().expect("port");
             let cs = format!("host=127.0.0.1 port={port} user=postgres");
@@ -300,7 +296,6 @@ async fn bank_conserves_under_crash_and_partition_nemesis() {
                     committed += 1;
                 }
             }
-            remaining.fetch_sub(1, Ordering::Relaxed);
             committed
         }));
     }
@@ -310,7 +305,7 @@ async fn bank_conserves_under_crash_and_partition_nemesis() {
     // follower for quorum. Alternate (a) kill+respawn and (b) brief partition+heal.
     // No fixed sleeps — the kill/respawn/control I/O paces the loop.
     let mut round = 0usize;
-    while remaining.load(Ordering::Relaxed) > 0 || round < MIN_ROUNDS {
+    while !workers.iter().all(|w| w.is_finished()) || round < MIN_ROUNDS {
         let victim = followers[round % followers.len()];
         if round.is_multiple_of(2) {
             c.kill(victim).await;
