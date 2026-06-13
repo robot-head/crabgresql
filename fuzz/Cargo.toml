@@ -1,0 +1,56 @@
+# Fuzz targets for crabgresql's untrusted-input parsers (cargo-fuzz / libFuzzer).
+#
+# This crate is DELIBERATELY a separate workspace (see the empty `[workspace]`
+# table below) so libfuzzer-sys's native `cc`/libFuzzer build never enters the
+# main workspace tree — `cargo build --workspace`, `cargo deny`, and
+# `scripts/check-no-native.sh` (which inspect the `crabgresql` workspace) are
+# unaffected, and the shipped binary stays pure Rust.
+#
+# Requires the nightly toolchain: `cargo +nightly fuzz run <target>`.
+
+[package]
+name = "crabgresql-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+pgparser = { path = "../crates/pgparser" }
+pgwire = { path = "../crates/pgwire" }
+kv = { path = "../crates/kv" }
+
+[[bin]]
+name = "parse_sql"
+path = "fuzz_targets/parse_sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_row"
+path = "fuzz_targets/decode_row.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_key"
+path = "fuzz_targets/decode_key.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]

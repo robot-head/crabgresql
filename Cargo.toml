@@ -12,6 +12,9 @@ members = [
     "crates/mvcc",
     "crates/cluster",
 ]
+# The fuzz crate is its own workspace (libfuzzer-sys pulls native `cc`); keep it
+# out of the main workspace so the shipped tree stays pure Rust.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
