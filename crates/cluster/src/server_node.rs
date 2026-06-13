@@ -17,8 +17,8 @@ use openraft::{BasicNode, ServerState};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::committer::RaftCommitter;
-use crate::linearizer::RaftLinearizer;
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
+use crate::linearizer::RaftLinearizer;
 use crate::transport::client::TcpRaftNetwork;
 use crate::transport::partition::PartitionState;
 use crate::transport::server::{ShutdownSignal, serve_node_protocol};

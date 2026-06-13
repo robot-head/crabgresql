@@ -22,7 +22,11 @@ pub struct RaftLinearizer {
 #[async_trait::async_trait]
 impl Linearizer for RaftLinearizer {
     async fn ensure_readable(&self) -> Result<(), ExecError> {
-        self.raft.ensure_linearizable().await.map(|_read_log_id| ()).map_err(map_err)
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map(|_read_log_id| ())
+            .map_err(map_err)
     }
 }
 

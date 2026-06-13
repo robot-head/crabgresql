@@ -5,8 +5,8 @@
 pub mod addr;
 mod cluster;
 mod committer;
-mod linearizer;
 mod durable;
+mod linearizer;
 mod network;
 mod node;
 pub mod route;

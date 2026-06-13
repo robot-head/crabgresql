@@ -207,3 +207,14 @@ Leader leases, follower reads, read-modify-write serializability (SSI), and
 connection-level force-close on gate failure are all out of scope (see the Deferred
 column above). This slice is the minimal correct ReadIndex gate and the
 Scenario-B TDD flip.
+
+## Traceability (implemented)
+
+| # | Criterion | Verified by |
+|---|---|---|
+| 1 | `Linearizer` seam; single-node uses no-op `LocalLinearizer`, reads unchanged | `executor/tests/linearizable_reads.rs::healthy_leader_admits_reads` + `::healthy_leader_admits_repeatable_read_in_txn`; unchanged `transactions`/`concurrency`/`durability` suites |
+| 2 | A rejecting gate makes a read fail with 40001 and return no rows | `linearizable_reads.rs::deposed_leader_rejects_autocommit_read_with_40001`, `::deposed_leader_gates_read_committed_in_txn_select_not_begin`, `::deposed_leader_gates_repeatable_read_at_begin` |
+| 3 | `RaftLinearizer` rejects on a deposed leader, admits on a healthy one | `jepsen_elle.rs::leader_failover_read_is_linearizable` (reject) + Scenario A (admit under follower faults) |
+| 4 | Scenario B flips: deposed read not stale, routed read fresh, history `is_consistent()` | `jepsen_elle.rs::leader_failover_read_is_linearizable` + `crabgresql-sp12-linearizable-read.edn` artifact |
+| 5 | Reads under tolerated faults reflect the latest acked append | `jepsen_elle.rs::list_append_is_strict_serializable_under_follower_faults` (Scenario A) — the gate now runs on every in-txn `SELECT` under follower faults; a separate read-heavy e2e (spec test plan #3) was folded into Scenario A rather than duplicated, since `append_txn` already does an in-txn read after its INSERT |
+| 6 | No new dependency; `#![forbid(unsafe_code)]`; full gauntlet green | `cargo deny` + workspace clippy/test; `RaftLinearizer` uses the already-present openraft `ensure_linearizable` |

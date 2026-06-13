@@ -621,7 +621,8 @@ async fn leader_failover_read_is_linearizable() {
         assert!(ok1, "seed append must commit");
         // Isolate L; the majority elects L'.
         let others: Vec<u64> = (0..3u64).filter(|&i| i != l).collect();
-        c.control(l, ControlRequest::SetPartition(others.clone())).await;
+        c.control(l, ControlRequest::SetPartition(others.clone()))
+            .await;
         for &o in &others {
             c.control(o, ControlRequest::SetPartition(vec![l])).await;
         }
@@ -677,7 +678,11 @@ async fn leader_failover_read_is_linearizable() {
         }
         // (2) A routed read observes the fresh, linearizable value (recorded).
         let fresh = read_txn(&c.pg(neu).await, &rec, 2, KEY).await;
-        assert_eq!(fresh, vec![1, 2], "routed read after failover must be fresh");
+        assert_eq!(
+            fresh,
+            vec![1, 2],
+            "routed read after failover must be fresh"
+        );
         // Heal.
         for id in 0..3u64 {
             c.control(id, ControlRequest::Heal).await;

@@ -100,7 +100,10 @@ impl SqlEngine {
         committer: Arc<dyn crate::commit::Committer>,
         linearizer: Arc<dyn crate::read_gate::Linearizer>,
     ) -> Result<Self, ExecError> {
-        let procarray = Arc::new(ProcArray::open(Arc::clone(&sm_kv), PersistMode::Replicated)?);
+        let procarray = Arc::new(ProcArray::open(
+            Arc::clone(&sm_kv),
+            PersistMode::Replicated,
+        )?);
         Ok(Self {
             kv: sm_kv,
             procarray,

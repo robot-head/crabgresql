@@ -40,7 +40,9 @@ fn engine(linearizer: Arc<dyn Linearizer>) -> SqlEngine {
     let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
     SqlEngine::replicated(
         Arc::clone(&kv),
-        Arc::new(MemCommitter { kv: Arc::clone(&kv) }),
+        Arc::new(MemCommitter {
+            kv: Arc::clone(&kv),
+        }),
         linearizer,
     )
     .expect("replicated engine")
@@ -50,23 +52,34 @@ fn engine(linearizer: Arc<dyn Linearizer>) -> SqlEngine {
 async fn deposed_leader_rejects_autocommit_read_with_40001() {
     let mut s = engine(Arc::new(DeposedLeader)).connect();
     // DDL + writes are NOT gated (they go through the committer) → succeed.
-    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
-    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
     // The read IS gated → rejected with the retryable 40001, no rows.
     let err = s
         .simple_query("SELECT id FROM t")
         .await
         .expect_err("read must be rejected on a deposed leader");
-    assert_eq!(err.code, "40001", "deposed-leader read maps to retryable 40001");
+    assert_eq!(
+        err.code, "40001",
+        "deposed-leader read maps to retryable 40001"
+    );
 }
 
 #[tokio::test]
 async fn deposed_leader_gates_read_committed_in_txn_select_not_begin() {
     let mut s = engine(Arc::new(DeposedLeader)).connect();
-    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
     // Plain BEGIN is READ COMMITTED → its placeholder snapshot is refreshed per
     // statement, so BEGIN itself is NOT gated.
-    s.simple_query("BEGIN").await.expect("plain begin is not gated");
+    s.simple_query("BEGIN")
+        .await
+        .expect("plain begin is not gated");
     let err = s
         .simple_query("SELECT id FROM t")
         .await
@@ -78,7 +91,9 @@ async fn deposed_leader_gates_read_committed_in_txn_select_not_begin() {
 #[tokio::test]
 async fn deposed_leader_gates_repeatable_read_at_begin() {
     let mut s = engine(Arc::new(DeposedLeader)).connect();
-    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
     // REPEATABLE READ fixes its snapshot at BEGIN, so the gate fires at BEGIN.
     let err = s
         .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
@@ -90,9 +105,16 @@ async fn deposed_leader_gates_repeatable_read_at_begin() {
 #[tokio::test]
 async fn healthy_leader_admits_reads() {
     let mut s = engine(Arc::new(HealthyLeader)).connect();
-    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
-    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
-    let res = s.simple_query("SELECT id FROM t").await.expect("read admitted");
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
+    let res = s
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect("read admitted");
     match &res[0] {
         QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
         other => panic!("expected Rows, got {other:?}"),
@@ -102,8 +124,12 @@ async fn healthy_leader_admits_reads() {
 #[tokio::test]
 async fn healthy_leader_admits_repeatable_read_in_txn() {
     let mut s = engine(Arc::new(HealthyLeader)).connect();
-    s.simple_query("CREATE TABLE t (id int4)").await.expect("create");
-    s.simple_query("INSERT INTO t VALUES (1)").await.expect("insert");
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    s.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
     // RR gates at BEGIN; a healthy leader admits, and the in-txn SELECT reuses the
     // begin-gated snapshot (exercises the admit path through the fixed-snapshot branch).
     s.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
