@@ -5,6 +5,13 @@
 //! (kill/respawn/wait_applied/add_node/…) used by the scenarios in
 //! `multiprocess.rs` — the crash-recovery, runtime-membership, and
 //! crash+partition bank-nemesis tests exercise the whole surface.
+//!
+//! Each test binary that `mod`-includes this file compiles it independently, so
+//! dead-code is judged per binary: `jepsen_elle.rs` exercises only the
+//! crash+partition subset, while `multiprocess.rs` drives the membership and
+//! apply-lag helpers. Every item here is live in *some* consumer, so we allow
+//! dead_code module-wide rather than churn per-item attributes as binaries vary.
+#![allow(dead_code)]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
