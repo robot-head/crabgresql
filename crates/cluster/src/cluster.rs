@@ -83,9 +83,14 @@ impl Cluster {
     ///
     /// The drop-before-reopen ordering is mandatory: fjall locks the data directory,
     /// so two `Database` handles on the same path cannot coexist. We `shutdown()` the
-    /// core (deterministically joining it, which drops the log+SM `Database` Arcs),
-    /// deregister the switchboard's handle, and drop the old `Node` (dropping
-    /// `sm_kv`'s `Database` Arc) — only then is the dir lock free to reopen.
+    /// core (joining the core task, which synchronously drops the log-store `Database`
+    /// Arc), `deregister` the switchboard's handle, and drop the old `Node` (dropping
+    /// `sm_kv`'s `Database` Arc). The state-machine `Database` Arc is released slightly
+    /// later: openraft's SM-worker task is not joined by `shutdown()`, so it drops its
+    /// Arc asynchronously once its command channel closes (a microsecond-scale,
+    /// I/O-free path). What actually guarantees the reopen succeeds is fjall's lock
+    /// acquisition, which retries (3×100ms) when `<dir>/.lock` is still held — a window
+    /// that dwarfs the worker-drop latency, so by reopen time the lock is free.
     ///
     /// Panics if `id` is an in-memory node (no `dir`).
     pub async fn restart(&mut self, id: NodeId) {
@@ -94,9 +99,9 @@ impl Cluster {
         // Take ownership of the old node out of the vec (remove+insert at the same
         // index preserves order and keeps `nodes[id]` stable).
         let old = self.nodes.remove(i);
-        old.raft.shutdown().await.ok(); // join the core; releases its storage Arcs
+        old.raft.shutdown().await.ok(); // join the core; releases the log-store Arc
         self.sb.deregister(id); // drop the switchboard's (now-dead) handle
-        drop(old); // drop sm_kv's Database Arc -> closes the DB
+        drop(old); // drop sm_kv's Database Arc (SM-worker Arc drops just after)
         let new = Node::start_durable(id, self.sb.clone(), dir, Node::default_config()).await;
         self.nodes.insert(i, new);
     }
