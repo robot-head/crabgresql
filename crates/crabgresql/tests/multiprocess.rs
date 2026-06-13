@@ -394,6 +394,145 @@ async fn bank_conserves_under_crash_and_partition_nemesis() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (5a) Every node in a 3-node cluster serves SQL — directly or via proxy.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_node_serves_sql() {
+    let c = harness::Cluster::spawn(3).await;
+    let _l = c.wait_for_leader().await;
+    let setup = c.pg(0).await;
+    setup
+        .simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    setup
+        .simple_query("INSERT INTO t VALUES (42)")
+        .await
+        .expect("insert");
+    for id in 0..3u64 {
+        let client = c.pg(id).await;
+        let rows = client
+            .simple_query("SELECT id FROM t")
+            .await
+            .expect("select");
+        let n = rows
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(n, 1, "node {id} serves the row (directly or via proxy)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (5b) After the leader is killed, routing follows the new leader.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_follows_failover() {
+    let mut c = harness::Cluster::spawn(3).await;
+    let old = c.wait_for_leader().await;
+    {
+        let client = c.pg(old).await;
+        client
+            .simple_query("CREATE TABLE t (id int4)")
+            .await
+            .expect("create");
+        client
+            .simple_query("INSERT INTO t VALUES (1)")
+            .await
+            .expect("insert");
+    }
+    c.kill(old).await;
+    // Wait (bounded) for a new leader among the survivors.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut found = false;
+        for id in (0..3u64).filter(|&i| i != old) {
+            if let Some(st) = c.status(id).await
+                && st.current_leader.is_some_and(|l| l != old)
+            {
+                found = true;
+            }
+        }
+        if found {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no new leader after killing the old one"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // A NEW connection to a surviving node reaches the new leader and sees the data.
+    let survivor = (0..3u64).find(|&i| i != old).expect("a survivor");
+    let client = c.pg(survivor).await;
+    let rows = client
+        .simple_query("SELECT id FROM t")
+        .await
+        .expect("select after failover");
+    let n = rows
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(
+        n, 1,
+        "post-failover connection routes to the new leader and sees committed data"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (5c) When there is no leader, a connection attempt resolves (with an error)
+//      within the route layer's NO_LEADER_WAIT (5 s) + margin — never hangs.
+//
+//      Implementation note: we use the kill-two variant (kill 2 of 3 nodes
+//      so the survivor has no quorum → no leader) because the app-layer
+//      partition alternative can be flaky: a node may briefly still
+//      self-report as leader before openraft steps it down on quorum loss,
+//      causing the `is_err()` assertion to race.  Kill-two is deterministic.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_leader_connection_is_bounded() {
+    let mut c = harness::Cluster::spawn(3).await;
+    let leader = c.wait_for_leader().await;
+    // Kill the two nodes that are NOT the survivor (pick survivor = 0 if it
+    // isn't the leader, otherwise pick node 1).
+    let survivor = if leader != 0 { 0u64 } else { 1u64 };
+    for id in 0..3u64 {
+        if id != survivor {
+            c.kill(id).await;
+        }
+    }
+    // The survivor has no quorum → openraft will step it down. Wait a short
+    // moment for the heartbeat timeout to fire (no fixed sleep — we bound via
+    // the outer tokio::time::timeout, which is 20 s and far exceeds 5 s
+    // NO_LEADER_WAIT + openraft election/heartbeat timers).
+    let port = c
+        .sql_addr(survivor)
+        .rsplit(':')
+        .next()
+        .expect("port")
+        .to_string();
+    let cs = format!("host=127.0.0.1 port={port} user=postgres");
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio_postgres::connect(&cs, tokio_postgres::NoTls),
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "connect attempt must resolve within the bound, not hang"
+    );
+    assert!(
+        res.expect("not timed out").is_err(),
+        "with no leader, the connection is refused/closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+
 /// Perform one transfer transaction over `client`. Returns `true` iff it committed.
 ///
 /// `BEGIN; UPDATE -amt; UPDATE +amt; COMMIT`, each statement bounded by a 10s
