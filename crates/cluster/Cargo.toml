@@ -20,7 +20,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 zerocopy = { workspace = true }
-postcard = { workspace = true }
 
 [dev-dependencies]
 kv = { workspace = true }

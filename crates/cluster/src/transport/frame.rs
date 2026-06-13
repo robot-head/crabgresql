@@ -1,4 +1,7 @@
-//! Length-prefixed (u32 BE) postcard frames over any async byte stream.
+//! Length-prefixed (u32 BE) JSON frames over any async byte stream.
+//!
+//! JSON (serde_json, already used to serialize openraft types to disk in
+//! `durable.rs`) keeps the wire codec self-describing and adds no new dependency.
 use std::io;
 
 use serde::Serialize;
@@ -7,14 +10,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::MAX_FRAME;
 
-/// Serialize `msg` with postcard and write it as a u32-BE length prefix + body.
+/// Serialize `msg` as JSON and write it as a u32-BE length prefix + body.
 pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
     T: Serialize,
 {
     let bytes =
-        postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -27,7 +30,7 @@ where
     Ok(())
 }
 
-/// Read one length-prefixed postcard frame and deserialize it as `T`.
+/// Read one length-prefixed JSON frame and deserialize it as `T`.
 pub async fn read_msg<R, T>(r: &mut R) -> io::Result<T>
 where
     R: AsyncReadExt + Unpin,
@@ -44,7 +47,7 @@ where
     }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
-    postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
