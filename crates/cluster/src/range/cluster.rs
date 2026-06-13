@@ -69,7 +69,9 @@ impl MultiRangeCluster {
         self.groups[0].nodes[0].sm_kv.clone()
     }
 
-    /// Block until `range` has a stable leader; return its node id.
+    /// Block until `range` has a stable leader; return its node id. A node counts
+    /// as leader only if it both reports `state == Leader` and names itself as
+    /// `current_leader`, so a stranded ex-leader's stale view isn't trusted.
     pub async fn wait_for_leader(&self, range: RangeId) -> NodeId {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -82,6 +84,35 @@ impl MultiRangeCluster {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "range {range} elected no leader"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Block until `range` has a stable leader that is **not** `old`, returning its
+    /// id. Mirrors the single-range `Cluster::wait_for_leader_excluding`: a *paused*
+    /// node still reports itself `state == Leader` in its own metrics (pausing only
+    /// drops its RPCs — openraft never tells it to step down), and the naive
+    /// [`wait_for_leader`] scans node ids in order and would return that stale
+    /// ex-leader. After pausing/isolating `old`, this is the correct probe for "the
+    /// surviving majority re-elected someone else": it requires a node `id != old`
+    /// that both reports `Leader` and names itself, ignoring `old` entirely. Bounded
+    /// so a stuck group fails the test instead of hanging.
+    pub async fn wait_for_leader_excluding(&self, range: RangeId, old: NodeId) -> NodeId {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            for node in &self.groups[range as usize].nodes {
+                if node.id == old {
+                    continue;
+                }
+                let m = node.raft.metrics().borrow().clone();
+                if m.state == ServerState::Leader && m.current_leader == Some(m.id) && m.id != old {
+                    return m.id;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "range {range} elected no leader excluding {old}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
