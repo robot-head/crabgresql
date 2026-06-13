@@ -64,7 +64,7 @@ pub fn next_xid_key() -> Vec<u8> {
 /// Key for a transaction's commit-status-log entry: `/0/clog/<xid>`.
 pub fn clog_key(xid: u64) -> Vec<u8> {
     let mut k = system_prefix("clog");
-    k.extend_from_slice(&xid.to_be_bytes());
+    crate::keyenc::put_u64(&mut k, xid);
     k
 }
 

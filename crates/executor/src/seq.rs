@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use kv::Kv;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::big_endian::U64;
 
 use crate::PersistMode;
 use crate::error::ExecError;
@@ -46,7 +48,7 @@ impl SequenceManager {
         let new_next = next + count;
         let op = kv::WriteOp::Put {
             key: kv::key::seq_key(table),
-            value: new_next.to_be_bytes().to_vec(),
+            value: U64::new(new_next).as_bytes().to_vec(),
         };
         let folded = match self.mode {
             // Persist BEFORE releasing the lock and BEFORE handing out the rowid,

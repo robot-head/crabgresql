@@ -4,32 +4,31 @@
 //! arbitrary PRIMARY KEY column types are deferred; the key layout reserves the
 //! slot, so adding them is additive.
 
+use zerocopy::byteorder::big_endian::{U32, U64};
+use zerocopy::{FromBytes, IntoBytes};
+
 use crate::KvError;
 
 pub fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_be_bytes());
+    out.extend_from_slice(U32::new(v).as_bytes());
 }
 
 pub fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_be_bytes());
+    out.extend_from_slice(U64::new(v).as_bytes());
 }
 
 pub fn take_u32(cur: &mut &[u8]) -> Result<u32, KvError> {
-    if cur.len() < 4 {
-        return Err(KvError::CorruptRow("truncated u32 key component".into()));
-    }
-    let (head, rest) = cur.split_at(4);
+    let (v, rest) = U32::read_from_prefix(cur)
+        .map_err(|_| KvError::CorruptRow("truncated u32 key component".into()))?;
     *cur = rest;
-    Ok(u32::from_be_bytes(head.try_into().expect("4 bytes")))
+    Ok(v.get())
 }
 
 pub fn take_u64(cur: &mut &[u8]) -> Result<u64, KvError> {
-    if cur.len() < 8 {
-        return Err(KvError::CorruptRow("truncated u64 key component".into()));
-    }
-    let (head, rest) = cur.split_at(8);
+    let (v, rest) = U64::read_from_prefix(cur)
+        .map_err(|_| KvError::CorruptRow("truncated u64 key component".into()))?;
     *cur = rest;
-    Ok(u64::from_be_bytes(head.try_into().expect("8 bytes")))
+    Ok(v.get())
 }
 
 #[cfg(test)]
@@ -74,6 +73,17 @@ mod tests {
         assert!(enc32(0) < enc32(1));
         assert!(enc32(u32::MAX - 1) < enc32(u32::MAX));
         assert!(enc32(0x00FF_FFFF) < enc32(0x0100_0000));
+    }
+
+    #[test]
+    fn put_emits_big_endian_bytes() {
+        let mut b = Vec::new();
+        put_u32(&mut b, 0x0102_0304);
+        assert_eq!(b, vec![0x01, 0x02, 0x03, 0x04]);
+
+        let mut b = Vec::new();
+        put_u64(&mut b, 0x0102_0304_0506_0708);
+        assert_eq!(b, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
     }
 
     proptest! {

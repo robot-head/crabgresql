@@ -4,6 +4,9 @@
 //! ascending xid suffix, so versions sort chronologically. The value carries
 //! the xmin/xmax header and the row payload.
 
+use zerocopy::byteorder::big_endian::U64;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
 use pgtypes::Datum;
 
 use kv::KvError;
@@ -14,7 +17,7 @@ use kv::KvError;
 /// ascending). A rowid's versions all share `kv::key::row_key(table, rowid)`.
 pub fn version_key_xid(table_id: u32, rowid: u64, xid: u64) -> Vec<u8> {
     let mut k = kv::key::row_key(table_id, rowid);
-    k.extend_from_slice(&xid.to_be_bytes());
+    k.extend_from_slice(U64::new(xid).as_bytes());
     k
 }
 
@@ -28,11 +31,19 @@ pub fn row_prefix_of(key: &[u8]) -> Result<&[u8], KvError> {
 
 /// The creating xid encoded in a version key's 8-byte suffix.
 pub fn xid_of_key(key: &[u8]) -> Result<u64, KvError> {
-    if key.len() < 8 {
-        return Err(KvError::CorruptRow("version key too short".into()));
-    }
-    let suffix: [u8; 8] = key[key.len() - 8..].try_into().expect("8 bytes");
-    Ok(u64::from_be_bytes(suffix))
+    let (_, xid) = U64::read_from_suffix(key)
+        .map_err(|_| KvError::CorruptRow("version key too short".into()))?;
+    Ok(xid.get())
+}
+
+/// Fixed 17-byte tuple header: tag + big-endian xmin/xmax. `#[repr(C)]` with
+/// alignment-1 fields packs with no padding, matching the on-disk layout.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct TupleHeader {
+    tag: u8,
+    xmin: U64,
+    xmax: U64,
 }
 
 const T_TUPLE: u8 = 1;
@@ -41,29 +52,52 @@ const T_TUPLE: u8 = 1;
 /// `xmax == INVALID_XID` (0) marks a live version. A delete keeps the row bytes
 /// and sets `xmax` (PostgreSQL retains the tuple until vacuum).
 pub fn encode_tuple(xmin: u64, xmax: u64, row: &[Datum]) -> Vec<u8> {
+    let header = TupleHeader {
+        tag: T_TUPLE,
+        xmin: U64::new(xmin),
+        xmax: U64::new(xmax),
+    };
     let mut out = Vec::with_capacity(17 + row.len() * 8);
-    out.push(T_TUPLE);
-    out.extend_from_slice(&xmin.to_be_bytes());
-    out.extend_from_slice(&xmax.to_be_bytes());
+    out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&kv::rowenc::encode_row(row));
     out
 }
 
 /// Decode a tuple version into `(xmin, xmax, row)`.
 pub fn decode_tuple(bytes: &[u8]) -> Result<(u64, u64, Vec<Datum>), KvError> {
-    if bytes.len() < 17 || bytes[0] != T_TUPLE {
+    let (header, rest) = TupleHeader::ref_from_prefix(bytes)
+        .map_err(|_| KvError::CorruptRow("bad tuple header".into()))?;
+    if header.tag != T_TUPLE {
         return Err(KvError::CorruptRow("bad tuple header".into()));
     }
-    let xmin = u64::from_be_bytes(bytes[1..9].try_into().expect("8 bytes"));
-    let xmax = u64::from_be_bytes(bytes[9..17].try_into().expect("8 bytes"));
-    let row = kv::rowenc::decode_row(&bytes[17..])?;
-    Ok((xmin, xmax, row))
+    let row = kv::rowenc::decode_row(rest)?;
+    Ok((header.xmin.get(), header.xmax.get(), row))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pgtypes::Datum;
+
+    #[test]
+    fn tuple_header_is_packed_17_bytes() {
+        assert_eq!(core::mem::size_of::<TupleHeader>(), 17);
+    }
+
+    #[test]
+    fn tuple_header_layout_matches_manual_be() {
+        use zerocopy::IntoBytes;
+        use zerocopy::byteorder::big_endian::U64;
+        let h = TupleHeader {
+            tag: T_TUPLE,
+            xmin: U64::new(5),
+            xmax: U64::new(9),
+        };
+        let mut manual = vec![T_TUPLE];
+        manual.extend_from_slice(&5u64.to_be_bytes());
+        manual.extend_from_slice(&9u64.to_be_bytes());
+        assert_eq!(h.as_bytes(), manual.as_slice());
+    }
 
     #[test]
     fn row_prefix_of_strips_xid_suffix() {
