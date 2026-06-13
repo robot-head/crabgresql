@@ -8,6 +8,9 @@ on:
     - cron: "17 4 * * *" # daily, 04:17 UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }} (extended)
@@ -19,10 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      # Build cargo-fuzz from source so it targets the gnu host (the prebuilt is
-      # musl → no std + sanitizer-incompatible default target).
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-binstall }
+      # Prebuilt cargo-fuzz is musl; the explicit --target below forces the gnu
+      # build (the musl default has no std + is sanitizer-incompatible).
+      - name: Install cargo-fuzz (prebuilt)
+        run: cargo binstall -y cargo-fuzz
       - name: Fuzz ${{ matrix.target }} (5 min)
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
       - name: Upload crash artifacts

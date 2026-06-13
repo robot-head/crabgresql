@@ -3,6 +3,11 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# Minimal default GITHUB_TOKEN permissions for every job; clippy-sarif overrides
+# with the security-events write it needs to upload SARIF.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -94,11 +99,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      # Build cargo-fuzz from source so it targets the gnu host. The prebuilt
-      # (cargo-binstall) artifact is musl, which makes cargo-fuzz default the
-      # build to x86_64-unknown-linux-musl — no std + sanitizer-incompatible.
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-binstall }
+      # The cargo-fuzz prebuilt is musl; on its own it would default the fuzz
+      # build to x86_64-unknown-linux-musl (no std installed + sanitizer is
+      # incompatible with static libc). The explicit --target below overrides
+      # that, so the fast prebuilt builds for the gnu host correctly.
+      - name: Install cargo-fuzz (prebuilt)
+        run: cargo binstall -y cargo-fuzz
       - name: Build all fuzz targets
         run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Smoke-run each target (bounded)
