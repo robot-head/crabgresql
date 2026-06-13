@@ -2,31 +2,25 @@
 //! replay on open; durability is fsync on each commit.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 
 use crate::{Kv, KvError, WriteOp};
 
-/// Durable key-value store backed by a single fjall keyspace (partition).
-///
-/// Opening an existing directory recovers via fjall's journal replay —
-/// no bespoke recovery code required. Every write is fsynced before returning.
-pub struct FjallKv {
-    db: Database,
+/// A `Kv` over one fjall keyspace within a (possibly shared) `Database`. Every
+/// mutation fsyncs the whole Database as its tail, so a returned `Ok` is
+/// power-loss durable. Multiple `KeyspaceKv`s over the same `Arc<Database>` share
+/// that fsync (a single `persist` flushes all keyspaces' pending writes).
+pub struct KeyspaceKv {
+    db: Arc<Database>,
     ks: fjall::Keyspace,
 }
 
-impl FjallKv {
-    /// Opens (or creates) a `FjallKv` at the given path.
-    ///
-    /// If the directory already contains a database, it is recovered via
-    /// fjall's journal replay.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, KvError> {
-        let db = Database::builder(path).open().map_err(io)?;
-        let ks = db
-            .keyspace("data", KeyspaceCreateOptions::default)
-            .map_err(io)?;
-        Ok(Self { db, ks })
+impl KeyspaceKv {
+    /// Wrap an already-open keyspace `ks` belonging to `db`.
+    pub fn new(db: Arc<Database>, ks: fjall::Keyspace) -> Self {
+        Self { db, ks }
     }
 
     /// Flush the journal to disk (full fsync). Called as the TAIL of every
@@ -43,7 +37,7 @@ fn io(e: impl std::fmt::Display) -> KvError {
     KvError::Io(e.to_string())
 }
 
-impl Kv for FjallKv {
+impl Kv for KeyspaceKv {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         Ok(self.ks.get(key).map_err(io)?.map(|v| v.to_vec()))
     }
@@ -77,6 +71,52 @@ impl Kv for FjallKv {
         }
         batch.commit().map_err(io)?;
         self.sync()
+    }
+}
+
+/// Durable single-keyspace `Kv`: opens (or recovers) a one-keyspace `Database`.
+///
+/// Opening an existing directory recovers via fjall's journal replay —
+/// no bespoke recovery code required. Every write is fsynced before returning.
+pub struct FjallKv {
+    inner: KeyspaceKv,
+}
+
+impl FjallKv {
+    /// Opens (or creates) a `FjallKv` at the given path.
+    ///
+    /// If the directory already contains a database, it is recovered via
+    /// fjall's journal replay.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, KvError> {
+        let db = Arc::new(Database::builder(path).open().map_err(io)?);
+        let ks = db
+            .keyspace("data", KeyspaceCreateOptions::default)
+            .map_err(io)?;
+        Ok(Self {
+            inner: KeyspaceKv::new(db, ks),
+        })
+    }
+}
+
+impl Kv for FjallKv {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), KvError> {
+        self.inner.put(key, value)
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), KvError> {
+        self.inner.delete(key)
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        self.inner.scan_prefix(prefix)
+    }
+
+    fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
+        self.inner.write_batch(ops)
     }
 }
 
