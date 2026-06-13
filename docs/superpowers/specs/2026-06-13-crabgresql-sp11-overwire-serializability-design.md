@@ -72,19 +72,34 @@ case, so the history is intentionally small (a few clients, a few keys, a handfu
 appends each) — exactly as the existing register test keeps its workload small.
 Larger histories are the use case for the EDN export → real Elle (below).
 
-### Workload — single-key list-append (serializable-by-construction)
+### Workload — single-key list-append (serializable-by-construction via per-key locking)
 
-Strict serializability is *stronger* than the engine's guarantee (REPEATABLE READ is
-snapshot isolation, which permits write-skew / G2; there is no SSI). So the workload
-must avoid cross-key write-skew: each transaction appends a globally-unique value to
-**one** key and reads that key's list back:
+Strict serializability is *stronger* than the engine's guarantee (READ COMMITTED /
+REPEATABLE READ are snapshot isolation, which permits write-skew / G2; there is no
+SSI). So the workload must be made serializable explicitly. Each transaction appends
+a globally-unique value to **one** key and reads that key's list back, taking a
+**`FOR UPDATE` lock on a per-key anchor row first** so concurrent same-key appends
+serialize:
 
 ```sql
 BEGIN;
+SELECT key FROM anchor WHERE key = :k FOR UPDATE;  -- serialize same-key appends
 INSERT INTO appends(key, val) VALUES (:k, :v);
 SELECT val FROM appends WHERE key = :k;
 COMMIT;
 ```
+
+**Why the lock is required (a real SI hazard).** Single key alone is NOT enough
+under snapshot isolation: two concurrent same-key append transactions can each take
+a snapshot *before the other commits*, so each `SELECT` sees only its own append —
+T1 observes `[a]`, T2 observes `[b]` — a genuinely non-serializable pair (T1 saw
+a-without-b ⇒ T1 before T2; T2 saw b-without-a ⇒ T2 before T1; a cycle). Without the
+lock the checker correctly flags this (~2-4/15 runs). The `SELECT … FOR UPDATE` on a
+per-key `anchor` row (one row per key, seeded at setup) serializes concurrent
+same-key transactions through SP6 row-locking — one waits for the other's COMMIT,
+then reads the committed list — so the committed path is genuinely strict-serializable.
+The gate thus *tests* that SP6 row-locking + Raft total order = strict serializability.
+Each transaction locks exactly one anchor row, so there is no deadlock.
 
 **Ordering mechanism (verified against the engine).** crabgresql has **no** SQL
 `SERIAL`/`SEQUENCE`/`nextval`. Instead, every INSERT is assigned a monotonic
