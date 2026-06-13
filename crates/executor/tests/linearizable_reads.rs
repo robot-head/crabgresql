@@ -145,3 +145,28 @@ async fn healthy_leader_admits_repeatable_read_in_txn() {
     }
     s.simple_query("COMMIT").await.expect("commit");
 }
+
+#[tokio::test]
+async fn deposed_leader_gates_locking_select() {
+    let mut s = engine(Arc::new(DeposedLeader)).connect();
+    s.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    // Autocommit FOR UPDATE returns rows to the client → it is gated (before any
+    // xid/lock allocation).
+    let err = s
+        .simple_query("SELECT id FROM t FOR UPDATE")
+        .await
+        .expect_err("autocommit FOR UPDATE is gated");
+    assert_eq!(err.code, "40001");
+    // RC in-txn: plain BEGIN is not gated, but the locking SELECT is.
+    s.simple_query("BEGIN")
+        .await
+        .expect("plain begin not gated");
+    let err = s
+        .simple_query("SELECT id FROM t FOR UPDATE")
+        .await
+        .expect_err("in-txn FOR UPDATE is gated");
+    assert_eq!(err.code, "40001");
+    s.simple_query("ROLLBACK").await.ok();
+}

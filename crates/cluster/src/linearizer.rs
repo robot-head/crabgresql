@@ -31,9 +31,12 @@ impl Linearizer for RaftLinearizer {
 }
 
 /// Map openraft's `ensure_linearizable` error onto an `ExecError`. A
-/// `ForwardToLeader` (this node isn't the leader) is a retryable redirect →
-/// `NotLeader`; a `QuorumNotEnough` (couldn't confirm leadership) or any `Fatal`
-/// → `Unavailable` (also retryable). Either way the read returns no stale rows.
+/// `ForwardToLeader` (this node saw a higher term / isn't the leader) is a
+/// retryable redirect → `NotLeader` (SQLSTATE 40001); a `QuorumNotEnough`
+/// (couldn't reach a quorum to confirm leadership) or any `Fatal` → `Unavailable`
+/// (SQLSTATE 08006, also retryable). Note the *partitioned*-leader case (a leader
+/// isolated from its followers — the D5 Scenario-B case) yields `QuorumNotEnough`,
+/// so its read surfaces 08006, not 40001. Either way the read returns no stale rows.
 fn map_err(e: RaftError<NodeId, CheckIsLeaderError<NodeId, BasicNode>>) -> ExecError {
     match e {
         RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_)) => ExecError::NotLeader,
