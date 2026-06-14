@@ -264,6 +264,13 @@ impl SqlEngine {
     /// Scan THIS range's clog for in-doubt `Prepared(Li -> g)` markers and return the
     /// distinct `g`s NOT yet decided in range 0's global clog. Used by the leadership-
     /// rise recovery sweep to finalize a failed-over participant's txns.
+    ///
+    /// The decidedness check reads `self.catalog_kv` directly (NOT through the range-0
+    /// read barrier), so on a lagging local range-0 replica an already-decided `g` may
+    /// be reported in-doubt. That is harmless: the recovery sweep merely abort-races
+    /// `g` to range 0, and the decision is WRITE-ONCE — racing an already-terminal `g`
+    /// is a no-op against the real decision. Do not "fix" this by routing through the
+    /// barrier; the staleness is intentional and adds no latency to the hot path.
     pub async fn in_doubt_globals(&self) -> Result<Vec<u64>, ExecError> {
         use std::collections::BTreeSet;
         let mut gs: BTreeSet<u64> = BTreeSet::new();
