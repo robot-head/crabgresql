@@ -76,6 +76,29 @@ pub fn meta_next_global_xid_key() -> Vec<u8> {
     k
 }
 
+/// Key for a DATA range's recovery-scan watermark: the smallest local xid `Li`
+/// at/after which the leadership-rise recovery scan must still look. Lives in the
+/// `meta` namespace (disjoint from the `/0/clog/` prefix, so a clog scan never
+/// returns it). Stored per-range in that range's own store. Value = `Li` big-endian.
+pub fn clog_scan_lo_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"clog_scan_lo");
+    k
+}
+
+/// Exclusive upper bound for a scan over the whole `/0/clog/` keyspace: the clog
+/// prefix with its trailing byte incremented (the prefix's successor). `clog_prefix`
+/// is `system_prefix("clog")`, i.e. `…clog` followed by the `/` separator, so the
+/// last byte `0x2f` increments to `0x30` with no carry. This is strictly greater than
+/// `clog_key(u64::MAX)`, so it covers every clog entry. (Relies on the prefix never
+/// ending in `0xFF` — true for the `/`-separated system prefixes.)
+pub fn clog_scan_end() -> Vec<u8> {
+    let mut p = clog_prefix();
+    let last = p.last_mut().expect("clog prefix is non-empty");
+    *last += 1; // 0x2f ('/') -> 0x30; no carry
+    p
+}
+
 /// Key for a transaction's commit-status-log entry: `/0/clog/<xid>`.
 pub fn clog_key(xid: u64) -> Vec<u8> {
     let mut k = system_prefix("clog");
@@ -215,5 +238,12 @@ mod tests {
         assert_ne!(next_xid_key(), meta_next_table_id_key());
         // clog keys sort by xid (order-preserving big-endian suffix).
         assert!(clog_key(5) < clog_key(6));
+    }
+
+    #[test]
+    fn clog_scan_end_is_above_every_clog_key() {
+        assert!(clog_scan_end() > clog_key(u64::MAX));
+        // The watermark key is NOT inside the clog prefix (a clog scan won't return it).
+        assert!(!clog_scan_lo_key().starts_with(&clog_prefix()));
     }
 }

@@ -61,6 +61,15 @@ impl Kv for KeyspaceKv {
         Ok(out)
     }
 
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        let mut out = Vec::new();
+        for guard in self.ks.range(start.to_vec()..end.to_vec()) {
+            let (k, v) = guard.into_inner().map_err(io)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         let mut batch = self.db.batch();
         for op in ops {
@@ -113,6 +122,10 @@ impl Kv for FjallKv {
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        self.inner.scan_range(start, end)
     }
 
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
