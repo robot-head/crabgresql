@@ -636,4 +636,55 @@ mod tests {
             assert_eq!(format!("{env:?}"), format!("{back:?}"));
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let svc = TxnService::new(node.engines.clone());
+        // Seed a row on range 1 (create a placeholder table id 1 on range 0 first so b gets id 2).
+        let mut seed0 = node.engines[&0].connect();
+        seed0
+            .run(&parse_one("CREATE TABLE placeholder (id int4)"))
+            .await
+            .expect("placeholder");
+        seed0
+            .run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("b"); // id 2 -> range 1
+        let mut seed1 = node.engines[&1].connect();
+        seed1
+            .run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed");
+        let g = node.engines[&0].begin_global_durable().await.expect("g");
+        // Stage a held participant (writes Prepared(Li -> g) durably), then DROP the in-memory
+        // session WITHOUT a decision (simulate the participant leader crashing): the durable
+        // marker persists, the in-memory session is gone.
+        assert!(matches!(
+            svc.handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                }
+            )
+            .await,
+            TxnResp::Staged
+        ));
+        svc.release_all_for_range(1).await; // drop in-memory session; durable Prepared marker stays
+        // The marker is in-doubt; finalize it.
+        let gs = node.engines[&1].in_doubt_globals().await.expect("scan");
+        assert_eq!(gs, vec![g], "the durable Prepared marker is in-doubt");
+        node.engines[&0]
+            .commit_global_decision(g, mvcc::clog::XidStatus::Aborted)
+            .await
+            .expect("finalize");
+        // Now resolved: no longer in-doubt.
+        let gs2 = node.engines[&1].in_doubt_globals().await.expect("scan2");
+        assert!(
+            gs2.is_empty(),
+            "after the write-once Aborted decision, g is no longer in-doubt"
+        );
+    }
 }

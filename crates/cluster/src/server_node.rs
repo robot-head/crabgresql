@@ -237,6 +237,9 @@ impl ServerNode {
         // 0's own engine needs none (it reads its own current store). Built over the
         // now-complete `rafts` map.
         let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        // Cross-range recovery: a per-DATA-range client the leadership-rise sweep uses
+        // to abort-race in-doubt `Prepared(-> g)` markers against range 0 (write-once).
+        let sweep_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
         for (range, raft, sm_kv, mut engine) in pending {
             let barrier: Arc<dyn executor::Linearizer> = Arc::new(
                 crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
@@ -244,6 +247,14 @@ impl ServerNode {
             engine.set_range0_barrier(barrier);
             let engine = Arc::new(engine);
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+            // On THIS data-range's leadership rising edge, finalize a failed-over
+            // participant's durable in-doubt markers (range 0 holds only global xids).
+            tokio::spawn(resolve_in_doubt_on_leadership(
+                raft.clone(),
+                cfg.id,
+                engine.clone(),
+                sweep_client.clone(),
+            ));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }
@@ -543,6 +554,39 @@ async fn release_on_leadership_loss(
         let is_leader = rx.borrow().current_leader == Some(id);
         if was_leader && !is_leader {
             txn.release_all_for_range(range).await; // free held locks; global clog is the arbiter
+        }
+        was_leader = is_leader;
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// On the RISING edge of this node's leadership for `range`, finalize any in-doubt
+/// `Prepared(-> g)` markers in this range's durable clog whose coordinator died:
+/// abort-race each undecided `g` against range 0 (write-once). Heals a failed-over
+/// participant so its rows resolve (invisible for presumed-abort) rather than
+/// staying in-doubt forever. No sleep — mirrors `release_on_leadership_loss`.
+async fn resolve_in_doubt_on_leadership(
+    raft: openraft::Raft<TypeConfig>,
+    id: NodeId,
+    engine: Arc<SqlEngine>,
+    client: std::sync::Arc<crate::twopc::TwoPcClient>,
+) {
+    use crate::transport::protocol::TxnRpc;
+    let mut rx = raft.metrics();
+    let mut was_leader = false;
+    loop {
+        let is_leader = rx.borrow().current_leader == Some(id);
+        if is_leader
+            && !was_leader
+            && let Ok(gs) = engine.in_doubt_globals().await
+        {
+            for g in gs {
+                let _ = client
+                    .call(0, TxnRpc::CommitGlobal { g, commit: false })
+                    .await;
+            }
         }
         was_leader = is_leader;
         if rx.changed().await.is_err() {

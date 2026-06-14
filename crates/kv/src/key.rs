@@ -89,6 +89,16 @@ pub fn clog_prefix() -> Vec<u8> {
     system_prefix("clog")
 }
 
+/// Decode the xid from a `/0/clog/<xid>` key, or `None` if `key` is not a clog key.
+pub fn clog_xid_of(key: &[u8]) -> Option<u64> {
+    let prefix = clog_prefix();
+    if key.len() != prefix.len() + 8 || key[..prefix.len()] != prefix[..] {
+        return None;
+    }
+    let mut rest = &key[prefix.len()..];
+    crate::keyenc::take_u64(&mut rest).ok()
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;

@@ -261,6 +261,28 @@ impl SqlEngine {
         Ok(mvcc::clog::get(self.kv.as_ref(), g)?)
     }
 
+    /// Scan THIS range's clog for in-doubt `Prepared(Li -> g)` markers and return the
+    /// distinct `g`s NOT yet decided in range 0's global clog. Used by the leadership-
+    /// rise recovery sweep to finalize a failed-over participant's txns.
+    pub async fn in_doubt_globals(&self) -> Result<Vec<u64>, ExecError> {
+        use std::collections::BTreeSet;
+        let mut gs: BTreeSet<u64> = BTreeSet::new();
+        for (k, v) in self.kv.scan_prefix(&kv::key::clog_prefix())? {
+            if kv::key::clog_xid_of(&k).is_none() {
+                continue;
+            }
+            if let mvcc::clog::XidStatus::Prepared(g) = mvcc::clog::decode(&v)?
+                && !matches!(
+                    mvcc::clog::get(self.catalog_kv.as_ref(), g)?,
+                    mvcc::clog::XidStatus::Committed | mvcc::clog::XidStatus::Aborted
+                )
+            {
+                gs.insert(g);
+            }
+        }
+        Ok(gs.into_iter().collect())
+    }
+
     /// Deregister a decided global txn from the in-memory running-set.
     pub fn finish_global(&self, g: u64) {
         self.gtm
@@ -309,5 +331,37 @@ impl Engine for SqlEngine {
             self.gtm.as_ref().map(Arc::clone),
             self.range0_barrier.as_ref().map(Arc::clone),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_doubt_globals_lists_undecided_prepared_markers() {
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        // Single-store in-memory engine: `self.kv == self.catalog_kv` (both are the
+        // same `Arc` per `with_kv`), so `MemKv` here is range 0's global clog too.
+        let kv = Arc::new(MemKv::new());
+        let engine = SqlEngine::with_kv(Arc::clone(&kv) as Arc<dyn Kv>).expect("engine");
+        let g_undecided = GLOBAL_XID_BASE + 1;
+        let g_committed = GLOBAL_XID_BASE + 2;
+        // Two local participants prepared into two global xids.
+        kv.write_batch(&[put_op(11, XidStatus::Prepared(g_undecided))])
+            .expect("p1");
+        kv.write_batch(&[put_op(12, XidStatus::Prepared(g_committed))])
+            .expect("p2");
+        // g_committed is decided; g_undecided is not.
+        kv.write_batch(&[put_op(g_committed, XidStatus::Committed)])
+            .expect("decide");
+        let mut got = engine.in_doubt_globals().await.expect("scan");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![g_undecided],
+            "only undecided Prepared markers are returned"
+        );
     }
 }
