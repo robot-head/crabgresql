@@ -46,19 +46,34 @@ async fn connect_with_retry(
 /// table 2: table id 1 → range 0, id ≥ 2 → range 1) and wait until it
 /// self-confirms leadership of **every** range (event-based, no sleep).
 async fn start_two_range_node() -> (ServerNode, String) {
-    let node_addr = free_port().await;
-    let sql_addr = free_port().await;
-    let node = ServerNode::start(NodeConfig {
-        id: 0,
-        node_addr: node_addr.clone(),
-        sql_addr: sql_addr.clone(),
-        data_dir: tempfile::tempdir().expect("tempdir").keep(),
-        peers: vec![(0, node_addr.clone())],
-        bootstrap: true,
-        range_map: RangeMap::with_boundaries(vec![2]),
-    })
-    .await
-    .expect("start node");
+    // Retry on a port-bind race: free_port binds-then-drops to find a free port, so
+    // under heavy test contention another binder can steal it before ServerNode
+    // rebinds. Bounded so a genuinely stuck bind still fails the test.
+    let mut attempts = 0;
+    let (node, sql_addr) = loop {
+        let node_addr = free_port().await;
+        let sql_addr = free_port().await;
+        match ServerNode::start(NodeConfig {
+            id: 0,
+            node_addr: node_addr.clone(),
+            sql_addr: sql_addr.clone(),
+            data_dir: tempfile::tempdir().expect("tempdir").keep(),
+            peers: vec![(0, node_addr.clone())],
+            bootstrap: true,
+            range_map: RangeMap::with_boundaries(vec![2]),
+        })
+        .await
+        {
+            Ok(node) => break (node, sql_addr),
+            Err(e) => {
+                attempts += 1;
+                assert!(
+                    attempts < 16,
+                    "start_two_range_node: bind race did not clear: {e:?}"
+                );
+            }
+        }
+    };
 
     // A one-node group elects immediately after `initialize`. Wait per range via
     // openraft's event API — the instant each range self-confirms as leader.

@@ -94,6 +94,24 @@ fn raft_config() -> Arc<openraft::Config> {
     )
 }
 
+/// Bind a TCP listener, retrying briefly on `AddrInUse`. A node's configured port
+/// can be transiently contended — by a `TIME_WAIT` socket from a prior instance, or
+/// (in tests) by the `free_port` bind-drop-rebind idiom racing a concurrent binder
+/// under heavy contention. Bounded, so a genuinely-occupied port still fails fast.
+async fn bind_with_retry(addr: &str) -> std::io::Result<TcpListener> {
+    let mut attempts = 0;
+    loop {
+        match TcpListener::bind(addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl ServerNode {
     /// Open the durable store over the whole `RangeMap`, build a Raft + applied
     /// engine per range over the range-aware TCP transport (Task 1), register each
@@ -160,7 +178,7 @@ impl ServerNode {
 
         // One node-protocol listener for the whole node; it resolves the target
         // group from the registry by the RPC's `(range, from)`.
-        let node_listener = TcpListener::bind(&cfg.node_addr).await?;
+        let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
@@ -182,7 +200,7 @@ impl ServerNode {
         // Task 3): each simple-query frame runs on the range's local-leader engine
         // or is forwarded to the remote leader through the seam (a `RejectForward`
         // stub here — Task 4 swaps in the pooled pgwire client).
-        let sql_listener = TcpListener::bind(&cfg.sql_addr).await?;
+        let sql_listener = bind_with_retry(&cfg.sql_addr).await?;
         let sql_config = Arc::new(pgwire::session::SessionConfig::trust());
         if cfg.range_map.range_count() > 1 {
             // The remote arm of the gateway: a pooled pgwire forwarding client over

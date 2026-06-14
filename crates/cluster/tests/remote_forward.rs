@@ -22,9 +22,25 @@ async fn free_port() -> String {
     a
 }
 
-/// Two co-located multi-range nodes (ranges {0,1}); return both, plus the packed
-/// `node|sql` peer addresses. Both bootstrap range 0 and range 1.
+/// Two co-located multi-range nodes (ranges {0,1}); return both. Both bootstrap
+/// range 0 and range 1.
+///
+/// Retries on a port-bind race: `free_port` binds-then-drops to discover a free
+/// port, so under heavy test contention another binder can steal it before the
+/// node rebinds, and `ServerNode::start`'s `bind` returns `Err`. We retry with
+/// fresh ports rather than flake — bounded so a genuinely stuck bind still fails.
 async fn two_node_cluster() -> (ServerNode, ServerNode) {
+    let mut last_err = None;
+    for _ in 0..16 {
+        match try_two_node_cluster().await {
+            Ok(pair) => return pair,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!("two_node_cluster: port-bind race did not clear in 16 attempts: {last_err:?}");
+}
+
+async fn try_two_node_cluster() -> std::io::Result<(ServerNode, ServerNode)> {
     let map = RangeMap::with_boundaries(vec![2]); // table id 1 -> range 0, id >=2 -> range 1
     let n0_node = free_port().await;
     let n0_sql = free_port().await;
@@ -45,8 +61,7 @@ async fn two_node_cluster() -> (ServerNode, ServerNode) {
         bootstrap: true,
         range_map: map.clone(),
     })
-    .await
-    .expect("start n0");
+    .await?;
     let n1 = ServerNode::start(NodeConfig {
         id: 1,
         node_addr: n1_node.clone(),
@@ -56,9 +71,8 @@ async fn two_node_cluster() -> (ServerNode, ServerNode) {
         bootstrap: false,
         range_map: map,
     })
-    .await
-    .expect("start n1");
-    (n0, n1)
+    .await?;
+    Ok((n0, n1))
 }
 
 /// Await `range`'s self-confirmed leader id across the two nodes' raft handles,
