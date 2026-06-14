@@ -54,6 +54,13 @@ pub fn meta_next_table_id_key() -> Vec<u8> {
     k
 }
 
+/// Key for the replicated range-descriptor blob: `/0/meta/range_map`.
+pub fn meta_range_map_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"range_map");
+    k
+}
+
 /// Key for the global next-transaction-id counter: `/0/meta/next_xid`.
 pub fn next_xid_key() -> Vec<u8> {
     let mut k = system_prefix("meta");
@@ -137,6 +144,19 @@ mod tests {
         // User rows use table_id >= 1; system keys use table_id 0.
         assert!(!catalog_key("t").starts_with(&table_prefix(1)));
         assert!(!seq_key(1).starts_with(&table_prefix(1)));
+    }
+
+    #[test]
+    fn meta_range_map_key_is_under_table_zero_meta() {
+        let k = meta_range_map_key();
+        let zero = {
+            let mut z = Vec::new();
+            crate::keyenc::put_u32(&mut z, 0);
+            z
+        };
+        assert!(k.starts_with(&zero), "range map key is under table 0");
+        assert_ne!(k, meta_next_table_id_key(), "distinct from next_table_id");
+        assert_ne!(k, next_xid_key(), "distinct from next_xid");
     }
 
     #[test]
