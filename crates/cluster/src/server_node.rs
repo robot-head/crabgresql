@@ -176,15 +176,31 @@ impl ServerNode {
             }
         }
 
-        // SQL listener: single-range fast-path this slice — serve/route via range
-        // 0's Raft + engine. The per-statement multi-range gateway is Task 3.
+        // SQL listener. A single-range node keeps the leader-routing fast-path
+        // (`serve_routed`: serve locally if leader, else byte-proxy to the leader).
+        // A multi-range node is a per-statement range gateway (`serve_range_routed`,
+        // Task 3): each simple-query frame runs on the range's local-leader engine
+        // or is forwarded to the remote leader through the seam (a `RejectForward`
+        // stub here — Task 4 swaps in the pooled pgwire client).
         let sql_listener = TcpListener::bind(&cfg.sql_addr).await?;
-        tokio::spawn(crate::route::serve_routed(
-            sql_listener,
-            rafts[&0].clone(),
-            engines[&0].clone(),
-            Arc::new(pgwire::session::SessionConfig::trust()),
-        ));
+        let sql_config = Arc::new(pgwire::session::SessionConfig::trust());
+        if cfg.range_map.range_count() > 1 {
+            tokio::spawn(crate::route::serve_range_routed(
+                sql_listener,
+                cfg.range_map.clone(),
+                engines.clone(),
+                catalog_kv.clone(),
+                Arc::new(crate::range::router::RejectForward),
+                sql_config,
+            ));
+        } else {
+            tokio::spawn(crate::route::serve_routed(
+                sql_listener,
+                rafts[&0].clone(),
+                engines[&0].clone(),
+                sql_config,
+            ));
+        }
 
         Ok(Self {
             rafts,

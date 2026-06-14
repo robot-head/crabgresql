@@ -106,6 +106,86 @@ async fn proxy(mut client: TcpStream, leader_sql_addr: &str) {
     }
 }
 
+use std::collections::HashMap;
+
+use crate::range::map::{RangeId, RangeMap};
+use crate::range::router::{RangeRouter, RemoteForward};
+
+/// A `pgwire` `Engine` whose every connection is a per-statement range gateway.
+/// `connect()` builds a `RangeRouter` over this node's LOCAL-leader engines, the
+/// range-0 catalog store, and the remote-forward seam — so each simple-query frame
+/// runs locally for a range this node leads and forwards otherwise. The per-range
+/// engines are shared (`Arc`) across all connections; each connection gets fresh
+/// `SqlSession`s lazily (`SqlEngine::connect`), as the router already does.
+pub struct RangeGatewayEngine {
+    map: RangeMap,
+    engines: HashMap<RangeId, Arc<SqlEngine>>,
+    catalog_kv: Arc<dyn kv::Kv>,
+    forward: Arc<dyn RemoteForward>,
+}
+
+impl RangeGatewayEngine {
+    pub fn new(
+        map: RangeMap,
+        engines: HashMap<RangeId, Arc<SqlEngine>>,
+        catalog_kv: Arc<dyn kv::Kv>,
+        forward: Arc<dyn RemoteForward>,
+    ) -> Self {
+        Self {
+            map,
+            engines,
+            catalog_kv,
+            forward,
+        }
+    }
+}
+
+impl pgwire::engine::Engine for RangeGatewayEngine {
+    type Session = RangeRouter;
+
+    fn connect(&self) -> RangeRouter {
+        // The router owns one engine per range by value; clone the shared engines
+        // into per-connection routing handles. `SqlEngine` is a bundle of `Arc`s
+        // (`lib.rs:49-63`), so this is a cheap pointer clone, not a deep copy.
+        let engines: HashMap<RangeId, SqlEngine> = self
+            .engines
+            .iter()
+            .map(|(&r, e)| (r, (**e).clone_handle()))
+            .collect();
+        RangeRouter::new(
+            self.map.clone(),
+            engines,
+            Arc::clone(&self.catalog_kv),
+            Arc::clone(&self.forward),
+        )
+    }
+}
+
+/// Serve the public SQL port as a per-statement range gateway: each simple-query
+/// frame is demuxed to its range's local leader engine or forwarded to the remote
+/// leader. The multi-range analog of `serve_routed`; T2 selects this when the
+/// node hosts more than one range.
+pub async fn serve_range_routed(
+    listener: TcpListener,
+    map: RangeMap,
+    engines: HashMap<RangeId, Arc<SqlEngine>>,
+    catalog_kv: Arc<dyn kv::Kv>,
+    forward: Arc<dyn RemoteForward>,
+    config: Arc<SessionConfig>,
+) -> std::io::Result<()> {
+    let engine = Arc::new(RangeGatewayEngine::new(map, engines, catalog_kv, forward));
+    let registry = Arc::new(CancelRegistry::default());
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let engine = engine.clone();
+        let config = config.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let _ = serve_conn(stream, engine, config, registry, None).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

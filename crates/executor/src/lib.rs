@@ -134,6 +134,33 @@ impl SqlEngine {
         self.seq.reseed_from_applied();
         Ok(())
     }
+
+    /// A second handle to the SAME engine (all fields are `Arc`/`Copy`): every
+    /// clone shares the applied store, committer, linearizer, and counters.
+    /// Used by the gateway to give each connection its own router without
+    /// re-opening the engine.
+    pub fn clone_handle(&self) -> SqlEngine {
+        SqlEngine {
+            kv: Arc::clone(&self.kv),
+            catalog_kv: Arc::clone(&self.catalog_kv),
+            procarray: Arc::clone(&self.procarray),
+            seq: Arc::clone(&self.seq),
+            lockmgr: Arc::clone(&self.lockmgr),
+            catalog_lock: Arc::clone(&self.catalog_lock),
+            committer: Arc::clone(&self.committer),
+            linearizer: Arc::clone(&self.linearizer),
+            persist_mode: self.persist_mode,
+        }
+    }
+}
+
+/// Field descriptions for `sql` resolving schema from `catalog_kv`, without a
+/// data store or execution (the gateway's Describe only needs the catalog).
+pub fn describe_fields(
+    catalog_kv: &dyn Kv,
+    sql: &str,
+) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
+    crate::exec::describe(catalog_kv, catalog_kv, sql)
 }
 
 impl Engine for SqlEngine {
