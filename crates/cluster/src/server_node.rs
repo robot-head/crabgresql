@@ -427,17 +427,19 @@ impl ServerNode {
         sm_kvs.insert(0, r0_sm_kv);
         engines.insert(0, r0_engine);
 
-        // Replicated path: the node listener binds before the full engines map is
-        // built (only range 0 is ready), so it hosts no 2PC service yet — cross-range
-        // 2PC over the replicated layout is future work. The static path (used by the
-        // multi-process e2e) wires Some(txn).
+        // The node listener binds with only range 0 ready, but it DOES host the 2PC
+        // service from the start: `TxnService`'s engines map is growable, so global/
+        // coordinator ops (Begin/Commit/GlobalBarrier — they need only engine(0)) work
+        // immediately, and data ranges are registered live in Phase 2. The listener
+        // must stay bound throughout Phase 2 to serve range-0 Raft RPCs.
+        let txn = crate::twopc::TxnService::new(engines.clone());
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
             partition.clone(),
             shutdown.clone(),
-            None,
+            Some(txn.clone()),
         ));
 
         // Bootstrap range 0's voting group (bootstrap node only) and, once we lead
@@ -479,16 +481,44 @@ impl ServerNode {
         // Cross-node visibility: every DATA-range engine gets a range-0 read barrier
         // (range 0's own engine reads its own current store, so it needs none).
         let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        // Cross-range recovery: the per-DATA-range client the leadership-rise sweep uses
+        // to abort-race in-doubt `Prepared(-> g)` markers against range 0 (write-once).
+        let sweep_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
         for (range, raft, sm_kv, mut engine) in pending {
             let barrier: Arc<dyn executor::Linearizer> = Arc::new(
                 crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
             );
             engine.set_range0_barrier(barrier);
             let engine = Arc::new(engine);
+            // Register this data range so the listener can serve Stage/Release for it.
+            txn.register_engine(range, engine.clone());
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+            // On THIS data-range's leadership rising edge, finalize a failed-over
+            // participant's durable in-doubt markers.
+            tokio::spawn(resolve_in_doubt_on_leadership(
+                raft.clone(),
+                cfg.id,
+                engine.clone(),
+                sweep_client.clone(),
+            ));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }
+
+        // Per-range leadership-loss release: free held 2PC locks promptly when this
+        // node loses a range's leadership. All watchers share the same Arc held-map.
+        for (&range, raft) in &rafts {
+            tokio::spawn(release_on_leadership_loss(
+                raft.clone(),
+                range,
+                cfg.id,
+                txn.clone(),
+            ));
+        }
+        // Coordinator-silence recovery: a per-node heartbeat self-resolves held 2PC
+        // sessions whose coordinator crashed after staging but before deciding.
+        let sweeper_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        tokio::spawn(participant_silence_sweeper(txn.clone(), sweeper_client));
 
         // A replicated node always serves through the gateway (even at one range):
         // the layout is dynamic in principle, so the byte-proxy fast path — which is
