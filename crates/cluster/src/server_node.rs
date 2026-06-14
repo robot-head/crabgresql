@@ -131,10 +131,10 @@ async fn bind_with_retry(addr: &str) -> std::io::Result<TcpListener> {
 }
 
 /// Build one range's Raft group + applied store + replicated engine over its
-/// per-range keyspaces, register it in the `(range, node)` registry, and spawn its
-/// reseed-on-leadership task. Returns `(raft, sm_kv, engine)` for the caller's
-/// maps. Both Static and Replicated bring-up call this — Static once per range up
-/// front, Replicated once for range 0 then once per data range after the blob read.
+/// per-range keyspaces, register it in the `(range, node)` registry. Returns
+/// `(raft, sm_kv, engine)` — engine is UN-Arc'd so the caller can mutate it
+/// (e.g. `init_gtm_coordinator` on range 0) before Arc-wrapping. Callers are
+/// responsible for spawning `reseed_on_leadership` after Arc-wrapping.
 async fn build_range_group(
     store: &NodeStore,
     range: RangeId,
@@ -142,7 +142,7 @@ async fn build_range_group(
     partition: &PartitionState,
     registry: &RangeRegistry,
     catalog_kv: &Arc<dyn kv::Kv>,
-) -> (openraft::Raft<TypeConfig>, Arc<dyn kv::Kv>, Arc<SqlEngine>) {
+) -> (openraft::Raft<TypeConfig>, Arc<dyn kv::Kv>, SqlEngine) {
     let log = DurableLogStore::open(store, range).expect("durable log");
     let sm = DurableStateMachineStore::open(store, range).expect("durable sm");
     // Annotate as the trait object so the returned trio coerces cleanly (the
@@ -159,16 +159,13 @@ async fn build_range_group(
         .expect("raft::new");
     registry.register(range, id, raft.clone());
 
-    let engine = Arc::new(
-        SqlEngine::replicated(
-            catalog_kv.clone(),
-            sm_kv.clone(),
-            Arc::new(RaftCommitter { raft: raft.clone() }),
-            Arc::new(RaftLinearizer { raft: raft.clone() }),
-        )
-        .expect("replicated engine"),
-    );
-    tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+    let engine = SqlEngine::replicated(
+        catalog_kv.clone(),
+        sm_kv.clone(),
+        Arc::new(RaftCommitter { raft: raft.clone() }),
+        Arc::new(RaftLinearizer { raft: raft.clone() }),
+    )
+    .expect("replicated engine");
 
     (raft, sm_kv, engine)
 }
@@ -195,9 +192,24 @@ impl ServerNode {
         let mut sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>> = HashMap::new();
         let mut engines: HashMap<RangeId, Arc<SqlEngine>> = HashMap::new();
 
-        for range in map.range_ids() {
+        // Range 0 is special: init the GTM coordinator before Arc-wrapping.
+        let (r0_raft, r0_sm_kv, mut r0_engine) =
+            build_range_group(&store, 0, cfg.id, &partition, &registry, &catalog_kv).await;
+        r0_engine
+            .init_gtm_coordinator()
+            .expect("init GTM coordinator over range 0");
+        let r0_engine = Arc::new(r0_engine);
+        tokio::spawn(reseed_on_leadership(r0_raft.clone(), r0_engine.clone()));
+        rafts.insert(0, r0_raft);
+        sm_kvs.insert(0, r0_sm_kv);
+        engines.insert(0, r0_engine);
+
+        // Data ranges (all ranges except 0).
+        for range in map.range_ids().filter(|&r| r != 0) {
             let (raft, sm_kv, engine) =
                 build_range_group(&store, range, cfg.id, &partition, &registry, &catalog_kv).await;
+            let engine = Arc::new(engine);
+            tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             rafts.insert(range, raft);
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
@@ -331,8 +343,13 @@ impl ServerNode {
         let mut sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>> = HashMap::new();
         let mut engines: HashMap<RangeId, Arc<SqlEngine>> = HashMap::new();
 
-        let (r0_raft, r0_sm_kv, r0_engine) =
+        let (r0_raft, r0_sm_kv, mut r0_engine) =
             build_range_group(&store, 0, cfg.id, &partition, &registry, &catalog_kv).await;
+        r0_engine
+            .init_gtm_coordinator()
+            .expect("init GTM coordinator over range 0");
+        let r0_engine = Arc::new(r0_engine);
+        tokio::spawn(reseed_on_leadership(r0_raft.clone(), r0_engine.clone()));
         rafts.insert(0, r0_raft.clone());
         sm_kvs.insert(0, r0_sm_kv);
         engines.insert(0, r0_engine);
@@ -375,9 +392,11 @@ impl ServerNode {
             store.open_range(range).expect("open data range keyspace");
             let (raft, sm_kv, engine) =
                 build_range_group(&store, range, cfg.id, &partition, &registry, &catalog_kv).await;
+            let engine = Arc::new(engine);
             if cfg.bootstrap {
                 tokio::spawn(bootstrap(raft.clone(), cfg.peers.clone()));
             }
+            tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             rafts.insert(range, raft);
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
@@ -442,6 +461,7 @@ async fn reseed_on_leadership(raft: openraft::Raft<TypeConfig>, engine: Arc<SqlE
         };
         if is_leader && !was_leader {
             let _ = engine.reseed_counters();
+            let _ = engine.reseed_gtm(); // lift next_global past every durable allocation
         }
         was_leader = is_leader;
         if rx.changed().await.is_err() {

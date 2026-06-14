@@ -60,7 +60,6 @@ impl Gtm {
         }
     }
 
-    #[allow(dead_code)] // used on leader transition in Tasks 3/4
     pub fn reseed_from_applied(&self) -> Result<(), ExecError> {
         let durable = match self.kv.get(&kv::key::meta_next_global_xid_key())? {
             Some(b) => {

@@ -131,6 +131,32 @@ async fn gateway_routes_create_insert_select_across_local_ranges() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn begin_global_durable_persists_next_global() {
+    use mvcc::xid::GLOBAL_XID_BASE;
+    let (node, _sql_addr) = start_two_range_node().await;
+    let engine = node.engines.get(&0).expect("range-0 engine");
+    assert!(
+        engine.has_gtm(),
+        "range-0 engine must carry the GTM after wiring"
+    );
+
+    let g0 = engine.begin_global_durable().await.expect("alloc g0");
+    assert!(g0 >= GLOBAL_XID_BASE, "global xids live above the base");
+    let g1 = engine.begin_global_durable().await.expect("alloc g1");
+    assert_eq!(g1, g0 + 1, "allocations are monotonic");
+
+    // The advance is durable (no raw byte decode — avoids endianness coupling):
+    // a reseed of a fresh in-memory counter never regresses below the persisted
+    // value, so a subsequent allocation stays strictly monotone past g1.
+    engine.reseed_gtm().expect("reseed");
+    let g2 = engine.begin_global_durable().await.expect("alloc g2");
+    assert!(
+        g2 > g1,
+        "post-reseed allocation never regresses below the durable counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_rejects_a_cross_range_transaction_with_0a000() {
     let (_node, sql_addr) = start_two_range_node().await;
     let port = sql_addr.rsplit(':').next().expect("port");

@@ -399,12 +399,15 @@ impl RangeRouter {
     }
 
     /// Whether this router can escalate a txn to cross-range 2PC: it must hold range
-    /// 0's engine locally AND that engine must carry the shared GTM coordinator.
-    /// True for the in-process `MultiRangeCluster` (every engine is GTM-wired);
-    /// false for the cross-node gateway path, where a cross-range txn is rejected
-    /// with 0A000 until the cross-node decision path lands (SP17).
+    /// 0's engine locally AND that engine must have escalation enabled. True for the
+    /// in-process `MultiRangeCluster` (engines are wired via `share_gtm_to` which
+    /// sets `escalation_enabled`); false for the network gateway path, where
+    /// `init_gtm_coordinator` wires the GTM for durable allocation but does NOT
+    /// enable escalation until the cross-node coordinator lands in SP17 T4.
     fn can_escalate(&self) -> bool {
-        self.engines.get(&0).is_some_and(SqlEngine::has_gtm)
+        self.engines
+            .get(&0)
+            .is_some_and(SqlEngine::escalation_enabled)
     }
 
     /// Open a held txn on `range`'s session if it is Idle, so a participant's first

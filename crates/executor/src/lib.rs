@@ -66,6 +66,13 @@ pub struct SqlEngine {
     /// on a single-range engine. Single-range behavior is byte-for-byte unchanged
     /// when `gtm` is `None`.
     pub(crate) gtm: Option<Arc<gtm::Gtm>>,
+    /// Whether this engine handle may escalate a single-range txn to a cross-range
+    /// global 2PC txn. `true` only for in-process multi-range engines (set by
+    /// `share_gtm_to`); `false` on engines in the network gateway path until the
+    /// cross-node coordinator is wired (SP17 T4). Separate from `gtm`: range 0's
+    /// engine may carry the GTM (for `begin_global_durable`) without yet allowing
+    /// the gateway's `RangeRouter` to escalate cross-range txns.
+    pub(crate) escalation_enabled: bool,
 }
 
 impl Default for SqlEngine {
@@ -102,6 +109,7 @@ impl SqlEngine {
             linearizer: Arc::new(crate::read_gate::LocalLinearizer),
             persist_mode: PersistMode::Durable,
             gtm: None,
+            escalation_enabled: false,
         })
     }
 
@@ -133,6 +141,7 @@ impl SqlEngine {
             linearizer,
             persist_mode: PersistMode::Replicated,
             gtm: None,
+            escalation_enabled: false,
         })
     }
 
@@ -159,6 +168,7 @@ impl SqlEngine {
             linearizer: Arc::clone(&self.linearizer),
             persist_mode: self.persist_mode,
             gtm: self.gtm.as_ref().map(Arc::clone),
+            escalation_enabled: self.escalation_enabled,
         }
     }
 
@@ -172,22 +182,33 @@ impl SqlEngine {
         Ok(())
     }
 
-    /// Copy this engine's `Arc<Gtm>` into `other`. Both engines then share the
-    /// same GTM — any range can resolve a `Prepared` row and the coordinator can
-    /// drive range 0. `self` must have been initialized via `init_gtm_coordinator`
-    /// first; `other` can be any range's engine.
+    /// Copy this engine's `Arc<Gtm>` into `other` and enable in-process escalation.
+    /// Both engines then share the same GTM — any range can resolve a `Prepared`
+    /// row and the coordinator can drive range 0. `self` must have been initialized
+    /// via `init_gtm_coordinator` first; `other` can be any range's engine.
+    /// Setting `escalation_enabled = true` marks this handle as able to escalate a
+    /// txn to cross-range 2PC (valid for in-process cluster engines; the network
+    /// gateway path stays `false` until T4 wires the cross-node coordinator).
     pub fn share_gtm_to(&self, other: &mut SqlEngine) {
         other.gtm = self.gtm.as_ref().map(Arc::clone);
+        other.escalation_enabled = true;
     }
 
-    /// Whether this engine carries the shared GTM (so cross-range 2PC can run).
-    /// `true` on every range engine of a multi-range cluster wired via
-    /// `init_gtm_coordinator`/`share_gtm_to`; `false` on a single-range engine or a
-    /// gateway engine built outside that wiring (the cross-node decision path is a
-    /// later slice). The router gates escalation on this: no GTM ⇒ a cross-range txn
-    /// is rejected rather than escalated.
+    /// Whether this engine carries the shared GTM (so `begin_global_durable` and
+    /// global-decision methods are available). `true` on range 0's engine in any
+    /// multi-range configuration; `false` on a single-range engine. Does NOT imply
+    /// that the `RangeRouter` may escalate cross-range transactions — use
+    /// `escalation_enabled()` for that gate.
     pub fn has_gtm(&self) -> bool {
         self.gtm.is_some()
+    }
+
+    /// Whether the `RangeRouter` may escalate a single-range txn to a cross-range
+    /// global 2PC txn via this engine. `true` only for in-process multi-range
+    /// engines (set by `share_gtm_to`); `false` for the network gateway path until
+    /// SP17 T4 wires the cross-node coordinator.
+    pub fn escalation_enabled(&self) -> bool {
+        self.escalation_enabled
     }
 
     /// Allocate a global (cross-range) txn id. Coordinator-only (range 0's engine).
@@ -196,6 +217,32 @@ impl SqlEngine {
             .as_ref()
             .expect("begin_global on a non-GTM engine")
             .begin_global()
+    }
+
+    /// Durably allocate a global xid: bump the in-memory counter, then persist
+    /// `next_global` through range 0's committer BEFORE returning, so any later
+    /// range-0 leader reseeds past `g` and a global xid is never reused across a
+    /// range-0 leader change. Only succeeds on range 0's leader (the committer
+    /// rejects non-leaders -> ExecError::NotLeader).
+    pub async fn begin_global_durable(&self) -> Result<u64, ExecError> {
+        let gtm = self
+            .gtm
+            .as_ref()
+            .expect("begin_global_durable on a non-GTM engine");
+        let g = gtm.begin_global();
+        self.committer
+            .commit(vec![gtm.next_global_xid_op()])
+            .await?;
+        Ok(g)
+    }
+
+    /// Lift the GTM's in-memory `next_global` to the durable value (never
+    /// regresses). Called on the range-0 leadership rising edge.
+    pub fn reseed_gtm(&self) -> Result<(), ExecError> {
+        if let Some(gtm) = self.gtm.as_ref() {
+            gtm.reseed_from_applied()?;
+        }
+        Ok(())
     }
 
     /// Durably record the global decision (Committed/Aborted) for `g` in range 0's
