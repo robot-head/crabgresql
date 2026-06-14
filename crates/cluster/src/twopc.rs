@@ -17,9 +17,10 @@ use crate::types::{NodeId, TypeConfig};
 
 const TXN_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone)]
 struct PooledConn {
     addr: String,
-    stream: TcpStream,
+    stream: Arc<Mutex<TcpStream>>,
 }
 
 /// Sends `TxnRpc`s to the current leader of a target range; pools one node-port
@@ -63,6 +64,7 @@ impl TwoPcClient {
         Some((leader, addr?))
     }
 
+    /// Event-driven (no sleep) wait for a resolvable leader — see forward::ForwardPool::await_leader for the metrics-lag rationale.
     async fn await_leader(&self, range: RangeId) -> Option<(NodeId, String)> {
         let raft = self.rafts.get(&range)?;
         let deadline = tokio::time::Instant::now() + TXN_TIMEOUT;
@@ -83,6 +85,7 @@ impl TwoPcClient {
 
     /// Send one `TxnRpc` to `target_range`'s leader, bounded re-resolve+retry once
     /// on `NotLeader`/wire failure.
+    // Err(()) = transport/leader-resolution failure; a participant-level retryable is carried as Ok(TxnResp::Retryable). T4 maps these to ExecError.
     // used in SP17 T4
     #[allow(dead_code)]
     pub async fn call(&self, target_range: RangeId, rpc: TxnRpc) -> Result<TxnResp, ()> {
@@ -106,30 +109,45 @@ impl TwoPcClient {
         if self.partition.blocked(leader) {
             return Err(());
         }
-        let mut conns = self.conns.lock().await;
-        let needs_dial = conns.get(&leader).is_none_or(|c| c.addr != addr);
-        if needs_dial {
-            let stream = tokio::time::timeout(TXN_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
-            conns.insert(
-                leader,
-                PooledConn {
-                    addr: addr.to_string(),
-                    stream,
-                },
-            );
-        }
-        let conn = conns.get_mut(&leader).expect("pooled conn present");
+        // Map lock held ONLY to get-or-dial + clone the per-conn handle out.
+        let conn = {
+            let mut conns = self.conns.lock().await;
+            let needs_dial = conns.get(&leader).is_none_or(|c| c.addr != addr);
+            if needs_dial {
+                let stream = tokio::time::timeout(TXN_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                conns.insert(
+                    leader,
+                    PooledConn {
+                        addr: addr.to_string(),
+                        stream: Arc::new(Mutex::new(stream)),
+                    },
+                );
+            }
+            conns.get(&leader).expect("pooled conn present").clone()
+        }; // map guard dropped here, before any network I/O
+
+        // Per-connection lock: serializes only THIS leader's in-flight request.
+        let mut stream = conn.stream.lock().await;
         let exchange = async {
-            write_msg(&mut conn.stream, env).await?;
-            read_msg::<_, NodeResponse>(&mut conn.stream).await
+            write_msg(&mut *stream, env).await?;
+            read_msg::<_, NodeResponse>(&mut *stream).await
         };
         match tokio::time::timeout(TXN_TIMEOUT, exchange).await {
             Ok(Ok(NodeResponse::Txn(resp))) => Ok(resp),
             _ => {
-                conns.remove(&leader);
+                drop(stream);
+                // Drop the poisoned conn so the next attempt redials — but only if
+                // it is still the same handle (don't clobber a concurrent redial).
+                let mut conns = self.conns.lock().await;
+                if conns
+                    .get(&leader)
+                    .is_some_and(|c| Arc::ptr_eq(&c.stream, &conn.stream))
+                {
+                    conns.remove(&leader);
+                }
                 Err(())
             }
         }
