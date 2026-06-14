@@ -33,6 +33,33 @@ pub trait RemoteForward: Send + Sync {
     ) -> FuturePin<Box<dyn Future<Output = Result<QueryResult, ExecError>> + Send + 'a>>;
 }
 
+/// Whether THIS node currently leads a given range. The gateway runs a statement
+/// locally only when it both holds a local engine for the range AND currently
+/// leads it; otherwise it forwards to the remote leader. In D3a-net's co-located
+/// topology every node holds a replica (hence a local engine) of every range, so
+/// a local-engine check alone would never forward — this predicate is what makes a
+/// FOLLOWER gateway forward instead of running its local follower committer (which
+/// returns `ForwardToLeader` → SQLSTATE 40001).
+///
+/// Object-safe behind `Arc<dyn LeadsRange>`. The implementation is synchronous —
+/// it borrows a metrics watch, compares, and drops the `Ref` before returning, so
+/// no `Ref` is ever held across an `.await`.
+pub trait LeadsRange: Send + Sync {
+    fn leads(&self, range: RangeId) -> bool;
+}
+
+/// An always-true `LeadsRange`: every range this router holds locally is treated as
+/// led locally. Used by the in-process harness (`RangeRouter::connect`), which
+/// builds each range's LEADER engine via `leader_engine`, so local execution is
+/// already the leader — preserving the SP13 `range::*` behavior.
+pub struct AlwaysLeads;
+
+impl LeadsRange for AlwaysLeads {
+    fn leads(&self, _range: RangeId) -> bool {
+        true
+    }
+}
+
 /// The Task-3 stub: no range is remotely reachable yet, so any statement that
 /// lands on a non-local range is rejected. Replaced by the real client in Task 4.
 pub struct RejectForward;
@@ -73,8 +100,12 @@ pub struct RangeRouter {
     sessions: HashMap<RangeId, SqlSession>,
     pin: Pin,
     map: RangeMap,
-    /// Engines for ranges THIS node leads; a range absent here is remote.
+    /// Engines for ranges this node holds a replica of; a range absent here is
+    /// remote. Holding an engine does NOT imply leadership — see `leads`.
     engines: HashMap<RangeId, SqlEngine>,
+    /// Whether THIS node currently leads a range. A statement runs locally only
+    /// when `engines` holds the range AND this returns true; otherwise it forwards.
+    leads: Arc<dyn LeadsRange>,
     /// Range-0 catalog store (schema resolution). For a range-0 follower gateway
     /// Task 4 makes this a wire-read handle; here it is the local range-0 store.
     catalog_kv: Arc<dyn kv::Kv>,
@@ -85,11 +116,13 @@ pub struct RangeRouter {
 }
 
 impl RangeRouter {
-    /// Cluster-agnostic constructor: the local-leader engines this node holds, the
-    /// range-0 catalog store, and the remote-forward seam. No `&MultiRangeCluster`.
+    /// Cluster-agnostic constructor: the local engines this node holds, a predicate
+    /// for which of those ranges this node currently leads, the range-0 catalog
+    /// store, and the remote-forward seam. No `&MultiRangeCluster`.
     pub fn new(
         map: RangeMap,
         engines: HashMap<RangeId, SqlEngine>,
+        leads: Arc<dyn LeadsRange>,
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
     ) -> Self {
@@ -98,6 +131,7 @@ impl RangeRouter {
             pin: Pin::None,
             map,
             engines,
+            leads,
             catalog_kv,
             forward,
             cur_sql: String::new(),
@@ -106,7 +140,9 @@ impl RangeRouter {
 
     /// In-process harness constructor: the harness leads every range from one of
     /// its co-located nodes, so it has a local engine per range and never needs to
-    /// forward — delegates to `new` with a `RejectForward` (never hit in-process).
+    /// forward — delegates to `new` with an `AlwaysLeads` predicate (every local
+    /// engine IS the range's leader engine) and a `RejectForward` (never hit
+    /// in-process). This preserves the SP13 `range::*` behavior exactly.
     pub async fn connect(c: &MultiRangeCluster) -> Self {
         let mut engines = HashMap::new();
         for r in c.range_map().range_ids() {
@@ -115,6 +151,7 @@ impl RangeRouter {
         Self::new(
             c.range_map().clone(),
             engines,
+            Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(RejectForward),
         )
@@ -229,13 +266,21 @@ impl RangeRouter {
         }
     }
 
-    /// Run a statement on `range`: locally if this node leads it, else forward the
-    /// in-flight simple-query text to the remote leader through the seam.
+    /// Run a statement on `range`: locally only when this node holds a local engine
+    /// for the range AND currently leads it; otherwise forward the in-flight
+    /// simple-query text to the remote leader through the seam.
+    ///
+    /// The leadership check is essential under co-located placement (every node
+    /// holds a replica of every range): without it, a statement landing on a
+    /// FOLLOWER gateway would run the local follower `RaftCommitter`, which returns
+    /// `ForwardToLeader` → `ExecError::NotLeader` → SQLSTATE 40001 instead of being
+    /// forwarded. `leads` borrows a metrics watch and drops the `Ref` before
+    /// returning (synchronous — no `Ref` held across the `.await` below).
     async fn run_on(&mut self, range: RangeId, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        if self.engines.contains_key(&range) {
+        if self.engines.contains_key(&range) && self.leads.leads(range) {
             return self.session_mut(range).run(stmt).await;
         }
-        // No local engine for this range → remote. The forward seam relays the
+        // Not the local leader of this range → remote. The forward seam relays the
         // single statement text (the pgwire `Query`) and returns its one result.
         let sql = self.cur_sql.clone();
         self.forward.forward(range, &sql).await
@@ -415,11 +460,14 @@ mod gateway_seam_tests {
         c.wait_for_replication(0).await;
 
         // A router that holds only range 0 locally; range 1 → RejectForward.
+        // `AlwaysLeads` keeps range-0 local execution on (it holds range 0's leader
+        // engine); range 1 has no local engine, so it forwards regardless of leads.
         let mut engines = HashMap::new();
         engines.insert(0, c.leader_engine(0).await);
         let mut router = RangeRouter::new(
             c.range_map().clone(),
             engines,
+            Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(RejectForward),
         );

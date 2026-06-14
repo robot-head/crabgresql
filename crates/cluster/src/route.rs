@@ -116,17 +116,19 @@ async fn proxy(mut client: TcpStream, leader_sql_addr: &str) {
 use std::collections::HashMap;
 
 use crate::range::map::{RangeId, RangeMap};
-use crate::range::router::{RangeRouter, RemoteForward};
+use crate::range::router::{LeadsRange, RangeRouter, RemoteForward};
 
 /// A `pgwire` `Engine` whose every connection is a per-statement range gateway.
-/// `connect()` builds a `RangeRouter` over this node's LOCAL-leader engines, the
-/// range-0 catalog store, and the remote-forward seam — so each simple-query frame
-/// runs locally for a range this node leads and forwards otherwise. The per-range
-/// engines are shared (`Arc`) across all connections; each connection gets fresh
-/// `SqlSession`s lazily (`SqlEngine::connect`), as the router already does.
+/// `connect()` builds a `RangeRouter` over this node's local engines, a per-range
+/// leadership predicate, the range-0 catalog store, and the remote-forward seam —
+/// so each simple-query frame runs locally only for a range this node currently
+/// LEADS and forwards otherwise. The per-range engines are shared (`Arc`) across
+/// all connections; each connection gets fresh `SqlSession`s lazily
+/// (`SqlEngine::connect`), as the router already does.
 pub struct RangeGatewayEngine {
     map: RangeMap,
     engines: HashMap<RangeId, Arc<SqlEngine>>,
+    leads: Arc<dyn LeadsRange>,
     catalog_kv: Arc<dyn kv::Kv>,
     forward: Arc<dyn RemoteForward>,
 }
@@ -135,12 +137,14 @@ impl RangeGatewayEngine {
     pub fn new(
         map: RangeMap,
         engines: HashMap<RangeId, Arc<SqlEngine>>,
+        leads: Arc<dyn LeadsRange>,
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
     ) -> Self {
         Self {
             map,
             engines,
+            leads,
             catalog_kv,
             forward,
         }
@@ -162,6 +166,7 @@ impl pgwire::engine::Engine for RangeGatewayEngine {
         RangeRouter::new(
             self.map.clone(),
             engines,
+            Arc::clone(&self.leads),
             Arc::clone(&self.catalog_kv),
             Arc::clone(&self.forward),
         )
@@ -176,11 +181,14 @@ pub async fn serve_range_routed(
     listener: TcpListener,
     map: RangeMap,
     engines: HashMap<RangeId, Arc<SqlEngine>>,
+    leads: Arc<dyn LeadsRange>,
     catalog_kv: Arc<dyn kv::Kv>,
     forward: Arc<dyn RemoteForward>,
     config: Arc<SessionConfig>,
 ) -> std::io::Result<()> {
-    let engine = Arc::new(RangeGatewayEngine::new(map, engines, catalog_kv, forward));
+    let engine = Arc::new(RangeGatewayEngine::new(
+        map, engines, leads, catalog_kv, forward,
+    ));
     let registry = Arc::new(CancelRegistry::default());
     loop {
         let (stream, _peer) = listener.accept().await?;

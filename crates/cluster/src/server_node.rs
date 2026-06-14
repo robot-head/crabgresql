@@ -196,10 +196,21 @@ impl ServerNode {
             );
             let forward: Arc<dyn crate::range::router::RemoteForward> =
                 Arc::new(crate::forward::PgwireForward { pool });
+            // The leadership predicate the gateway runs locally on: a statement runs
+            // on this node's engine ONLY for a range this node currently leads;
+            // otherwise it forwards. Under co-located placement every node holds a
+            // replica of every range, so without this check a follower gateway would
+            // run its local follower committer (→ NotLeader → 40001) instead of
+            // forwarding.
+            let leads: Arc<dyn crate::range::router::LeadsRange> = Arc::new(NodeLeadership {
+                rafts: rafts.clone(),
+                id: cfg.id,
+            });
             tokio::spawn(crate::route::serve_range_routed(
                 sql_listener,
                 cfg.range_map.clone(),
                 engines.clone(),
+                leads,
                 catalog_kv.clone(),
                 forward,
                 sql_config,
@@ -221,6 +232,25 @@ impl ServerNode {
             sm_kvs,
             id: cfg.id,
         })
+    }
+}
+
+/// The real per-node leadership predicate for the gateway: this node leads `range`
+/// iff range `range`'s Raft currently reports `current_leader == Some(self.id)`.
+/// Backed by the per-range raft handles. `leads` borrows the metrics watch, reads
+/// `current_leader`, and drops the `Ref` before returning — it is synchronous, so
+/// no `Ref` is held across an `.await` in the caller (`RangeRouter::run_on`).
+struct NodeLeadership {
+    rafts: HashMap<RangeId, openraft::Raft<TypeConfig>>,
+    id: NodeId,
+}
+
+impl crate::range::router::LeadsRange for NodeLeadership {
+    fn leads(&self, range: RangeId) -> bool {
+        self.rafts
+            .get(&range)
+            .map(|r| r.metrics().borrow().current_leader == Some(self.id))
+            .unwrap_or(false)
     }
 }
 
