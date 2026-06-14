@@ -94,13 +94,15 @@ registry it introduces is deliberately forward-compatible with D4's runtime rang
    runs on static. The point of the slice is to make SP18's hardening reachable on the
    replicated layout, so recovery is in scope.
 
-3. **A `Stage`/`Release` for an unregistered range returns a *retryable* `TxnResp::NotLeader`,
-   not a hard `Err`.** In the co-located replicated layout every node eventually hosts every
-   range, so "range absent from the growable map" means "this participant is still
-   mid-bootstrap," not "wrong node." Returning `NotLeader` makes the coordinator's
-   `TwoPcClient` retry within `TXN_TIMEOUT` (re-resolving) rather than spuriously aborting the
-   global txn. Conservation holds either way (a hard-`Err` `Stage` is a clean nil abort), but
-   this improves liveness under the nemesis and across respawns.
+3. **A `Stage` for an unregistered range returns a *retryable* `TxnResp::NotLeader`, not a
+   hard `Err`.** In the co-located replicated layout every node eventually hosts every range,
+   so "range absent from the growable map" means "this participant is still mid-bootstrap,"
+   not "wrong node." Returning `NotLeader` makes the coordinator's `TwoPcClient` retry within
+   `TXN_TIMEOUT` (re-resolving) rather than spuriously aborting the global txn. Conservation
+   holds either way (a hard-`Err` `Stage` is a clean nil abort), but this improves liveness
+   under the nemesis and across respawns. (`Release` already returns an idempotent
+   `TxnResp::Released` no-op for an absent `(g, range)` — a session can only have been staged
+   on a node whose engine was registered — so it needs no change.)
 
 4. **The proving e2e covers BOTH crash/partition conservation AND a full-cluster restart.**
    Boot via the replicated path, run the SP18 cross-range conservation crash nemesis, then
@@ -207,7 +209,7 @@ replicated nodes (they did not before this slice).
 | 1 | A replicated node serves every Txn RPC (`BeginGlobal`/`CommitGlobal`/`GlobalBarrier`/`Stage`/`Release`) — no more `TxnResp::Err("node hosts no 2PC service")`. | e2e bring-up + a cross-range commit through a replicated gateway |
 | 2 | `TxnService`'s engines map is growable: `register_engine` adds a range, `engine`/`session_handle` see it, reads are lock-free and never hold a guard across `await`. | `twopc.rs` unit test for register/lookup + clippy |
 | 3 | The full recovery set (`release_on_leadership_loss`, `resolve_in_doubt_on_leadership`, `participant_silence_sweeper`) runs on the replicated path. | e2e recovery under the nemesis |
-| 4 | A `Stage`/`Release` for an unregistered range returns retryable `TxnResp::NotLeader`, not a hard `Err`. | `twopc.rs` unit test |
+| 4 | A `Stage` for an unregistered range returns retryable `TxnResp::NotLeader`, not a hard `Err` (`Release` is already an idempotent no-op). | `twopc.rs` unit test |
 | 5 | The cross-range bank total is conserved under a multi-process crash/partition nemesis on the **replicated** boot path, and the workload makes progress. | `crossrange_2pc_replicated` nemesis conservation + non-vacuity |
 | 6 | Conservation + recovery survive a **full-cluster restart** (descriptor blob + durable 2PC state re-read). | `crossrange_2pc_replicated` restart round |
 | 7 | All SP16/SP17/SP18 in-process + networked cross-range suites pass unchanged; `arc-swap` is the only new dependency; `#![forbid(unsafe_code)]`; full gauntlet green; traceability. | regression gate + gauntlet |
