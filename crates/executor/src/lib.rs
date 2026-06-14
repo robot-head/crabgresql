@@ -322,6 +322,12 @@ impl SqlEngine {
 
     /// Durably advance this range's recovery-scan watermark (monotone; a no-op if `lo`
     /// is not greater than the current value). Proposed through the range committer.
+    ///
+    /// The read-then-write is NOT a CAS: monotonicity relies on the single-writer
+    /// discipline of the edge-triggered per-range leadership-rise sweep (one advance at a
+    /// time). Even a hypothetical interleaving that regressed the value low is
+    /// correctness-preserving — a lower watermark only enlarges the next scan, never skips
+    /// an in-doubt marker.
     pub async fn advance_clog_scan_lo(&self, lo: u64) -> Result<(), ExecError> {
         if lo <= self.clog_scan_lo()? {
             return Ok(());
@@ -463,6 +469,19 @@ mod tests {
         assert_eq!(
             lo2, 13,
             "all terminal -> watermark = one past the largest local Li (12)"
+        );
+        // Edge: scan_lo above all markers -> empty scan -> watermark unchanged.
+        assert_eq!(engine.in_doubt_globals_from(99).await.expect("scan").1, 99);
+        // Edge: an in-doubt marker at the HIGHEST Li (terminals below) holds the
+        // watermark exactly there (the ascending scan stops at the first undecided).
+        sm_kv
+            .write_batch(&[put_op(20, XidStatus::Prepared(GLOBAL_XID_BASE + 3))])
+            .expect("high in-doubt marker");
+        let (gs3, lo3) = engine.in_doubt_globals_from(0).await.expect("scan");
+        assert_eq!(gs3, vec![GLOBAL_XID_BASE + 3]);
+        assert_eq!(
+            lo3, 20,
+            "in-doubt at the highest Li holds the watermark there"
         );
     }
 
