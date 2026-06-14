@@ -138,6 +138,11 @@ pub async fn serve_node_protocol(
                             )),
                         }
                     }
+                    NodeRequest::Txn { .. } => {
+                        NodeResponse::Txn(crate::transport::protocol::TxnResp::Err(
+                            "txn service not wired yet (SP17 T3)".into(),
+                        ))
+                    }
                 };
                 if write_msg(&mut sock, &resp).await.is_err() {
                     return;
