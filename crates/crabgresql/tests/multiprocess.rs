@@ -416,25 +416,18 @@ async fn bank_conserves_with_random_node_clients() {
     let followers: Vec<u64> = (0..3u64).filter(|&i| i != leader).collect();
     let n_nodes = c.len();
 
-    // Seed the accounts via pg_try loop (leader is up, so some node routes us).
-    {
-        let mut seed_idx: usize = 0;
-        let setup = loop {
-            if let Some(cl) = c.pg_try(seed_idx).await {
-                break cl;
-            }
-            seed_idx = seed_idx.wrapping_add(1) % n_nodes;
-        };
-        setup
-            .simple_query("CREATE TABLE accounts (id int8, bal int8)")
-            .await
-            .expect("create accounts");
-        for id in 0..ACCOUNTS {
-            setup
-                .simple_query(&format!("INSERT INTO accounts VALUES ({id}, {SEED})"))
-                .await
-                .expect("seed account");
-        }
+    // Seed the accounts. `wait_for_leader` guarantees a leader exists, but right
+    // after bring-up (especially on a slow CI runner, e.g. directly after a long
+    // nemesis test) the node we land on may not yet have a quorum view, so the
+    // first DDL can hit a transient `08006 no-quorum`. Drive each setup statement
+    // through `exec_until_ok` (bounded retry across nodes until it commits) rather
+    // than an unretried `.expect`. Setup is fault-free, so a retried statement was
+    // cleanly rejected (not applied) — no double-apply of a seed insert.
+    c.exec_until_ok("CREATE TABLE accounts (id int8, bal int8)")
+        .await;
+    for id in 0..ACCOUNTS {
+        c.exec_until_ok(&format!("INSERT INTO accounts VALUES ({id}, {SEED})"))
+            .await;
     }
 
     // Workers cannot borrow `c` (main task holds &mut for the nemesis), so we

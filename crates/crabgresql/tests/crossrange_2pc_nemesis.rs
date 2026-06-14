@@ -22,26 +22,22 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
     // acct_b (id 2) -> range 1.
     let mut c = Cluster::spawn_multirange(5, vec![2]).await;
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)); // committed-op progress signal
-    let admin = c.pg(0).await;
-    admin
-        .simple_query("CREATE TABLE acct_a (id int8, bal int8)")
-        .await
-        .expect("a");
-    admin
-        .simple_query("CREATE TABLE acct_b (id int8, bal int8)")
-        .await
-        .expect("b");
+    // Seed via `exec_until_ok` (bounded retry across nodes): right after bring-up the
+    // gateway we land on may not yet have a quorum view, so an unretried first DDL can
+    // hit a transient `08006 no-quorum`. Sequential `exec_until_ok` calls each commit
+    // before the next begins, so acct_a (table id 1 -> range 0) is still created before
+    // acct_b (id 2 -> range 1). Setup is fault-free, so a retried statement was cleanly
+    // rejected, never double-applied.
+    c.exec_until_ok("CREATE TABLE acct_a (id int8, bal int8)")
+        .await;
+    c.exec_until_ok("CREATE TABLE acct_b (id int8, bal int8)")
+        .await;
     for id in 0..ACCOUNTS {
-        admin
-            .simple_query(&format!("INSERT INTO acct_a VALUES ({id}, {SEED})"))
-            .await
-            .expect("seed a");
-        admin
-            .simple_query(&format!("INSERT INTO acct_b VALUES ({id}, {SEED})"))
-            .await
-            .expect("seed b");
+        c.exec_until_ok(&format!("INSERT INTO acct_a VALUES ({id}, {SEED})"))
+            .await;
+        c.exec_until_ok(&format!("INSERT INTO acct_b VALUES ({id}, {SEED})"))
+            .await;
     }
-    drop(admin);
 
     // Workers are spread one-per-node across nodes 0..PROCS (each worker pins to its
     // own gateway for the whole run), so a coordinator is often a NON-leading gateway
