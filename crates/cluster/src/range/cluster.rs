@@ -30,6 +30,14 @@ pub struct MultiRangeCluster {
     map: RangeMap,
     groups: Vec<RangeGroup>, // indexed by RangeId
     sb: Switchboard,
+    /// The ONE shared Global Transaction Manager for the whole cluster, opened over
+    /// range 0's store and made the coordinator (`init_gtm_coordinator`). Every
+    /// range's `leader_engine` copies this same `Arc<Gtm>` into its engine (via
+    /// `share_gtm_to`), so any range can resolve a `Prepared(-> g)` row against
+    /// range 0's global clog and the coordinator (`engines[&0]`) can drive the
+    /// global decision. Held as a GTM-bearing range-0 `SqlEngine` because the
+    /// cluster crate never names `Gtm` directly — it shares it through the engine.
+    gtm_source: SqlEngine,
 }
 
 impl MultiRangeCluster {
@@ -53,7 +61,31 @@ impl MultiRangeCluster {
                 .expect("initialize range group");
             groups.push(RangeGroup { nodes });
         }
-        Self { n, map, groups, sb }
+        let mut this = Self {
+            n,
+            map,
+            groups,
+            sb,
+            // Placeholder; replaced below once range 0 has a leader. A fresh
+            // in-memory engine is a cheap stand-in that is never used (the real
+            // GTM-bearing source is built immediately after).
+            gtm_source: SqlEngine::new(),
+        };
+        this.gtm_source = this.build_gtm_source().await;
+        this
+    }
+
+    /// Build the ONE GTM coordinator engine: a range-0 leader engine with its GTM
+    /// opened over range 0's store via `init_gtm_coordinator`. Every per-range
+    /// `leader_engine` later copies this engine's `Arc<Gtm>` (see `share_gtm_to`),
+    /// so the whole cluster shares a single global-xid allocator + global clog,
+    /// and `engines[&0]` (the router's coordinator) drives the global decision.
+    async fn build_gtm_source(&self) -> SqlEngine {
+        let mut engine = self.raw_leader_engine(0).await;
+        engine
+            .init_gtm_coordinator()
+            .expect("init GTM coordinator over range 0");
+        engine
     }
 
     pub fn range_map(&self) -> &RangeMap {
@@ -174,8 +206,21 @@ impl MultiRangeCluster {
     }
 
     /// A replicated `SqlEngine` for `range`'s leader node: reads/writes go to that
-    /// node's range replica; the catalog always resolves from range 0's store.
+    /// node's range replica; the catalog always resolves from range 0's store. The
+    /// cluster's ONE shared GTM is injected so every range engine can resolve a
+    /// cross-range `Prepared(-> g)` row and `engines[&0]` can drive the global
+    /// decision — single-range engines built elsewhere keep `gtm: None`.
     pub async fn leader_engine(&self, range: RangeId) -> SqlEngine {
+        let mut engine = self.raw_leader_engine(range).await;
+        self.gtm_source.share_gtm_to(&mut engine);
+        engine
+    }
+
+    /// The replicated `SqlEngine` for `range`'s leader node WITHOUT GTM injection —
+    /// the base from which both `leader_engine` (which then shares the GTM in) and
+    /// the GTM source itself (`build_gtm_source`, which initializes the GTM on it)
+    /// are derived.
+    async fn raw_leader_engine(&self, range: RangeId) -> SqlEngine {
         let leader = self.wait_for_leader(range).await;
         let node = &self.groups[range as usize].nodes[leader as usize];
         let engine = SqlEngine::replicated(
