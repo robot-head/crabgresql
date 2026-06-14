@@ -79,3 +79,5 @@ only file that previously tripped the guard, `update_delete.rs`, was renamed to
 `mutation_semantics.rs` in this slice. The multi-process harness resolves children
 via `env!("CARGO_BIN_EXE_crabgresql")`, which stays UAC-safe only while the binary
 is named `crabgresql` — do not rename it.
+
+**SP15 (2026-06-13):** two new binaries — `cluster::meta_range_replicated` and `crabgresql::meta_range_gateway` — both UAC-safe (no `setup/install/update/patch/upgrad` substring). The cluster list now reads `{durable_scenarios, gateway_local, jepsen_bank, meta_range_replicated, model, multirange, remote_forward, scenarios, sql_durable, sql_over_raft}`; the crabgresql list reads `{jepsen_elle, meta_range_gateway, multiprocess, multirange_gateway}`.

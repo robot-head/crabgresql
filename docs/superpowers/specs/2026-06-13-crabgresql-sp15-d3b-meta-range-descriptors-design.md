@@ -145,3 +145,17 @@ Table ids are allocated densely from 1 (`catalog`'s `next_table_id` defaults to 
 - **`open_range` / incremental keyspace open** touches the durable store's invariant that the range set is fixed at `open`. Mitigated by keeping Static-mode `NodeStore::open` unchanged and adding `open_range` as a separate, on-demand path used only by Replicated bring-up; the retained `Arc<Database>` (`durable.rs:31`) already supports it.
 - **os-740 (Windows UAC)** — the new multi-process e2e binary must avoid `setup/install/update/patch/upgrad` in its target name (CLAUDE.md policy). `meta_range_gateway` is clean; the T6 task and the gauntlet name-grep re-verify.
 - **Scope creep toward D4** (runtime mutation, dynamic keyspaces, epochs, stable id allocation): fenced in Non-goals; T3/T4 must build *bootstrap-time* range-set construction only.
+
+## Traceability (implemented)
+
+| # | Criterion | Verified by |
+|---|---|---|
+| 1 | RangeMap round-trips its blob; corrupt/forward-version → Err, not panic | `cluster::range::map::tests::{descriptor_bytes_round_trip, corrupt_blobs_error_not_panic, non_contiguous_descriptor_set_is_rejected}` (T1) |
+| 2 | bootstrap node commits its seed; blob present + decodes to seed | `cluster::range::meta::tests::read_range_map_absent_then_present` + `meta_range_replicated::no_seed_node_derives_committed_range_map` (T2/T5) |
+| 3 | no-seed node derives the bootstrap node's committed map | `cluster::meta_range_replicated::no_seed_node_derives_committed_range_map` (T5) |
+| 4 | wrong-seed node routes by the committed descriptors | `cluster::meta_range_replicated::wrong_seed_node_routes_by_committed_map` (T5) |
+| R | write-once invariant: a second seed does NOT rewrite the committed blob (Risks-section guard) | `cluster::meta_range_replicated::descriptor_blob_is_write_once` (T5) |
+| 5 | replicated routing lands rows in the committed range | `cluster::meta_range_replicated::replicated_routing_lands_rows_in_the_committed_range` (T5) |
+| 6 | SP9/SP10/SP13/SP14 suites pass unchanged in Static mode | full `cargo nextest run --workspace` green (T4 refactor gate) |
+| 7 | multi-process: a node with no boundary config learns the layout + routes/reads | `crabgresql::meta_range_gateway::replicated_layout_is_learned_from_the_meta_range` (T6) |
+| 8 | no new dependency; `#![forbid(unsafe_code)]`; full gauntlet green | `cargo deny` + fmt + clippy + nextest + doctests (T7) |
