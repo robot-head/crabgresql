@@ -83,3 +83,5 @@ is named `crabgresql` — do not rename it.
 **SP15 (2026-06-13):** two new binaries — `cluster::meta_range_replicated` and `crabgresql::meta_range_gateway` — both UAC-safe (no `setup/install/update/patch/upgrad` substring). The cluster list now reads `{durable_scenarios, gateway_local, jepsen_bank, meta_range_replicated, model, multirange, remote_forward, scenarios, sql_durable, sql_over_raft}`; the crabgresql list reads `{jepsen_elle, meta_range_gateway, multiprocess, multirange_gateway}`.
 
 **SP16 (2026-06-14):** one new binary — `cluster::crossrange_2pc` (cross-range two-phase-commit proofs) — UAC-safe. The cluster list now also includes `crossrange_2pc`.
+
+**SP17 (2026-06-14):** one new binary — `crabgresql::crossrange_2pc_net` (cross-range 2PC over the network, multi-process e2e) — UAC-safe (no `setup/install/update/patch/upgrad` substring). The crabgresql list now reads `{crossrange_2pc_net, jepsen_elle, meta_range_gateway, multiprocess, multirange_gateway}`. SP17 added no new test target with a forbidden substring; the full guard `git ls-files 'crates/*/tests/*.rs' | grep -iE 'setup|install|update|patch|upgrad'` returns empty.

@@ -31,9 +31,14 @@ pub enum RaftRpcResp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     GetStatus,
+    /// Returns `(range, current_leader)` for every Raft group registered on this node.
+    RangeLeaders,
     SetPartition(Vec<NodeId>),
     Heal,
-    AddLearner { id: NodeId, addr: String },
+    AddLearner {
+        id: NodeId,
+        addr: String,
+    },
     ChangeMembership(Vec<NodeId>),
     Shutdown,
 }
@@ -52,7 +57,52 @@ pub struct NodeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
     Status(NodeStatus),
+    /// `(range, current_leader)` for every Raft group on this node, sorted by range.
+    RangeLeaders(Vec<(RangeId, Option<NodeId>)>),
     Ok,
+    Err(String),
+}
+
+/// Structured cross-range 2PC requests on the node port. `BeginGlobal`,
+/// `CommitGlobal`, and `GlobalBarrier` target range 0 (the GTM authority);
+/// `Stage`/`Release` target the participant `range` (carried in the
+/// `NodeRequest::Txn` envelope's `range`, which the server resolves the group with).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxnRpc {
+    BeginGlobal,
+    Stage {
+        g: u64,
+        range: RangeId,
+        sql: String,
+    },
+    CommitGlobal {
+        g: u64,
+        commit: bool,
+    },
+    Release {
+        g: u64,
+        range: RangeId,
+        commit: bool,
+    },
+    GlobalBarrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TxnResp {
+    Began {
+        g: u64,
+    },
+    Staged,
+    Committed,
+    Released,
+    Barrier {
+        applied_index: u64,
+    },
+    /// Target was not the range's leader — caller re-resolves and retries.
+    NotLeader,
+    /// A retryable serialization failure / deadlock on the participant (40001 /
+    /// 40P01) — surfaced to the client as retryable, not collapsed to 0A000.
+    Retryable,
     Err(String),
 }
 
@@ -69,10 +119,16 @@ pub enum NodeRequest {
         rpc: RaftRpc,
     },
     Control(ControlRequest),
+    /// A structured 2PC RPC for the `range`-th co-located group on this node.
+    Txn {
+        range: RangeId,
+        rpc: TxnRpc,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponse {
     Raft(RaftRpcResp),
     Control(ControlResponse),
+    Txn(TxnResp),
 }

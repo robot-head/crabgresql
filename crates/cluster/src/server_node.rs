@@ -26,6 +26,16 @@ use crate::transport::partition::PartitionState;
 use crate::transport::server::{RangeRegistry, ShutdownSignal, serve_node_protocol};
 use crate::types::{NodeId, TypeConfig};
 
+/// A built-but-not-yet-Arc'd data range: `(range, raft, applied store, engine)`.
+/// Collected during bring-up so the range-0 read barrier can be injected on each
+/// engine (with `&mut`) once the per-range `rafts` map is complete.
+type PendingRange = (
+    RangeId,
+    openraft::Raft<TypeConfig>,
+    Arc<dyn kv::Kv>,
+    SqlEngine,
+);
+
 /// Where a node's range layout comes from.
 pub enum RangeLayout {
     /// Static config: the range map is fixed at startup, identical on every node
@@ -78,6 +88,8 @@ pub struct ServerNode {
     sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>>,
     /// This node's id (`cfg.id`), exposed via `id()` for Task 4's leader resolution.
     id: NodeId,
+    /// `host:port` the node-protocol listener is bound to (`cfg.node_addr`).
+    node_addr: String,
     /// The authoritative range map this node brought up (Static config or the
     /// committed Replicated descriptor blob). Exposed so tests can assert a node
     /// derived its layout from the meta range rather than its own seed.
@@ -94,6 +106,11 @@ impl ServerNode {
     /// This node's id.
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// The `host:port` address the node-protocol listener is bound to.
+    pub fn node_addr(&self) -> &str {
+        &self.node_addr
     }
 }
 
@@ -131,10 +148,10 @@ async fn bind_with_retry(addr: &str) -> std::io::Result<TcpListener> {
 }
 
 /// Build one range's Raft group + applied store + replicated engine over its
-/// per-range keyspaces, register it in the `(range, node)` registry, and spawn its
-/// reseed-on-leadership task. Returns `(raft, sm_kv, engine)` for the caller's
-/// maps. Both Static and Replicated bring-up call this — Static once per range up
-/// front, Replicated once for range 0 then once per data range after the blob read.
+/// per-range keyspaces, register it in the `(range, node)` registry. Returns
+/// `(raft, sm_kv, engine)` — engine is UN-Arc'd so the caller can mutate it
+/// (e.g. `init_gtm_coordinator` on range 0) before Arc-wrapping. Callers are
+/// responsible for spawning `reseed_on_leadership` after Arc-wrapping.
 async fn build_range_group(
     store: &NodeStore,
     range: RangeId,
@@ -142,7 +159,7 @@ async fn build_range_group(
     partition: &PartitionState,
     registry: &RangeRegistry,
     catalog_kv: &Arc<dyn kv::Kv>,
-) -> (openraft::Raft<TypeConfig>, Arc<dyn kv::Kv>, Arc<SqlEngine>) {
+) -> (openraft::Raft<TypeConfig>, Arc<dyn kv::Kv>, SqlEngine) {
     let log = DurableLogStore::open(store, range).expect("durable log");
     let sm = DurableStateMachineStore::open(store, range).expect("durable sm");
     // Annotate as the trait object so the returned trio coerces cleanly (the
@@ -159,16 +176,13 @@ async fn build_range_group(
         .expect("raft::new");
     registry.register(range, id, raft.clone());
 
-    let engine = Arc::new(
-        SqlEngine::replicated(
-            catalog_kv.clone(),
-            sm_kv.clone(),
-            Arc::new(RaftCommitter { raft: raft.clone() }),
-            Arc::new(RaftLinearizer { raft: raft.clone() }),
-        )
-        .expect("replicated engine"),
-    );
-    tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+    let engine = SqlEngine::replicated(
+        catalog_kv.clone(),
+        sm_kv.clone(),
+        Arc::new(RaftCommitter { raft: raft.clone() }),
+        Arc::new(RaftLinearizer { raft: raft.clone() }),
+    )
+    .expect("replicated engine");
 
     (raft, sm_kv, engine)
 }
@@ -195,20 +209,65 @@ impl ServerNode {
         let mut sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>> = HashMap::new();
         let mut engines: HashMap<RangeId, Arc<SqlEngine>> = HashMap::new();
 
-        for range in map.range_ids() {
+        // Range 0 is special: init the GTM coordinator before Arc-wrapping.
+        let (r0_raft, r0_sm_kv, mut r0_engine) =
+            build_range_group(&store, 0, cfg.id, &partition, &registry, &catalog_kv).await;
+        r0_engine
+            .init_gtm_coordinator()
+            .expect("init GTM coordinator over range 0");
+        let r0_engine = Arc::new(r0_engine);
+        tokio::spawn(reseed_on_leadership(r0_raft.clone(), r0_engine.clone()));
+        rafts.insert(0, r0_raft);
+        sm_kvs.insert(0, r0_sm_kv);
+        engines.insert(0, r0_engine);
+
+        // Data ranges (all ranges except 0). Build each trio FIRST (engines still
+        // un-Arc'd so the range-0 barrier can be injected with `&mut`), collecting
+        // them until `rafts` is complete — the barrier's `TwoPcClient` needs the
+        // full per-range raft map.
+        let mut pending: Vec<PendingRange> = Vec::new();
+        for range in map.range_ids().filter(|&r| r != 0) {
             let (raft, sm_kv, engine) =
                 build_range_group(&store, range, cfg.id, &partition, &registry, &catalog_kv).await;
-            rafts.insert(range, raft);
+            rafts.insert(range, raft.clone());
+            pending.push((range, raft, sm_kv, engine));
+        }
+        // Cross-node visibility: every DATA-range engine gets a range-0 read barrier
+        // so its cross-range resolver reads a caught-up local range-0 replica. Range
+        // 0's own engine needs none (it reads its own current store). Built over the
+        // now-complete `rafts` map.
+        let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        for (range, raft, sm_kv, mut engine) in pending {
+            let barrier: Arc<dyn executor::Linearizer> = Arc::new(
+                crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
+            );
+            engine.set_range0_barrier(barrier);
+            let engine = Arc::new(engine);
+            tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }
 
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
+        let txn = crate::twopc::TxnService::new(engines.clone());
+        // Spawn a per-range leadership-loss watcher: on the falling edge of this
+        // node's leadership for a range, release (presumed-abort) every held 2PC
+        // session for that range so locks are freed promptly. TxnService is Clone
+        // (shares its Arc held-map), so every watcher shares the same registry.
+        for (&range, raft) in &rafts {
+            tokio::spawn(release_on_leadership_loss(
+                raft.clone(),
+                range,
+                cfg.id,
+                txn.clone(),
+            ));
+        }
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
             partition.clone(),
             shutdown.clone(),
+            Some(txn),
         ));
 
         if cfg.bootstrap {
@@ -237,6 +296,7 @@ impl ServerNode {
             shutdown,
             sm_kvs,
             id: cfg.id,
+            node_addr: cfg.node_addr,
             range_map: map,
         })
     }
@@ -299,6 +359,12 @@ impl ServerNode {
             rafts: rafts.clone(),
             id,
         });
+        // Cross-range 2PC over the network: every global op (begin/stage/commit/
+        // release) is an RPC to the relevant range's leader — even to self via
+        // loopback — so the path is uniform whether or not this gateway leads it.
+        let client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        let coordinator: Arc<dyn crate::range::router::GlobalCoordinator> =
+            Arc::new(crate::twopc::NetCoordinator::new(client));
         tokio::spawn(crate::route::serve_range_routed(
             sql_listener,
             map.clone(),
@@ -306,6 +372,7 @@ impl ServerNode {
             leads,
             catalog_kv.clone(),
             forward,
+            coordinator,
             sql_config,
         ));
     }
@@ -331,21 +398,28 @@ impl ServerNode {
         let mut sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>> = HashMap::new();
         let mut engines: HashMap<RangeId, Arc<SqlEngine>> = HashMap::new();
 
-        let (r0_raft, r0_sm_kv, r0_engine) =
+        let (r0_raft, r0_sm_kv, mut r0_engine) =
             build_range_group(&store, 0, cfg.id, &partition, &registry, &catalog_kv).await;
+        r0_engine
+            .init_gtm_coordinator()
+            .expect("init GTM coordinator over range 0");
+        let r0_engine = Arc::new(r0_engine);
+        tokio::spawn(reseed_on_leadership(r0_raft.clone(), r0_engine.clone()));
         rafts.insert(0, r0_raft.clone());
         sm_kvs.insert(0, r0_sm_kv);
         engines.insert(0, r0_engine);
 
-        // Bind the node listener BEFORE blocking on the blob, so peers can reach us
-        // (range 0 needs a quorum to elect, and a joining node needs to receive the
-        // seed via replication).
+        // Replicated path: the node listener binds before the full engines map is
+        // built (only range 0 is ready), so it hosts no 2PC service yet — cross-range
+        // 2PC over the replicated layout is future work. The static path (used by the
+        // multi-process e2e) wires Some(txn).
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
             partition.clone(),
             shutdown.clone(),
+            None,
         ));
 
         // Bootstrap range 0's voting group (bootstrap node only) and, once we lead
@@ -370,7 +444,10 @@ impl ServerNode {
         // decodes the authoritative map.
         let map = wait_for_range_map(&r0_raft, catalog_kv.as_ref(), boot_timeout).await?;
 
-        // Build each data range named by the descriptors.
+        // Build each data range named by the descriptors. Collect the trios FIRST
+        // (engines un-Arc'd) so the range-0 barrier can be injected once `rafts` is
+        // complete — the barrier's `TwoPcClient` needs the full per-range raft map.
+        let mut pending: Vec<PendingRange> = Vec::new();
         for range in map.range_ids().filter(|&r| r != 0) {
             store.open_range(range).expect("open data range keyspace");
             let (raft, sm_kv, engine) =
@@ -378,7 +455,19 @@ impl ServerNode {
             if cfg.bootstrap {
                 tokio::spawn(bootstrap(raft.clone(), cfg.peers.clone()));
             }
-            rafts.insert(range, raft);
+            rafts.insert(range, raft.clone());
+            pending.push((range, raft, sm_kv, engine));
+        }
+        // Cross-node visibility: every DATA-range engine gets a range-0 read barrier
+        // (range 0's own engine reads its own current store, so it needs none).
+        let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        for (range, raft, sm_kv, mut engine) in pending {
+            let barrier: Arc<dyn executor::Linearizer> = Arc::new(
+                crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
+            );
+            engine.set_range0_barrier(barrier);
+            let engine = Arc::new(engine);
+            tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }
@@ -406,6 +495,7 @@ impl ServerNode {
             shutdown,
             sm_kvs,
             id: cfg.id,
+            node_addr: cfg.node_addr,
             range_map: map,
         })
     }
@@ -430,6 +520,30 @@ impl crate::range::router::LeadsRange for NodeLeadership {
     }
 }
 
+/// Drop every held 2PC session for `range` on the FALLING edge of this node's
+/// leadership (follower/candidate after having been leader). Sessions are presumed-
+/// aborted; the global clog remains the sole arbiter of commit/abort status. No
+/// sleep — mirrors `reseed_on_leadership`'s `raft.metrics()` + `rx.changed()` loop.
+async fn release_on_leadership_loss(
+    raft: openraft::Raft<TypeConfig>,
+    range: RangeId,
+    id: NodeId,
+    txn: crate::twopc::TxnService,
+) {
+    let mut rx = raft.metrics();
+    let mut was_leader = false;
+    loop {
+        let is_leader = rx.borrow().current_leader == Some(id);
+        if was_leader && !is_leader {
+            txn.release_all_for_range(range).await; // free held locks; global clog is the arbiter
+        }
+        was_leader = is_leader;
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Reseed xid/seq counters on each follower→leader transition so they never
 /// regress below a prior leader's high-water mark. Idempotent (only bumps up).
 async fn reseed_on_leadership(raft: openraft::Raft<TypeConfig>, engine: Arc<SqlEngine>) {
@@ -442,6 +556,7 @@ async fn reseed_on_leadership(raft: openraft::Raft<TypeConfig>, engine: Arc<SqlE
         };
         if is_leader && !was_leader {
             let _ = engine.reseed_counters();
+            let _ = engine.reseed_gtm(); // lift next_global past every durable allocation
         }
         was_leader = is_leader;
         if rx.changed().await.is_err() {
@@ -471,6 +586,60 @@ async fn bootstrap(raft: openraft::Raft<TypeConfig>, peers: Vec<(NodeId, String)
         .map(|(id, addr)| (id, BasicNode { addr }))
         .collect();
     let _ = raft.initialize(members).await; // ignore AlreadyInitialized on restart
+}
+
+/// Start a self-bootstrapping two-range node and wait until it leads every range.
+/// Used by unit tests in `twopc` that need a live in-process node without going
+/// through the integration-test gateway. ONE node, id 0, `RangeMap::with_boundaries(vec![2])`.
+#[cfg(test)]
+pub(crate) async fn testonly_two_range_node() -> (ServerNode, String) {
+    use crate::range::RangeMap;
+    let mut attempts = 0u32;
+    loop {
+        let node_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let a = l.local_addr().expect("local_addr").to_string();
+            drop(l);
+            a
+        };
+        let sql_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let a = l.local_addr().expect("local_addr").to_string();
+            drop(l);
+            a
+        };
+        match ServerNode::start(NodeConfig {
+            id: 0,
+            node_addr: node_addr.clone(),
+            sql_addr: sql_addr.clone(),
+            data_dir: tempfile::tempdir().expect("tempdir").keep(),
+            peers: vec![(0, node_addr.clone())],
+            bootstrap: true,
+            layout: RangeLayout::Static(RangeMap::with_boundaries(vec![2])),
+        })
+        .await
+        {
+            Ok(node) => {
+                for raft in node.rafts.values() {
+                    raft.wait(Some(Duration::from_secs(10)))
+                        .metrics(
+                            |m| m.state == ServerState::Leader && m.current_leader == Some(0),
+                            "range self-confirmed leader",
+                        )
+                        .await
+                        .expect("range elects within the bound");
+                }
+                return (node, sql_addr);
+            }
+            Err(_) => {
+                attempts += 1;
+                assert!(
+                    attempts < 16,
+                    "testonly_two_range_node: bind race did not clear"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

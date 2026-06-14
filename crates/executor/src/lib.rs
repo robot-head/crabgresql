@@ -66,6 +66,12 @@ pub struct SqlEngine {
     /// on a single-range engine. Single-range behavior is byte-for-byte unchanged
     /// when `gtm` is `None`.
     pub(crate) gtm: Option<Arc<gtm::Gtm>>,
+    /// A range-0 read barrier, injected by the cluster on every DATA-range engine
+    /// (range != 0) of a multi-range node. Before a cross-range resolver reads
+    /// range 0's global clog, this catches the node's LOCAL range-0 replica up to
+    /// range 0's linearizable applied index. `None` on range 0's own engine (it
+    /// reads its own current store) and on single-range engines.
+    pub(crate) range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
 }
 
 impl Default for SqlEngine {
@@ -102,6 +108,7 @@ impl SqlEngine {
             linearizer: Arc::new(crate::read_gate::LocalLinearizer),
             persist_mode: PersistMode::Durable,
             gtm: None,
+            range0_barrier: None,
         })
     }
 
@@ -133,6 +140,7 @@ impl SqlEngine {
             linearizer,
             persist_mode: PersistMode::Replicated,
             gtm: None,
+            range0_barrier: None,
         })
     }
 
@@ -159,6 +167,7 @@ impl SqlEngine {
             linearizer: Arc::clone(&self.linearizer),
             persist_mode: self.persist_mode,
             gtm: self.gtm.as_ref().map(Arc::clone),
+            range0_barrier: self.range0_barrier.as_ref().map(Arc::clone),
         }
     }
 
@@ -172,20 +181,24 @@ impl SqlEngine {
         Ok(())
     }
 
-    /// Copy this engine's `Arc<Gtm>` into `other`. Both engines then share the
-    /// same GTM — any range can resolve a `Prepared` row and the coordinator can
-    /// drive range 0. `self` must have been initialized via `init_gtm_coordinator`
-    /// first; `other` can be any range's engine.
+    /// Copy this engine's `Arc<Gtm>` into `other`. Both engines then share the same
+    /// GTM — any range can resolve a `Prepared` row and the coordinator can drive
+    /// range 0. `self` must have been initialized via `init_gtm_coordinator` first;
+    /// `other` can be any range's engine.
     pub fn share_gtm_to(&self, other: &mut SqlEngine) {
         other.gtm = self.gtm.as_ref().map(Arc::clone);
     }
 
-    /// Whether this engine carries the shared GTM (so cross-range 2PC can run).
-    /// `true` on every range engine of a multi-range cluster wired via
-    /// `init_gtm_coordinator`/`share_gtm_to`; `false` on a single-range engine or a
-    /// gateway engine built outside that wiring (the cross-node decision path is a
-    /// later slice). The router gates escalation on this: no GTM ⇒ a cross-range txn
-    /// is rejected rather than escalated.
+    /// Inject a range-0 read barrier on this (data-range) engine. Called by the
+    /// cluster on every range != 0 engine so its cross-range resolver reads a
+    /// caught-up range-0 replica. Range 0's own engine needs no barrier.
+    pub fn set_range0_barrier(&mut self, b: Arc<dyn crate::read_gate::Linearizer>) {
+        self.range0_barrier = Some(b);
+    }
+
+    /// Whether this engine carries the shared GTM (so `begin_global_durable` and
+    /// global-decision methods are available). `true` on range 0's engine in any
+    /// multi-range configuration; `false` on a single-range engine.
     pub fn has_gtm(&self) -> bool {
         self.gtm.is_some()
     }
@@ -196,6 +209,32 @@ impl SqlEngine {
             .as_ref()
             .expect("begin_global on a non-GTM engine")
             .begin_global()
+    }
+
+    /// Durably allocate a global xid: bump the in-memory counter, then persist
+    /// `next_global` through range 0's committer BEFORE returning, so any later
+    /// range-0 leader reseeds past `g` and a global xid is never reused across a
+    /// range-0 leader change. Only succeeds on range 0's leader (the committer
+    /// rejects non-leaders -> ExecError::NotLeader).
+    pub async fn begin_global_durable(&self) -> Result<u64, ExecError> {
+        let gtm = self
+            .gtm
+            .as_ref()
+            .expect("begin_global_durable on a non-GTM engine");
+        let g = gtm.begin_global();
+        self.committer
+            .commit(vec![gtm.next_global_xid_op()])
+            .await?;
+        Ok(g)
+    }
+
+    /// Lift the GTM's in-memory `next_global` to the durable value (never
+    /// regresses). Called on the range-0 leadership rising edge.
+    pub fn reseed_gtm(&self) -> Result<(), ExecError> {
+        if let Some(gtm) = self.gtm.as_ref() {
+            gtm.reseed_from_applied()?;
+        }
+        Ok(())
     }
 
     /// Durably record the global decision (Committed/Aborted) for `g` in range 0's
@@ -223,15 +262,6 @@ impl SqlEngine {
             .as_ref()
             .expect("finish_global on a non-GTM engine")
             .finish_global(g);
-    }
-
-    /// The current global snapshot (for capturing a cross-range reader's horizon).
-    /// Returns `NO_GLOBAL_SNAPSHOT()` when there is no GTM (single-range engines).
-    pub fn global_snapshot(&self) -> mvcc::visibility::Snapshot {
-        self.gtm
-            .as_ref()
-            .map(|g| g.global_snapshot())
-            .unwrap_or_else(NO_GLOBAL_SNAPSHOT)
     }
 }
 
@@ -272,6 +302,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.linearizer),
             self.persist_mode,
             self.gtm.as_ref().map(Arc::clone),
+            self.range0_barrier.as_ref().map(Arc::clone),
         )
     }
 }

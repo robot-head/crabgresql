@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cluster::range::router::{AlwaysLeads, RejectForward};
+use cluster::range::router::{AlwaysLeads, GlobalCoordinator, LocalCoordinator, RejectForward};
 use cluster::range::{MultiRangeCluster, RangeId, RangeMap, RangeRouter};
 use executor::{SqlEngine, SqlSession};
 use pgwire::engine::{Cell, Engine, QueryResult, Session};
@@ -1012,12 +1012,19 @@ fn router_over(
 ) -> RangeRouter {
     let engines: HashMap<RangeId, SqlEngine> =
         shared.iter().map(|(r, e)| (*r, e.clone_handle())).collect();
+    // The in-process coordinator drives 2PC against the SHARED range-0 engine (a
+    // `clone_handle` shares its GTM + counters), so every router escalates against
+    // the one global clog — matching SP16's in-process behavior through the seam.
+    let coordinator: Arc<dyn GlobalCoordinator> = Arc::new(LocalCoordinator {
+        range0: shared[&0].clone_handle(),
+    });
     RangeRouter::new(
         map.clone(),
         engines,
         Arc::new(AlwaysLeads),
         Arc::clone(catalog_kv),
         Arc::new(RejectForward),
+        Some(coordinator),
     )
 }
 

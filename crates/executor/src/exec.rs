@@ -859,6 +859,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durable_global_snapshot_resolves_committed_against_range0() {
+        use kv::{Kv, MemKv};
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let local = MemKv::new(); // this range's clog
+        let global = MemKv::new(); // range 0's global clog + meta
+        let g = GLOBAL_XID_BASE + 5;
+
+        local
+            .write_batch(&[put_op(3, XidStatus::Prepared(g))])
+            .expect("local prepared");
+        // Range 0: g committed, next_global persisted past g — BIG-ENDIAN, the exact
+        // on-disk layout the GTM allocator writes (correction C1).
+        global
+            .write_batch(&[put_op(g, XidStatus::Committed)])
+            .expect("global committed");
+        global
+            .write_batch(&[kv::WriteOp::Put {
+                key: kv::key::meta_next_global_xid_key(),
+                value: (g + 1).to_be_bytes().to_vec(),
+            }])
+            .expect("persist next_global");
+
+        let gsnap = crate::session::durable_global_snapshot(&global).expect("rebuild gsnap");
+        let resolve = crate::exec::global_status(&local, &global, &gsnap);
+        assert_eq!(
+            resolve(3).expect("resolve"),
+            XidStatus::Committed,
+            "committed cross-range deleter resolves Committed via range 0's durable clog"
+        );
+
+        let g2 = GLOBAL_XID_BASE + 6;
+        local
+            .write_batch(&[put_op(4, XidStatus::Prepared(g2))])
+            .expect("local prepared 2");
+        global
+            .write_batch(&[kv::WriteOp::Put {
+                key: kv::key::meta_next_global_xid_key(),
+                value: (g2 + 1).to_be_bytes().to_vec(),
+            }])
+            .expect("advance next_global past g2");
+        let gsnap2 = crate::session::durable_global_snapshot(&global).expect("rebuild gsnap2");
+        let resolve2 = crate::exec::global_status(&local, &global, &gsnap2);
+        assert_eq!(
+            resolve2(4).expect("resolve g2"),
+            XidStatus::InProgress,
+            "allocated-but-undecided cross-range deleter is invisible"
+        );
+    }
+
     async fn run_s(s: &mut SqlSession, sql: &str) -> Vec<QueryResult> {
         s.simple_query(sql).await.expect("ok")
     }

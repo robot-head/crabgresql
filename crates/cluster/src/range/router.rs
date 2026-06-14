@@ -35,6 +35,57 @@ pub trait RemoteForward: Send + Sync {
     ) -> FuturePin<Box<dyn Future<Output = Result<QueryResult, ExecError>> + Send + 'a>>;
 }
 
+/// Drives the cross-range 2PC global operations for the gateway. `LocalCoordinator`
+/// (in-process tests) calls the local range-0 engine + local participant sessions;
+/// `NetCoordinator` (networked gateway) RPCs to the relevant range leaders.
+#[async_trait::async_trait]
+pub trait GlobalCoordinator: Send + Sync {
+    async fn begin_global(&self) -> Result<u64, ExecError>;
+    /// Stage `sql` on a REMOTE participant `range` inside held txn `g`.
+    async fn stage_remote(&self, g: u64, range: RangeId, sql: &str) -> Result<(), ExecError>;
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError>;
+    /// Release a REMOTE participant `range`'s held txn `g`.
+    async fn release_remote(&self, g: u64, range: RangeId, commit: bool) -> Result<(), ExecError>;
+}
+
+/// In-process coordinator over a local GTM-bearing range-0 engine. Participants are
+/// always local in `MultiRangeCluster`, so `stage_remote`/`release_remote` are unreachable.
+pub struct LocalCoordinator {
+    pub range0: SqlEngine,
+}
+
+#[async_trait::async_trait]
+impl GlobalCoordinator for LocalCoordinator {
+    async fn begin_global(&self) -> Result<u64, ExecError> {
+        self.range0.begin_global_durable().await
+    }
+    async fn stage_remote(&self, _g: u64, range: RangeId, _sql: &str) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported(format!(
+            "local coordinator has no remote range {range}"
+        )))
+    }
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError> {
+        let status = if commit {
+            mvcc::clog::XidStatus::Committed
+        } else {
+            mvcc::clog::XidStatus::Aborted
+        };
+        self.range0.commit_global_decision(g, status).await?;
+        self.range0.finish_global(g);
+        Ok(())
+    }
+    async fn release_remote(
+        &self,
+        _g: u64,
+        range: RangeId,
+        _commit: bool,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported(format!(
+            "local coordinator has no remote range {range}"
+        )))
+    }
+}
+
 /// Whether THIS node currently leads a given range. The gateway runs a statement
 /// locally only when it both holds a local engine for the range AND currently
 /// leads it; otherwise it forwards to the remote leader. In D3a-net's co-located
@@ -122,6 +173,11 @@ pub struct RangeRouter {
     catalog_kv: Arc<dyn kv::Kv>,
     /// Forwards a statement whose range has no local engine.
     forward: Arc<dyn RemoteForward>,
+    /// Drives the cross-range 2PC global operations (begin/stage/commit/release).
+    /// `Some` when this router can escalate a txn to cross-range 2PC: a
+    /// `LocalCoordinator` in-process or a `NetCoordinator` on the networked gateway.
+    /// `None` for routers that never escalate (unit-test seam routers).
+    coordinator: Option<Arc<dyn GlobalCoordinator>>,
     /// The EXACT source text of the statement currently being dispatched (set per
     /// statement from `parse_with_source`) — what the forward seam relays for a
     /// non-local range. Per-statement, NOT the whole `;`-separated frame, so a frame
@@ -147,6 +203,7 @@ impl RangeRouter {
         leads: Arc<dyn LeadsRange>,
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
+        coordinator: Option<Arc<dyn GlobalCoordinator>>,
     ) -> Self {
         Self {
             sessions: HashMap::new(),
@@ -156,6 +213,7 @@ impl RangeRouter {
             leads,
             catalog_kv,
             forward,
+            coordinator,
             cur_sql: String::new(),
             #[cfg(test)]
             before_global_decision: None,
@@ -200,12 +258,18 @@ impl RangeRouter {
         for r in c.range_map().range_ids() {
             engines.insert(r, c.leader_engine(r).await);
         }
+        // The in-process coordinator drives 2PC directly against range 0's local
+        // GTM-bearing engine; every participant is local, so it never RPCs.
+        let coordinator: Arc<dyn GlobalCoordinator> = Arc::new(LocalCoordinator {
+            range0: c.leader_engine(0).await,
+        });
         Self::new(
             c.range_map().clone(),
             engines,
             Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(RejectForward),
+            Some(coordinator),
         )
     }
 
@@ -269,82 +333,87 @@ impl RangeRouter {
             // Autocommit: route each statement independently to its target range
             // (table-bearing -> its range; otherwise range 0).
             Pin::None => self.run_on(pinning.unwrap_or(0), stmt).await,
-            // The first table-bearing statement of the txn pins it to that
-            // statement's range — even range 0. A later table-bearing statement on
-            // a *different* range escalates to a cross-range global txn (the
-            // `Pin::Range` arm below), no longer rejected (D3c).
-            Pin::Open => {
-                match pinning {
-                    Some(r) => {
+            // The first table-bearing statement of the txn pins it. A LOCALLY-led
+            // range pins to `Pin::Range(r)` and runs locally; a range this gateway
+            // does NOT lead immediately escalates to a cross-range global txn `g`
+            // and STAGES the statement as a held participant — this is what lets a
+            // gateway that leads nothing still coordinate.
+            Pin::Open => match pinning {
+                Some(r) => {
+                    if self.engines.contains_key(&r) && self.leads.leads(r) {
                         // Hold the first DML even when it lands on a NON-range-0
-                        // range: BEGIN ran only on range 0's session, so this
-                        // range's session is still Idle and the DML would otherwise
-                        // autocommit (the D3a looseness). `ensure_began_on` opens a
-                        // held txn on `r` first so the write is held until COMMIT —
-                        // required so a later escalation's `Prepared` backfill can't
-                        // retroactively hide an already-committed row.
+                        // range: BEGIN ran only on range 0's session, so this range's
+                        // session is still Idle and the DML would otherwise autocommit.
+                        // `ensure_began_on` opens a held txn on `r` first so the write
+                        // is held until COMMIT.
                         self.pin = Pin::Range(r);
                         self.ensure_began_on(r).await?;
-                        self.run_on(r, stmt).await
+                        return self.run_on(r, stmt).await;
                     }
-                    None => self.run_on(0, stmt).await, // DDL / FROM-less SELECT: range 0, stay unpinned.
-                }
-            }
-            // Already pinned to `p`: a table-bearing statement on another range `r`
-            // escalates the txn to a cross-range global txn `g`. Strictly sequential
-            // single-borrow steps — we cannot hold `&mut` to two sessions of one
-            // HashMap at once, so `session_mut` is called one at a time.
-            Pin::Range(p) => {
-                let p = *p;
-                if let Some(r) = pinning
-                    && r != p
-                {
-                    // Cross-range 2PC requires the shared GTM coordinator (range 0's
-                    // engine). The in-process `MultiRangeCluster` wires it into every
-                    // range engine; the cross-node gateway path (`serve_routed`)
-                    // does NOT yet (deferred to SP17), so there a cross-range txn is
-                    // still rejected with 0A000 instead of escalated.
+                    // The very first participant is remote: escalate now and stage it.
                     if !self.can_escalate() {
                         return Err(ExecError::Unsupported(
                             "a transaction may not span ranges yet (D3b)".into(),
                         ));
                     }
-                    // Coordinator (range 0's engine) allocates the global xid.
-                    let g = self.engines[&0].begin_global();
-                    // Backfill Prepared(Lp -> g) on the already-written `p` + deregister.
+                    let coord = self
+                        .coordinator
+                        .as_ref()
+                        .expect("coordinator to escalate")
+                        .clone();
+                    let g = coord.begin_global().await?;
+                    let mut ranges = std::collections::BTreeSet::new();
+                    ranges.insert(r);
+                    self.pin = Pin::Global { ranges, g };
+                    self.stage_on(r, g, stmt).await
+                }
+                None => self.run_on(0, stmt).await, // DDL / FROM-less SELECT: range 0, stay unpinned.
+            },
+            // Already pinned to `p`: a table-bearing statement on another range `r`
+            // escalates the txn to a cross-range global txn `g`. The already-pinned
+            // local range `p` joins `g` via its local session; `r` is staged (locally
+            // if led, else over RPC) through `stage_on`.
+            Pin::Range(p) => {
+                let p = *p;
+                if let Some(r) = pinning
+                    && r != p
+                {
+                    if !self.can_escalate() {
+                        return Err(ExecError::Unsupported(
+                            "a transaction may not span ranges yet (D3b)".into(),
+                        ));
+                    }
+                    let coord = self
+                        .coordinator
+                        .as_ref()
+                        .expect("coordinator to escalate")
+                        .clone();
+                    let g = coord.begin_global().await?;
+                    // Backfill Prepared(Lp -> g) on the already-written local `p`.
                     self.session_mut(p).join_global(g).await?;
-                    // Hold a txn on `r` before its first write (no autocommit), then
-                    // mark it a participant (no xid yet -> the first write writes the
-                    // marker and deregisters in `run_write`).
-                    self.ensure_began_on(r).await?;
-                    self.session_mut(r).join_global(g).await?;
                     let mut ranges = std::collections::BTreeSet::new();
                     ranges.insert(p);
                     ranges.insert(r);
                     self.pin = Pin::Global { ranges, g };
-                    return self.run_on(r, stmt).await;
+                    return self.stage_on(r, g, stmt).await;
                 }
                 // Same range (or no-table statement): run on the pinned session.
                 self.run_on(p, stmt).await
             }
-            // Already global: a table-bearing statement on a not-yet-joined range
-            // joins the set the same way (hold + join); a statement on an existing
-            // participant (or a no-table statement) runs on its range's session.
+            // Already global: a table-bearing statement on any range is staged into
+            // `g` (joining the set if new); a no-table statement runs on range 0.
             Pin::Global { ranges, g } => {
                 let g = *g;
-                if let Some(r) = pinning
-                    && !ranges.contains(&r)
-                {
-                    self.ensure_began_on(r).await?;
-                    self.session_mut(r).join_global(g).await?;
-                    if let Pin::Global { ranges, .. } = &mut self.pin {
+                if let Some(r) = pinning {
+                    if !ranges.contains(&r)
+                        && let Pin::Global { ranges, .. } = &mut self.pin
+                    {
                         ranges.insert(r);
                     }
+                    return self.stage_on(r, g, stmt).await;
                 }
-                // A no-table statement (DDL / FROM-less SELECT) runs on range 0; a
-                // table-bearing one on its own range.
-                let r = pinning.unwrap_or(0);
-                self.run_on(r, stmt).await
+                // A no-table statement (DDL / FROM-less SELECT) runs on range 0.
+                self.run_on(0, stmt).await
             }
         }
     }
@@ -355,14 +424,7 @@ impl RangeRouter {
     async fn finish_txn(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         match std::mem::replace(&mut self.pin, Pin::None) {
             Pin::Global { ranges, g } => {
-                let decision = if matches!(stmt, Statement::Commit) {
-                    mvcc::clog::XidStatus::Committed
-                } else {
-                    // Always a POSITIVE Aborted(g) on ROLLBACK (not mere absence),
-                    // so presumed-abort is a record, not an indistinguishable lost
-                    // commit.
-                    mvcc::clog::XidStatus::Aborted
-                };
+                let commit = matches!(stmt, Statement::Commit);
                 // Test-only pause seam: every participant has staged (joined `g`);
                 // fire the hook BEFORE the decision so a crash test can strand the
                 // coordinator at the staged-but-undecided point.
@@ -370,21 +432,29 @@ impl RangeRouter {
                 if let Some(hook) = self.before_global_decision.as_mut() {
                     hook();
                 }
-                // ONE range-0 append = the atomic instant both ranges flip at.
-                self.engines[&0].commit_global_decision(g, decision).await?;
+                let coord = self.coordinator.as_ref().expect("coordinator").clone();
+                // The single atomic instant: one range-0 append both ranges flip at.
+                coord.commit_global(g, commit).await?;
                 // Release each participant's locks + deregister (no per-participant
                 // clog write — the decision was recorded once, globally, above).
+                // Best-effort: the decision is durable and final, so a single remote
+                // release failure must NOT strand the other participants (a stranded
+                // remote lock is the known SP18 liveness gap, covered by
+                // release-on-leadership-loss in T6).
                 for r in &ranges {
-                    let session = self.session_mut(*r);
-                    if matches!(decision, mvcc::clog::XidStatus::Committed) {
-                        session.commit_release();
+                    if self.engines.contains_key(r) && self.leads.leads(*r) {
+                        let session = self.session_mut(*r);
+                        if commit {
+                            session.commit_release();
+                        } else {
+                            session.abort_release();
+                        }
                     } else {
-                        session.abort_release();
+                        let _ = coord.release_remote(g, *r, commit).await;
                     }
                 }
-                self.engines[&0].finish_global(g);
                 Ok(QueryResult::Command {
-                    tag: if matches!(stmt, Statement::Commit) {
+                    tag: if commit {
                         "COMMIT".into()
                     } else {
                         "ROLLBACK".into()
@@ -398,13 +468,12 @@ impl RangeRouter {
         }
     }
 
-    /// Whether this router can escalate a txn to cross-range 2PC: it must hold range
-    /// 0's engine locally AND that engine must carry the shared GTM coordinator.
-    /// True for the in-process `MultiRangeCluster` (every engine is GTM-wired);
-    /// false for the cross-node gateway path, where a cross-range txn is rejected
-    /// with 0A000 until the cross-node decision path lands (SP17).
+    /// Whether this router can escalate a txn to cross-range 2PC: it has a wired
+    /// `GlobalCoordinator`. True for both the in-process `MultiRangeCluster`
+    /// (`LocalCoordinator`) and the networked gateway (`NetCoordinator`); false only
+    /// for unit-test seam routers that never escalate.
     fn can_escalate(&self) -> bool {
-        self.engines.get(&0).is_some_and(SqlEngine::has_gtm)
+        self.coordinator.is_some()
     }
 
     /// Open a held txn on `range`'s session if it is Idle, so a participant's first
@@ -413,6 +482,30 @@ impl RangeRouter {
     /// single-range non-range-0 first-DML case and for cross-range escalation.
     async fn ensure_began_on(&mut self, range: RangeId) -> Result<(), ExecError> {
         self.session_mut(range).ensure_began().await
+    }
+
+    /// Run a participant statement on `range` inside global txn `g`: locally if led,
+    /// else Stage over RPC. NEVER routes a remote range through session_mut (which panics).
+    async fn stage_on(
+        &mut self,
+        range: RangeId,
+        g: u64,
+        stmt: &Statement,
+    ) -> Result<QueryResult, ExecError> {
+        if self.engines.contains_key(&range) && self.leads.leads(range) {
+            self.ensure_began_on(range).await?;
+            self.session_mut(range).join_global(g).await?;
+            return self.session_mut(range).run(stmt).await;
+        }
+        let coord = self
+            .coordinator
+            .as_ref()
+            .expect("coordinator for cross-range")
+            .clone();
+        // A remote Stage returns no rows (the participant holds its result); the
+        // gateway reports a generic command tag, like any held-write in a txn.
+        coord.stage_remote(g, range, &self.cur_sql).await?;
+        Ok(QueryResult::Command { tag: "OK".into() })
     }
 
     /// Run a statement on `range`: locally only when this node holds a local engine
@@ -856,6 +949,7 @@ mod gateway_seam_tests {
             Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(RejectForward),
+            None,
         );
         // Range-0 work runs locally.
         router
@@ -929,6 +1023,7 @@ mod gateway_seam_tests {
             Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(EngineForward { engines: remote }),
+            None,
         );
 
         router

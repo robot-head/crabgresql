@@ -11,6 +11,7 @@ use super::frame::{read_msg, write_msg};
 use super::partition::PartitionState;
 use super::protocol::{
     ControlRequest, ControlResponse, NodeRequest, NodeResponse, NodeStatus, RaftRpc, RaftRpcResp,
+    TxnResp, TxnRpc,
 };
 use crate::range::RangeId;
 use crate::types::{NodeId, TypeConfig};
@@ -72,6 +73,17 @@ impl RangeRegistry {
             .next()
             .map(|&(_, id)| id)
     }
+
+    /// `(range, current_leader)` for every group registered on this node, sorted by range.
+    pub fn group_leaders(&self) -> Vec<(RangeId, Option<NodeId>)> {
+        let map = self.handles.lock().expect("range registry");
+        let mut out: Vec<(RangeId, Option<NodeId>)> = map
+            .iter()
+            .map(|(&(range, _id), raft)| (range, raft.metrics().borrow().current_leader))
+            .collect();
+        out.sort_by_key(|&(r, _)| r);
+        out
+    }
 }
 
 /// Resolve `(range, node)`'s group, or `None` for an unregistered range (the
@@ -103,13 +115,18 @@ pub async fn serve_node_protocol(
     registry: RangeRegistry,
     partition: PartitionState,
     shutdown: ShutdownSignal,
+    txn: Option<crate::twopc::TxnService>,
 ) {
     loop {
         let Ok((sock, _)) = listener.accept().await else {
             return;
         };
-        let (registry, partition, shutdown) =
-            (registry.clone(), partition.clone(), shutdown.clone());
+        let (registry, partition, shutdown, txn) = (
+            registry.clone(),
+            partition.clone(),
+            shutdown.clone(),
+            txn.clone(),
+        );
         tokio::spawn(async move {
             let mut sock = sock;
             loop {
@@ -127,6 +144,9 @@ pub async fn serve_node_protocol(
                         };
                         NodeResponse::Raft(dispatch_raft(&raft, rpc).await)
                     }
+                    NodeRequest::Control(ControlRequest::RangeLeaders) => NodeResponse::Control(
+                        ControlResponse::RangeLeaders(registry.group_leaders()),
+                    ),
                     NodeRequest::Control(c) => {
                         // Control is node-global: answer against the range-0 group.
                         match resolve(&registry, 0) {
@@ -138,6 +158,12 @@ pub async fn serve_node_protocol(
                             )),
                         }
                     }
+                    NodeRequest::Txn { range, rpc } => match &txn {
+                        Some(svc) => {
+                            NodeResponse::Txn(handle_txn(&registry, svc, range, rpc).await)
+                        }
+                        None => NodeResponse::Txn(TxnResp::Err("node hosts no 2PC service".into())),
+                    },
                 };
                 if write_msg(&mut sock, &resp).await.is_err() {
                     return;
@@ -162,6 +188,9 @@ async fn handle_control(
     req: ControlRequest,
 ) -> ControlResponse {
     match req {
+        // RangeLeaders is special-cased in serve_node_protocol before this function
+        // is called (it needs the whole registry, not just range 0's raft).
+        ControlRequest::RangeLeaders => unreachable!("RangeLeaders handled before handle_control"),
         ControlRequest::GetStatus => {
             let m = raft.metrics().borrow().clone();
             let members: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
@@ -200,6 +229,52 @@ async fn handle_control(
             shutdown.fire();
             ControlResponse::Ok
         }
+    }
+}
+
+async fn handle_txn(
+    registry: &RangeRegistry,
+    svc: &crate::twopc::TxnService,
+    range: RangeId,
+    rpc: TxnRpc,
+) -> TxnResp {
+    match rpc {
+        TxnRpc::BeginGlobal => match svc.engine(0) {
+            Some(e) => match e.begin_global_durable().await {
+                Ok(g) => TxnResp::Began { g },
+                Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
+                Err(e) => TxnResp::Err(format!("{e:?}")),
+            },
+            None => TxnResp::Err("no range-0 engine".into()),
+        },
+        TxnRpc::CommitGlobal { g, commit } => match svc.engine(0) {
+            Some(e) => {
+                let status = if commit {
+                    mvcc::clog::XidStatus::Committed
+                } else {
+                    mvcc::clog::XidStatus::Aborted
+                };
+                match e.commit_global_decision(g, status).await {
+                    Ok(()) => {
+                        e.finish_global(g); // prune g from in-memory running set
+                        TxnResp::Committed
+                    }
+                    Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
+                    Err(e) => TxnResp::Err(format!("{e:?}")),
+                }
+            }
+            None => TxnResp::Err("no range-0 engine".into()),
+        },
+        TxnRpc::GlobalBarrier => match resolve(registry, 0) {
+            Some(raft) => match raft.ensure_linearizable().await {
+                Ok(read_log_id) => TxnResp::Barrier {
+                    applied_index: read_log_id.map(|l| l.index).unwrap_or(0),
+                },
+                Err(_) => TxnResp::NotLeader,
+            },
+            None => TxnResp::Err("no range-0 group".into()),
+        },
+        rpc @ (TxnRpc::Stage { .. } | TxnRpc::Release { .. }) => svc.handle(range, rpc).await,
     }
 }
 
@@ -318,6 +393,7 @@ mod range_aware {
             registry,
             PartitionState::default(),
             ShutdownSignal::default(),
+            None,
         ));
 
         // Wait (event-based, no sleep) for range 1's single-voter group to lead, so

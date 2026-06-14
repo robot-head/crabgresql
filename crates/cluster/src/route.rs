@@ -116,7 +116,7 @@ async fn proxy(mut client: TcpStream, leader_sql_addr: &str) {
 use std::collections::HashMap;
 
 use crate::range::map::{RangeId, RangeMap};
-use crate::range::router::{LeadsRange, RangeRouter, RemoteForward};
+use crate::range::router::{GlobalCoordinator, LeadsRange, RangeRouter, RemoteForward};
 
 /// A `pgwire` `Engine` whose every connection is a per-statement range gateway.
 /// `connect()` builds a `RangeRouter` over this node's local engines, a per-range
@@ -131,6 +131,8 @@ pub struct RangeGatewayEngine {
     leads: Arc<dyn LeadsRange>,
     catalog_kv: Arc<dyn kv::Kv>,
     forward: Arc<dyn RemoteForward>,
+    /// The cross-range 2PC coordinator, cloned into every connection's router.
+    coordinator: Arc<dyn GlobalCoordinator>,
 }
 
 impl RangeGatewayEngine {
@@ -140,6 +142,7 @@ impl RangeGatewayEngine {
         leads: Arc<dyn LeadsRange>,
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
+        coordinator: Arc<dyn GlobalCoordinator>,
     ) -> Self {
         Self {
             map,
@@ -147,6 +150,7 @@ impl RangeGatewayEngine {
             leads,
             catalog_kv,
             forward,
+            coordinator,
         }
     }
 }
@@ -169,6 +173,7 @@ impl pgwire::engine::Engine for RangeGatewayEngine {
             Arc::clone(&self.leads),
             Arc::clone(&self.catalog_kv),
             Arc::clone(&self.forward),
+            Some(Arc::clone(&self.coordinator)),
         )
     }
 }
@@ -177,6 +182,7 @@ impl pgwire::engine::Engine for RangeGatewayEngine {
 /// frame is demuxed to its range's local leader engine or forwarded to the remote
 /// leader. The multi-range analog of `serve_routed`; T2 selects this when the
 /// node hosts more than one range.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_range_routed(
     listener: TcpListener,
     map: RangeMap,
@@ -184,10 +190,16 @@ pub async fn serve_range_routed(
     leads: Arc<dyn LeadsRange>,
     catalog_kv: Arc<dyn kv::Kv>,
     forward: Arc<dyn RemoteForward>,
+    coordinator: Arc<dyn GlobalCoordinator>,
     config: Arc<SessionConfig>,
 ) -> std::io::Result<()> {
     let engine = Arc::new(RangeGatewayEngine::new(
-        map, engines, leads, catalog_kv, forward,
+        map,
+        engines,
+        leads,
+        catalog_kv,
+        forward,
+        coordinator,
     ));
     let registry = Arc::new(CancelRegistry::default());
     loop {
