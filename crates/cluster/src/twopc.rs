@@ -725,6 +725,12 @@ mod tests {
         );
         svc.register_engine(1, node.engines[&1].clone()); // idempotent
         assert!(svc.engine(1).is_some());
+        // Copy-on-write preserves prior entries: registering range 1 must not drop
+        // the originally-constructed range 0 (would fail a `store`-whole-map impl).
+        assert!(
+            svc.engine(0).is_some(),
+            "register preserves prior entries (copy-on-write)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
