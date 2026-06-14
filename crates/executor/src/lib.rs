@@ -261,6 +261,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.committer),
             Arc::clone(&self.linearizer),
             self.persist_mode,
+            self.gtm.as_ref().map(Arc::clone),
         )
     }
 }

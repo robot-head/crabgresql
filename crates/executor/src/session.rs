@@ -28,6 +28,12 @@ pub(crate) struct TxnCtx {
     /// fixed at BEGIN under REPEATABLE READ.
     pub(crate) snapshot: Snapshot,
     pub(crate) repeatable_read: bool,
+    /// The GLOBAL snapshot the cross-range resolver (`exec::global_status`) gates
+    /// `Prepared(-> g)` rows against. Captured at BEGIN for REPEATABLE READ (fixed
+    /// for the txn's life), re-captured per statement for READ COMMITTED. `None`
+    /// on a non-GTM (single-range) engine — reads then use `NO_GLOBAL_SNAPSHOT()`
+    /// and the `Prepared` branch is unreachable.
+    pub(crate) global_snapshot: Option<Snapshot>,
 }
 
 /// Per-connection transaction state. `Failed` carries the aborted block's
@@ -55,6 +61,15 @@ pub struct SqlSession {
     committer: Arc<dyn crate::commit::Committer>,
     linearizer: Arc<dyn crate::read_gate::Linearizer>,
     persist_mode: crate::PersistMode,
+    /// Range 0's GTM, shared from the engine. `Some` on every range engine of a
+    /// multi-range cluster (so any range can capture a global snapshot and
+    /// resolve a `Prepared` row); `None` on a single-range engine.
+    gtm: Option<Arc<crate::gtm::Gtm>>,
+    /// Set when this session is enlisted as a participant in a cross-range global
+    /// txn `g` (Task 4's coordinator calls `join_global`). While set, each local
+    /// write also stamps a `Prepared(local_xid -> g)` clog marker and deregisters
+    /// the local xid at prepare time. `None` for ordinary single-range txns.
+    global_xid: Option<u64>,
     state: TxnState,
 }
 
@@ -73,6 +88,7 @@ impl SqlSession {
         committer: Arc<dyn crate::commit::Committer>,
         linearizer: Arc<dyn crate::read_gate::Linearizer>,
         persist_mode: crate::PersistMode,
+        gtm: Option<Arc<crate::gtm::Gtm>>,
     ) -> Self {
         Self {
             kv,
@@ -84,6 +100,8 @@ impl SqlSession {
             committer,
             linearizer,
             persist_mode,
+            gtm,
+            global_xid: None,
             state: TxnState::Idle,
         }
     }
@@ -159,10 +177,19 @@ impl SqlSession {
             self.linearizer.ensure_readable().await?;
         }
         let snapshot = self.procarray.snapshot();
+        // RR fixes its GLOBAL snapshot at BEGIN too (so a Prepared(-> g) row's
+        // in-doubt-ness is stable for the whole txn); RC re-captures per statement,
+        // so leave it None here. None on a non-GTM engine.
+        let global_snapshot = if rr {
+            self.gtm.as_ref().map(|g| g.global_snapshot())
+        } else {
+            None
+        };
         self.state = TxnState::InTransaction(TxnCtx {
             xid: None,
             snapshot,
             repeatable_read: rr,
+            global_snapshot,
         });
         Ok(QueryResult::Command {
             tag: "BEGIN".into(),
@@ -222,9 +249,30 @@ impl SqlSession {
         })
     }
 
+    /// The GLOBAL snapshot a read should resolve `Prepared(-> g)` rows against.
+    /// RR reuses the one captured at BEGIN (`stored`); RC / autocommit capture a
+    /// fresh one from the GTM. A non-GTM (single-range) engine has no GTM, so this
+    /// is `NO_GLOBAL_SNAPSHOT()` and the resolver's `Prepared` branch is
+    /// unreachable (no `Prepared` tuple ever exists there).
+    fn global_read_snapshot(&self, stored: Option<&Snapshot>) -> Snapshot {
+        match (&self.gtm, stored) {
+            (None, _) => crate::NO_GLOBAL_SNAPSHOT(),
+            (Some(_), Some(s)) => s.clone(),
+            (Some(gtm), None) => gtm.global_snapshot(),
+        }
+    }
+
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        let (snapshot, own) = self.read_context().await?;
-        crate::exec::execute_read(&*self.catalog_kv, &*self.kv, &snapshot, own, stmt)
+        let (snapshot, own, gsnap) = self.read_context().await?;
+        crate::exec::execute_read(
+            &*self.catalog_kv,
+            &*self.kv,
+            &*self.catalog_kv,
+            &gsnap,
+            &snapshot,
+            own,
+            stmt,
+        )
     }
 
     /// Locking SELECT (FOR UPDATE / FOR SHARE). Allocates an xid if none is
@@ -260,6 +308,14 @@ impl SqlSession {
                         c.snapshot = snap;
                     }
                 }
+                // RC re-captures the global snapshot per statement; RR reuses the
+                // one fixed at BEGIN. NO_GLOBAL_SNAPSHOT() on a non-GTM engine.
+                let gsnap = match &self.state {
+                    TxnState::InTransaction(c) if c.repeatable_read => {
+                        self.global_read_snapshot(c.global_snapshot.as_ref())
+                    }
+                    _ => self.global_read_snapshot(None),
+                };
                 let (snapshot, xid, repeatable_read) = match &self.state {
                     TxnState::InTransaction(c) => (
                         c.snapshot.clone(),
@@ -274,6 +330,8 @@ impl SqlSession {
                 crate::exec::execute_read_locking(
                     &*self.catalog_kv,
                     &*kv,
+                    &*self.catalog_kv,
+                    &gsnap,
                     &self.procarray,
                     &self.lockmgr,
                     &snapshot,
@@ -293,10 +351,13 @@ impl SqlSession {
                 // end — there is no open block to hold them).
                 let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
+                let gsnap = self.global_read_snapshot(None);
                 let kv = Arc::clone(&self.kv);
                 let result = crate::exec::execute_read_locking(
                     &*self.catalog_kv,
                     &*kv,
+                    &*self.catalog_kv,
+                    &gsnap,
                     &self.procarray,
                     &self.lockmgr,
                     &snapshot,
@@ -315,11 +376,13 @@ impl SqlSession {
         }
     }
 
-    /// The snapshot + own-xid a read should use. Autocommit: a fresh snapshot,
-    /// no own xid. In a txn: RC re-snapshots per statement, RR reuses its
-    /// snapshot; own xid is the txn's (Some after its first write). Gates before
-    /// establishing a fresh snapshot (autocommit + RC); RR was gated at BEGIN.
-    async fn read_context(&mut self) -> Result<(Snapshot, Option<u64>), ExecError> {
+    /// The (local snapshot, own-xid, global snapshot) a read should use.
+    /// Autocommit: a fresh local + global snapshot, no own xid. In a txn: RC
+    /// re-snapshots both per statement, RR reuses the local + global snapshots
+    /// fixed at BEGIN; own xid is the txn's (Some after its first write). Gates
+    /// before establishing a fresh snapshot (autocommit + RC); RR was gated at
+    /// BEGIN. The global snapshot is `NO_GLOBAL_SNAPSHOT()` on a non-GTM engine.
+    async fn read_context(&mut self) -> Result<(Snapshot, Option<u64>, Snapshot), ExecError> {
         enum Plan {
             Auto,
             RcRefresh,
@@ -341,21 +404,27 @@ impl SqlSession {
         match plan {
             Plan::Auto => {
                 self.linearizer.ensure_readable().await?;
-                Ok((self.procarray.snapshot(), None))
+                let gsnap = self.global_read_snapshot(None);
+                Ok((self.procarray.snapshot(), None, gsnap))
             }
             Plan::RcRefresh => {
                 self.linearizer.ensure_readable().await?;
                 let snap = self.procarray.snapshot();
+                // RC re-captures the global snapshot per statement too.
+                let gsnap = self.global_read_snapshot(None);
                 match &mut self.state {
                     TxnState::InTransaction(c) => {
                         c.snapshot = snap.clone();
-                        Ok((snap, c.xid))
+                        Ok((snap, c.xid, gsnap))
                     }
                     _ => unreachable!(),
                 }
             }
             Plan::RrReuse => match &self.state {
-                TxnState::InTransaction(c) => Ok((c.snapshot.clone(), c.xid)),
+                TxnState::InTransaction(c) => {
+                    let gsnap = self.global_read_snapshot(c.global_snapshot.as_ref());
+                    Ok((c.snapshot.clone(), c.xid, gsnap))
+                }
                 _ => unreachable!(),
             },
         }
@@ -387,6 +456,15 @@ impl SqlSession {
                         c.snapshot = s;
                     }
                 }
+                // RC re-captures the global snapshot per statement; RR reuses the
+                // one fixed at BEGIN. NO_GLOBAL_SNAPSHOT() on a non-GTM engine. The
+                // UPDATE/DELETE re-check resolves a cross-range supersede through it.
+                let gsnap = match &self.state {
+                    TxnState::InTransaction(c) if c.repeatable_read => {
+                        self.global_read_snapshot(c.global_snapshot.as_ref())
+                    }
+                    _ => self.global_read_snapshot(None),
+                };
                 let (snapshot, xid, repeatable_read) = match &self.state {
                     TxnState::InTransaction(c) => (
                         c.snapshot.clone(),
@@ -406,6 +484,8 @@ impl SqlSession {
                 let (result, mut ops) = crate::exec::execute_write(
                     &*self.catalog_kv,
                     &*kv,
+                    &*self.catalog_kv,
+                    &gsnap,
                     &self.procarray,
                     &self.lockmgr,
                     &self.seq,
@@ -415,10 +495,26 @@ impl SqlSession {
                     stmt,
                 )
                 .await?;
+                // A participant in a cross-range global txn `g` stamps a
+                // Prepared(xid -> g) marker into the SAME durable batch so the row
+                // carries it from the start, and deregisters `xid` from the
+                // ProcArray running-set at prepare time (the atomicity linchpin):
+                // the local snapshot then no longer gates the row, deferring
+                // visibility entirely to range 0's global clog. This also covers
+                // the case where the escalation trigger IS this range's first
+                // write, so `join_global` had no local xid to backfill. Idempotent
+                // on later writes of the same txn (the marker key/value is stable
+                // and `finish` is a set-remove).
+                if let Some(g) = self.global_xid {
+                    ops.push(mvcc::clog::put_op(xid, XidStatus::Prepared(g)));
+                }
                 if self.persist_mode == crate::PersistMode::Replicated {
                     ops.push(self.procarray.next_xid_op());
                 }
                 self.committer.commit(ops).await?;
+                if self.global_xid.is_some() {
+                    self.procarray.finish(xid); // deregister-at-prepare
+                }
                 Ok(result)
             }
             TxnState::Idle => {
@@ -427,10 +523,13 @@ impl SqlSession {
                 // lock; next_xid was persisted eagerly by begin_write.
                 let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
+                let gsnap = self.global_read_snapshot(None);
                 let kv = Arc::clone(&self.kv);
                 let outcome = crate::exec::execute_write(
                     &*self.catalog_kv,
                     &*kv,
+                    &*self.catalog_kv,
+                    &gsnap,
                     &self.procarray,
                     &self.lockmgr,
                     &self.seq,
@@ -487,6 +586,77 @@ impl SqlSession {
         }
         Ok(())
     }
+
+    /// The current transaction's local xid, if one has been allocated (`None` for
+    /// an idle session or a read-only txn that has not yet written). For a
+    /// participant in a global txn this is the per-range local `Li` the
+    /// `Prepared(Li -> g)` marker ties to the global `g`.
+    pub fn local_xid(&self) -> Option<u64> {
+        match &self.state {
+            TxnState::InTransaction(c) | TxnState::Failed(c) => c.xid,
+            TxnState::Idle => None,
+        }
+    }
+
+    /// Begin a held txn on this session if it is Idle, so a participant's first
+    /// DML is HELD (never autocommitted): the coordinator can then drive its
+    /// COMMIT/ROLLBACK and the `Prepared` marker is written before any of its rows
+    /// become eligible to commit on their own. Idempotent (no-op if already in a
+    /// txn). Reuses `begin`.
+    pub async fn ensure_began(&mut self) -> Result<(), ExecError> {
+        if matches!(self.state, TxnState::Idle) {
+            self.begin(None).await?;
+        }
+        Ok(())
+    }
+
+    /// Enlist this session as a participant of global txn `g`. If it has already
+    /// done a write (local xid `Li` allocated), write the `Prepared(Li -> g)`
+    /// marker durably AND deregister `Li` from the ProcArray running-set so the
+    /// local snapshot no longer gates its rows — range 0's global clog becomes the
+    /// sole arbiter, which is what makes both ranges flip visible atomically at
+    /// the single `Committed(g)` instant (the deregister-at-PREPARE linchpin). If
+    /// no write has happened yet there is nothing to backfill: the first write's
+    /// commit batch (see `run_write`) carries the marker and deregisters then.
+    /// Idempotent.
+    pub async fn join_global(&mut self, g: u64) -> Result<(), ExecError> {
+        self.global_xid = Some(g);
+        if let Some(local) = self.local_xid() {
+            self.committer
+                .commit(vec![mvcc::clog::put_op(local, XidStatus::Prepared(g))])
+                .await?;
+            self.procarray.finish(local); // deregister-at-PREPARE (the atomicity linchpin)
+        }
+        Ok(())
+    }
+
+    /// Release this participant's resources after the coordinator's global COMMIT.
+    /// The rows are already `Prepared` + durable and their local xid is already
+    /// deregistered, so the single `Committed(g)` write makes them visible; here
+    /// we only free row locks and reset to Idle (NO per-participant clog write).
+    pub fn commit_release(&mut self) {
+        self.finish_current_txn();
+    }
+
+    /// Release this participant's resources after the coordinator's global ABORT.
+    /// The rows stay invisible (range 0's global clog is absent/`Aborted(g)`); we
+    /// only free row locks and reset to Idle (NO per-participant clog write).
+    pub fn abort_release(&mut self) {
+        self.finish_current_txn();
+    }
+
+    /// Deregister the current txn's xid from the ProcArray and free its row locks,
+    /// then reset to Idle. Writes NO clog entry — used by `Drop` (presumed-abort
+    /// on disconnect) and by the global participant `commit_release`/`abort_release`
+    /// (the decision was recorded once, globally, by the coordinator).
+    fn finish_current_txn(&mut self) {
+        if let Some(xid) = self.local_xid() {
+            self.procarray.finish(xid);
+            self.lockmgr.release_all(xid);
+        }
+        self.global_xid = None;
+        self.state = TxnState::Idle;
+    }
 }
 
 impl Drop for SqlSession {
@@ -494,16 +664,12 @@ impl Drop for SqlSession {
     /// its xid in the ProcArray, nor leave its row locks held forever (which
     /// would hang any writer blocked on them). Deregister the xid so it stops
     /// pinning snapshots' xmin, and free its row locks. The uncommitted versions
-    /// stay invisible (no clog Committed entry).
+    /// stay invisible (no clog Committed entry). This is presumed-abort: a global
+    /// participant dropped before the coordinator's decision releases its locks
+    /// and its rows never become visible (range 0's global clog has no
+    /// `Committed(g)`).
     fn drop(&mut self) {
-        let xid = match &self.state {
-            TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => ctx.xid,
-            TxnState::Idle => None,
-        };
-        if let Some(xid) = xid {
-            self.procarray.finish(xid);
-            self.lockmgr.release_all(xid);
-        }
+        self.finish_current_txn();
     }
 }
 
