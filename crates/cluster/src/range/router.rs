@@ -1,8 +1,10 @@
 //! Per-connection multi-range SQL dispatch. Parses each statement, routes DDL to
 //! range 0 and single-table DML to the table's data range (schema resolved from
-//! range 0's catalog), pins a transaction to one range, and rejects a transaction
-//! that would span ranges (deferred to D3b). Single statements are never
-//! cross-range — the grammar has no joins and every DML carries one table.
+//! range 0's catalog), and pins a transaction to one range. A transaction that
+//! touches a second range ESCALATES to a cross-range global txn (`Pin::Global`)
+//! committed all-or-nothing by a single decision in range 0 (D3c 2PC), instead of
+//! being rejected. Single statements are never cross-range — the grammar has no
+//! joins and every DML carries one table.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -81,9 +83,9 @@ impl RemoteForward for RejectForward {
 /// Where a transaction is pinned. Distinguishing `Open` (a BEGIN block exists but
 /// no table-bearing statement has run yet) from `Range(_)` is essential: the first
 /// DML pins the txn *to its range even when that range is 0*, so a later statement
-/// on a different range can be rejected. (A bare `Option<RangeId>` conflated
-/// "provisional, unpinned" with "pinned to range 0".)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// on a different range can escalate it to a cross-range `Global` txn. (A bare
+/// `Option<RangeId>` conflated "provisional, unpinned" with "pinned to range 0".)
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pin {
     /// No open transaction (autocommit): each statement routes to its own range.
     None,
@@ -91,6 +93,15 @@ enum Pin {
     Open,
     /// Inside BEGIN..COMMIT, pinned to this range by the first DML / FROM SELECT.
     Range(RangeId),
+    /// Inside BEGIN..COMMIT, escalated to a cross-range global txn `g` spanning
+    /// `ranges` (every participant has joined `g` and writes a `Prepared(-> g)`
+    /// marker). COMMIT/ROLLBACK drives the single global decision through range 0.
+    /// `Pin` loses `Copy` for this owning `BTreeSet` — every prior by-value use is
+    /// rewritten to borrow (`match &self.pin`) or consume (`mem::replace`).
+    Global {
+        ranges: std::collections::BTreeSet<RangeId>,
+        g: u64,
+    },
 }
 
 /// A connection's view: per range it has touched, a leader `SqlSession` (LOCAL
@@ -117,6 +128,13 @@ pub struct RangeRouter {
     /// mixing a local and a remote range forwards only the remote statement and never
     /// re-runs the local one on the remote node.
     cur_sql: String,
+    /// Test-only coordinator pause seam: invoked inside the global COMMIT/ROLLBACK
+    /// path AFTER every participant has staged (joined `g`) and BEFORE
+    /// `commit_global_decision` writes the global decision. A crash test installs a
+    /// hook that drops/strands the router at exactly the staged-but-undecided point
+    /// — deterministically, with no sleep. `None` in production (the seam is inert).
+    #[cfg(test)]
+    before_global_decision: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl RangeRouter {
@@ -139,7 +157,37 @@ impl RangeRouter {
             catalog_kv,
             forward,
             cur_sql: String::new(),
+            #[cfg(test)]
+            before_global_decision: None,
         }
+    }
+
+    /// Install the test-only coordinator pause seam (see `before_global_decision`).
+    /// The hook fires once per global COMMIT/ROLLBACK, just before the global
+    /// decision is written.
+    #[cfg(test)]
+    fn set_before_global_decision(&mut self, hook: Box<dyn FnMut() + Send>) {
+        self.before_global_decision = Some(hook);
+    }
+
+    /// Test-only: the global xid this txn has escalated to, if it is currently a
+    /// staged cross-range txn (`Pin::Global`). Used by the crash-before/after-
+    /// decision tests to drive the global decision out-of-band (simulating a
+    /// coordinator that crashes after the decision is durable but before it
+    /// releases the participants) without going through the normal COMMIT close.
+    #[cfg(test)]
+    fn staged_global_xid(&self) -> Option<u64> {
+        match &self.pin {
+            Pin::Global { g, .. } => Some(*g),
+            _ => None,
+        }
+    }
+
+    /// Test-only: the coordinator engine (range 0's GTM-bearing engine), so a crash
+    /// test can write the global decision directly for a known `g`.
+    #[cfg(test)]
+    fn coordinator_engine(&self) -> &SqlEngine {
+        &self.engines[&0]
     }
 
     /// In-process harness constructor: the harness leads every range from one of
@@ -206,68 +254,165 @@ impl RangeRouter {
         match stmt {
             Statement::Begin { .. } => {
                 // Idempotent like PG: a BEGIN inside a block leaves the pin as-is.
-                if self.pin == Pin::None {
+                if matches!(self.pin, Pin::None) {
                     self.pin = Pin::Open;
                 }
                 return self.run_on(0, stmt).await;
             }
             Statement::Commit | Statement::Rollback => {
-                let exec = match self.pin {
-                    Pin::Range(r) => r,
-                    Pin::Open | Pin::None => 0,
-                };
-                self.pin = Pin::None;
-                return self.run_on(exec, stmt).await;
+                return self.finish_txn(stmt).await;
             }
             _ => {}
         }
 
-        match self.pin {
+        match &self.pin {
             // Autocommit: route each statement independently to its target range
             // (table-bearing -> its range; otherwise range 0).
             Pin::None => self.run_on(pinning.unwrap_or(0), stmt).await,
             // The first table-bearing statement of the txn pins it to that
-            // statement's range — even range 0. Thereafter a table-bearing
-            // statement on a *different* range is rejected (the `Pin::Range` arm
-            // below, SQLSTATE 0A000), so a txn whose first DML is on range 0 is
-            // correctly held single-range.
-            //
-            // KNOWN D3a LIMITATION (no data-integrity or durability impact; full
-            // cross-range / 2PC semantics are deferred to D3b): if a txn opened
-            // with BEGIN runs only range-0 work (DDL / FROM-less SELECT) — staying
-            // `Pin::Open` — and then its first *table-bearing* statement lands on a
-            // NON-range-0 range, the BEGIN executed only on range 0's `SqlSession`,
-            // so the data range's session is still `TxnState::Idle`. That DML
-            // therefore runs through `run_write`'s AUTOCOMMIT branch (commits at
-            // once in a single Raft batch) instead of being held until COMMIT, and
-            // a later ROLLBACK on that range is a no-op (the row already committed).
-            // The row still commits atomically and durably through the correct
-            // range's consensus — only cross-range transactionality is loose. This
-            // mirrors existing behavior: DDL is already non-transactional
-            // (`run_ddl`) and a FROM-less SELECT carries no transactional payload.
+            // statement's range — even range 0. A later table-bearing statement on
+            // a *different* range escalates to a cross-range global txn (the
+            // `Pin::Range` arm below), no longer rejected (D3c).
             Pin::Open => {
-                let exec = match pinning {
+                match pinning {
                     Some(r) => {
+                        // Hold the first DML even when it lands on a NON-range-0
+                        // range: BEGIN ran only on range 0's session, so this
+                        // range's session is still Idle and the DML would otherwise
+                        // autocommit (the D3a looseness). `ensure_began_on` opens a
+                        // held txn on `r` first so the write is held until COMMIT —
+                        // required so a later escalation's `Prepared` backfill can't
+                        // retroactively hide an already-committed row.
                         self.pin = Pin::Range(r);
-                        r
+                        self.ensure_began_on(r).await?;
+                        self.run_on(r, stmt).await
                     }
-                    None => 0, // DDL / FROM-less SELECT: run on range 0, stay unpinned.
-                };
-                self.run_on(exec, stmt).await
+                    None => self.run_on(0, stmt).await, // DDL / FROM-less SELECT: range 0, stay unpinned.
+                }
             }
-            // Already pinned: a table-bearing statement on another range is rejected;
-            // range-0-targeting (no-table) statements run on the pinned session.
+            // Already pinned to `p`: a table-bearing statement on another range `r`
+            // escalates the txn to a cross-range global txn `g`. Strictly sequential
+            // single-borrow steps — we cannot hold `&mut` to two sessions of one
+            // HashMap at once, so `session_mut` is called one at a time.
             Pin::Range(p) => {
+                let p = *p;
                 if let Some(r) = pinning
                     && r != p
                 {
-                    return Err(ExecError::Unsupported(
-                        "a transaction may not span ranges yet (D3b)".into(),
-                    ));
+                    // Cross-range 2PC requires the shared GTM coordinator (range 0's
+                    // engine). The in-process `MultiRangeCluster` wires it into every
+                    // range engine; the cross-node gateway path (`serve_routed`)
+                    // does NOT yet (deferred to SP17), so there a cross-range txn is
+                    // still rejected with 0A000 instead of escalated.
+                    if !self.can_escalate() {
+                        return Err(ExecError::Unsupported(
+                            "a transaction may not span ranges yet (D3b)".into(),
+                        ));
+                    }
+                    // Coordinator (range 0's engine) allocates the global xid.
+                    let g = self.engines[&0].begin_global();
+                    // Backfill Prepared(Lp -> g) on the already-written `p` + deregister.
+                    self.session_mut(p).join_global(g).await?;
+                    // Hold a txn on `r` before its first write (no autocommit), then
+                    // mark it a participant (no xid yet -> the first write writes the
+                    // marker and deregisters in `run_write`).
+                    self.ensure_began_on(r).await?;
+                    self.session_mut(r).join_global(g).await?;
+                    let mut ranges = std::collections::BTreeSet::new();
+                    ranges.insert(p);
+                    ranges.insert(r);
+                    self.pin = Pin::Global { ranges, g };
+                    return self.run_on(r, stmt).await;
                 }
+                // Same range (or no-table statement): run on the pinned session.
                 self.run_on(p, stmt).await
             }
+            // Already global: a table-bearing statement on a not-yet-joined range
+            // joins the set the same way (hold + join); a statement on an existing
+            // participant (or a no-table statement) runs on its range's session.
+            Pin::Global { ranges, g } => {
+                let g = *g;
+                if let Some(r) = pinning
+                    && !ranges.contains(&r)
+                {
+                    self.ensure_began_on(r).await?;
+                    self.session_mut(r).join_global(g).await?;
+                    if let Pin::Global { ranges, .. } = &mut self.pin {
+                        ranges.insert(r);
+                    }
+                }
+                // A no-table statement (DDL / FROM-less SELECT) runs on range 0; a
+                // table-bearing one on its own range.
+                let r = pinning.unwrap_or(0);
+                self.run_on(r, stmt).await
+            }
         }
+    }
+
+    /// COMMIT / ROLLBACK: consumes the pin (`mem::replace` mirrors `commit_cmd`).
+    /// Under `Pin::Global` this drives the single global decision through range 0;
+    /// otherwise it is the unchanged single-range close.
+    async fn finish_txn(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        match std::mem::replace(&mut self.pin, Pin::None) {
+            Pin::Global { ranges, g } => {
+                let decision = if matches!(stmt, Statement::Commit) {
+                    mvcc::clog::XidStatus::Committed
+                } else {
+                    // Always a POSITIVE Aborted(g) on ROLLBACK (not mere absence),
+                    // so presumed-abort is a record, not an indistinguishable lost
+                    // commit.
+                    mvcc::clog::XidStatus::Aborted
+                };
+                // Test-only pause seam: every participant has staged (joined `g`);
+                // fire the hook BEFORE the decision so a crash test can strand the
+                // coordinator at the staged-but-undecided point.
+                #[cfg(test)]
+                if let Some(hook) = self.before_global_decision.as_mut() {
+                    hook();
+                }
+                // ONE range-0 append = the atomic instant both ranges flip at.
+                self.engines[&0].commit_global_decision(g, decision).await?;
+                // Release each participant's locks + deregister (no per-participant
+                // clog write — the decision was recorded once, globally, above).
+                for r in &ranges {
+                    let session = self.session_mut(*r);
+                    if matches!(decision, mvcc::clog::XidStatus::Committed) {
+                        session.commit_release();
+                    } else {
+                        session.abort_release();
+                    }
+                }
+                self.engines[&0].finish_global(g);
+                Ok(QueryResult::Command {
+                    tag: if matches!(stmt, Statement::Commit) {
+                        "COMMIT".into()
+                    } else {
+                        "ROLLBACK".into()
+                    },
+                })
+            }
+            // Single-range or never-pinned: unchanged close on the pinned session
+            // (or range 0).
+            Pin::Range(p) => self.run_on(p, stmt).await,
+            Pin::Open | Pin::None => self.run_on(0, stmt).await,
+        }
+    }
+
+    /// Whether this router can escalate a txn to cross-range 2PC: it must hold range
+    /// 0's engine locally AND that engine must carry the shared GTM coordinator.
+    /// True for the in-process `MultiRangeCluster` (every engine is GTM-wired);
+    /// false for the cross-node gateway path, where a cross-range txn is rejected
+    /// with 0A000 until the cross-node decision path lands (SP17).
+    fn can_escalate(&self) -> bool {
+        self.engines.get(&0).is_some_and(SqlEngine::has_gtm)
+    }
+
+    /// Open a held txn on `range`'s session if it is Idle, so a participant's first
+    /// write is HELD (never autocommitted). Only meaningful for a LOCAL range; in
+    /// the in-process harness every participant range is local. Used both for the
+    /// single-range non-range-0 first-DML case and for cross-range escalation.
+    async fn ensure_began_on(&mut self, range: RangeId) -> Result<(), ExecError> {
+        self.session_mut(range).ensure_began().await
     }
 
     /// Run a statement on `range`: locally only when this node holds a local engine
@@ -357,7 +502,9 @@ impl pgwire::engine::Session for RangeRouter {
     fn tx_status(&self) -> pgwire::engine::TxStatus {
         match self.pin {
             Pin::None => pgwire::engine::TxStatus::Idle,
-            Pin::Open | Pin::Range(_) => pgwire::engine::TxStatus::InTransaction,
+            Pin::Open | Pin::Range(_) | Pin::Global { .. } => {
+                pgwire::engine::TxStatus::InTransaction
+            }
         }
     }
 }
@@ -417,8 +564,11 @@ mod tests {
         assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![20]);
     }
 
+    /// A cross-range transaction now escalates to two-phase commit instead of being
+    /// rejected: `BEGIN; INSERT a@range0; INSERT b@range1; COMMIT;` commits both rows
+    /// all-or-nothing, and fresh routers read both back through the global clog.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_transaction_may_not_span_ranges() {
+    async fn a_cross_range_transaction_commits_atomically() {
         let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
         for r in c.range_map().range_ids() {
             c.wait_for_leader(r).await;
@@ -427,22 +577,248 @@ mod tests {
         router
             .simple("CREATE TABLE a (id int4)")
             .await
-            .expect("create a");
+            .expect("create a"); // id 1 -> range 0
         router
             .simple("CREATE TABLE b (id int4)")
             .await
-            .expect("create b");
+            .expect("create b"); // id 2 -> range 1
         router.simple("BEGIN").await.expect("begin");
         router
             .simple("INSERT INTO a VALUES (1)")
             .await
             .expect("first DML pins range 0");
-        let err = router
+        router
             .simple("INSERT INTO b VALUES (2)")
             .await
-            .expect_err("a second range in one txn must be rejected");
-        assert_eq!(err.code, "0A000");
-        router.simple("ROLLBACK").await.ok();
+            .expect("second range escalates to 2PC, not rejected");
+        // Read-your-writes within the txn: both rows visible to the same router.
+        assert_eq!(router.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![2]);
+        router.simple("COMMIT").await.expect("commit");
+
+        // Both rows visible to the same router after COMMIT.
+        assert_eq!(router.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![2]);
+
+        // And to a fresh router resolving through the global clog.
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM b").await, vec![2]);
+    }
+
+    /// The coordinator pause seam fires exactly between staging and the global
+    /// decision: while a cross-range COMMIT is parked at the seam (all participants
+    /// have staged their `Prepared(-> g)` markers but `Committed(g)` is NOT yet
+    /// written), a concurrent fresh router sees NEITHER row (in-doubt invisibility);
+    /// once released, the decision lands and both rows become visible. The seam is a
+    /// rendezvous (channel), never a sleep — the concurrent read happens exactly when
+    /// the COMMIT is parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_pause_seam_holds_a_txn_in_doubt() {
+        let c = Arc::new(MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await);
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut setup = RangeRouter::connect(&c).await;
+        setup
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        setup
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        drop(setup);
+
+        // The committing router stages both participants, then parks at the seam.
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router.simple("INSERT INTO a VALUES (1)").await.expect("a");
+        router.simple("INSERT INTO b VALUES (2)").await.expect("b");
+
+        // Rendezvous: the seam signals it has parked (staged, pre-decision) and then
+        // blocks until the test releases it. Synchronous channels are fine — the hook
+        // runs on a runtime worker thread, the blocking recv is bounded by the test.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        router.set_before_global_decision(Box::new(move || {
+            parked_tx.send(()).expect("signal parked");
+            release_rx.recv().expect("await release");
+        }));
+
+        let commit = tokio::spawn(async move {
+            router.simple("COMMIT").await.expect("commit");
+            router
+        });
+
+        // Wait until the COMMIT is parked at the seam (staged, undecided).
+        parked_rx.recv().expect("seam parked");
+
+        // A concurrent fresh router sees NEITHER row: the participants are staged
+        // (Prepared) but range 0's global clog has no Committed(g) yet → in-doubt.
+        let mut concurrent = RangeRouter::connect(&c).await;
+        assert_eq!(
+            concurrent.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new(),
+            "range-0 row in-doubt while staged"
+        );
+        assert_eq!(
+            concurrent.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new(),
+            "range-1 row in-doubt while staged"
+        );
+
+        // Release the seam; the decision lands and the COMMIT completes.
+        release_tx.send(()).expect("release seam");
+        let _router = commit.await.expect("commit task");
+
+        // Now both rows are visible through a fresh router.
+        let mut after = RangeRouter::connect(&c).await;
+        assert_eq!(after.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(after.scan_one_i32("SELECT id FROM b").await, vec![2]);
+    }
+
+    /// The ROLLBACK sibling: the same cross-range txn rolled back leaves NEITHER row
+    /// visible, through fresh routers (the global clog records a positive Aborted(G)).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_range_transaction_rolls_back_atomically() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        router
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("first DML pins range 0");
+        router
+            .simple("INSERT INTO b VALUES (2)")
+            .await
+            .expect("second range escalates to 2PC");
+        router.simple("ROLLBACK").await.expect("rollback");
+
+        // Neither row is visible, to the same router or a fresh one.
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new()
+        );
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new()
+        );
+    }
+
+    /// Crash-BEFORE-decision (criterion 5, presumed-abort arm). Both participants
+    /// are staged (each has written its `Prepared(-> g)` marker), then the
+    /// coordinator router is DROPPED before any global decision is written — the
+    /// in-process analog of the coordinator crashing mid-2PC. Dropping the router
+    /// runs each participant session's `Drop` (releases row locks); range 0's
+    /// global clog never records a decision and `g` is never `finish_global`'d, so
+    /// it stays in-doubt forever. A fresh router therefore sees NEITHER row: the
+    /// resolver treats every `Prepared(-> g)` tuple whose `g` is still running as
+    /// invisible. This is presumed-abort without any active recovery sweep (the
+    /// sweep + a durable txn record are SP17's cross-node problem).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_before_global_decision_presumes_abort() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        drop(admin);
+
+        // Stage both participants but DO NOT commit: the second INSERT escalates to
+        // a global txn and both rows now carry `Prepared(-> g)` markers.
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router.simple("INSERT INTO a VALUES (1)").await.expect("a");
+        router.simple("INSERT INTO b VALUES (2)").await.expect("b");
+        assert!(
+            router.staged_global_xid().is_some(),
+            "txn escalated to a staged global txn"
+        );
+        // The coordinator crashes mid-2PC, before writing the decision.
+        drop(router);
+
+        // A fresh router sees neither row — both are in-doubt (no Committed(g),
+        // and g is still in the GTM running-set), so presumed abort.
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new(),
+            "range-0 row in-doubt after coordinator crash → invisible"
+        );
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new(),
+            "range-1 row in-doubt after coordinator crash → invisible"
+        );
+    }
+
+    /// Crash-AFTER-decision (criterion 5, commit-durable arm). Both participants are
+    /// staged, then the global decision `Committed(g)` is written durably to range
+    /// 0's global clog (and `g` is settled) OUT-OF-BAND — modeling a coordinator
+    /// that crashes the instant after the decision is durable but BEFORE it releases
+    /// the participants (no `commit_release` runs; the router is dropped instead). A
+    /// fresh router still sees BOTH rows: range 0's global clog is the sole arbiter,
+    /// so a durable `Committed(g)` makes both `Prepared(-> g)` tuples visible even
+    /// though the original coordinator never cleaned up. The dropped router's
+    /// session `Drop`s release the (now-committed) locks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_after_global_decision_commits() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        drop(admin);
+
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router.simple("INSERT INTO a VALUES (1)").await.expect("a");
+        router.simple("INSERT INTO b VALUES (2)").await.expect("b");
+        let g = router
+            .staged_global_xid()
+            .expect("txn escalated to a staged global txn");
+
+        // The decision is made durable in range 0's global clog and settled in the
+        // GTM, but the coordinator crashes (is dropped) before releasing the
+        // participants via the normal COMMIT close.
+        router
+            .coordinator_engine()
+            .commit_global_decision(g, mvcc::clog::XidStatus::Committed)
+            .await
+            .expect("durable global Committed(g)");
+        router.coordinator_engine().finish_global(g);
+        drop(router); // crash after decision, before commit_release
+
+        // A fresh router sees BOTH rows: the durable Committed(g) is the global
+        // arbiter; both Prepared(-> g) tuples resolve to it.
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM b").await, vec![2]);
     }
 }
 

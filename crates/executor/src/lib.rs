@@ -9,6 +9,7 @@ mod commit;
 mod error;
 mod eval;
 mod exec;
+mod gtm;
 mod lockmgr;
 mod procarray;
 mod read_gate;
@@ -60,6 +61,11 @@ pub struct SqlEngine {
     pub(crate) committer: Arc<dyn crate::commit::Committer>,
     pub(crate) linearizer: Arc<dyn crate::read_gate::Linearizer>,
     pub(crate) persist_mode: PersistMode,
+    /// Range 0's Global Transaction Manager. `Some` on every range engine of a
+    /// multi-range cluster (injected by the cluster after construction); `None`
+    /// on a single-range engine. Single-range behavior is byte-for-byte unchanged
+    /// when `gtm` is `None`.
+    pub(crate) gtm: Option<Arc<gtm::Gtm>>,
 }
 
 impl Default for SqlEngine {
@@ -95,6 +101,7 @@ impl SqlEngine {
             committer,
             linearizer: Arc::new(crate::read_gate::LocalLinearizer),
             persist_mode: PersistMode::Durable,
+            gtm: None,
         })
     }
 
@@ -125,6 +132,7 @@ impl SqlEngine {
             committer,
             linearizer,
             persist_mode: PersistMode::Replicated,
+            gtm: None,
         })
     }
 
@@ -150,7 +158,93 @@ impl SqlEngine {
             committer: Arc::clone(&self.committer),
             linearizer: Arc::clone(&self.linearizer),
             persist_mode: self.persist_mode,
+            gtm: self.gtm.as_ref().map(Arc::clone),
         }
+    }
+
+    /// Open a GTM over this engine's `kv` (range 0's store) and make this engine
+    /// the GTM coordinator. Called once on range 0's engine by the cluster during
+    /// construction, before `share_gtm_to` distributes the same `Arc` to every
+    /// other range engine.
+    pub fn init_gtm_coordinator(&mut self) -> Result<(), ExecError> {
+        let g = Arc::new(gtm::Gtm::open(Arc::clone(&self.kv))?);
+        self.gtm = Some(g);
+        Ok(())
+    }
+
+    /// Copy this engine's `Arc<Gtm>` into `other`. Both engines then share the
+    /// same GTM — any range can resolve a `Prepared` row and the coordinator can
+    /// drive range 0. `self` must have been initialized via `init_gtm_coordinator`
+    /// first; `other` can be any range's engine.
+    pub fn share_gtm_to(&self, other: &mut SqlEngine) {
+        other.gtm = self.gtm.as_ref().map(Arc::clone);
+    }
+
+    /// Whether this engine carries the shared GTM (so cross-range 2PC can run).
+    /// `true` on every range engine of a multi-range cluster wired via
+    /// `init_gtm_coordinator`/`share_gtm_to`; `false` on a single-range engine or a
+    /// gateway engine built outside that wiring (the cross-node decision path is a
+    /// later slice). The router gates escalation on this: no GTM ⇒ a cross-range txn
+    /// is rejected rather than escalated.
+    pub fn has_gtm(&self) -> bool {
+        self.gtm.is_some()
+    }
+
+    /// Allocate a global (cross-range) txn id. Coordinator-only (range 0's engine).
+    pub fn begin_global(&self) -> u64 {
+        self.gtm
+            .as_ref()
+            .expect("begin_global on a non-GTM engine")
+            .begin_global()
+    }
+
+    /// Durably record the global decision (Committed/Aborted) for `g` in range 0's
+    /// group, folding the global next-id advance. The atomic commit instant.
+    pub async fn commit_global_decision(
+        &self,
+        g: u64,
+        status: mvcc::clog::XidStatus,
+    ) -> Result<(), ExecError> {
+        let gtm = self
+            .gtm
+            .as_ref()
+            .expect("commit_global_decision on a non-GTM engine");
+        self.committer
+            .commit(vec![
+                mvcc::clog::put_op(g, status),
+                gtm.next_global_xid_op(),
+            ])
+            .await
+    }
+
+    /// Deregister a decided global txn from the in-memory running-set.
+    pub fn finish_global(&self, g: u64) {
+        self.gtm
+            .as_ref()
+            .expect("finish_global on a non-GTM engine")
+            .finish_global(g);
+    }
+
+    /// The current global snapshot (for capturing a cross-range reader's horizon).
+    /// Returns `NO_GLOBAL_SNAPSHOT()` when there is no GTM (single-range engines).
+    pub fn global_snapshot(&self) -> mvcc::visibility::Snapshot {
+        self.gtm
+            .as_ref()
+            .map(|g| g.global_snapshot())
+            .unwrap_or_else(NO_GLOBAL_SNAPSHOT)
+    }
+}
+
+/// A sentinel global snapshot for single-range (non-GTM) engines. Any global xid
+/// `g >= xmax` is treated as InProgress by the resolver, but no `Prepared` tuples
+/// ever exist on a single-range engine so the Prepared branch is unreachable.
+#[allow(non_snake_case)]
+pub(crate) fn NO_GLOBAL_SNAPSHOT() -> mvcc::visibility::Snapshot {
+    use mvcc::xid::GLOBAL_XID_BASE;
+    mvcc::visibility::Snapshot {
+        xmin: GLOBAL_XID_BASE,
+        xmax: GLOBAL_XID_BASE,
+        xip: vec![],
     }
 }
 
@@ -177,6 +271,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.committer),
             Arc::clone(&self.linearizer),
             self.persist_mode,
+            self.gtm.as_ref().map(Arc::clone),
         )
     }
 }

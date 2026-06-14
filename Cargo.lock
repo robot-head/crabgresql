@@ -543,6 +543,7 @@ dependencies = [
  "executor",
  "fjall",
  "kv",
+ "mvcc",
  "openraft",
  "pgparser",
  "pgwire",

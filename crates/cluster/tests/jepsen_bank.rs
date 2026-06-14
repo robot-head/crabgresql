@@ -50,14 +50,18 @@
 //! in `tokio::time::timeout`, and a stuck/erroring commit becomes an `info`
 //! (indeterminate) history entry rather than a hang.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cluster::range::router::{AlwaysLeads, RejectForward};
+use cluster::range::{MultiRangeCluster, RangeId, RangeMap, RangeRouter};
 use executor::{SqlEngine, SqlSession};
 use pgwire::engine::{Cell, Engine, QueryResult, Session};
 use stateright::semantics::register::{Register, RegisterOp, RegisterRet};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
+use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
 // History model (a Vec<HistEntry> is enough to later emit Elle/EDN).
@@ -955,5 +959,455 @@ fn stateright_rejects_a_known_nonlinearizable_register_history() {
     assert!(
         !tester.is_consistent(),
         "checker must reject a read of a never-written value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-range bank conservation (SP16 / D3c, Task 5, criterion 6 — the
+// load-bearing 2PC atomicity oracle).
+//
+// Accounts are partitioned across TWO tables in TWO DIFFERENT ranges
+// (`acct_a` in range 1, `acct_b` in range 2; range 0 holds only the catalog).
+// Every transfer moves `amt` between an `acct_a` account and an `acct_b`
+// account, so each transfer is a CROSS-RANGE transaction driven through the
+// `RangeRouter` 2PC path (`BEGIN; UPDATE acct_a; UPDATE acct_b; COMMIT`), with
+// the single global decision recorded once in range 0. The bank-conservation
+// invariant (the sum of all balances is constant) then proves the cross-range
+// commit is genuinely ALL-OR-NOTHING across two independent Raft groups: a
+// half-applied transfer (one range's update visible, the other's not) would
+// break conservation. A `40P01`/serialization/timeout abort is a clean
+// retryable failure that nets zero, so it cannot break the invariant.
+//
+// Determinism (CLAUDE.md no-sleep rule): every wait is openraft's event-based
+// `wait_for_leader` / `wait_for_replication`, and the fault nemesis is paced on
+// the workload's committed-transfer counter (a `Notify` the workers fire), never
+// a clock sleep. The nemesis pauses only physical nodes that lead NONE of the
+// three ranges — so no range's pinned leader engine is ever paused — which a
+// 5-node cluster (≥2 leaderless nodes for 3 ranges) always provides.
+// ---------------------------------------------------------------------------
+
+/// A 5-node, 3-range cluster: boundaries `[1, 2]` put the catalog (table 0) in
+/// range 0, the first user table (`acct_a`, id 1) in range 1, and the second
+/// (`acct_b`, id 2) in range 2. 5 nodes guarantee at least two physical nodes
+/// lead none of the three ranges, so the nemesis always has a safe victim while
+/// every range keeps a 3/5 quorum when one node is paused.
+async fn cross_range_bank_cluster() -> MultiRangeCluster {
+    let c = MultiRangeCluster::new(5, RangeMap::with_boundaries(vec![1, 2])).await;
+    for r in c.range_map().range_ids() {
+        c.wait_for_leader(r).await;
+    }
+    c
+}
+
+/// Build a fresh `RangeRouter` whose per-range engines are `clone_handle()`s of a
+/// SHARED engine set — so every process's router shares each range's
+/// `RowLockManager` / `ProcArray` and the one GTM coordinator, exactly as the
+/// single-range bank shares one `Arc<SqlEngine>`. (A plain `RangeRouter::connect`
+/// would mint independent engines per router, so concurrent writers to the same
+/// account would NOT serialize through row locks — a lost-update hazard.)
+fn router_over(
+    shared: &HashMap<RangeId, SqlEngine>,
+    map: &RangeMap,
+    catalog_kv: &Arc<dyn kv::Kv>,
+) -> RangeRouter {
+    let engines: HashMap<RangeId, SqlEngine> =
+        shared.iter().map(|(r, e)| (*r, e.clone_handle())).collect();
+    RangeRouter::new(
+        map.clone(),
+        engines,
+        Arc::new(AlwaysLeads),
+        Arc::clone(catalog_kv),
+        Arc::new(RejectForward),
+    )
+}
+
+/// Read the whole bank's total: sum `acct_a` (ids `0..accounts`) plus `acct_b`
+/// (ids `0..accounts`), through a `RangeRouter` (so each read resolves its range's
+/// rows, and any cross-range `Prepared` marker through range 0's global clog).
+async fn read_total_cross(router: &mut RangeRouter, accounts: i64) -> i64 {
+    let mut total = 0;
+    for (table, ids) in [("acct_a", accounts), ("acct_b", accounts)] {
+        for id in 0..ids {
+            let r = router
+                .simple(&format!("SELECT bal FROM {table} WHERE id = {id}"))
+                .await
+                .expect("read balance");
+            total += first_i64(&r).expect("balance row");
+        }
+    }
+    total
+}
+
+/// One cross-range transfer transaction through a `RangeRouter`, returning its
+/// recorded history entry. Moves `amt` between `acct_a[a_id]` and `acct_b[b_id]`;
+/// `a_to_b` picks the direction. Whichever account is debited is overdraw-checked
+/// first (clean `Fail`, nets zero). Every statement is bounded by a timeout so a
+/// blocked row-lock wait under a fault becomes `Info`/`Fail`, never a hang. A
+/// COMMIT that errors retryably (`40001`/`40P01`/`08*`) or times out is `Info`
+/// (indeterminate); a mid-txn error rolls back to nil (`Fail`). On success the
+/// committed-transfer `Notify` is fired so the nemesis can pace on real progress.
+#[allow(clippy::too_many_arguments)]
+async fn do_transfer_cross(
+    router: &mut RangeRouter,
+    a_id: i64,
+    b_id: i64,
+    amt: i64,
+    a_to_b: bool,
+    process: usize,
+    committed: &Notify,
+) -> HistEntry {
+    // Map the logical (acct_a[a_id], acct_b[b_id]) pair + direction onto a debit
+    // table/id and a credit table/id. `from`/`to` in the recorded op are encoded
+    // as global indices for the history (a_id in [0,N), b_id offset by a sentinel).
+    let (debit_tbl, debit_id, credit_tbl, credit_id) = if a_to_b {
+        ("acct_a", a_id, "acct_b", b_id)
+    } else {
+        ("acct_b", b_id, "acct_a", a_id)
+    };
+    let op = OpKind::Transfer {
+        from: if a_to_b { a_id } else { b_id + ACCT_B_BASE },
+        to: if a_to_b { b_id + ACCT_B_BASE } else { a_id },
+        amt,
+    };
+    let fail = |outcome| HistEntry {
+        process,
+        op: op.clone(),
+        outcome,
+    };
+
+    async fn stmt(router: &mut RangeRouter, sql: &str) -> Result<QueryResult, StmtErr> {
+        match tokio::time::timeout(Duration::from_secs(10), router.simple(sql)).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(StmtErr::Pg(e.code)),
+            Err(_) => Err(StmtErr::Timeout),
+        }
+    }
+
+    // BEGIN.
+    if let Err(e) = stmt(router, "BEGIN").await {
+        recover_router(router).await;
+        return fail(match e {
+            StmtErr::Timeout => Outcome::Info,
+            StmtErr::Pg(_) => Outcome::Fail,
+        });
+    }
+
+    // Read the DEBIT account's balance; skip (clean Fail) if it would overdraw.
+    // This first table-bearing statement pins the txn to the debit table's range.
+    match stmt(
+        router,
+        &format!("SELECT bal FROM {debit_tbl} WHERE id = {debit_id}"),
+    )
+    .await
+    {
+        Ok(r) => {
+            let bal = first_i64(&r).unwrap_or(0);
+            if bal < amt {
+                let _ = stmt(router, "ROLLBACK").await;
+                return fail(Outcome::Fail);
+            }
+        }
+        Err(_) => {
+            recover_router(router).await;
+            return fail(Outcome::Fail);
+        }
+    }
+
+    // The two updates. The debit UPDATE stays on the pinned range; the credit
+    // UPDATE on the OTHER table's range escalates the txn to cross-range 2PC.
+    // A mid-txn error leaves no global decision, so the txn is all-or-nothing nil.
+    let upd_debit = format!("UPDATE {debit_tbl} SET bal = bal - {amt} WHERE id = {debit_id}");
+    let upd_credit = format!("UPDATE {credit_tbl} SET bal = bal + {amt} WHERE id = {credit_id}");
+    if stmt(router, &upd_debit).await.is_err() || stmt(router, &upd_credit).await.is_err() {
+        recover_router(router).await;
+        return fail(Outcome::Fail);
+    }
+
+    // COMMIT: writes the single Committed(g) global decision both ranges flip at.
+    // Its failure is the only genuinely indeterminate point.
+    match stmt(router, "COMMIT").await {
+        Ok(_) => {
+            committed.notify_one();
+            fail(Outcome::ok_unit())
+        }
+        Err(StmtErr::Timeout) => {
+            recover_router(router).await;
+            fail(Outcome::Info)
+        }
+        Err(StmtErr::Pg(code)) if is_unavailable_class(&code) => {
+            recover_router(router).await;
+            fail(Outcome::Info)
+        }
+        // Any other COMMIT error means the global decision was rejected outright
+        // (clean abort): all-or-nothing nil, a definite Fail.
+        Err(StmtErr::Pg(_)) => {
+            recover_router(router).await;
+            fail(Outcome::Fail)
+        }
+    }
+}
+
+/// History encoding offset for `acct_b` account ids, so an `OpKind::Transfer`'s
+/// `from`/`to` are globally distinct across the two tables (purely for the
+/// recorded history; not load-bearing for the invariant).
+const ACCT_B_BASE: i64 = 1_000_000;
+
+/// Reset a router that may be in a Failed/aborted block by issuing a bounded
+/// ROLLBACK so the next transfer starts clean. (Unlike the single-range helper we
+/// keep the same router — a `RangeRouter` owns the shared per-range engine handles
+/// and rebuilding it mid-run is unnecessary; a stuck ROLLBACK is bounded.)
+async fn recover_router(router: &mut RangeRouter) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), router.simple("ROLLBACK")).await;
+}
+
+/// Run the cross-range bank workload and return `(history, final_total,
+/// seeded_total)`. `accounts` accounts PER TABLE (so `2 * accounts` total) are
+/// each seeded to SEED; the invariant total is `2 * accounts * SEED`. `procs`
+/// processes each perform `ops` cross-range transfers concurrently while a nemesis
+/// pauses/resumes a leaderless follower node, paced on committed-transfer progress.
+async fn run_cross_range_bank(
+    accounts: i64,
+    procs: usize,
+    ops: usize,
+    with_nemesis: bool,
+) -> (Vec<HistEntry>, i64, i64) {
+    const SEED: i64 = 100;
+    let seeded_total = 2 * accounts * SEED;
+
+    let c = Arc::new(cross_range_bank_cluster().await);
+    let map = c.range_map().clone();
+    let catalog_kv = c.catalog_kv().await;
+
+    // The ONE shared engine per range (every process router clones handles of
+    // these, so they share each range's row locks + ProcArray + the GTM).
+    let mut shared: HashMap<RangeId, SqlEngine> = HashMap::new();
+    for r in map.range_ids() {
+        shared.insert(r, c.leader_engine(r).await);
+    }
+
+    // Seed: two account tables in two ranges, each with `accounts` rows at SEED.
+    {
+        let mut admin = router_over(&shared, &map, &catalog_kv);
+        admin
+            .simple("CREATE TABLE acct_a (id int8, bal int8)")
+            .await
+            .expect("create acct_a"); // id 1 -> range 1
+        admin
+            .simple("CREATE TABLE acct_b (id int8, bal int8)")
+            .await
+            .expect("create acct_b"); // id 2 -> range 2
+        for id in 0..accounts {
+            admin
+                .simple(&format!("INSERT INTO acct_a VALUES ({id}, {SEED})"))
+                .await
+                .expect("seed acct_a");
+            admin
+                .simple(&format!("INSERT INTO acct_b VALUES ({id}, {SEED})"))
+                .await
+                .expect("seed acct_b");
+        }
+    }
+    // Make the seed visible on every replica before faulting begins.
+    for r in map.range_ids() {
+        c.wait_for_replication(r).await;
+    }
+
+    // Nemesis: pause/resume a physical node that leads NONE of the three ranges
+    // (so no range's pinned leader engine is ever paused), paced on the workload's
+    // committed-transfer counter — never a clock sleep. Each range keeps quorum
+    // (3/5) while one node is down.
+    let leaders: std::collections::BTreeSet<u64> = {
+        let mut s = std::collections::BTreeSet::new();
+        for r in map.range_ids() {
+            s.insert(c.wait_for_leader(r).await);
+        }
+        s
+    };
+    let victims: Vec<u64> = (0..c.n()).filter(|n| !leaders.contains(n)).collect();
+    assert!(
+        !victims.is_empty(),
+        "a 5-node / 3-range cluster always leaves a leaderless node to fault"
+    );
+
+    let committed = Arc::new(Notify::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let nemesis = with_nemesis.then(|| {
+        let c = Arc::clone(&c);
+        let committed = Arc::clone(&committed);
+        let stop = Arc::clone(&stop);
+        let victims = victims.clone();
+        let map = map.clone();
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let victim = victims[i % victims.len()];
+                c.pause(victim);
+                // Wait until the workload commits a transfer under the fault, OR the
+                // workload signals done (stop). Bounded so a finished workload can't
+                // hang the nemesis; paced on real progress, never the clock.
+                let _ = tokio::time::timeout(Duration::from_secs(2), committed.notified()).await;
+                c.resume(victim);
+                // Let the victim catch up before the next fault (event-based).
+                for r in map.range_ids() {
+                    c.wait_for_replication(r).await;
+                }
+                i += 1;
+            }
+            c.heal();
+        })
+    });
+
+    // Worker processes: each its own router (sharing the engines), each a
+    // deterministic per-process LCG. A transfer picks one acct_a and one acct_b
+    // account and a direction — always cross-range.
+    let mut workers = Vec::new();
+    for process in 0..procs {
+        let mut router = router_over(&shared, &map, &catalog_kv);
+        let committed = Arc::clone(&committed);
+        workers.push(tokio::spawn(async move {
+            let mut history: Vec<HistEntry> = Vec::new();
+            let mut rng = Lcg::new(0x9E3779B9_u64.wrapping_mul(process as u64 + 1));
+            for _ in 0..ops {
+                let a_id = (rng.next() % accounts as u64) as i64;
+                let b_id = (rng.next() % accounts as u64) as i64;
+                let amt = 1 + (rng.next() % 20) as i64;
+                let a_to_b = rng.next().is_multiple_of(2);
+                history.push(
+                    do_transfer_cross(&mut router, a_id, b_id, amt, a_to_b, process, &committed)
+                        .await,
+                );
+            }
+            history
+        }));
+    }
+
+    let mut history: Vec<HistEntry> = Vec::new();
+    for w in workers {
+        history.extend(w.await.expect("worker joined"));
+    }
+
+    // Stop + heal before the authoritative final read.
+    stop.store(true, Ordering::Relaxed);
+    committed.notify_one(); // unblock a nemesis parked on notified()
+    if let Some(nemesis) = nemesis {
+        nemesis.await.expect("nemesis joined");
+    }
+    c.heal();
+    for r in map.range_ids() {
+        c.wait_for_leader(r).await;
+    }
+
+    // Final total through a fresh router over freshly-resolved leader engines (the
+    // leaders may have moved during faults; rebuild handles from current leaders).
+    let mut final_shared: HashMap<RangeId, SqlEngine> = HashMap::new();
+    for r in map.range_ids() {
+        final_shared.insert(r, c.leader_engine(r).await);
+    }
+    let final_catalog = c.catalog_kv().await;
+    let mut reader = router_over(&final_shared, &map, &final_catalog);
+    let final_total = read_total_cross(&mut reader, accounts).await;
+    history.push(HistEntry {
+        process: usize::MAX,
+        op: OpKind::ReadTotal,
+        outcome: Outcome::ok_total(final_total),
+    });
+
+    (history, final_total, seeded_total)
+}
+
+/// Criterion 6: cross-range transfers conserve the bank total under a fault
+/// nemesis. Every transfer is a two-phase commit spanning two Raft groups; the
+/// conserved total is a direct proof that each such commit is all-or-nothing.
+/// Single-process (no concurrency) cross-range conservation: a serial sequence of
+/// cross-range transfers conserves the total. This passes against the current
+/// implementation — it isolates the 2PC commit/rollback path from the concurrency
+/// isolation bug the multi-process test below exposes (see its `#[ignore]` note).
+/// It is the non-concurrent half of criterion 6 and a regression guard for the
+/// serial 2PC path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_range_bank_conserves_total_serial() {
+    let (history, final_total, seeded_total) = run_cross_range_bank(3, 1, 30, false).await;
+    assert_eq!(
+        final_total, seeded_total,
+        "serial cross-range transfers conserve the bank total"
+    );
+    let committed = history
+        .iter()
+        .filter(|e| {
+            matches!(e.op, OpKind::Transfer { .. }) && matches!(e.outcome, Outcome::Ok { .. })
+        })
+        .count();
+    assert!(
+        committed > 0,
+        "non-vacuous: at least one transfer committed"
+    );
+}
+
+/// Criterion 6: CONCURRENT cross-range transfers conserve the bank total under a
+/// fault nemesis. Every transfer is a two-phase commit spanning two Raft groups;
+/// the conserved total is a direct proof that each such commit is all-or-nothing.
+///
+/// # BLOCKED on a real Task-3 isolation bug (SP16 / D3c) — do NOT un-ignore until fixed
+///
+/// This test currently FAILS (observed total 646 vs seeded 600 — money created),
+/// and the failure is a GENUINE correctness defect in the cross-range 2PC
+/// visibility path, not a test artifact:
+///
+/// In `executor::exec::eval_plan_qual`, an UPDATE/DELETE resolves a row's
+/// `Prepared(Li -> g)` deleter against the GLOBAL snapshot (`gsnap`) that was
+/// captured BEFORE the row lock was acquired (in `run_write`, lines ~462-467).
+/// When a concurrent cross-range transaction `g1` commits its global decision
+/// WHILE this writer is blocked on the row lock, the stale `gsnap` still lists
+/// `g1` as in-doubt, so `global_status` returns `InProgress` for `g1`'s just-
+/// committed `Prepared` rows. `eval_plan_qual` therefore neither flags the row as
+/// "changed since snapshot" nor re-finds the new version — it returns the OLD
+/// version, and `bal = bal - amt` is computed from the stale balance. The
+/// decrement is lost and the bank total drifts up: a lost update across the 2PC
+/// boundary.
+///
+/// The local snapshot IS re-captured per statement (RC) and again in
+/// `eval_plan_qual`'s re-find, but the GLOBAL snapshot is NOT — that asymmetry is
+/// the bug. Validated by experiment: re-deriving the global horizon LIVE from the
+/// global clog inside `eval_plan_qual` (under the row lock, a `Prepared(g)` on the
+/// locked row has already resolved) makes this exact test conserve. The proper fix
+/// is to re-capture the global snapshot after the row lock is held (mirroring the
+/// local re-snapshot) — a Task-3 executor change, out of scope for this tests-only
+/// task. The single-range bank is unaffected (`NO_GLOBAL_SNAPSHOT()`, the
+/// `Prepared` arm is unreachable), which is why `bank_conserves_total_under_nemesis`
+/// still passes.
+///
+/// The conservation checker below is intentionally NOT weakened and has NO retry
+/// masking — per the slice's guardrail, a non-conserved total is a real signal.
+///
+/// FIXED (SP16 D3c): `eval_plan_qual` now resolves a locked row's
+/// `Prepared(Li -> g)` markers against a SETTLED global view (range 0's global
+/// clog read directly), not the statement's stale pre-lock global snapshot. Under
+/// the row lock every concurrent global txn that touched the row has already
+/// settled, so the direct read is exact and the lost update is gone — this test
+/// conserves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_range_bank_conserves_total_under_nemesis() {
+    let (history, final_total, seeded_total) = run_cross_range_bank(
+        /*accounts per table*/ 3, /*procs*/ 3, /*ops*/ 20, true,
+    )
+    .await;
+
+    assert_eq!(
+        final_total, seeded_total,
+        "cross-range transfers must conserve the bank total (2PC all-or-nothing \
+         across two Raft groups)"
+    );
+
+    // The workload must actually commit at least one cross-range transfer, else
+    // conservation would be vacuously true.
+    let committed = history
+        .iter()
+        .filter(|e| {
+            matches!(e.op, OpKind::Transfer { .. }) && matches!(e.outcome, Outcome::Ok { .. })
+        })
+        .count();
+    assert!(
+        committed > 0,
+        "workload must commit at least one cross-range transfer (non-vacuous)"
     );
 }
