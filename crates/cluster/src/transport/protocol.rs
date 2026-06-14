@@ -94,6 +94,9 @@ pub enum TxnResp {
     },
     Staged,
     Committed,
+    /// The global decision for `g` is Aborted (a participant won the write-once
+    /// abort-race, or the client rolled back). The caller releases with abort semantics.
+    Aborted,
     Released,
     Barrier {
         applied_index: u64,

@@ -175,3 +175,29 @@ async fn three_range_transaction_commits_atomically() {
     assert_eq!(scan_i32(&mut fresh, "SELECT id FROM b").await, vec![2]);
     assert_eq!(scan_i32(&mut fresh, "SELECT id FROM d").await, vec![3]);
 }
+
+/// The global decision is WRITE-ONCE and `commit_global_decision` returns the
+/// EFFECTIVE decision via read-back: a first `Aborted` decision wins over a
+/// later contending `Committed`, and the second call observes the `Aborted` that
+/// was actually recorded (not the `Committed` it asked for). This is the
+/// abort-race serialization a stranded participant relies on in later tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_decision_is_write_once_and_returns_effective() {
+    use mvcc::clog::XidStatus;
+    let c = two_range_cluster().await; // existing helper in crossrange_2pc.rs
+    let e = c.leader_engine(0).await; // GTM-bearing range-0 engine (pub)
+    let g = e.begin_global_durable().await.expect("alloc g");
+    assert_eq!(
+        e.commit_global_decision(g, XidStatus::Aborted)
+            .await
+            .expect("decide"),
+        XidStatus::Aborted
+    );
+    assert_eq!(
+        e.commit_global_decision(g, XidStatus::Committed)
+            .await
+            .expect("decide"),
+        XidStatus::Aborted,
+        "first terminal decision wins; commit_global_decision returns the effective decision"
+    );
+}

@@ -255,9 +255,15 @@ async fn handle_txn(
                     mvcc::clog::XidStatus::Aborted
                 };
                 match e.commit_global_decision(g, status).await {
-                    Ok(()) => {
-                        e.finish_global(g); // prune g from in-memory running set
-                        TxnResp::Committed
+                    Ok(effective) => {
+                        e.finish_global(g); // prune g from the in-memory running set
+                        match effective {
+                            mvcc::clog::XidStatus::Committed => TxnResp::Committed,
+                            mvcc::clog::XidStatus::Aborted => TxnResp::Aborted,
+                            other => {
+                                TxnResp::Err(format!("non-terminal effective decision {other:?}"))
+                            }
+                        }
                     }
                     Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
                     Err(e) => TxnResp::Err(format!("{e:?}")),

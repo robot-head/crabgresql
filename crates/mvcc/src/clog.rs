@@ -22,22 +22,26 @@ const S_PREPARED: u8 = 3;
 /// Read an xid's status. An absent entry is treated as `InProgress`
 /// (aborted-equivalent once the xid is in no live snapshot — see recovery).
 pub fn get(kv: &dyn Kv, xid: u64) -> Result<XidStatus, KvError> {
-    match kv.get(&kv::key::clog_key(xid))? {
-        None => Ok(XidStatus::InProgress),
-        Some(b) => match b.first() {
-            Some(&S_COMMITTED) => Ok(XidStatus::Committed),
-            Some(&S_ABORTED) => Ok(XidStatus::Aborted),
-            Some(&S_IN_PROGRESS) => Ok(XidStatus::InProgress),
-            Some(&S_PREPARED) => {
-                let g: [u8; 8] = b
-                    .get(1..9)
-                    .ok_or_else(|| KvError::CorruptRow("prepared clog missing global xid".into()))?
-                    .try_into()
-                    .expect("slice 1..9 is 8 bytes");
-                Ok(XidStatus::Prepared(u64::from_be_bytes(g)))
-            }
-            _ => Err(KvError::CorruptRow("bad clog status byte".into())),
-        },
+    decode(&kv.get(&kv::key::clog_key(xid))?.unwrap_or_default())
+}
+
+/// Decode a clog entry's bytes. An EMPTY slice (an absent key, via
+/// `kv.get(...)?.unwrap_or_default()`) is `InProgress` — preserving `get`'s
+/// absent-key semantics. A non-empty value decodes its status byte.
+pub fn decode(value: &[u8]) -> Result<XidStatus, KvError> {
+    match value.first() {
+        None | Some(&S_IN_PROGRESS) => Ok(XidStatus::InProgress),
+        Some(&S_COMMITTED) => Ok(XidStatus::Committed),
+        Some(&S_ABORTED) => Ok(XidStatus::Aborted),
+        Some(&S_PREPARED) => {
+            let g: [u8; 8] = value
+                .get(1..9)
+                .ok_or_else(|| KvError::CorruptRow("prepared clog missing global xid".into()))?
+                .try_into()
+                .expect("slice 1..9 is 8 bytes");
+            Ok(XidStatus::Prepared(u64::from_be_bytes(g)))
+        }
+        _ => Err(KvError::CorruptRow("bad clog status byte".into())),
     }
 }
 
@@ -58,6 +62,13 @@ pub fn put_op(xid: u64, status: XidStatus) -> WriteOp {
         key: kv::key::clog_key(xid),
         value,
     }
+}
+
+/// True iff `value` (a clog entry's bytes) encodes a TERMINAL decision
+/// (Committed/Aborted) — the statuses the write-once global decision must keep.
+/// `Prepared`/`InProgress`/empty are non-terminal.
+pub fn is_terminal(value: &[u8]) -> bool {
+    matches!(value.first(), Some(&S_COMMITTED) | Some(&S_ABORTED))
 }
 
 #[cfg(test)]

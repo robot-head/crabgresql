@@ -243,7 +243,7 @@ impl SqlEngine {
         &self,
         g: u64,
         status: mvcc::clog::XidStatus,
-    ) -> Result<(), ExecError> {
+    ) -> Result<mvcc::clog::XidStatus, ExecError> {
         let gtm = self
             .gtm
             .as_ref()
@@ -253,7 +253,41 @@ impl SqlEngine {
                 mvcc::clog::put_op(g, status),
                 gtm.next_global_xid_op(),
             ])
-            .await
+            .await?;
+        // Write-once: apply keeps any prior terminal decision, so the EFFECTIVE
+        // decision (what is actually recorded) may differ from `status` if a
+        // participant won an abort-race. `commit` guarantees applied-on-leader, and
+        // `self.kv` is range 0's applied store, so this read-back is authoritative.
+        Ok(mvcc::clog::get(self.kv.as_ref(), g)?)
+    }
+
+    /// Scan THIS range's clog for in-doubt `Prepared(Li -> g)` markers and return the
+    /// distinct `g`s NOT yet decided in range 0's global clog. Used by the leadership-
+    /// rise recovery sweep to finalize a failed-over participant's txns.
+    ///
+    /// The decidedness check reads `self.catalog_kv` directly (NOT through the range-0
+    /// read barrier), so on a lagging local range-0 replica an already-decided `g` may
+    /// be reported in-doubt. That is harmless: the recovery sweep merely abort-races
+    /// `g` to range 0, and the decision is WRITE-ONCE — racing an already-terminal `g`
+    /// is a no-op against the real decision. Do not "fix" this by routing through the
+    /// barrier; the staleness is intentional and adds no latency to the hot path.
+    pub async fn in_doubt_globals(&self) -> Result<Vec<u64>, ExecError> {
+        use std::collections::BTreeSet;
+        let mut gs: BTreeSet<u64> = BTreeSet::new();
+        for (k, v) in self.kv.scan_prefix(&kv::key::clog_prefix())? {
+            if kv::key::clog_xid_of(&k).is_none() {
+                continue;
+            }
+            if let mvcc::clog::XidStatus::Prepared(g) = mvcc::clog::decode(&v)?
+                && !matches!(
+                    mvcc::clog::get(self.catalog_kv.as_ref(), g)?,
+                    mvcc::clog::XidStatus::Committed | mvcc::clog::XidStatus::Aborted
+                )
+            {
+                gs.insert(g);
+            }
+        }
+        Ok(gs.into_iter().collect())
     }
 
     /// Deregister a decided global txn from the in-memory running-set.
@@ -304,5 +338,37 @@ impl Engine for SqlEngine {
             self.gtm.as_ref().map(Arc::clone),
             self.range0_barrier.as_ref().map(Arc::clone),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_doubt_globals_lists_undecided_prepared_markers() {
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        // Single-store in-memory engine: `self.kv == self.catalog_kv` (both are the
+        // same `Arc` per `with_kv`), so `MemKv` here is range 0's global clog too.
+        let kv = Arc::new(MemKv::new());
+        let engine = SqlEngine::with_kv(Arc::clone(&kv) as Arc<dyn Kv>).expect("engine");
+        let g_undecided = GLOBAL_XID_BASE + 1;
+        let g_committed = GLOBAL_XID_BASE + 2;
+        // Two local participants prepared into two global xids.
+        kv.write_batch(&[put_op(11, XidStatus::Prepared(g_undecided))])
+            .expect("p1");
+        kv.write_batch(&[put_op(12, XidStatus::Prepared(g_committed))])
+            .expect("p2");
+        // g_committed is decided; g_undecided is not.
+        kv.write_batch(&[put_op(g_committed, XidStatus::Committed)])
+            .expect("decide");
+        let mut got = engine.in_doubt_globals().await.expect("scan");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![g_undecided],
+            "only undecided Prepared markers are returned"
+        );
     }
 }

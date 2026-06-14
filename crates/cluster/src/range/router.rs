@@ -43,7 +43,9 @@ pub trait GlobalCoordinator: Send + Sync {
     async fn begin_global(&self) -> Result<u64, ExecError>;
     /// Stage `sql` on a REMOTE participant `range` inside held txn `g`.
     async fn stage_remote(&self, g: u64, range: RangeId, sql: &str) -> Result<(), ExecError>;
-    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError>;
+    /// Write the single global decision and return the EFFECTIVE outcome
+    /// (true = committed, false = aborted — e.g. a participant won the abort-race).
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<bool, ExecError>;
     /// Release a REMOTE participant `range`'s held txn `g`.
     async fn release_remote(&self, g: u64, range: RangeId, commit: bool) -> Result<(), ExecError>;
 }
@@ -64,15 +66,15 @@ impl GlobalCoordinator for LocalCoordinator {
             "local coordinator has no remote range {range}"
         )))
     }
-    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError> {
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<bool, ExecError> {
         let status = if commit {
             mvcc::clog::XidStatus::Committed
         } else {
             mvcc::clog::XidStatus::Aborted
         };
-        self.range0.commit_global_decision(g, status).await?;
+        let effective = self.range0.commit_global_decision(g, status).await?;
         self.range0.finish_global(g);
-        Ok(())
+        Ok(matches!(effective, mvcc::clog::XidStatus::Committed))
     }
     async fn release_remote(
         &self,
@@ -434,7 +436,10 @@ impl RangeRouter {
                 }
                 let coord = self.coordinator.as_ref().expect("coordinator").clone();
                 // The single atomic instant: one range-0 append both ranges flip at.
-                coord.commit_global(g, commit).await?;
+                // The RETURNED decision is the EFFECTIVE one (write-once): a COMMIT
+                // that lost the abort-race comes back `false`, and must become an
+                // honest ROLLBACK for both the release semantics AND the client tag.
+                let committed = coord.commit_global(g, commit).await?;
                 // Release each participant's locks + deregister (no per-participant
                 // clog write — the decision was recorded once, globally, above).
                 // Best-effort: the decision is durable and final, so a single remote
@@ -444,17 +449,17 @@ impl RangeRouter {
                 for r in &ranges {
                     if self.engines.contains_key(r) && self.leads.leads(*r) {
                         let session = self.session_mut(*r);
-                        if commit {
+                        if committed {
                             session.commit_release();
                         } else {
                             session.abort_release();
                         }
                     } else {
-                        let _ = coord.release_remote(g, *r, commit).await;
+                        let _ = coord.release_remote(g, *r, committed).await;
                     }
                 }
                 Ok(QueryResult::Command {
-                    tag: if commit {
+                    tag: if committed {
                         "COMMIT".into()
                     } else {
                         "ROLLBACK".into()
@@ -912,6 +917,67 @@ mod tests {
         let mut fresh = RangeRouter::connect(&c).await;
         assert_eq!(fresh.scan_one_i32("SELECT id FROM a").await, vec![1]);
         assert_eq!(fresh.scan_one_i32("SELECT id FROM b").await, vec![2]);
+    }
+
+    /// Coordinator honesty (SP18 T2). A participant wins the write-once abort-race:
+    /// `Aborted(g)` is written to range 0's global clog BEFORE the coordinator runs
+    /// its COMMIT close. Because the global decision is write-once, the coordinator's
+    /// `commit_global_decision(g, Committed)` reads back the EFFECTIVE `Aborted`, so
+    /// the COMMIT must report an honest `ROLLBACK` (never a false `COMMIT`) and
+    /// release every participant with abort semantics — leaving NEITHER row visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_reports_rollback_when_decision_already_aborted() {
+        use mvcc::clog::XidStatus;
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        router.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("stage a");
+        router
+            .simple("INSERT INTO b VALUES (2)")
+            .await
+            .expect("escalate b");
+        // A participant wins the abort-race: pre-write Aborted(g) BEFORE the
+        // coordinator commits.
+        let g = router.staged_global_xid().expect("a global txn is staged");
+        router
+            .coordinator_engine()
+            .commit_global_decision(g, XidStatus::Aborted)
+            .await
+            .expect("participant aborts g");
+        // The coordinator's COMMIT must observe the effective Aborted and report
+        // ROLLBACK.
+        let tag = router.simple("COMMIT").await.expect("commit returns a tag");
+        assert!(
+            format!("{tag:?}").contains("ROLLBACK"),
+            "coordinator that lost the abort-race reports ROLLBACK, got {tag:?}"
+        );
+        // Both rows invisible (an aborted cross-range txn leaves neither), to the
+        // same router and a fresh one resolving through the global clog.
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new()
+        );
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new()
+        );
     }
 }
 
