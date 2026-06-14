@@ -24,6 +24,55 @@
 
 ---
 
+## Review corrections (adversarial plan review, 2026-06-14 — BINDING)
+
+An adversarial multi-agent review (5 lenses, per-finding verification) confirmed 17 findings. The fixes below are folded into the tasks; where a code block elsewhere in this plan disagrees with one of these, **this section wins**. The two CRITICALs are the load-bearing ones — read them before T5.
+
+**C1 (CRITICAL) — `next_global_xid` is BIG-endian on disk.** `gtm.rs` writes/reads it with `zerocopy::byteorder::big_endian::U64` (`gtm.rs:13/55-60/32`). Any reconstruction MUST decode big-endian; any test vector MUST write `to_be_bytes()`. Native-endian + `to_le_bytes` is self-consistent (the unit test passes green) but mis-decodes the allocator's real bytes → `xmax` clamps to `GLOBAL_XID_BASE` → **every committed cross-range row resolves InProgress (invisible) forever** in the wired path. Fix: add one shared decoder in `gtm.rs` used by both `Gtm::open` and `durable_global_snapshot` so the layout can never drift (see C2).
+
+**C2 (CRITICAL) — visibility `gsnap` is ALWAYS reconstructed from durable range-0 state; the in-memory GTM running set is NEVER used for visibility.** The network commit never prunes `g` from the range-0 leader's in-memory `Gtm.running`, so a range-0-leader read using `gtm.global_snapshot()` would see its own just-committed range-0 row as in-doubt → invisible cluster-wide (gateways forward range-0 reads to that leader). Fix (replaces the T5 Step 3 `global_read_snapshot` and the BEGIN/RR capture):
+- `global_read_snapshot(None)` and the RR BEGIN capture both reconstruct from durable range-0 state whenever the engine can see cross-range rows (`self.gtm.is_some() || self.range0_barrier.is_some()`), never `gtm.global_snapshot()`.
+- Add a **shared** helper in `gtm.rs` and reuse it in `durable_global_snapshot`:
+  ```rust
+  // crates/executor/src/gtm.rs — used by Gtm::open AND session::durable_global_snapshot
+  pub(crate) fn read_next_global(kv: &dyn Kv) -> Result<u64, ExecError> {
+      use mvcc::xid::GLOBAL_XID_BASE;
+      use zerocopy::byteorder::big_endian::U64;
+      use zerocopy::FromBytes;
+      let next = match kv.get(&kv::key::meta_next_global_xid_key())? {
+          Some(b) => {
+              let (v, _) = U64::read_from_prefix(b.as_slice())
+                  .map_err(|_| kv::KvError::CorruptRow("next_global_xid not u64".into()))?;
+              v.get()
+          }
+          None => GLOBAL_XID_BASE,
+      };
+      Ok(next.max(GLOBAL_XID_BASE))
+  }
+  ```
+  `durable_global_snapshot(range0)` returns `Snapshot { xmin: GLOBAL_XID_BASE, xmax: gtm::read_next_global(range0)?, xip: vec![] }`.
+- **Prune the running set on commit** (bounds memory; the set is now visibility-irrelevant): in `handle_txn`'s `CommitGlobal` arm, after `commit_global_decision` succeeds, call `e.finish_global(g)` on the range-0 engine. (`LocalCoordinator::commit_global` already calls `finish_global`.)
+- Net effect: `finish_global` is genuinely a visibility no-op; a range-0 leader change is transparent; the in-process `MultiRangeCluster` stays correct because `begin_global_durable` (used by `LocalCoordinator`) persists `next_global` at allocation, so the durable reconstruction matches the in-doubt logic.
+
+**H1 (HIGH) — remote SQL errors must keep their SQLSTATE class, not collapse to 0A000.** Add a `Retryable` variant to `TxnResp` (T1) and split `map_exec_err` (T3): `SerializationFailure`/`Deadlock` → `TxnResp::Retryable`, `NotLeader` → `TxnResp::NotLeader`, else → `TxnResp::Err(msg)`. In `NetCoordinator::stage_remote` (T4): `Retryable` → `Err(ExecError::SerializationFailure)`, `NotLeader` → `Err(ExecError::NotLeader)`, `Err(m)` → `Err(ExecError::Unsupported(m))`. This preserves 40001 retryability on the remote-participant path. (`TwoPcClient::call` must also `continue` retry on `Retryable` the same as `NotLeader`? No — `Retryable` is a serialization failure the CLIENT retries, not the pooled client; return it.)
+
+**H2 (HIGH) — `TxnService` must not hold the map lock across session work.** Map value is `Arc<tokio::sync::Mutex<executor::SqlSession>>`. `stage`/`release`/`holds`/`release_all_for_range` lock the map only to get/insert/remove+clone the `Arc`, drop the map guard, then lock the per-session `Arc`. This prevents the hold-and-wait deadlock (a `Stage` on g1 blocking on a row lock held by g2 while pinning the map mutex that `Release(g2)` needs). Corrected code in T3 Step 3 below.
+
+**H3 (HIGH) — `serve_node_protocol` per-connection clone must include `txn`.** The accept loop re-clones shared state per connection (`server.rs:111`). Change to `let (registry, partition, shutdown, txn) = (registry.clone(), partition.clone(), shutdown.clone(), txn.clone());` (`TxnService: Clone`).
+
+**H4 (HIGH) — task ordering: the gateway_local atomic-commit FLIP belongs in T5, not T4.** At T4's commit, range-1's engine has `gtm=None` and no barrier yet, so `SELECT id FROM b` resolves invisible and the "both rows visible" assertion fails. **Move** `gateway_commits_a_cross_range_transaction_atomically` + `gateway_rolls_back_a_cross_range_transaction_atomically` into T5 (after `durable_global_snapshot` + the `Range0Barrier` are wired). T4's own test instead asserts only that escalation no longer errors `0A000` (the `BEGIN/INSERT a/INSERT b/COMMIT` all return `Ok`, and range-0's `a` reads back — range-0's engine has the GTM) — see corrected T4 Step 1.
+
+**Mechanical corrections (apply where the inline text differs):**
+- **M1 — static bring-up double-builds range 0.** `start_static` loops `for range in map.range_ids()` (includes range 0). Special-case range 0 out (init its GTM), then loop `map.range_ids().filter(|&r| r != 0)` for data ranges (mirroring the replicated path).
+- **M2 — `RangeRouter::new` has FOUR call sites**, not two: `route.rs:166` (gateway), `router.rs:203` (`connect`), and the two in-module test sites `router.rs:853`/`router.rs:926`. Make the new field `coordinator: Option<Arc<dyn GlobalCoordinator>>`; the two test sites pass `None`.
+- **M3 — `RangeRouter::connect` lives in `router.rs:198` (not `cluster.rs`).** Edit `router.rs` `connect` to build `LocalCoordinator { range0: c.leader_engine(0).await }` (uses the param `c`, not `self`) and pass `Some(Arc::new(local))`. `cluster.rs` needs no change.
+- **M4 — test KV API:** use `kv::MemKv::new()` + `.write_batch(&[WriteOp])` (copy `exec.rs` SP16 tests), NOT `kv::mem::MemKv`/`.apply`. Build the durable `next_global` value with `(g+1).to_be_bytes().to_vec()`.
+- **M5 — `ServerNode` has no `node_addr`.** Add `pub fn node_addr(&self) -> &str` (store `cfg.node_addr` in the struct at bring-up) so the T6 control test reaches the node port WITHOUT changing `start_two_range_node`'s return arity (which would break the two existing destructures at `gateway_local.rs:94/135`).
+- **M6 — best-effort release in `finish_txn`.** After `commit_global` succeeds, do NOT `?`-propagate a per-participant release failure — iterate every participant, attempt release, and still return `COMMIT`/`ROLLBACK` success (the durable decision is the source of truth; a lingering remote lock is the SP18 liveness gap, covered by release-on-leadership-loss). Never let one participant's failure skip the others.
+- **M7 — fix the false endianness prose** at the old T2 Step 1 note and T5 Step 1/3 notes: the layout is **big-endian**, not "native/LE".
+
+---
+
 ## File structure (what changes, and why)
 
 **New files:**
@@ -133,6 +182,10 @@ pub enum TxnResp {
     Barrier { applied_index: u64 },
     /// The target was not the range's leader — the caller re-resolves and retries.
     NotLeader,
+    /// A retryable serialization failure / deadlock on the participant (40001 /
+    /// 40P01) — surfaced to the CLIENT as a retryable error, not collapsed to
+    /// 0A000 (correction H1).
+    Retryable,
     Err(String),
 }
 ```
@@ -344,27 +397,16 @@ async fn begin_global_durable_persists_next_global() {
     let g1 = engine.begin_global_durable().await.expect("alloc g1");
     assert_eq!(g1, g0 + 1, "allocations are monotonic");
 
-    // The advance is durable: a fresh GTM opened over the same store reseeds past g1.
-    let next = node
-        .sm_kv(0)
-        .get(&kv::key::meta_next_global_xid_key())
-        .expect("kv get")
-        .expect("next_global_xid persisted after begin_global_durable");
-    let durable = u64::from_be_bytes(next[..8].try_into().expect("8 bytes"));
-    assert!(durable > g1, "next_global_xid persisted strictly past the last allocation");
-}
-```
-
-(`node.engines` and `node.sm_kv(range)` are public — `server_node.rs:69` field, `:90` accessor. The U64 layout written by `next_global_xid_op` is `zerocopy` little-endian native; on the standard x86_64/aarch64 runners that is LE, but to be byte-order-safe assert via the executor's own reader — replace the hand-decode with `assert!(durable > g1)` only after confirming `meta_next_global_xid_key` round-trips through the executor. To avoid endianness coupling in the test, prefer asserting `g1 == g0 + 1` and re-opening: skip the raw decode and instead assert a *second* engine reseeds — see Step 3's `reseed_gtm`.)
-
-Simplify the durability assertion to avoid raw byte decode (final form):
-
-```rust
-    // The advance is durable: reseed lifts a fresh in-memory counter past g1.
+    // The advance is durable (no raw byte decode — avoids endianness coupling):
+    // a reseed of a fresh in-memory counter never regresses below the persisted
+    // value, so a subsequent allocation stays strictly monotone past g1.
     engine.reseed_gtm().expect("reseed");
     let g2 = engine.begin_global_durable().await.expect("alloc g2");
     assert!(g2 > g1, "post-reseed allocation never regresses below the durable counter");
+}
 ```
+
+(`node.engines` is a public field — `server_node.rs:69`. `reseed_gtm` is added in Step 3. The on-disk `next_global_xid` layout is **big-endian** — see correction C1; this test deliberately asserts via `reseed_gtm` + a fresh allocation rather than decoding bytes, so it is byte-order-agnostic.)
 
 - [ ] **Step 2: Run it — expect failure**
 
@@ -545,11 +587,17 @@ use crate::transport::protocol::TxnResp as _; // (TxnResp already imported above
 /// Participant-side held-session registry. Lives on each node; resolves the
 /// node's per-range engines and keeps one `SqlSession` per in-flight `(G, range)`
 /// it participates in, detached from any TCP connection so a later `Release(G)`
-/// from a different connection finds it.
+/// from a different connection finds it. Each session is its OWN `Arc<Mutex>` so
+/// the map lock is held only for lookup/insert/remove — NEVER across session work
+/// (correction H2: holding the map lock across `session.run().await` deadlocks a
+/// `Stage(g1)` that blocks on a row lock held by `g2` against the `Release(g2)`
+/// that needs the same map lock).
+type HeldSession = Arc<Mutex<executor::SqlSession>>;
+
 #[derive(Clone)]
 pub struct TxnService {
     engines: HashMap<RangeId, Arc<SqlEngine>>,
-    held: Arc<Mutex<HashMap<(u64, RangeId), executor::SqlSession>>>,
+    held: Arc<Mutex<HashMap<(u64, RangeId), HeldSession>>>,
 }
 
 impl TxnService {
@@ -567,19 +615,22 @@ impl TxnService {
     /// the sole arbiter (a committed g's durable Prepared rows stay visible; an
     /// undecided g's rows are invisible).
     pub async fn release_all_for_range(&self, range: RangeId) {
-        let mut held = self.held.lock().await;
-        let keys: Vec<(u64, RangeId)> = held.keys().copied().filter(|&(_, r)| r == range).collect();
-        for k in keys {
-            if let Some(mut s) = held.remove(&k) {
-                s.abort_release();
-            }
+        // Take the sessions OUT under a brief map lock, drop the guard, then abort.
+        let victims: Vec<HeldSession> = {
+            let mut held = self.held.lock().await;
+            let keys: Vec<(u64, RangeId)> =
+                held.keys().copied().filter(|&(_, r)| r == range).collect();
+            keys.into_iter().filter_map(|k| held.remove(&k)).collect()
+        };
+        for s in victims {
+            s.lock().await.abort_release();
         }
     }
 
     /// Dispatch one participant-targeted `TxnRpc` (`Stage`/`Release`). Global ops
     /// (`BeginGlobal`/`CommitGlobal`/`GlobalBarrier`) are handled by the server
     /// against range 0's engine/raft — see `server::handle_txn`.
-    pub async fn handle(&self, range: RangeId, rpc: TxnRpc) -> TxnResp {
+    pub async fn handle(&self, _range: RangeId, rpc: TxnRpc) -> TxnResp {
         match rpc {
             TxnRpc::Stage { g, range: r, sql } => self.stage(g, r, &sql).await,
             TxnRpc::Release { g, range: r, commit } => self.release(g, r, commit).await,
@@ -588,21 +639,33 @@ impl TxnService {
         }
     }
 
+    /// Get-or-create the held session for `(g, range)` under a BRIEF map lock,
+    /// returning a clone of its `Arc<Mutex>` (map guard dropped before any await).
+    async fn session_handle(&self, g: u64, range: RangeId) -> Option<HeldSession> {
+        let engine = self.engines.get(&range)?.clone();
+        let mut held = self.held.lock().await;
+        Some(
+            held.entry((g, range))
+                .or_insert_with(|| Arc::new(Mutex::new(engine.connect())))
+                .clone(),
+        )
+    }
+
     async fn stage(&self, g: u64, range: RangeId, sql: &str) -> TxnResp {
-        let Some(engine) = self.engines.get(&range) else {
+        let stmt = match pgparser::parse(sql) {
+            Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
+            _ => return TxnResp::Err("stage expects exactly one statement".into()),
+        };
+        let Some(handle) = self.session_handle(g, range).await else {
             return TxnResp::Err(format!("no engine for range {range}"));
         };
-        let stmt = match pgparser::parse(sql).ok().and_then(|mut v| {
-            if v.len() == 1 { v.pop() } else { None }
-        }) {
-            Some(s) => s,
-            None => return TxnResp::Err("stage expects exactly one statement".into()),
-        };
-        let mut held = self.held.lock().await;
-        let session = held.entry((g, range)).or_insert_with(|| engine.connect());
+        // Per-session lock only (the map lock was already dropped) — different g's
+        // progress independently; a Release for another g is never blocked behind
+        // this stage.
+        let mut session = handle.lock().await;
         // First stage on this (g, range): begin a held txn + enlist as participant.
         if let Err(e) = session.ensure_began().await {
-            return TxnResp::Err(e.to_string());
+            return map_exec_err(e);
         }
         if let Err(e) = session.join_global(g).await {
             return map_exec_err(e);
@@ -614,8 +677,10 @@ impl TxnService {
     }
 
     async fn release(&self, g: u64, range: RangeId, commit: bool) -> TxnResp {
-        let mut held = self.held.lock().await;
-        if let Some(mut session) = held.remove(&(g, range)) {
+        // Remove from the map under a brief lock, then release the session.
+        let handle = { self.held.lock().await.remove(&(g, range)) };
+        if let Some(handle) = handle {
+            let mut session = handle.lock().await;
             if commit { session.commit_release() } else { session.abort_release() }
         }
         // Releasing an unknown (g, range) is a no-op success (idempotent retry).
@@ -623,15 +688,20 @@ impl TxnService {
     }
 }
 
+/// Map an `ExecError` from a staged statement to a wire response, PRESERVING the
+/// retryable serialization-failure class (correction H1: collapsing 40001 to
+/// 0A000 would make a retryable conflict look like an unsupported feature).
 fn map_exec_err(e: executor::ExecError) -> TxnResp {
+    use executor::ExecError;
     match e {
-        executor::ExecError::NotLeader => TxnResp::NotLeader,
+        ExecError::NotLeader => TxnResp::NotLeader,
+        ExecError::SerializationFailure | ExecError::Deadlock => TxnResp::Retryable,
         other => TxnResp::Err(other.to_string()),
     }
 }
 ```
 
-(Confirm `executor::SqlSession`, `executor::SqlEngine`, `executor::ExecError`, and `SqlSession::{ensure_began, join_global, commit_release, abort_release, run}` are exported — `session.rs:110/606/622/637/644` and `lib.rs` re-exports. `pgparser::parse` returns `Vec<Statement>`.)
+(Confirm `executor::SqlSession`, `executor::SqlEngine`, `executor::ExecError` and `SqlSession::{ensure_began, join_global, commit_release, abort_release, run}` are exported — `session.rs:110/606/622/637/644` and `lib.rs` re-exports. `pgparser::parse` returns `Result<Vec<Statement>, _>`. Confirm the exact `ExecError` variant names `SerializationFailure`/`Deadlock` against `executor/src/error.rs`; if a name differs, match it.)
 
 - [ ] **Step 4: Add the `handle_txn` server dispatch (`transport/server.rs`)**
 
@@ -673,7 +743,10 @@ async fn handle_txn(
                     mvcc::clog::XidStatus::Aborted
                 };
                 match e.commit_global_decision(g, status).await {
-                    Ok(()) => TxnResp::Committed,
+                    Ok(()) => {
+                        e.finish_global(g); // prune g from the in-memory running set (C2; bounds memory)
+                        TxnResp::Committed
+                    }
                     Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
                     Err(e) => TxnResp::Err(e.to_string()),
                 }
@@ -712,6 +785,15 @@ Add the `engine(range)` accessor to `TxnService` (so `handle_txn` reaches range 
 
 Import `TxnResp`, `TxnRpc` into `server.rs` from `crate::transport::protocol`.
 
+**Correction H3 — the per-connection clone tuple must include `txn`.** `serve_node_protocol`'s accept loop re-clones shared state for each spawned connection task (`server.rs:111`). Extend it so `txn` is available in every connection:
+
+```rust
+        let (registry, partition, shutdown, txn) =
+            (registry.clone(), partition.clone(), shutdown.clone(), txn.clone());
+```
+
+(`TxnService` derives `Clone` over `Arc`s, so this is a cheap refcount bump; without it the owned `txn` is moved into the first connection's `move` task and the loop fails to compile.)
+
 - [ ] **Step 6: Run the test + regressions — expect PASS**
 
 Run: `cargo nextest run -p cluster --lib twopc::tests::stage_then_release_holds_then_frees_a_per_g_session`
@@ -737,13 +819,13 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `crates/cluster/src/route.rs` + `crates/cluster/src/server_node.rs` (the gateway wires `NetCoordinator`)
 - Modify: `crates/cluster/tests/gateway_local.rs` (flip the `0A000` rejection test → atomic cross-range commit)
 
-- [ ] **Step 1: Write the failing test (flip `gateway_rejects_a_cross_range_transaction_with_0a000`)**
+- [ ] **Step 1: Write the failing test (escalation no longer rejects with `0A000`)**
 
-Replace the body of `gateway_rejects_a_cross_range_transaction_with_0a000` (`gateway_local.rs:133-166`) with an atomic-commit assertion and rename it:
+Per correction **H4**, T4 proves *escalation wiring* only — it does NOT assert range-1 (`b`) visibility, which needs T5's durable-`gsnap` reconstruction (range-1's engine has `gtm=None` and no barrier until T5). Replace the body of `gateway_rejects_a_cross_range_transaction_with_0a000` (`gateway_local.rs:133-166`) and rename it:
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_commits_a_cross_range_transaction_atomically() {
+async fn gateway_escalates_a_cross_range_transaction_without_0a000() {
     let (_node, sql_addr) = start_two_range_node().await;
     let port = sql_addr.rsplit(':').next().expect("port");
     let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
@@ -754,49 +836,26 @@ async fn gateway_commits_a_cross_range_transaction_atomically() {
     client.simple_query("CREATE TABLE b (id int4)").await.expect("create b (range 1)");
     client.simple_query("BEGIN").await.expect("begin");
     client.simple_query("INSERT INTO a VALUES (1)").await.expect("first DML pins range 0");
-    // A second statement on a DIFFERENT range escalates to cross-range 2PC.
+    // A second statement on a DIFFERENT range escalates to cross-range 2PC — it no
+    // longer errors 0A000 (the whole point of T4's coordinator wiring).
     client.simple_query("INSERT INTO b VALUES (2)").await.expect("second range escalates");
-    client.simple_query("COMMIT").await.expect("atomic cross-range commit");
+    client.simple_query("COMMIT").await.expect("atomic cross-range commit succeeds");
 
-    // Both rows are visible after COMMIT (read back through the same gateway).
+    // Range-0's own engine carries the GTM, so `a` reads back here. (Range-1 `b`
+    // read-back is asserted in T5, after durable-gsnap visibility is wired.)
     let a = client.simple_query("SELECT id FROM a").await.expect("select a");
-    let b = client.simple_query("SELECT id FROM b").await.expect("select b");
-    assert_eq!(row_count(&a), 1, "range-0 row committed");
-    assert_eq!(row_count(&b), 1, "range-1 row committed");
+    assert_eq!(row_count(&a), 1, "range-0 row committed and visible");
 }
 
-// Counts SimpleQueryMessage::Row entries in a simple_query result.
+// Counts SimpleQueryMessage::Row entries in a simple_query result (reused by T5).
 fn row_count(msgs: &[tokio_postgres::SimpleQueryMessage]) -> usize {
     msgs.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count()
 }
 ```
 
-Also add a ROLLBACK sibling:
-
-```rust
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_rolls_back_a_cross_range_transaction_atomically() {
-    let (_node, sql_addr) = start_two_range_node().await;
-    let port = sql_addr.rsplit(':').next().expect("port");
-    let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
-    let (client, connection) = connect_with_retry(&conn_str).await;
-    tokio::spawn(connection);
-    client.simple_query("CREATE TABLE a (id int4)").await.expect("a");
-    client.simple_query("CREATE TABLE b (id int4)").await.expect("b");
-    client.simple_query("BEGIN").await.expect("begin");
-    client.simple_query("INSERT INTO a VALUES (1)").await.expect("a");
-    client.simple_query("INSERT INTO b VALUES (2)").await.expect("b");
-    client.simple_query("ROLLBACK").await.expect("rollback");
-    let a = client.simple_query("SELECT id FROM a").await.expect("select a");
-    let b = client.simple_query("SELECT id FROM b").await.expect("select b");
-    assert_eq!(row_count(&a), 0, "range-0 row rolled back");
-    assert_eq!(row_count(&b), 0, "range-1 row rolled back");
-}
-```
-
 - [ ] **Step 2: Run it — expect failure**
 
-Run: `cargo nextest run -p cluster --test gateway_local gateway_commits_a_cross_range_transaction_atomically`
+Run: `cargo nextest run -p cluster --test gateway_local gateway_escalates_a_cross_range_transaction_without_0a000`
 Expected: FAIL — escalation is still rejected (`can_escalate()` false on the gateway path, no coordinator wired) so `INSERT INTO b` errors `0A000`.
 
 - [ ] **Step 3: Add the `GlobalCoordinator` seam to `router.rs`**
@@ -956,13 +1015,19 @@ The `Pin::Global` arm (line 333-348) routes each statement via `stage_on` if the
         #[cfg(test)]
         if let Some(hook) = self.before_global_decision.as_mut() { hook(); }
         let coord = self.coordinator.as_ref().expect("coordinator").clone();
+        // The single atomic instant. After this returns Ok the decision is durable
+        // and is the sole source of truth.
         coord.commit_global(g, commit).await?;
+        // Release every participant BEST-EFFORT (correction M6): the decision is
+        // already final, so a release failure (a remote leader moved) must NOT
+        // abort the loop and strand the OTHER participants' releases. A lingering
+        // remote lock is the bounded SP18 liveness gap (release-on-leadership-loss).
         for r in &ranges {
             if self.engines.contains_key(r) && self.leads.leads(*r) {
                 let s = self.session_mut(*r);
                 if commit { s.commit_release() } else { s.abort_release() }
             } else {
-                coord.release_remote(g, *r, commit).await?;
+                let _ = coord.release_remote(g, *r, commit).await; // best-effort
             }
         }
         Ok(QueryResult::Command { tag: if commit { "COMMIT".into() } else { "ROLLBACK".into() } })
@@ -1003,6 +1068,9 @@ impl GlobalCoordinator for NetCoordinator {
         match self.client.call(range, TxnRpc::Stage { g, range, sql: sql.to_string() }).await {
             Ok(TxnResp::Staged) => Ok(()),
             Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
+            // Preserve the retryable serialization-failure class (correction H1) —
+            // do NOT collapse 40001 into a non-retryable 0A000.
+            Ok(TxnResp::Retryable) => Err(ExecError::SerializationFailure),
             Ok(TxnResp::Err(e)) => Err(ExecError::Unsupported(e)),
             _ => Err(ExecError::Unavailable),
         }
@@ -1029,10 +1097,10 @@ impl GlobalCoordinator for NetCoordinator {
 - `server_node.rs spawn_sql_gateway` (line 280-311): build a `TwoPcClient::new(rafts.clone(), partition.clone())`, wrap as `Arc::new(NetCoordinator::new(client))`, and thread it through `serve_range_routed` → `RangeGatewayEngine::new` → `RangeRouter::new`. Add the `coordinator: Arc<dyn GlobalCoordinator>` param to `serve_range_routed` (route.rs:180) and `RangeGatewayEngine` (route.rs:129-152), cloned into each `connect()` (route.rs:157-173).
 - `cluster.rs` in-process `RangeRouter::connect` (the harness path used by `crossrange_2pc.rs`): build `LocalCoordinator { range0: self.leader_engine(0).await }` (a GTM-bearing range-0 engine via the existing `gtm_source`) and pass `Some(Arc::new(local))`. This keeps `MultiRangeCluster`'s router escalating exactly as in SP16 (now through the seam, with durable begin_global).
 
-- [ ] **Step 8: Run the flip + in-process regressions — expect PASS**
+- [ ] **Step 8: Run the escalation test + in-process regressions — expect PASS**
 
-Run: `cargo nextest run -p cluster --test gateway_local` and `cargo nextest run -p cluster --test crossrange_2pc`
-Expected: PASS — the gateway now escalates and commits atomically (begin/commit RPC loopback-to-self exercises the wire); the in-process `crossrange_2pc` suite still passes through `LocalCoordinator`.
+Run: `cargo nextest run -p cluster --test gateway_local gateway_escalates_a_cross_range_transaction_without_0a000` and `cargo nextest run -p cluster --test crossrange_2pc`
+Expected: PASS — the gateway now escalates without `0A000` and commits (begin/commit RPC loopback-to-self exercises the wire; range-0 `a` reads back). The full both-rows / rollback visibility assertions land in T5 once durable-`gsnap` is wired. The in-process `crossrange_2pc` suite still passes through `LocalCoordinator`.
 
 - [ ] **Step 9: Commit**
 
@@ -1063,20 +1131,22 @@ The participant resolves a `Prepared(Li→g)` row against range 0's durable clog
 ```rust
     #[test]
     fn durable_global_snapshot_resolves_committed_against_range0() {
+        use kv::{Kv, MemKv};
         use mvcc::clog::{put_op, XidStatus};
         use mvcc::xid::GLOBAL_XID_BASE;
-        let local = kv::mem::MemKv::new();   // this range's clog
-        let global = kv::mem::MemKv::new();  // range 0's global clog + meta
+        let local = MemKv::new();   // this range's clog
+        let global = MemKv::new();  // range 0's global clog + meta
         let g = GLOBAL_XID_BASE + 5;
 
         // Local row's deleter is Prepared(Li -> g); Li = 3.
-        local.apply(&[put_op(3, XidStatus::Prepared(g))]).expect("local prepared");
-        // Range 0: g committed, and next_global persisted past g.
-        global.apply(&[put_op(g, XidStatus::Committed)]).expect("global committed");
+        local.write_batch(&[put_op(3, XidStatus::Prepared(g))]).expect("local prepared");
+        // Range 0: g committed, and next_global persisted past g (BIG-endian, the
+        // exact on-disk layout the GTM allocator writes — correction C1).
+        global.write_batch(&[put_op(g, XidStatus::Committed)]).expect("global committed");
         global
-            .apply(&[kv::WriteOp::Put {
+            .write_batch(&[kv::WriteOp::Put {
                 key: kv::key::meta_next_global_xid_key(),
-                value: (g + 1).to_le_bytes().to_vec(), // matches U64 zerocopy layout
+                value: (g + 1).to_be_bytes().to_vec(),
             }])
             .expect("persist next_global");
 
@@ -1088,11 +1158,11 @@ The participant resolves a `Prepared(Li→g)` row against range 0's durable clog
 
         // A still-in-doubt g' (no decision, but allocated) resolves InProgress (invisible).
         let g2 = GLOBAL_XID_BASE + 6;
-        local.apply(&[put_op(4, XidStatus::Prepared(g2))]).expect("local prepared 2");
+        local.write_batch(&[put_op(4, XidStatus::Prepared(g2))]).expect("local prepared 2");
         global
-            .apply(&[kv::WriteOp::Put {
+            .write_batch(&[kv::WriteOp::Put {
                 key: kv::key::meta_next_global_xid_key(),
-                value: (g2 + 1).to_le_bytes().to_vec(),
+                value: (g2 + 1).to_be_bytes().to_vec(),
             }])
             .expect("advance next_global past g2");
         let gsnap2 = crate::session::durable_global_snapshot(&global).expect("rebuild gsnap2");
@@ -1102,7 +1172,7 @@ The participant resolves a `Prepared(Li→g)` row against range 0's durable clog
     }
 ```
 
-(Confirm the in-memory test KV is `kv::mem::MemKv` with `new()` + `apply(&[WriteOp])` + `get` — match whatever the existing exec/mvcc tests use; the SP16 `eval_plan_qual_settled_global_*` test in this same module already constructs the pattern, so copy its store setup verbatim. `meta_next_global_xid_key` is `kv::key::meta_next_global_xid_key()`. The `U64` value layout is `zerocopy` native-endian — match `gtm::next_global_xid_op`'s `U64::new(next).as_bytes()`; on LE runners that is `to_le_bytes`. To stay endian-safe, build the value via the executor's own writer if exposed, else keep `to_le_bytes` and note the LE-runner assumption.)
+(Store API verified: the in-memory KV is `kv::MemKv` with `MemKv::new()` + `.write_batch(&[WriteOp])` + `.get` — copy the setup from the SP16 `eval_plan_qual_settled_global_*` / `global_status_derefs_*` tests in this same module. `next_global_xid` is **big-endian** on disk (`gtm.rs` uses `zerocopy::byteorder::big_endian::U64`); `(v).to_be_bytes()` matches `U64::new(v).as_bytes()` for a `u64`, so the test exercises the real layout.)
 
 - [ ] **Step 2: Run it — expect failure**
 
@@ -1111,48 +1181,63 @@ Expected: FAIL — `session::durable_global_snapshot` does not exist.
 
 - [ ] **Step 3: Add `durable_global_snapshot` + reconstruct `gsnap` on participant nodes (`session.rs`)**
 
-Add a free fn (so the exec test + the session can share it):
+Add the shared big-endian decoder to `gtm.rs` (correction **C1/C2** — used by BOTH `Gtm::open` and the new `durable_global_snapshot`, so the layout cannot drift), then the free fn in `session.rs`:
 
 ```rust
-/// Reconstruct the global visibility snapshot from range 0's DURABLE state (not
-/// an in-memory running set). `xmax = next_global_xid`; `xip = []` — a `g < xmax`
-/// is resolved by reading range 0's global clog directly (absent ⇒ in-doubt). The
-/// caller must have barriered range 0's replica current first.
-pub(crate) fn durable_global_snapshot(range0: &dyn Kv) -> Result<Snapshot, ExecError> {
+// crates/executor/src/gtm.rs
+pub(crate) fn read_next_global(kv: &dyn Kv) -> Result<u64, ExecError> {
     use mvcc::xid::GLOBAL_XID_BASE;
-    let xmax = match range0.get(&kv::key::meta_next_global_xid_key())? {
+    use zerocopy::FromBytes;
+    use zerocopy::byteorder::big_endian::U64; // MATCHES the writer next_global_xid_op
+    let next = match kv.get(&kv::key::meta_next_global_xid_key())? {
         Some(b) => {
-            let (v, _) = zerocopy::byteorder::U64::<zerocopy::byteorder::NativeEndian>::read_from_prefix(b.as_slice())
+            let (v, _) = U64::read_from_prefix(b.as_slice())
                 .map_err(|_| kv::KvError::CorruptRow("next_global_xid not u64".into()))?;
-            v.get().max(GLOBAL_XID_BASE)
+            v.get()
         }
         None => GLOBAL_XID_BASE,
     };
-    Ok(Snapshot { xmin: GLOBAL_XID_BASE, xmax, xip: vec![] })
+    Ok(next.max(GLOBAL_XID_BASE))
+}
+```
+(Refactor `Gtm::open` at `gtm.rs:29-45` to call `read_next_global(&*kv)?` so there is a single decode site.)
+
+```rust
+// crates/executor/src/session.rs
+/// Reconstruct the global visibility snapshot from range 0's DURABLE state (never
+/// an in-memory running set — see correction C2). `xmax = next_global_xid`;
+/// `xip = []` — a `g < xmax` is resolved by reading range 0's global clog directly
+/// (absent ⇒ in-doubt). The caller must have barriered range 0's replica current
+/// first.
+pub(crate) fn durable_global_snapshot(range0: &dyn Kv) -> Result<Snapshot, ExecError> {
+    use mvcc::xid::GLOBAL_XID_BASE;
+    Ok(Snapshot { xmin: GLOBAL_XID_BASE, xmax: crate::gtm::read_next_global(range0)?, xip: vec![] })
 }
 ```
 
-(Reuse the exact `U64` reader `gtm.rs:33-36`/`open` uses — copy that decode so the layout matches `next_global_xid_op`.)
-
-Change `global_read_snapshot` (`session.rs:257-263`) so a participant node (no in-memory GTM but a real range-0 store, signalled by `range0_barrier.is_some()`) reconstructs from durable state:
+Change `global_read_snapshot` (`session.rs:257-263`) so visibility is ALWAYS reconstructed from durable range-0 state — never `gtm.global_snapshot()` (correction **C2**):
 
 ```rust
     fn global_read_snapshot(&self, stored: Option<&Snapshot>) -> Snapshot {
-        match (&self.gtm, stored) {
-            // RR reuses the snapshot captured at BEGIN.
-            (_, Some(s)) => s.clone(),
-            // Range-0 leader / in-process: the in-memory GTM snapshot is fresh.
-            (Some(gtm), None) => gtm.global_snapshot(),
-            // Participant node (no local GTM) with a range-0 replica: reconstruct
-            // from durable range-0 state (barriered current by the caller).
-            (None, None) if self.range0_barrier.is_some() => {
-                durable_global_snapshot(&*self.catalog_kv).unwrap_or_else(crate::NO_GLOBAL_SNAPSHOT)
-            }
-            // Single-range engine: no global xids exist.
-            (None, None) => crate::NO_GLOBAL_SNAPSHOT(),
+        // RR reuses the snapshot captured (durably) at BEGIN.
+        if let Some(s) = stored {
+            return s.clone();
         }
+        // Any engine that can see cross-range Prepared rows — the range-0 leader's
+        // own GTM-bearing engine OR a participant data-range engine with a range-0
+        // barrier — reconstructs gsnap from range 0's DURABLE state. The in-memory
+        // GTM running set is NEVER consulted for visibility, so finish_global is a
+        // no-op for correctness and a range-0 leader change is transparent.
+        if self.gtm.is_some() || self.range0_barrier.is_some() {
+            return durable_global_snapshot(&*self.catalog_kv)
+                .unwrap_or_else(|_| crate::NO_GLOBAL_SNAPSHOT());
+        }
+        // Single-range engine: no global xids exist.
+        crate::NO_GLOBAL_SNAPSHOT()
     }
 ```
+
+And the RR BEGIN capture (`session.rs:183-187`) reconstructs durably too (after the range-0 barrier at `:177`): replace `self.gtm.as_ref().map(|g| g.global_snapshot())` with `Some(self.global_read_snapshot(None))` (guarded by `rr`).
 
 - [ ] **Step 4: Add the engine field + thread it; add `ensure_global_readable`; gate the read sites**
 
@@ -1246,15 +1331,60 @@ Inject it in `server_node.rs` after the engines + `TwoPcClient` exist: build `le
 
 (Confirm openraft's `Wait::applied_index_at_least` signature — CLAUDE.md cites `.applied_index_at_least(idx, "reason")`; `idx` may be `Option<u64>` or `u64` in this version. Match `cluster::cluster`'s existing `wait().applied_index_at_least` usage exactly.)
 
-- [ ] **Step 6: Run the focused test + executor regressions — expect PASS**
+- [ ] **Step 6: Add the gateway_local full atomic-commit + rollback tests (moved from T4 per H4)**
 
-Run: `cargo nextest run -p executor durable_global_snapshot_resolves_committed_against_range0` then `cargo nextest run -p executor` and `cargo nextest run -p cluster --test gateway_local --test crossrange_2pc`.
-Expected: PASS (the barrier is `None` on single-node gateway_local where the node leads range 0, so it is a fast local ReadIndex; the in-process `crossrange_2pc` uses `LocalCoordinator` + the in-memory GTM snapshot path, unaffected).
+Now that durable-`gsnap` reconstruction is wired, range-1 (`b`) reads back. Add to `crates/cluster/tests/gateway_local.rs` (they reuse the `row_count` helper added in T4):
 
-- [ ] **Step 7: Commit**
+```rust
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_commits_a_cross_range_transaction_atomically() {
+    let (_node, sql_addr) = start_two_range_node().await;
+    let port = sql_addr.rsplit(':').next().expect("port");
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
+    let (client, connection) = connect_with_retry(&conn_str).await;
+    tokio::spawn(connection);
+    client.simple_query("CREATE TABLE a (id int4)").await.expect("a");
+    client.simple_query("CREATE TABLE b (id int4)").await.expect("b");
+    client.simple_query("BEGIN").await.expect("begin");
+    client.simple_query("INSERT INTO a VALUES (1)").await.expect("pin range 0");
+    client.simple_query("INSERT INTO b VALUES (2)").await.expect("escalate range 1");
+    client.simple_query("COMMIT").await.expect("atomic cross-range commit");
+    // BOTH rows visible after COMMIT — range-1 `b` resolves via the durable gsnap.
+    let a = client.simple_query("SELECT id FROM a").await.expect("select a");
+    let b = client.simple_query("SELECT id FROM b").await.expect("select b");
+    assert_eq!(row_count(&a), 1, "range-0 row committed");
+    assert_eq!(row_count(&b), 1, "range-1 row committed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_rolls_back_a_cross_range_transaction_atomically() {
+    let (_node, sql_addr) = start_two_range_node().await;
+    let port = sql_addr.rsplit(':').next().expect("port");
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
+    let (client, connection) = connect_with_retry(&conn_str).await;
+    tokio::spawn(connection);
+    client.simple_query("CREATE TABLE a (id int4)").await.expect("a");
+    client.simple_query("CREATE TABLE b (id int4)").await.expect("b");
+    client.simple_query("BEGIN").await.expect("begin");
+    client.simple_query("INSERT INTO a VALUES (1)").await.expect("a");
+    client.simple_query("INSERT INTO b VALUES (2)").await.expect("b");
+    client.simple_query("ROLLBACK").await.expect("rollback");
+    let a = client.simple_query("SELECT id FROM a").await.expect("select a");
+    let b = client.simple_query("SELECT id FROM b").await.expect("select b");
+    assert_eq!(row_count(&a), 0, "range-0 row rolled back");
+    assert_eq!(row_count(&b), 0, "range-1 row rolled back");
+}
+```
+
+- [ ] **Step 7: Run the focused unit test + the flip tests + regressions — expect PASS**
+
+Run: `cargo nextest run -p executor durable_global_snapshot_resolves_committed_against_range0`, then `cargo nextest run -p executor`, then `cargo nextest run -p cluster --test gateway_local --test crossrange_2pc`.
+Expected: PASS — the unit test exercises the durable-`gsnap` resolver; the gateway_local flip tests now see both rows (single node leads every range, so the barrier is a fast local ReadIndex and `durable_global_snapshot` reads the node's own current range-0 store); the in-process `crossrange_2pc` stays green (`LocalCoordinator` + `begin_global_durable`, durable-`gsnap` reconstruction matches the in-doubt logic). Also run `cargo nextest run -p cluster --test jepsen_bank` to confirm SP16 cross-range conservation still holds under the durable-`gsnap` change.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/executor/src/lib.rs crates/executor/src/session.rs crates/executor/src/exec.rs crates/cluster/src/twopc.rs crates/cluster/src/server_node.rs
+git add crates/executor/src/lib.rs crates/executor/src/session.rs crates/executor/src/exec.rs crates/executor/src/gtm.rs crates/cluster/src/twopc.rs crates/cluster/src/server_node.rs crates/cluster/tests/gateway_local.rs
 git commit -m "feat(sp17): range-0 read barrier + durable-state global snapshot (cross-node visibility)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
