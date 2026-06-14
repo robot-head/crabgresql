@@ -94,6 +94,8 @@ fn resolve_targets(t: &Table, columns: &Option<Vec<String>>) -> Result<Vec<usize
 pub(crate) async fn execute_write(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     procarray: &crate::procarray::ProcArray,
     lockmgr: &crate::lockmgr::RowLockManager,
     seq: &crate::seq::SequenceManager,
@@ -168,7 +170,9 @@ pub(crate) async fn execute_write(
                 })
                 .collect::<Result<_, _>>()?;
             let mut n: u64 = 0;
-            for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+            for (rowid, _xmin, scanned_row) in
+                scan_live(kv, global, gsnap, snapshot, Some(xid), &t)?
+            {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause (avoids over-locking and
                 //    restores row-level write concurrency for different rows).
@@ -185,8 +189,17 @@ pub(crate) async fn execute_write(
                 }
                 // 3. EvalPlanQual: re-read this row under the lock and decide what to
                 //    operate on (40001 under RR if changed since our snapshot).
-                let Some((cur_xmin, cur_row)) =
-                    eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+                let Some((cur_xmin, cur_row)) = eval_plan_qual(
+                    kv,
+                    global,
+                    gsnap,
+                    procarray,
+                    snapshot,
+                    &t,
+                    rowid,
+                    xid,
+                    repeatable_read,
+                )?
                 else {
                     continue; // deleted by a concurrent committed txn — skip
                 };
@@ -232,7 +245,9 @@ pub(crate) async fn execute_write(
         Statement::Delete { table, filter } => {
             let t = catalog::get_table(catalog_kv, table)?;
             let mut n: u64 = 0;
-            for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+            for (rowid, _xmin, scanned_row) in
+                scan_live(kv, global, gsnap, snapshot, Some(xid), &t)?
+            {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause.
                 if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
@@ -247,8 +262,17 @@ pub(crate) async fn execute_write(
                     Err(()) => return Err(ExecError::Deadlock),
                 }
                 // 3. EvalPlanQual: re-read this row under the lock.
-                let Some((cur_xmin, cur_row)) =
-                    eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+                let Some((cur_xmin, cur_row)) = eval_plan_qual(
+                    kv,
+                    global,
+                    gsnap,
+                    procarray,
+                    snapshot,
+                    &t,
+                    rowid,
+                    xid,
+                    repeatable_read,
+                )?
                 else {
                     continue; // already deleted by a concurrent committed txn
                 };
@@ -291,18 +315,57 @@ fn snapshot_can_see(snapshot: &mvcc::visibility::Snapshot, xid: u64) -> bool {
     xid < snapshot.xmax && !snapshot.xip.contains(&xid)
 }
 
+/// The global-aware clog resolver handed to `satisfies_mvcc`. Given this range's
+/// local xid `Li`, reads this range's clog (`local`); a terminal status is
+/// returned unchanged (today's single-range behavior). A `Prepared(Li -> g)`
+/// marker is deref'd to range 0's global clog (`global`): if `g` is still
+/// in-doubt as of the reader's global snapshot (`gsnap`) it reports `InProgress`
+/// (the cross-range row is invisible until the global commit decision); once `g`
+/// is settled relative to `gsnap`, range 0's global-clog status for `g` is the
+/// answer — so both ranges' Prepared rows flip visible together at the single
+/// `Committed(g)` instant.
+///
+/// For a single-range (non-GTM) engine the caller passes `global = local` and
+/// `gsnap = NO_GLOBAL_SNAPSHOT()`; no `Prepared` tuple ever exists there, so the
+/// `Prepared` arm is unreachable and behavior is byte-for-byte unchanged.
+pub(crate) fn global_status<'a>(
+    local: &'a dyn kv::Kv,
+    global: &'a dyn kv::Kv,
+    gsnap: &'a mvcc::visibility::Snapshot,
+) -> impl Fn(u64) -> Result<mvcc::clog::XidStatus, kv::KvError> + 'a {
+    use mvcc::clog::XidStatus;
+    move |xid| match mvcc::clog::get(local, xid)? {
+        XidStatus::Prepared(g) => {
+            if g >= gsnap.xmax || gsnap.xip.binary_search(&g).is_ok() {
+                Ok(XidStatus::InProgress) // global txn in-doubt as of my global snapshot
+            } else {
+                Ok(mvcc::clog::get(global, g)?) // settled: range 0's global decision
+            }
+        }
+        other => Ok(other),
+    }
+}
+
 /// Find the single version of `rowid` visible to `snap` (with own-xid
 /// read-your-writes) among already-decoded `versions`. Mirrors `scan_live`'s
 /// per-version `satisfies_mvcc` check, but over one rowid's versions.
 fn find_visible_one(
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     snap: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     versions: &[(u64, u64, Vec<pgtypes::Datum>)],
 ) -> Result<Option<(u64, Vec<pgtypes::Datum>)>, ExecError> {
     let mut visible: Option<(u64, Vec<pgtypes::Datum>)> = None;
     for (xmin, xmax, row) in versions {
-        if mvcc::visibility::satisfies_mvcc(*xmin, *xmax, snap, own, |x| mvcc::clog::get(kv, x))? {
+        if mvcc::visibility::satisfies_mvcc(
+            *xmin,
+            *xmax,
+            snap,
+            own,
+            global_status(kv, global, gsnap),
+        )? {
             visible = Some((*xmin, row.clone())); // MVCC invariant: at most one
         }
     }
@@ -313,8 +376,11 @@ fn find_visible_one(
 /// operate on, or None to skip. Under REPEATABLE READ, a row changed by a txn
 /// that committed after our snapshot is a serialization failure (40001). Under
 /// READ COMMITTED, re-find the latest live version (a fresh snapshot).
+#[allow(clippy::too_many_arguments)]
 fn eval_plan_qual(
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     procarray: &crate::procarray::ProcArray,
     snapshot: &mvcc::visibility::Snapshot, // the txn snapshot (RR) used to detect "changed since"
     table: &catalog::Table,
@@ -332,13 +398,13 @@ fn eval_plan_qual(
     }
     // Is the row's latest committed version deleted/superseded by a transaction
     // NOT visible to our txn snapshot (committed AFTER it), other than ourselves?
+    // The resolver derefs a Prepared(xmx -> g) deleter to range 0's global
+    // decision so a cross-range supersede is detected exactly when it commits.
+    let resolve = global_status(kv, global, gsnap);
     let changed_since_snapshot = versions.iter().any(|&(_xmn, xmx, _)| {
         xmx != mvcc::xid::INVALID_XID
             && xmx != xid
-            && matches!(
-                mvcc::clog::get(kv, xmx),
-                Ok(mvcc::clog::XidStatus::Committed)
-            )
+            && matches!(resolve(xmx), Ok(mvcc::clog::XidStatus::Committed))
             && !snapshot_can_see(snapshot, xmx)
     });
     if changed_since_snapshot {
@@ -347,10 +413,10 @@ fn eval_plan_qual(
         }
         // READ COMMITTED: re-find the latest live version under a FRESH snapshot.
         let fresh = procarray.snapshot();
-        return find_visible_one(kv, &fresh, Some(xid), &versions);
+        return find_visible_one(kv, global, gsnap, &fresh, Some(xid), &versions);
     }
     // No concurrent committed change: find the version visible to our snapshot.
-    find_visible_one(kv, snapshot, Some(xid), &versions)
+    find_visible_one(kv, global, gsnap, snapshot, Some(xid), &versions)
 }
 
 /// Coerce an evaluated value into a target column type (assignment context).
@@ -381,6 +447,8 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
 /// of each live row, sorted by rowid.
 pub(crate) fn scan_live(
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     table: &catalog::Table,
@@ -395,9 +463,13 @@ pub(crate) fn scan_live(
         while i < scanned.len() && mvcc::version::row_prefix_of(&scanned[i].0)? == prefix.as_slice()
         {
             let (xmin, xmax, row) = mvcc::version::decode_tuple(&scanned[i].1)?;
-            if mvcc::visibility::satisfies_mvcc(xmin, xmax, snapshot, own, |x| {
-                mvcc::clog::get(kv, x)
-            })? {
+            if mvcc::visibility::satisfies_mvcc(
+                xmin,
+                xmax,
+                snapshot,
+                own,
+                global_status(kv, global, gsnap),
+            )? {
                 visible = Some((xmin, row)); // the MVCC invariant: at most one
             }
             i += 1;
@@ -428,9 +500,12 @@ fn row_matches(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_read(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     stmt: &Statement,
@@ -446,7 +521,7 @@ pub(crate) fn execute_read(
     // Source rows: scan the table (dropping the rowid/xmin for projection), or a
     // single empty row for FROM-less SELECT.
     let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => scan_live(kv, snapshot, own, t)?
+        Some(t) => scan_live(kv, global, gsnap, snapshot, own, t)?
             .into_iter()
             .map(|(_, _, row)| row)
             .collect(),
@@ -471,6 +546,8 @@ pub(crate) fn execute_read(
 pub(crate) async fn execute_read_locking(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
     procarray: &crate::procarray::ProcArray,
     lockmgr: &crate::lockmgr::RowLockManager,
     snapshot: &mvcc::visibility::Snapshot,
@@ -489,7 +566,7 @@ pub(crate) async fn execute_read_locking(
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
-    for (rowid, _xmin, scanned_row) in scan_live(kv, snapshot, Some(xid), &t)? {
+    for (rowid, _xmin, scanned_row) in scan_live(kv, global, gsnap, snapshot, Some(xid), &t)? {
         // 1. Filter on the snapshot-visible row FIRST — only lock rows that
         //    match the WHERE clause (a FOR UPDATE/SHARE with no WHERE still
         //    locks all rows because row_matches(None, ..) returns true).
@@ -505,8 +582,17 @@ pub(crate) async fn execute_read_locking(
 
         // 3. EvalPlanQual: re-read the row under the lock (40001 under RR if
         //    changed since our snapshot; RC re-finds the latest live version).
-        let Some((_cur_xmin, cur_row)) =
-            eval_plan_qual(kv, procarray, snapshot, &t, rowid, xid, repeatable_read)?
+        let Some((_cur_xmin, cur_row)) = eval_plan_qual(
+            kv,
+            global,
+            gsnap,
+            procarray,
+            snapshot,
+            &t,
+            rowid,
+            xid,
+            repeatable_read,
+        )?
         else {
             continue; // deleted by a concurrent committed txn — skip
         };
@@ -709,6 +795,51 @@ pub(crate) fn describe(
 mod tests {
     use crate::{SqlEngine, SqlSession};
     use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult, Session};
+
+    #[test]
+    fn global_status_derefs_prepared_to_range0_global_clog() {
+        use super::global_status;
+        use kv::{Kv, MemKv};
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let (local, global) = (MemKv::new(), MemKv::new());
+        let li = 5u64;
+        let g = GLOBAL_XID_BASE + 1;
+        local
+            .write_batch(&[put_op(li, XidStatus::Prepared(g))])
+            .expect("put prepared marker");
+        // G in-doubt (not in global clog, gsnap says running) => InProgress (invisible)
+        let running = mvcc::visibility::Snapshot {
+            xmin: g,
+            xmax: g + 1,
+            xip: vec![g],
+        };
+        assert_eq!(
+            global_status(&local, &global, &running)(li).expect("resolve in-doubt"),
+            XidStatus::InProgress
+        );
+        // G committed + settled (gsnap moved past it) => Committed (visible)
+        global
+            .write_batch(&[put_op(g, XidStatus::Committed)])
+            .expect("put global commit");
+        let settled = mvcc::visibility::Snapshot {
+            xmin: g + 2,
+            xmax: g + 2,
+            xip: vec![],
+        };
+        assert_eq!(
+            global_status(&local, &global, &settled)(li).expect("resolve settled"),
+            XidStatus::Committed
+        );
+        // A plain local xid is unaffected.
+        local
+            .write_batch(&[put_op(3, XidStatus::Committed)])
+            .expect("put local commit");
+        assert_eq!(
+            global_status(&local, &global, &settled)(3).expect("resolve local"),
+            XidStatus::Committed
+        );
+    }
 
     async fn run_s(s: &mut SqlSession, sql: &str) -> Vec<QueryResult> {
         s.simple_query(sql).await.expect("ok")
