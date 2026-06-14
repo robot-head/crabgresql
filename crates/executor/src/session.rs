@@ -45,6 +45,9 @@ enum TxnState {
 /// connections.
 pub struct SqlSession {
     pub(crate) kv: Arc<dyn Kv>,
+    /// The store catalog (schema) lookups resolve through. Same as `kv` for the
+    /// single-range engine; range 0's store for a multi-range data node.
+    catalog_kv: Arc<dyn Kv>,
     procarray: Arc<ProcArray>,
     seq: Arc<SequenceManager>,
     lockmgr: Arc<RowLockManager>,
@@ -62,6 +65,7 @@ impl SqlSession {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         kv: Arc<dyn Kv>,
+        catalog_kv: Arc<dyn Kv>,
         procarray: Arc<ProcArray>,
         seq: Arc<SequenceManager>,
         lockmgr: Arc<RowLockManager>,
@@ -72,6 +76,7 @@ impl SqlSession {
     ) -> Self {
         Self {
             kv,
+            catalog_kv,
             procarray,
             seq,
             lockmgr,
@@ -81,6 +86,11 @@ impl SqlSession {
             persist_mode,
             state: TxnState::Idle,
         }
+    }
+
+    /// Execute one already-parsed statement (the router parses once, then routes).
+    pub async fn run(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        self.run_one(stmt).await
     }
 
     async fn run_one(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
@@ -214,7 +224,7 @@ impl SqlSession {
 
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let (snapshot, own) = self.read_context().await?;
-        crate::exec::execute_read(&*self.kv, &snapshot, own, stmt)
+        crate::exec::execute_read(&*self.catalog_kv, &*self.kv, &snapshot, own, stmt)
     }
 
     /// Locking SELECT (FOR UPDATE / FOR SHARE). Allocates an xid if none is
@@ -262,6 +272,7 @@ impl SqlSession {
                 // Errors propagate to run_one which transitions to Failed,
                 // keeping the xid + locks until COMMIT/ROLLBACK.
                 crate::exec::execute_read_locking(
+                    &*self.catalog_kv,
                     &*kv,
                     &self.procarray,
                     &self.lockmgr,
@@ -284,6 +295,7 @@ impl SqlSession {
                 let snapshot = self.procarray.snapshot();
                 let kv = Arc::clone(&self.kv);
                 let result = crate::exec::execute_read_locking(
+                    &*self.catalog_kv,
                     &*kv,
                     &self.procarray,
                     &self.lockmgr,
@@ -392,6 +404,7 @@ impl SqlSession {
                 // next_xid op into this batch (the state machine max-merges it;
                 // re-folding on a later write in the same txn is harmless).
                 let (result, mut ops) = crate::exec::execute_write(
+                    &*self.catalog_kv,
                     &*kv,
                     &self.procarray,
                     &self.lockmgr,
@@ -416,6 +429,7 @@ impl SqlSession {
                 let snapshot = self.procarray.snapshot();
                 let kv = Arc::clone(&self.kv);
                 let outcome = crate::exec::execute_write(
+                    &*self.catalog_kv,
                     &*kv,
                     &self.procarray,
                     &self.lockmgr,
@@ -510,7 +524,7 @@ impl Session for SqlSession {
     }
 
     async fn describe(&mut self, sql: &str) -> Result<Vec<FieldDescription>, PgError> {
-        crate::exec::describe(&*self.kv, sql).map_err(ExecError::into_pg)
+        crate::exec::describe(&*self.catalog_kv, &*self.kv, sql).map_err(ExecError::into_pg)
     }
 
     fn tx_status(&self) -> TxStatus {

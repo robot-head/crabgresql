@@ -64,7 +64,7 @@ impl Cluster {
         let sb = Switchboard::new();
         let mut nodes = Vec::new();
         for id in 0..n {
-            nodes.push(Node::start_with_config(id, sb.clone(), config.clone()).await);
+            nodes.push(Node::start_with_config(0, id, sb.clone(), config.clone()).await);
         }
         let members: BTreeMap<NodeId, BasicNode> =
             (0..n).map(|id| (id, BasicNode::default())).collect();
@@ -79,7 +79,7 @@ impl Cluster {
         for id in 0..n {
             let dir = base_dir.join(format!("node-{id}"));
             std::fs::create_dir_all(&dir).expect("mkdir node");
-            nodes.push(Node::start_durable(id, sb.clone(), dir, Node::default_config()).await);
+            nodes.push(Node::start_durable(0, id, sb.clone(), dir, Node::default_config()).await);
         }
         let members: BTreeMap<NodeId, BasicNode> =
             (0..n).map(|id| (id, BasicNode::default())).collect();
@@ -111,13 +111,17 @@ impl Cluster {
     pub async fn restart(&mut self, id: NodeId) {
         let i = id as usize;
         let dir = self.nodes[i].dir.clone().expect("durable node has a dir");
+        // The single-range cluster lives at range 0; deregister/reopen the same
+        // (range, id) the node registered under.
+        let range = self.nodes[i].range;
         // Take ownership of the old node out of the vec (remove+insert at the same
         // index preserves order and keeps `nodes[id]` stable).
         let old = self.nodes.remove(i);
         old.raft.shutdown().await.ok(); // join the core; releases the log-store Arc
-        self.sb.deregister(id); // drop the switchboard's (now-dead) handle
+        self.sb.deregister(range, id); // drop the switchboard's (now-dead) handle
         drop(old); // drop sm_kv's Database Arc (SM-worker Arc drops just after)
-        let new = Node::start_durable(id, self.sb.clone(), dir, Node::default_config()).await;
+        let new =
+            Node::start_durable(range, id, self.sb.clone(), dir, Node::default_config()).await;
         self.nodes.insert(i, new);
     }
 

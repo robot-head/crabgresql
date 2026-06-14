@@ -48,6 +48,11 @@ pub(crate) enum PersistMode {
 /// snapshots see the same running-transaction set.
 pub struct SqlEngine {
     pub(crate) kv: Arc<dyn Kv>,
+    /// The store catalog lookups (table name→id→schema) resolve through. For the
+    /// single-range engine this is the same store as `kv`; under multi-range
+    /// sharding the catalog lives only on range 0, so a data range's engine
+    /// points this at range 0's store while `kv` holds its own rows.
+    pub(crate) catalog_kv: Arc<dyn Kv>,
     pub(crate) procarray: Arc<ProcArray>,
     pub(crate) seq: Arc<SequenceManager>,
     pub(crate) lockmgr: Arc<RowLockManager>,
@@ -81,6 +86,7 @@ impl SqlEngine {
                 kv: Arc::clone(&kv),
             });
         Ok(Self {
+            catalog_kv: Arc::clone(&kv),
             kv,
             procarray,
             seq: Arc::new(SequenceManager::new(PersistMode::Durable)),
@@ -95,7 +101,12 @@ impl SqlEngine {
     /// Build an engine whose reads come from `sm_kv` (the applied state machine)
     /// and whose writes are proposed through `committer` (a RaftCommitter). Uses
     /// the Replicated persist mode so counters fold into the proposed batch.
+    ///
+    /// `catalog_kv` is the store catalog (schema) lookups resolve through. For a
+    /// single-range node it is the same `Arc` as `sm_kv`; a multi-range data
+    /// node passes range 0's applied store here while `sm_kv` holds its own rows.
     pub fn replicated(
+        catalog_kv: Arc<dyn Kv>,
         sm_kv: Arc<dyn Kv>,
         committer: Arc<dyn crate::commit::Committer>,
         linearizer: Arc<dyn crate::read_gate::Linearizer>,
@@ -105,6 +116,7 @@ impl SqlEngine {
             PersistMode::Replicated,
         )?);
         Ok(Self {
+            catalog_kv,
             kv: sm_kv,
             procarray,
             seq: Arc::new(SequenceManager::new(PersistMode::Replicated)),
@@ -130,6 +142,7 @@ impl Engine for SqlEngine {
     fn connect(&self) -> SqlSession {
         SqlSession::new(
             Arc::clone(&self.kv),
+            Arc::clone(&self.catalog_kv),
             Arc::clone(&self.procarray),
             Arc::clone(&self.seq),
             Arc::clone(&self.lockmgr),

@@ -538,10 +538,12 @@ name = "cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "catalog",
  "executor",
  "fjall",
  "kv",
  "openraft",
+ "pgparser",
  "pgwire",
  "proptest",
  "serde",
