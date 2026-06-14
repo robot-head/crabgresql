@@ -113,6 +113,12 @@ pub struct RangeRouter {
     forward: Arc<dyn RemoteForward>,
     /// The text of the in-flight `simple_query` — what the forward seam relays.
     cur_sql: String,
+    /// True while executing a MULTI-statement simple-query frame. The forward seam
+    /// relays the whole `cur_sql` frame, so forwarding one statement of a
+    /// multi-statement frame would re-execute the others on the remote leader; such a
+    /// forward is rejected with `0A000` (a per-statement-text relay is D3b). A
+    /// single-statement frame — the routed surface — forwards correctly.
+    frame_multi: bool,
 }
 
 impl RangeRouter {
@@ -135,6 +141,7 @@ impl RangeRouter {
             catalog_kv,
             forward,
             cur_sql: String::new(),
+            frame_multi: false,
         }
     }
 
@@ -267,8 +274,8 @@ impl RangeRouter {
     }
 
     /// Run a statement on `range`: locally only when this node holds a local engine
-    /// for the range AND currently leads it; otherwise forward the in-flight
-    /// simple-query text to the remote leader through the seam.
+    /// for the range AND currently leads it; otherwise forward to the remote leader
+    /// through the seam.
     ///
     /// The leadership check is essential under co-located placement (every node
     /// holds a replica of every range): without it, a statement landing on a
@@ -276,12 +283,23 @@ impl RangeRouter {
     /// `ForwardToLeader` → `ExecError::NotLeader` → SQLSTATE 40001 instead of being
     /// forwarded. `leads` borrows a metrics watch and drops the `Ref` before
     /// returning (synchronous — no `Ref` held across the `.await` below).
+    ///
+    /// The forward seam relays the whole in-flight `cur_sql` frame — exact for a
+    /// single-statement frame (the routed surface), but forwarding from within a
+    /// MULTI-statement frame would re-execute the frame's other statements on the
+    /// remote leader, so it is rejected with `0A000` (consistent with the cross-range
+    /// non-goal; full multi-statement forwarding via per-statement text is D3b).
     async fn run_on(&mut self, range: RangeId, stmt: &Statement) -> Result<QueryResult, ExecError> {
         if self.engines.contains_key(&range) && self.leads.leads(range) {
             return self.session_mut(range).run(stmt).await;
         }
-        // Not the local leader of this range → remote. The forward seam relays the
-        // single statement text (the pgwire `Query`) and returns its one result.
+        // Not the local leader of this range → remote.
+        if self.frame_multi {
+            return Err(ExecError::Unsupported(
+                "a multi-statement simple query may not be forwarded across ranges yet (D3b)"
+                    .into(),
+            ));
+        }
         let sql = self.cur_sql.clone();
         self.forward.forward(range, &sql).await
     }
@@ -305,6 +323,7 @@ impl RangeRouter {
     pub async fn simple(&mut self, sql: &str) -> Result<QueryResult, PgError> {
         let stmts = pgparser::parse(sql).map_err(|e| ExecError::Parse(e).into_pg())?;
         self.cur_sql = sql.to_string();
+        self.frame_multi = stmts.len() > 1;
         let mut last = QueryResult::Command { tag: "OK".into() };
         for stmt in &stmts {
             last = self.dispatch(stmt).await.map_err(ExecError::into_pg)?;
@@ -326,6 +345,7 @@ impl pgwire::engine::Session for RangeRouter {
             return Ok(vec![QueryResult::Empty]);
         }
         self.cur_sql = sql.to_string();
+        self.frame_multi = stmts.len() > 1;
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
             results.push(self.dispatch(stmt).await.map_err(ExecError::into_pg)?);
@@ -482,5 +502,60 @@ mod gateway_seam_tests {
             .await
             .expect_err("no local range-1 engine → forward");
         assert_eq!(err.code, "0A000", "RejectForward stub surfaces 0A000");
+    }
+
+    /// A forward seam that always succeeds — lets us prove the multi-statement guard
+    /// fires BEFORE forwarding (a 0A000 with this seam can only be the guard).
+    struct OkForward;
+    impl RemoteForward for OkForward {
+        fn forward<'a>(
+            &'a self,
+            _range: RangeId,
+            _sql: &'a str,
+        ) -> FuturePin<
+            Box<dyn std::future::Future<Output = Result<QueryResult, ExecError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(QueryResult::Command { tag: "OK".into() }) })
+        }
+    }
+
+    /// A single-statement frame to a non-local range forwards; a MULTI-statement
+    /// frame is rejected with 0A000 (the guard) rather than re-executing the whole
+    /// frame on the remote leader (which would duplicate the other statements).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multi_statement_frame_is_not_forwarded_across_ranges() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a");
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b");
+        c.wait_for_replication(0).await;
+
+        let mut engines = HashMap::new();
+        engines.insert(0, c.leader_engine(0).await);
+        let mut router = RangeRouter::new(
+            c.range_map().clone(),
+            engines,
+            Arc::new(AlwaysLeads),
+            c.catalog_kv().await,
+            Arc::new(OkForward),
+        );
+        // Single-statement forward to the non-local range succeeds (OkForward).
+        router
+            .simple("INSERT INTO b VALUES (1)")
+            .await
+            .expect("single-statement forward succeeds");
+        // A multi-statement frame whose statements target the non-local range is
+        // rejected by the guard, before the (succeeding) forward.
+        let err = router
+            .simple("INSERT INTO b VALUES (2); INSERT INTO b VALUES (3)")
+            .await
+            .expect_err("multi-statement forward is rejected");
+        assert_eq!(
+            err.code, "0A000",
+            "multi-statement forward guard surfaces 0A000"
+        );
     }
 }
