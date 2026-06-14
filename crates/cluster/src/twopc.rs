@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use executor::SqlEngine;
+use pgwire::engine::Engine;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -154,9 +156,202 @@ impl TwoPcClient {
     }
 }
 
+/// Participant-side held-session registry. Lives on each node; resolves the
+/// node's per-range engines and keeps one `SqlSession` per in-flight `(G, range)`
+/// it participates in, detached from any TCP connection so a later `Release(G)`
+/// from a different connection finds it. Each session is its OWN `Arc<Mutex>` so
+/// the map lock is held only for lookup/insert/remove — NEVER across session work
+/// (holding the map lock across `session.run().await` would deadlock a Stage that
+/// blocks on a row lock held by another g against the Release that frees it).
+type HeldSession = Arc<Mutex<executor::SqlSession>>;
+
+#[derive(Clone)]
+pub struct TxnService {
+    engines: HashMap<RangeId, Arc<SqlEngine>>,
+    held: Arc<Mutex<HashMap<(u64, RangeId), HeldSession>>>,
+}
+
+impl TxnService {
+    pub fn new(engines: HashMap<RangeId, Arc<SqlEngine>>) -> Self {
+        Self {
+            engines,
+            held: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn engine(&self, range: RangeId) -> Option<&Arc<SqlEngine>> {
+        self.engines.get(&range)
+    }
+
+    #[cfg(test)]
+    pub async fn holds(&self, g: u64, range: RangeId) -> bool {
+        self.held.lock().await.contains_key(&(g, range))
+    }
+
+    /// Drop every held session for `range` (presumed-abort), freeing its locks.
+    /// Called on the loss of `range` leadership. Always safe: the global clog is
+    /// the sole arbiter (a committed g's durable Prepared rows stay visible; an
+    /// undecided g's rows are invisible). Sessions taken out under a brief map
+    /// lock, guard dropped, THEN aborted.
+    pub async fn release_all_for_range(&self, range: RangeId) {
+        let victims: Vec<HeldSession> = {
+            let mut held = self.held.lock().await;
+            let keys: Vec<(u64, RangeId)> =
+                held.keys().copied().filter(|&(_, r)| r == range).collect();
+            keys.into_iter().filter_map(|k| held.remove(&k)).collect()
+        };
+        for s in victims {
+            s.lock().await.abort_release();
+        }
+    }
+
+    /// Dispatch a participant-targeted `TxnRpc` (`Stage`/`Release`). Global ops
+    /// are handled by `server::handle_txn` against range 0's engine/raft.
+    pub async fn handle(&self, _range: RangeId, rpc: TxnRpc) -> TxnResp {
+        match rpc {
+            TxnRpc::Stage { g, range: r, sql } => self.stage(g, r, &sql).await,
+            TxnRpc::Release {
+                g,
+                range: r,
+                commit,
+            } => self.release(g, r, commit).await,
+            _ => TxnResp::Err("non-participant rpc routed to TxnService".into()),
+        }
+    }
+
+    /// Get-or-create the held session for `(g, range)` under a BRIEF map lock,
+    /// returning a clone of its `Arc<Mutex>` (map guard dropped before any await).
+    async fn session_handle(&self, g: u64, range: RangeId) -> Option<HeldSession> {
+        let engine = self.engines.get(&range)?.clone();
+        let mut held = self.held.lock().await;
+        Some(
+            held.entry((g, range))
+                .or_insert_with(|| Arc::new(Mutex::new(engine.connect())))
+                .clone(),
+        )
+    }
+
+    async fn stage(&self, g: u64, range: RangeId, sql: &str) -> TxnResp {
+        let stmt = match pgparser::parse(sql) {
+            Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
+            _ => return TxnResp::Err("stage expects exactly one statement".into()),
+        };
+        let Some(handle) = self.session_handle(g, range).await else {
+            return TxnResp::Err(format!("no engine for range {range}"));
+        };
+        let mut session = handle.lock().await; // per-session lock only; map lock dropped
+        if let Err(e) = session.ensure_began().await {
+            return map_exec_err(e);
+        }
+        if let Err(e) = session.join_global(g).await {
+            return map_exec_err(e);
+        }
+        match session.run(&stmt).await {
+            Ok(_) => TxnResp::Staged,
+            Err(e) => map_exec_err(e),
+        }
+    }
+
+    async fn release(&self, g: u64, range: RangeId, commit: bool) -> TxnResp {
+        let handle = { self.held.lock().await.remove(&(g, range)) };
+        if let Some(handle) = handle {
+            let mut session = handle.lock().await;
+            if commit {
+                session.commit_release()
+            } else {
+                session.abort_release()
+            }
+        }
+        TxnResp::Released // unknown (g,range) -> idempotent no-op success
+    }
+}
+
+/// Map an `ExecError` from a staged statement to a wire response, PRESERVING the
+/// retryable serialization-failure class (collapsing 40001 to 0A000 would make a
+/// retryable conflict look like an unsupported feature).
+fn map_exec_err(e: executor::ExecError) -> TxnResp {
+    use executor::ExecError;
+    match e {
+        ExecError::NotLeader => TxnResp::NotLeader,
+        ExecError::SerializationFailure | ExecError::Deadlock => TxnResp::Retryable,
+        other => TxnResp::Err(format!("{other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use pgwire::engine::Engine;
+
     use crate::transport::protocol::{NodeRequest, NodeResponse, TxnResp, TxnRpc};
+    use crate::twopc::TxnService;
+
+    fn parse_one(sql: &str) -> pgparser::ast::Statement {
+        pgparser::parse(sql)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one statement")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_then_release_holds_then_frees_a_per_g_session() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let svc = TxnService::new(node.engines.clone());
+
+        // DDL (CREATE TABLE) must run through range-0's engine (catalog lives there).
+        // Table id 2 is assigned by the counter → falls in range 1 (boundary at 2).
+        // First allocate table id 1 (range 0's "a" slot) so that the next allocation
+        // gives id 2 (range 1). We create TWO tables so the second lands in range 1.
+        let mut ddl = node.engines[&0].connect();
+        ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
+            .await
+            .expect("create placeholder → table id 1, range 0");
+        ddl.run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("create b → table id 2, range 1");
+
+        // Insert the seed row via range-1's engine (DML goes to the data range).
+        let mut seed = node.engines[&1].connect();
+        seed.run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed b");
+
+        let g: u64 = mvcc::xid::GLOBAL_XID_BASE + 7;
+        match svc
+            .handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into(),
+                },
+            )
+            .await
+        {
+            TxnResp::Staged => {}
+            other => panic!("expected Staged, got {other:?}"),
+        }
+        assert!(
+            svc.holds(g, 1).await,
+            "Stage parks a held session under (g, range)"
+        );
+
+        match svc
+            .handle(
+                1,
+                TxnRpc::Release {
+                    g,
+                    range: 1,
+                    commit: true,
+                },
+            )
+            .await
+        {
+            TxnResp::Released => {}
+            other => panic!("expected Released, got {other:?}"),
+        }
+        assert!(!svc.holds(g, 1).await, "Release drops the held session");
+    }
 
     #[test]
     fn txn_rpc_round_trips_through_json() {

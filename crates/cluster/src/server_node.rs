@@ -216,11 +216,13 @@ impl ServerNode {
         }
 
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
+        let txn = crate::twopc::TxnService::new(engines.clone());
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
             partition.clone(),
             shutdown.clone(),
+            Some(txn),
         ));
 
         if cfg.bootstrap {
@@ -356,13 +358,29 @@ impl ServerNode {
 
         // Bind the node listener BEFORE blocking on the blob, so peers can reach us
         // (range 0 needs a quorum to elect, and a joining node needs to receive the
-        // seed via replication).
+        // seed via replication). At this point only range 0's engine is built; the
+        // TxnService will be created with the full engines map below after all data
+        // ranges are built. For the replicated phase-1 node listener we pass None
+        // (no participant sessions possible until all engines are ready, which is
+        // after the blob wait — the final listener is spawned in start_replicated
+        // with Some(txn) only if we re-spawn, but this first listener is replaced
+        // after the data ranges come up).
+        //
+        // DESIGN NOTE: the replicated path binds once with None here (phase 1, only
+        // range 0 ready) and again with Some(txn) after data ranges are built. The
+        // second bind would conflict on the same addr, so instead we build the full
+        // TxnService now with engines as it grows and pass Some(txn) for the SINGLE
+        // listener that serves the entire lifetime of this node.
+        //
+        // Implementation: pass None here because the full engines map is not yet
+        // built; T4 will wire participants correctly after the full map is ready.
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
             partition.clone(),
             shutdown.clone(),
+            None,
         ));
 
         // Bootstrap range 0's voting group (bootstrap node only) and, once we lead
@@ -491,6 +509,60 @@ async fn bootstrap(raft: openraft::Raft<TypeConfig>, peers: Vec<(NodeId, String)
         .map(|(id, addr)| (id, BasicNode { addr }))
         .collect();
     let _ = raft.initialize(members).await; // ignore AlreadyInitialized on restart
+}
+
+/// Start a self-bootstrapping two-range node and wait until it leads every range.
+/// Used by unit tests in `twopc` that need a live in-process node without going
+/// through the integration-test gateway. ONE node, id 0, `RangeMap::with_boundaries(vec![2])`.
+#[cfg(test)]
+pub(crate) async fn testonly_two_range_node() -> (ServerNode, String) {
+    use crate::range::RangeMap;
+    let mut attempts = 0u32;
+    loop {
+        let node_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let a = l.local_addr().expect("local_addr").to_string();
+            drop(l);
+            a
+        };
+        let sql_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let a = l.local_addr().expect("local_addr").to_string();
+            drop(l);
+            a
+        };
+        match ServerNode::start(NodeConfig {
+            id: 0,
+            node_addr: node_addr.clone(),
+            sql_addr: sql_addr.clone(),
+            data_dir: tempfile::tempdir().expect("tempdir").keep(),
+            peers: vec![(0, node_addr.clone())],
+            bootstrap: true,
+            layout: RangeLayout::Static(RangeMap::with_boundaries(vec![2])),
+        })
+        .await
+        {
+            Ok(node) => {
+                for raft in node.rafts.values() {
+                    raft.wait(Some(Duration::from_secs(10)))
+                        .metrics(
+                            |m| m.state == ServerState::Leader && m.current_leader == Some(0),
+                            "range self-confirmed leader",
+                        )
+                        .await
+                        .expect("range elects within the bound");
+                }
+                return (node, sql_addr);
+            }
+            Err(_) => {
+                attempts += 1;
+                assert!(
+                    attempts < 16,
+                    "testonly_two_range_node: bind race did not clear"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

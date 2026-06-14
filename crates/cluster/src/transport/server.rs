@@ -11,6 +11,7 @@ use super::frame::{read_msg, write_msg};
 use super::partition::PartitionState;
 use super::protocol::{
     ControlRequest, ControlResponse, NodeRequest, NodeResponse, NodeStatus, RaftRpc, RaftRpcResp,
+    TxnResp, TxnRpc,
 };
 use crate::range::RangeId;
 use crate::types::{NodeId, TypeConfig};
@@ -103,13 +104,18 @@ pub async fn serve_node_protocol(
     registry: RangeRegistry,
     partition: PartitionState,
     shutdown: ShutdownSignal,
+    txn: Option<crate::twopc::TxnService>,
 ) {
     loop {
         let Ok((sock, _)) = listener.accept().await else {
             return;
         };
-        let (registry, partition, shutdown) =
-            (registry.clone(), partition.clone(), shutdown.clone());
+        let (registry, partition, shutdown, txn) = (
+            registry.clone(),
+            partition.clone(),
+            shutdown.clone(),
+            txn.clone(),
+        );
         tokio::spawn(async move {
             let mut sock = sock;
             loop {
@@ -138,11 +144,12 @@ pub async fn serve_node_protocol(
                             )),
                         }
                     }
-                    NodeRequest::Txn { .. } => {
-                        NodeResponse::Txn(crate::transport::protocol::TxnResp::Err(
-                            "txn service not wired yet (SP17 T3)".into(),
-                        ))
-                    }
+                    NodeRequest::Txn { range, rpc } => match &txn {
+                        Some(svc) => {
+                            NodeResponse::Txn(handle_txn(&registry, svc, range, rpc).await)
+                        }
+                        None => NodeResponse::Txn(TxnResp::Err("node hosts no 2PC service".into())),
+                    },
                 };
                 if write_msg(&mut sock, &resp).await.is_err() {
                     return;
@@ -205,6 +212,52 @@ async fn handle_control(
             shutdown.fire();
             ControlResponse::Ok
         }
+    }
+}
+
+async fn handle_txn(
+    registry: &RangeRegistry,
+    svc: &crate::twopc::TxnService,
+    range: RangeId,
+    rpc: TxnRpc,
+) -> TxnResp {
+    match rpc {
+        TxnRpc::BeginGlobal => match svc.engine(0) {
+            Some(e) => match e.begin_global_durable().await {
+                Ok(g) => TxnResp::Began { g },
+                Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
+                Err(e) => TxnResp::Err(format!("{e:?}")),
+            },
+            None => TxnResp::Err("no range-0 engine".into()),
+        },
+        TxnRpc::CommitGlobal { g, commit } => match svc.engine(0) {
+            Some(e) => {
+                let status = if commit {
+                    mvcc::clog::XidStatus::Committed
+                } else {
+                    mvcc::clog::XidStatus::Aborted
+                };
+                match e.commit_global_decision(g, status).await {
+                    Ok(()) => {
+                        e.finish_global(g); // prune g from in-memory running set
+                        TxnResp::Committed
+                    }
+                    Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
+                    Err(e) => TxnResp::Err(format!("{e:?}")),
+                }
+            }
+            None => TxnResp::Err("no range-0 engine".into()),
+        },
+        TxnRpc::GlobalBarrier => match resolve(registry, 0) {
+            Some(raft) => match raft.ensure_linearizable().await {
+                Ok(read_log_id) => TxnResp::Barrier {
+                    applied_index: read_log_id.map(|l| l.index).unwrap_or(0),
+                },
+                Err(_) => TxnResp::NotLeader,
+            },
+            None => TxnResp::Err("no range-0 group".into()),
+        },
+        rpc @ (TxnRpc::Stage { .. } | TxnRpc::Release { .. }) => svc.handle(range, rpc).await,
     }
 }
 
@@ -323,6 +376,7 @@ mod range_aware {
             registry,
             PartitionState::default(),
             ShutdownSignal::default(),
+            None,
         ));
 
         // Wait (event-based, no sleep) for range 1's single-voter group to lead, so

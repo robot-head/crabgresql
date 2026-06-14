@@ -69,6 +69,7 @@ impl TcpCluster {
                 registry,
                 partition.clone(),
                 ShutdownSignal::default(),
+                None,
             ));
             nodes.push(TcpNode {
                 id,
