@@ -37,6 +37,7 @@ pub struct Cluster {
     _tmp: TempDir, // base dir for all node data dirs; kept alive for the test
     peers_arg: Vec<String>,
     boundaries: Vec<u32>, // multi-range RangeMap boundaries (empty ⇒ single range)
+    replicated: bool,     // bring-up mode: true ⇒ nodes route through start_replicated
 }
 
 async fn free_port() -> u16 {
@@ -89,6 +90,7 @@ impl Cluster {
             _tmp: tmp,
             peers_arg,
             boundaries: Vec::new(),
+            replicated: false,
         };
         c.wait_for_leader().await;
         c
@@ -138,6 +140,7 @@ impl Cluster {
             _tmp: tmp,
             peers_arg,
             boundaries,
+            replicated: false,
         };
         c.wait_for_leader().await;
         c
@@ -184,13 +187,16 @@ impl Cluster {
             });
         }
         // `boundaries` is retained for respawn parity, but a respawned replicated
-        // node also reads its layout from the meta range, so its boundaries are
-        // irrelevant after the first boot.
+        // node re-boots through `start_replicated` (because `respawn` honors
+        // `self.replicated`) and reads its layout from the already-committed
+        // descriptor blob in range 0's log via `wait_for_range_map` — so its
+        // CLI boundaries are irrelevant after the first boot.
         let c = Self {
             nodes,
             _tmp: tmp,
             peers_arg,
             boundaries,
+            replicated: true,
         };
         c.wait_for_leader().await;
         c
@@ -409,6 +415,7 @@ impl Cluster {
     /// Respawn node `id` from its existing data dir (bootstrap=false; it recovers).
     pub fn respawn(&mut self, id: u64) {
         let boundaries = self.boundaries.clone();
+        let replicated = self.replicated;
         let n = &mut self.nodes[id as usize];
         n.child = spawn_node(
             id,
@@ -417,8 +424,8 @@ impl Cluster {
             &n.dir,
             &self.peers_arg,
             &boundaries,
-            false,
-            false,
+            replicated, // honor the cluster's bring-up mode (was hardcoded false)
+            false,      // bootstrap=false: recover from the durable store
         );
     }
 
