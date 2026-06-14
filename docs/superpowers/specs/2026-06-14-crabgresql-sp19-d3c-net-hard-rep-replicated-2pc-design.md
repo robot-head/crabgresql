@@ -97,10 +97,12 @@ registry it introduces is deliberately forward-compatible with D4's runtime rang
 3. **A `Stage` for an unregistered range returns a *retryable* `TxnResp::NotLeader`, not a
    hard `Err`.** In the co-located replicated layout every node eventually hosts every range,
    so "range absent from the growable map" means "this participant is still mid-bootstrap,"
-   not "wrong node." Returning `NotLeader` makes the coordinator's `TwoPcClient` retry within
-   `TXN_TIMEOUT` (re-resolving) rather than spuriously aborting the global txn. Conservation
-   holds either way (a hard-`Err` `Stage` is a clean nil abort), but this improves liveness
-   under the nemesis and across respawns. (`Release` already returns an idempotent
+   not "wrong node." Returning `NotLeader` lets the coordinator's `TwoPcClient` re-resolve once
+   within `TXN_TIMEOUT` and surfaces a *retryable* `40001` to the client rather than an
+   unsupported-feature `0A000`/hard error; it auto-succeeds only if Raft leadership actually
+   shifts during the window (otherwise the client retries the whole txn). Conservation holds
+   either way (a hard-`Err` `Stage` is a clean nil abort) — the value is a retryable signal, not
+   a guaranteed in-flight save. (`Release` already returns an idempotent
    `TxnResp::Released` no-op for an absent `(g, range)` — a session can only have been staged
    on a node whose engine was registered — so it needs no change.)
 
@@ -129,8 +131,11 @@ registry it introduces is deliberately forward-compatible with D4's runtime rang
   engine.clone()); m })` (the `rcu` closure receives `&Arc<HashMap>`). Idempotent
   (re-registering a range replaces with the same Arc).
 - `session_handle` calls `self.engine(range)?` (owned). Constraint 3 (retryable absent-range)
-  is implemented at the dispatch boundary: `handle()` returns `TxnResp::NotLeader` when
-  `session_handle` is `None` for `Stage`/`Release`, instead of `TxnResp::Err`.
+  is implemented inside **`stage`**: it resolves the engine FIRST (before `pgparser::parse`)
+  and short-circuits to `TxnResp::NotLeader` when `session_handle` is `None`, replacing the
+  current hard `TxnResp::Err("no engine for range …")`. (`handle()` just delegates `Stage` to
+  `stage`; `Release` already returns an idempotent `TxnResp::Released` for an absent
+  `(g, range)` and is unchanged.)
 - The `held` map (`Arc<Mutex<…>>`, `tokio::sync::Mutex`) is **unchanged** — its discipline
   and all of `release_all_for_range` / `sweep_stale` / `resolve_in_doubt` are untouched.
 
@@ -276,8 +281,25 @@ condition), not a fixed sleep.
   `seed_if_absent` is write-once (a no-op on restart) and `wait_for_range_map` re-reads the
   committed blob. The restart e2e is exactly the proof that this holds.
 - **The `engine()` owned-return ripple.** Changing `engine()` from `&Arc` to owned `Arc` touches
-  every caller; `cargo` makes the breakage explicit and the call sites (`handle_txn` ×2,
-  `session_handle`) all already use the value by `Deref`/`clone`. Low risk, mechanically verified.
+  every caller; `cargo` makes the breakage explicit and the call sites (exactly `handle_txn` ×2 at
+  `server.rs:242,250` and `session_handle`) all already use the value by `Deref`/`clone`. Low risk,
+  mechanically verified (the adversarial plan review confirmed no other `TxnService::engine` caller).
+- **The post-restart conservation read must be bounded-retry.** A one-shot `read_total_cross`
+  (`.expect`, no timeout) against a just-respawned node can hit a transient `08006` / a range still
+  applying the recovered blob — the exact flake class that failed PR #34's `check` job. Mitigated by
+  a `read_total_cross_until_ok` helper that re-resolves a live gateway and retries each SELECT under a
+  bounded deadline (never a settle-sleep).
+- **The all-node restart depends on leaderless re-election from persisted membership.** `respawn`
+  passes `bootstrap=false`, so every node re-forms quorum on both ranges from its persisted Raft
+  membership alone (no bootstrap hint). Standard Raft recovers this, but no existing test exercises a
+  whole-cluster replicated restart — so the plan de-risks it with an isolated re-election check before
+  the e2e relies on it; if the cluster cannot re-elect leaderless, that is an openraft restart-recovery
+  issue to fix, not something to mask with a longer timeout.
+- **CI wall-clock budget.** The e2e stacks a 5-node replicated initial boot (≤60s `boot_timeout`/node),
+  the nemesis loop, a full-cluster kill+respawn (another ≤60s window), and the post-restart round —
+  target ≤~120s. Keep `MIN_ROUNDS`/`OPS` at the SP18 minimum; if it approaches the nextest per-test
+  timeout on the 2-core runner, give `crossrange_2pc_replicated` its own slow concurrency group /
+  extended timeout in `.config/nextest.toml`.
 
 ## Traceability
 

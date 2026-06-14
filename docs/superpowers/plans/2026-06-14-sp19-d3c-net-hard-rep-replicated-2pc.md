@@ -113,7 +113,10 @@ Update `new` to wrap the map, and change `engine` to return an OWNED `Arc` (lock
     }
 
     /// Look up the engine for `range`. Returns an OWNED `Arc` (lock-free snapshot via
-    /// `arc-swap`); `None` if this node does not (yet) host that range.
+    /// `arc-swap`); `None` if this node does not (yet) host that range. `load()` yields a
+    /// `Guard` that auto-derefs to `&Arc<HashMap>`; `get()` + `cloned()` produce an owned
+    /// `Arc<SqlEngine>` and the `Guard` drops at end-of-expression — so no guard is ever
+    /// held across an `await` (the load-bearing arc-swap discipline).
     pub fn engine(&self, range: RangeId) -> Option<Arc<SqlEngine>> {
         self.engines.load().get(&range).cloned()
     }
@@ -146,15 +149,25 @@ Update `session_handle` to use the owned `engine` (it currently does `self.engin
         )
     }
 ```
-In `stage`, change the absent-engine branch from a hard `Err` to retryable `NotLeader` (currently `return TxnResp::Err(format!("no engine for range {range}"))`):
+In `stage`, **move the engine resolution to the very top — before `pgparser::parse` — and short-circuit to `NotLeader` when the engine is absent.** Currently `stage` parses the SQL first (`let stmt = match pgparser::parse(sql) { … }`) and only then calls `session_handle`, returning `TxnResp::Err(format!("no engine for range {range}"))` on `None`. Reorder so an unregistered range never parses:
 ```rust
+    async fn stage(&self, g: u64, range: RangeId, sql: &str) -> TxnResp {
+        // Resolve the participant engine FIRST. An unregistered range means this node
+        // is still mid-bootstrap on the replicated layout — RETRYABLE: return NotLeader
+        // (the coordinator re-resolves) instead of a hard Err that would abort the txn,
+        // and skip parsing entirely.
         let Some(handle) = self.session_handle(g, range).await else {
-            // This node does not host `range` yet (mid-bootstrap on the replicated
-            // layout). RETRYABLE: the coordinator re-resolves rather than aborting.
             return TxnResp::NotLeader;
         };
+        let stmt = match pgparser::parse(sql) {
+            Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
+            _ => return TxnResp::Err("stage expects exactly one statement".into()),
+        };
+        let mut session = handle.lock().await; // per-session lock only; map lock dropped
+        // … (the rest of `stage` — `ensure_began` / `join_global` / `run` — unchanged) …
+    }
 ```
-Leave `release` unchanged (it already returns the idempotent `TxnResp::Released` no-op for an absent `(g, range)`).
+This makes the Task-1 unit test (`stage_for_an_unregistered_range_is_retryable_not_a_hard_err`) pass: the absent range returns `NotLeader` regardless of the SQL. Leave `handle()` and `release` unchanged (`release` already returns the idempotent `TxnResp::Released` no-op for an absent `(g, range)`).
 
 - [ ] **Step 5: Fix the `engine()` call sites (owned `Arc` ripple)**
 
@@ -388,14 +401,11 @@ async fn replicated_cross_range_bank_conserves_under_nemesis_and_restart() {
         )).await;
     }
 
-    // Conservation after the nemesis.
-    {
-        let gw = c.pick_live_gateway().await;
-        let reader = c.pg(gw).await;
-        let total = read_total_cross(&reader, ACCOUNTS).await;
-        assert_eq!(total, seeded_total,
-            "replicated cross-range transfers conserve the total under the nemesis (got {total}, want {seeded_total})");
-    }
+    // Conservation after the nemesis. Bounded-retry read (a just-respawned victim could
+    // be the gateway): re-resolves a live gateway per attempt, never a one-shot .expect.
+    let total = read_total_cross_until_ok(&c, ACCOUNTS).await;
+    assert_eq!(total, seeded_total,
+        "replicated cross-range transfers conserve the total under the nemesis (got {total}, want {seeded_total})");
     assert!(total_committed > 0, "the workload must commit at least one transfer (non-vacuous)");
 
     // FULL-CLUSTER RESTART: stop every node, then respawn every node. Each replicated
@@ -415,19 +425,68 @@ async fn replicated_cross_range_bank_conserves_under_nemesis_and_restart() {
         )).await;
     }
 
-    // Conservation STILL holds after the full restart.
-    let gw = c.pick_live_gateway().await;
-    let reader = c.pg(gw).await;
-    let total = read_total_cross(&reader, ACCOUNTS).await;
+    // Conservation STILL holds after the full restart. MUST be the bounded-retry read:
+    // a one-shot read against a just-respawned node can hit a transient 08006 / a range
+    // whose state machine has not finished applying the recovered blob — the exact flake
+    // class that failed PR #34's `check` job. Never a raw .expect here.
+    let total = read_total_cross_until_ok(&c, ACCOUNTS).await;
     assert_eq!(total, seeded_total,
         "the descriptor blob + durable 2PC state survive a full-cluster restart (got {total}, want {seeded_total})");
 }
 ```
-Then paste the module-local helpers from `crossrange_2pc_nemesis.rs` (everything below its test fn: `Lcg`, `connect`, `cross_transfer`, `read_total_cross`, `first_i64`, `ctl_set_partition`, `ctl_heal`) verbatim.
+Then paste the module-local helpers from `crossrange_2pc_nemesis.rs` (everything below its test fn: `Lcg`, `connect`, `cross_transfer`, `read_total_cross`, `first_i64`, `ctl_set_partition`, `ctl_heal`) verbatim, and ADD a bounded-retry conservation read (the authoritative read must not be a one-shot `.expect` — that is the PR #34 flake class):
+```rust
+/// Authoritative cross-range conservation read, bounded-retry. Re-resolves a LIVE
+/// gateway each attempt and reads `acct_a`+`acct_b` over `0..accounts`; on any
+/// connect/read failure (transient `08006`, a just-respawned node still applying the
+/// recovered blob) it re-resolves and retries, bounded by a 30s deadline. No sleep
+/// masquerading as sync — paced by the real connect/read round-trip + a short poll.
+async fn read_total_cross_until_ok(c: &Cluster, accounts: i64) -> i64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(total) = try_read_total_cross(c, accounts).await {
+            return total;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "conservation read did not succeed within 30s");
+        tokio::time::sleep(Duration::from_millis(100)).await; // bounded poll cadence
+    }
+}
 
-- [ ] **Step 2: Run it — iterate to green**
+/// One attempt: pick a live gateway, sum every account; `None` on any failure.
+async fn try_read_total_cross(c: &Cluster, accounts: i64) -> Option<i64> {
+    let gw = c.pick_live_gateway().await;
+    let client = connect(c.sql_addr(gw)).await?;
+    let mut total = 0i64;
+    for table in ["acct_a", "acct_b"] {
+        for id in 0..accounts {
+            let rows = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.simple_query(&format!("SELECT bal FROM {table} WHERE id = {id}")),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            total += first_i64(&rows)?;
+        }
+    }
+    Some(total)
+}
+```
+(Confirm `connect`'s signature when pasting — it takes a `&str` address in the SP18 helper; `c.sql_addr(gw)` returns `&str`. `first_i64` is the SP18 helper that extracts the first `int8` from a `Vec<SimpleQueryMessage>`.)
 
-Run: `cargo nextest run -p crabgresql --test crossrange_2pc_replicated` (2-3× to confirm non-flaky). The replicated boot adds a ~60s `boot_timeout` window; nextest's concurrency groups serialize the multi-process suites. If a worker hangs, confirm `connect`/`cross_transfer` use bounded `tokio::time::timeout` (copied from the SP18 helpers). If the restart's `exec_until_ok` times out, the recovery path is not firing post-restart — confirm `start_replicated` spawns the full watcher set (Task 2) and that `respawn` re-reads the durable state. Do NOT add a settle-sleep; do NOT weaken the conservation/restart assertions.
+- [ ] **Step 2a: De-risk the all-node restart re-election FIRST** (the restart round depends on an unproven behavior)
+
+Before relying on the full restart, prove that an all-node replicated restart re-elects. `respawn` passes `bootstrap=false`, so every respawned node skips `bootstrap()`/`seed_if_absent` (gated on `cfg.bootstrap` at `server_node.rs:448,473`) and must re-form quorum on BOTH ranges from PERSISTED Raft membership alone, then `wait_for_range_map` (60s `boot_timeout`). No existing test exercises a whole-cluster replicated restart. Validate it in isolation — a throwaway run, or a minimal first assertion in this test before the workload:
+```rust
+// (scratch validation, can be a temporary first run): boot replicated, await leaders
+// on both ranges, kill ALL, respawn ALL, then `c.range_leader(0).await; c.range_leader(1).await;`
+// must return (a leader re-emerges on each range from persisted membership) within boot_timeout.
+```
+Standard Raft says this works (all nodes recover persisted membership `{0..N}`, election timers fire, a candidate wins a majority). If it instead HANGS to the `boot_timeout` (the cluster never re-elects leaderless), STOP and escalate — that is an openraft restart-recovery issue, not test logic; do not paper over it with a longer timeout or a weakened assertion. (A staggered respawn does NOT help at N=5: one node cannot form a 3-of-5 quorum, so "respawn node 0 first" is not a valid fallback.)
+
+- [ ] **Step 2b: Run the full e2e — iterate to green**
+
+Run: `cargo nextest run -p crabgresql --test crossrange_2pc_replicated` (2-3× to confirm non-flaky). **CI wall-clock budget:** the test stacks a 5-node replicated initial boot (≤60s `boot_timeout`/node, staggered), the nemesis loop (`MIN_ROUNDS`=4), a full-cluster kill+respawn (another ≤60s window), and the post-restart round — target ≤~120s total. Keep `MIN_ROUNDS`/`OPS` at the SP18 minimum that still proves non-vacuity. If the test consistently approaches the nextest per-test timeout on the 2-core runner, give `crossrange_2pc_replicated` its own slow concurrency group / extended timeout in `.config/nextest.toml` (note it in the commit). If a worker hangs, confirm `connect`/`cross_transfer` use bounded `tokio::time::timeout` (copied from the SP18 helpers). If the restart's `exec_until_ok` times out, the recovery path is not firing post-restart — confirm `start_replicated` spawns the full watcher set (Task 2) and that `respawn` re-reads the durable state. Do NOT add a settle-sleep; do NOT weaken the conservation/restart assertions.
 
 - [ ] **Step 3: Run the whole crate + guards + commit**
 
