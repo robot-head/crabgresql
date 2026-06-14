@@ -179,8 +179,17 @@ UAC-safe filename (no `setup/install/update/patch/upgrad`). Reuses `mod harness;
   survive a full restart on the replicated layout, and that recovery frees any txn left in-doubt
   across the restart.
 
-No harness additions: `spawn_multirange_replicated`, `kill`, `respawn`, `range_leader`,
-`exec_until_ok`, and `pick_live_gateway` all already exist.
+One harness fix (no new helpers): `respawn` now honors the cluster's replicated
+bring-up mode. `Cluster` gains a `replicated: bool` flag (set by the constructors:
+`false` for `spawn`/`spawn_multirange`, `true` for `spawn_multirange_replicated`),
+and `respawn` passes it to `spawn_node` instead of the previously-hardcoded `false`.
+This makes a respawned replicated node re-boot through `start_replicated` /
+`wait_for_range_map` — genuinely exercising the descriptor-blob re-read on restart
+(previously a respawn re-booted through the STATIC path, so the restart proved durable-
+state survival on the static layout, not the descriptor-blob re-read this slice
+requires). Everything else (`spawn_multirange_replicated`, `kill`, `range_leader`,
+`exec_until_ok`, `pick_live_gateway`) already exists and is unchanged; the static-
+respawn tests keep `replicated=false` and behave exactly as before.
 
 ## Data flow
 
