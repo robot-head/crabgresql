@@ -50,6 +50,17 @@ fn apply_op(kv: &MemKv, op: &WriteOp) {
             kv.put(key.clone(), U64::new(merged).as_bytes().to_vec())
                 .expect("memkv put");
         }
+        WriteOp::Put { key, value } if is_clog_key(key) => {
+            // Write-once: keep an existing TERMINAL decision (Committed/Aborted);
+            // otherwise (absent / InProgress / Prepared) apply the incoming value.
+            let keep = kv
+                .get(key)
+                .expect("memkv get")
+                .is_some_and(|b| mvcc::clog::is_terminal(&b));
+            if !keep {
+                kv.put(key.clone(), value.clone()).expect("memkv put");
+            }
+        }
         WriteOp::Put { key, value } => {
             kv.put(key.clone(), value.clone()).expect("memkv put");
         }
@@ -62,6 +73,13 @@ fn apply_op(kv: &MemKv, op: &WriteOp) {
 /// True for `/0/meta/next_xid` and any `/0/seq/<table>` key.
 pub(crate) fn is_counter_key(key: &[u8]) -> bool {
     key == kv::key::next_xid_key().as_slice() || is_seq_key(key)
+}
+
+/// True for any `/0/clog/<xid>` key (the commit-status log). Decision writes to
+/// these are WRITE-ONCE: a terminal status is never overwritten (see `apply_op`).
+pub(crate) fn is_clog_key(key: &[u8]) -> bool {
+    let prefix = kv::key::clog_prefix();
+    key.len() >= prefix.len() && key[..prefix.len()] == prefix[..]
 }
 
 fn is_seq_key(key: &[u8]) -> bool {
@@ -507,6 +525,27 @@ mod tests {
             },
         );
         assert_eq!(kv.get(&k).expect("get"), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn clog_decision_is_write_once_first_writer_wins() {
+        use mvcc::clog::{XidStatus, get as clog_get, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let kv = MemKv::new();
+        let g = GLOBAL_XID_BASE + 9;
+        apply_op(&kv, &put_op(g, XidStatus::Aborted));
+        assert_eq!(clog_get(&kv, g).expect("get"), XidStatus::Aborted);
+        // A LATER, DIFFERENT terminal decision (Committed) must NOT overwrite it.
+        apply_op(&kv, &put_op(g, XidStatus::Committed));
+        assert_eq!(
+            clog_get(&kv, g).expect("get"),
+            XidStatus::Aborted,
+            "first terminal decision wins; a contending Committed is dropped"
+        );
+        // A non-terminal write (Prepared) for a DIFFERENT xid is unaffected.
+        let li = 7u64;
+        apply_op(&kv, &put_op(li, XidStatus::Prepared(g)));
+        assert_eq!(clog_get(&kv, li).expect("get"), XidStatus::Prepared(g));
     }
 
     /// Build a snapshot from one store, install it into a fresh store, and

@@ -255,7 +255,7 @@ async fn handle_txn(
                     mvcc::clog::XidStatus::Aborted
                 };
                 match e.commit_global_decision(g, status).await {
-                    Ok(()) => {
+                    Ok(_eff) => {
                         e.finish_global(g); // prune g from in-memory running set
                         TxnResp::Committed
                     }

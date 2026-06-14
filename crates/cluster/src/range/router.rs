@@ -70,7 +70,7 @@ impl GlobalCoordinator for LocalCoordinator {
         } else {
             mvcc::clog::XidStatus::Aborted
         };
-        self.range0.commit_global_decision(g, status).await?;
+        let _eff = self.range0.commit_global_decision(g, status).await?;
         self.range0.finish_global(g);
         Ok(())
     }

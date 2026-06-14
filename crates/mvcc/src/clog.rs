@@ -60,6 +60,13 @@ pub fn put_op(xid: u64, status: XidStatus) -> WriteOp {
     }
 }
 
+/// True iff `value` (a clog entry's bytes) encodes a TERMINAL decision
+/// (Committed/Aborted) — the statuses the write-once global decision must keep.
+/// `Prepared`/`InProgress`/empty are non-terminal.
+pub fn is_terminal(value: &[u8]) -> bool {
+    matches!(value.first(), Some(&S_COMMITTED) | Some(&S_ABORTED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

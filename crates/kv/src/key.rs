@@ -83,6 +83,12 @@ pub fn clog_key(xid: u64) -> Vec<u8> {
     k
 }
 
+/// The shared prefix of every `/0/clog/<xid>` entry (for the write-once apply
+/// check + prefix scans). `clog_key(x)` is `clog_prefix() ++ put_u64(x)`.
+pub fn clog_prefix() -> Vec<u8> {
+    system_prefix("clog")
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;

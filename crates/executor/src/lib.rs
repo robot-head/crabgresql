@@ -243,7 +243,7 @@ impl SqlEngine {
         &self,
         g: u64,
         status: mvcc::clog::XidStatus,
-    ) -> Result<(), ExecError> {
+    ) -> Result<mvcc::clog::XidStatus, ExecError> {
         let gtm = self
             .gtm
             .as_ref()
@@ -253,7 +253,12 @@ impl SqlEngine {
                 mvcc::clog::put_op(g, status),
                 gtm.next_global_xid_op(),
             ])
-            .await
+            .await?;
+        // Write-once: apply keeps any prior terminal decision, so the EFFECTIVE
+        // decision (what is actually recorded) may differ from `status` if a
+        // participant won an abort-race. `commit` guarantees applied-on-leader, and
+        // `self.kv` is range 0's applied store, so this read-back is authoritative.
+        Ok(mvcc::clog::get(self.kv.as_ref(), g)?)
     }
 
     /// Deregister a decided global txn from the in-memory running-set.

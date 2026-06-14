@@ -416,7 +416,9 @@ use openraft::{
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::big_endian::U64;
 
-use crate::store::{SnapshotPayload, StateMachineMeta, StoredSnapshot, is_counter_key, u64_be};
+use crate::store::{
+    SnapshotPayload, StateMachineMeta, StoredSnapshot, is_clog_key, is_counter_key, u64_be,
+};
 use crate::types::WriteBatch;
 
 /// Durable Raft state machine over the `data` keyspace (application KV) and the
@@ -568,6 +570,10 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
         // encounter of the same key in this batch folds against the accumulated
         // in-memory max, never against the now-stale disk value.
         let mut counters: HashMap<Vec<u8>, u64> = HashMap::new();
+        // Write-once defense for clog decision keys, mirroring `counters`: tracks
+        // whether each `/0/clog/<xid>` key is already TERMINAL across THIS apply
+        // (a clog Put staged earlier in this batch is invisible to `data.get`).
+        let mut decided: HashMap<Vec<u8>, bool> = HashMap::new();
         let mut new_membership = meta.last_membership.clone();
         let mut last_id = meta.last_applied;
 
@@ -593,6 +599,24 @@ impl RaftStateMachine<TypeConfig> for Arc<DurableStateMachineStore> {
                                 let merged = cur.max(incoming);
                                 counters.insert(key.clone(), merged);
                                 batch.insert(&self.data, key, U64::new(merged).as_bytes());
+                            }
+                            WriteOp::Put { key, value } if is_clog_key(key) => {
+                                // Write-once across THIS apply AND the durable value
+                                // (mirrors the `counters` pending-map defense).
+                                let already_terminal = match decided.get(key) {
+                                    Some(&t) => t,
+                                    None => self
+                                        .data
+                                        .get(key)
+                                        .map_err(|e| StorageIOError::write_state_machine(&e))?
+                                        .is_some_and(|b| mvcc::clog::is_terminal(&b)),
+                                };
+                                if !already_terminal {
+                                    batch.insert(&self.data, key, value);
+                                    decided.insert(key.clone(), mvcc::clog::is_terminal(value));
+                                } else {
+                                    decided.insert(key.clone(), true);
+                                }
                             }
                             WriteOp::Put { key, value } => batch.insert(&self.data, key, value),
                             WriteOp::Delete { key } => batch.remove(&self.data, key),
