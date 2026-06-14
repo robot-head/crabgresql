@@ -229,4 +229,14 @@ waits — no settle-sleep.
 
 ## Traceability
 
-(Appended at finish — maps each success criterion 1–7 to its proving test.)
+Each success criterion (1–7) maps to its concrete proving test (all shipped and green at the SP20 gauntlet).
+
+| # | Criterion | Task | Proving test(s) |
+|---|---|---|---|
+| 1 | `Kv::scan_range(start, end)` returns exactly `[start, end)` in order, both backends | T1 | `kv::store::tests::scan_range_returns_inclusive_start_exclusive_end_in_order`; `kv::fjall_store::tests::scan_range_inclusive_start_exclusive_end_on_fjall`; `kv::key::tests::clog_scan_end_is_above_every_clog_key` |
+| 2 | `in_doubt_globals_from(scan_lo)` scans only `[scan_lo, end)`, returns the correct in-doubt `g`s + the right `new_scan_lo` | T2 | `executor::tests::in_doubt_globals_from_bounds_the_scan_and_advances_past_terminal` (two-store engine; `lo == 11`, `lo2 == 13`) |
+| 3 | The recovery scan cost is **bounded** (examines O(k + markers-above-watermark), not O(N+k)) — deterministically asserted | T2 | `executor::tests::in_doubt_globals_from_bounds_the_scan_and_advances_past_terminal` (the exact `lo2 == 13` pins the local-only scan) |
+| 4 | The watermark **never advances past a non-terminal `g`** (in-doubt holds it back); monotone + durable | T2/T3 | `executor::tests::in_doubt_globals_from_bounds_the_scan_and_advances_past_terminal` (highest-Li in-doubt holds the watermark) + `clog_scan_lo_persists_and_is_monotone`; `cluster::twopc::tests::recovery_scan_watermark_advances_and_persists` |
+| 5 | Markers never deleted; **row visibility unchanged** — all SP16/17/18/19 cross-range conservation + recovery suites pass unchanged with the watermark active | T3 | regression gate: `cluster::crossrange_2pc`, `cluster::jepsen_bank` cross-range, `crabgresql::crossrange_2pc_{net,nemesis,replicated}` |
+| 6 | Recovery correctness with the watermark: a failed-over participant's in-doubt markers above `scan_lo` are still finalized; conservation holds across a leadership change/restart | T3/T4 | `cluster::twopc::tests::a_durable_prepared_marker_is_finalized_by_the_leadership_sweep` (still green); `crabgresql::crossrange_2pc_{replicated,nemesis}` |
+| 7 | Full gauntlet green; no new dependency; `#![forbid(unsafe_code)]`; traceability | T4 | gauntlet (`cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo nextest run --workspace`; `cargo test --workspace --doc`; `cargo deny check`); UAC guard; this table |
