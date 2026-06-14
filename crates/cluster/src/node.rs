@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
 use crate::network::Switchboard;
-use crate::range::RangeId;
+use crate::range::{RangeId, RangeMap};
 use crate::store::{LogStore, StateMachineStore};
 use crate::types::{NodeId, TypeConfig};
 
@@ -99,9 +99,9 @@ impl Node {
         config: openraft::Config,
     ) -> Self {
         let config = Arc::new(config.validate().expect("valid raft config"));
-        let store = NodeStore::open(&dir).expect("open node store");
-        let log = DurableLogStore::open(&store).expect("durable log");
-        let sm = DurableStateMachineStore::open(&store).expect("durable sm");
+        let store = NodeStore::open(&dir, &RangeMap::single()).expect("open node store");
+        let log = DurableLogStore::open(&store, range).expect("durable log");
+        let sm = DurableStateMachineStore::open(&store, range).expect("durable sm");
         let sm_kv = sm.sm_kv();
         let raft = openraft::Raft::new(id, config, sb.for_node(range, id), log, sm)
             .await

@@ -7,7 +7,7 @@
 //! reseed task bumps the engine's xid/seq counters on each follower→leader edge so
 //! a new leader never hands out an id below a prior leader's high-water mark.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +19,10 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::committer::RaftCommitter;
 use crate::durable::{DurableLogStore, DurableStateMachineStore, NodeStore};
 use crate::linearizer::RaftLinearizer;
+use crate::range::map::{RangeId, RangeMap};
 use crate::transport::client::TcpRaftNetwork;
 use crate::transport::partition::PartitionState;
-use crate::transport::server::{ShutdownSignal, serve_node_protocol};
+use crate::transport::server::{RangeRegistry, ShutdownSignal, serve_node_protocol};
 use crate::types::{NodeId, TypeConfig};
 
 /// Startup configuration for one node.
@@ -39,13 +40,43 @@ pub struct NodeConfig {
     /// When true, this node initializes the voting group once every peer's
     /// node-addr accepts a connection.
     pub bootstrap: bool,
+    /// The static range map this node hosts. Identical on every node. Defaults to
+    /// `RangeMap::single()` (one range, id 0) — the single-range fast-path.
+    pub range_map: RangeMap,
 }
 
-/// A live node; `shutdown.wait()` resolves when a `Shutdown` control request fires.
+/// A live multi-range node; `shutdown.wait()` resolves when a `Shutdown` control
+/// request fires. Holds one Raft instance + one applied store + one replicated
+/// engine per range (all keyed by `RangeId`).
 pub struct ServerNode {
-    pub raft: openraft::Raft<TypeConfig>,
-    pub engine: Arc<SqlEngine>,
+    /// One Raft handle per range, keyed by `RangeId`.
+    pub rafts: HashMap<RangeId, openraft::Raft<TypeConfig>>,
+    /// One replicated engine per range, keyed by `RangeId`. Range 0's catalog
+    /// store seeds every data-range engine's `catalog_kv`.
+    pub engines: HashMap<RangeId, Arc<SqlEngine>>,
+    /// The process-local network partition state, shared by every range's
+    /// transport and the node-protocol server. Task 4 reads this to inject
+    /// partitions in its remote-forward test (`gw.partition.clone()`).
+    pub partition: PartitionState,
     pub shutdown: ShutdownSignal,
+    /// One applied `data-r{r}` store per range, keyed by `RangeId`. Reached via
+    /// the `sm_kv(range)` accessor (Task 4 needs `sm_kv(range)`, not a public map).
+    sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>>,
+    /// This node's id (`cfg.id`), exposed via `id()` for Task 4's leader resolution.
+    id: NodeId,
+}
+
+impl ServerNode {
+    /// This range's applied (`data-r{range}`) store. Panics if `range` is not
+    /// hosted on this node — a construction bug, never user input.
+    pub fn sm_kv(&self, range: RangeId) -> Arc<dyn kv::Kv> {
+        self.sm_kvs[&range].clone()
+    }
+
+    /// This node's id.
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
 }
 
 /// Long leader-stable timers (heartbeat 250ms, election 1000–2000ms) — the same
@@ -64,69 +95,104 @@ fn raft_config() -> Arc<openraft::Config> {
 }
 
 impl ServerNode {
-    /// Open the durable store, wire openraft over TCP, bind both listeners, and
-    /// share one replicated engine. Spawns the node-protocol server, the SQL
-    /// server, the reseed task, and (if `bootstrap`) the initializer.
+    /// Open the durable store over the whole `RangeMap`, build a Raft + applied
+    /// engine per range over the range-aware TCP transport (Task 1), register each
+    /// group in the process-local `(range, node)` registry, bootstrap each voting
+    /// group, and reseed each range's counters on its leadership edge.
+    ///
+    /// Per-range storage isolation (`data-r{r}`/`raft-r{r}`, Step 3) is the
+    /// prerequisite this loop relies on: range `r`'s Raft is built over range `r`'s
+    /// own keyspaces, so two ranges can never share log/SM state.
     pub async fn start(cfg: NodeConfig) -> std::io::Result<Self> {
-        let store = NodeStore::open(&cfg.data_dir).expect("open node store");
-        let log = DurableLogStore::open(&store).expect("durable log");
-        let sm = DurableStateMachineStore::open(&store).expect("durable sm");
-        let sm_kv = sm.sm_kv();
+        // One shared on-disk Database hosting every range's keyspace pair.
+        let store = NodeStore::open(&cfg.data_dir, &cfg.range_map).expect("open node store");
 
         let partition = PartitionState::default();
-        let net = TcpRaftNetwork {
-            from: cfg.id,
-            range: 0,
-            partition: partition.clone(),
-        };
-        let raft = openraft::Raft::new(cfg.id, raft_config(), net, log, sm)
-            .await
-            .expect("raft::new");
-
-        // Node-protocol listener (Raft RPCs + control). Single-range: one group at
-        // (range 0, id) in the registry; T2 turns this into the per-range loop.
-        let node_listener = TcpListener::bind(&cfg.node_addr).await?;
+        // Process-local registry the node-protocol server dispatches against:
+        // an inbound `Raft { range, .. }` RPC resolves `(range, id)` here.
+        let registry = RangeRegistry::new();
         let shutdown = ShutdownSignal::default();
-        let registry = crate::transport::server::RangeRegistry::new();
-        registry.register(0, cfg.id, raft.clone());
+
+        // Range 0's applied store is the catalog every data range resolves from.
+        let catalog_kv = store.data_kv(0) as Arc<dyn kv::Kv>;
+
+        let mut rafts: HashMap<RangeId, openraft::Raft<TypeConfig>> = HashMap::new();
+        let mut sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>> = HashMap::new();
+        let mut engines: HashMap<RangeId, Arc<SqlEngine>> = HashMap::new();
+
+        for range in cfg.range_map.range_ids() {
+            let log = DurableLogStore::open(&store, range).expect("durable log");
+            let sm = DurableStateMachineStore::open(&store, range).expect("durable sm");
+            let sm_kv = sm.sm_kv();
+
+            // Range-aware network: every client minted from `net` tags its RPCs
+            // with `range`, so the peer's server routes to the matching group.
+            let net = TcpRaftNetwork {
+                from: cfg.id,
+                range,
+                partition: partition.clone(),
+            };
+            let raft = openraft::Raft::new(cfg.id, raft_config(), net, log, sm)
+                .await
+                .expect("raft::new");
+
+            // Register THIS group so inbound `(range, id)` RPCs reach it.
+            registry.register(range, cfg.id, raft.clone());
+
+            // Replicated engine for this range. Data writes/reads hit this range's
+            // store; schema always resolves from range 0's catalog store.
+            let engine = Arc::new(
+                SqlEngine::replicated(
+                    catalog_kv.clone(),
+                    sm_kv.clone(),
+                    Arc::new(RaftCommitter { raft: raft.clone() }),
+                    Arc::new(RaftLinearizer { raft: raft.clone() }),
+                )
+                .expect("replicated engine"),
+            );
+            // Reseed THIS range's counters on its own follower→leader edge.
+            tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+
+            rafts.insert(range, raft);
+            sm_kvs.insert(range, sm_kv);
+            engines.insert(range, engine);
+        }
+
+        // One node-protocol listener for the whole node; it resolves the target
+        // group from the registry by the RPC's `(range, from)`.
+        let node_listener = TcpListener::bind(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
-            registry,
+            registry.clone(),
             partition.clone(),
             shutdown.clone(),
         ));
 
-        // One shared replicated engine; reseed its counters on the leadership edge.
-        // Single-range: catalog and data are the same applied store.
-        let engine = Arc::new(
-            SqlEngine::replicated(
-                sm_kv.clone(),
-                sm_kv,
-                Arc::new(RaftCommitter { raft: raft.clone() }),
-                Arc::new(RaftLinearizer { raft: raft.clone() }),
-            )
-            .expect("replicated engine"),
-        );
-        tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
+        // Bootstrap EVERY range's voting group once peers are dialable. Each range
+        // shares the same physical peer set (co-located placement).
+        if cfg.bootstrap {
+            for raft in rafts.values() {
+                tokio::spawn(bootstrap(raft.clone(), cfg.peers.clone()));
+            }
+        }
 
-        // pgwire SQL listener with leader routing: serves locally when this node
-        // is the leader, else byte-proxies to the leader's pgwire port.
+        // SQL listener: single-range fast-path this slice — serve/route via range
+        // 0's Raft + engine. The per-statement multi-range gateway is Task 3.
         let sql_listener = TcpListener::bind(&cfg.sql_addr).await?;
         tokio::spawn(crate::route::serve_routed(
             sql_listener,
-            raft.clone(),
-            engine.clone(),
+            rafts[&0].clone(),
+            engines[&0].clone(),
             Arc::new(pgwire::session::SessionConfig::trust()),
         ));
 
-        if cfg.bootstrap {
-            tokio::spawn(bootstrap(raft.clone(), cfg.peers.clone()));
-        }
-
         Ok(Self {
-            raft,
-            engine,
+            rafts,
+            engines,
+            partition,
             shutdown,
+            sm_kvs,
+            id: cfg.id,
         })
     }
 }
@@ -177,6 +243,7 @@ async fn bootstrap(raft: openraft::Raft<TypeConfig>, peers: Vec<(NodeId, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::range::RangeMap;
 
     /// Bind an ephemeral loopback port, read its address, and drop the listener so
     /// the address is free for the node to rebind.
@@ -201,12 +268,13 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             peers: vec![(0, node_addr.clone())],
             bootstrap: true,
+            range_map: RangeMap::single(),
         })
         .await
         .expect("start node");
 
         // A one-node group elects immediately after `initialize`.
-        node.raft
+        node.rafts[&0]
             .wait(Some(Duration::from_secs(10)))
             .metrics(|m| m.current_leader == Some(0), "self leader")
             .await
@@ -258,5 +326,124 @@ mod tests {
                 Err(e) => panic!("pg connect: {e}"),
             }
         }
+    }
+
+    /// A single process running ONE node that hosts a 2-range map brings up BOTH
+    /// ranges, and each range independently self-confirms a leader via openraft's
+    /// event-based `wait` (state==Leader && current_leader==self) — no sleep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_range_node_elects_a_leader_per_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node_addr = free_port().await;
+        let sql_addr = free_port().await;
+        // boundary at table_id 1 ⇒ range 0 = [0,1), range 1 = [1,∞). Two ranges.
+        let node = ServerNode::start(NodeConfig {
+            id: 0,
+            node_addr: node_addr.clone(),
+            sql_addr,
+            data_dir: dir.path().to_path_buf(),
+            peers: vec![(0, node_addr.clone())],
+            bootstrap: true,
+            range_map: RangeMap::with_boundaries(vec![1]),
+        })
+        .await
+        .expect("start multi-range node");
+
+        // Both ranges must self-confirm a leader. A one-node group elects itself
+        // immediately after its `initialize`; we await that condition per range.
+        assert_eq!(node.rafts.len(), 2, "node hosts a Raft instance per range");
+        for raft in node.rafts.values() {
+            raft.wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |m| m.state == ServerState::Leader && m.current_leader == Some(m.id),
+                    "range self-confirmed as leader",
+                )
+                .await
+                .expect("each range self-confirms a leader");
+        }
+    }
+
+    /// A write committed to range 1's Raft group lands in range 1's `data-r1`
+    /// keyspace and is ABSENT from range 0's `data-r0` keyspace — structural
+    /// per-range storage isolation, asserted over BOTH keyspaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_to_range1_is_isolated_to_data_r1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node_addr = free_port().await;
+        let sql_addr = free_port().await;
+        let node = ServerNode::start(NodeConfig {
+            id: 0,
+            node_addr: node_addr.clone(),
+            sql_addr,
+            data_dir: dir.path().to_path_buf(),
+            peers: vec![(0, node_addr.clone())],
+            bootstrap: true,
+            range_map: RangeMap::with_boundaries(vec![1]),
+        })
+        .await
+        .expect("start multi-range node");
+
+        // Await range 1's self-confirmed leadership before proposing to it.
+        let range1 = node.rafts[&1].clone();
+        range1
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |m| m.state == ServerState::Leader && m.current_leader == Some(m.id),
+                "range 1 leader",
+            )
+            .await
+            .expect("range 1 leader");
+
+        // Propose a marker row directly through range 1's Raft `client_write`
+        // (no SQL gateway yet — that is Task 3). A `WriteBatch` of one Put commits
+        // to range 1's group, applies into `data-r1`.
+        use crate::types::WriteBatch;
+        use kv::WriteOp;
+        let marker = kv::key::row_key(7, 1); // table 7 ⇒ range 1, but the key value
+        // itself is what we assert on, so the table id only needs to be nonzero.
+        range1
+            .client_write(WriteBatch(vec![WriteOp::Put {
+                key: marker.clone(),
+                value: b"r1-only".to_vec(),
+            }]))
+            .await
+            .expect("commit to range 1");
+
+        // Range 1's applied store has it; range 0's applied store does NOT — the
+        // two keyspaces are physically distinct (`data-r1` vs `data-r0`).
+        let data_r1 = node.sm_kv(1);
+        let data_r0 = node.sm_kv(0);
+        assert_eq!(
+            data_r1.get(&marker).expect("get r1"),
+            Some(b"r1-only".to_vec()),
+            "the write is present in range 1's data-r1 keyspace"
+        );
+        assert_eq!(
+            data_r0.get(&marker).expect("get r0"),
+            None,
+            "the write is ABSENT from range 0's data-r0 keyspace (storage isolation)"
+        );
+
+        // Criterion 3 also requires isolation across the RAFT keyspaces, not just
+        // `data-r{r}`. The commit appended an entry to range 1's `raft-r1` and
+        // applied it, advancing range 1's `last_applied`; range 0's `raft-r0` saw
+        // only its own bootstrap entries (no data write), so its `last_applied`
+        // did not advance from this write. We read both via openraft metrics — a
+        // borrow of the metrics watch, no sleep.
+        let r1_applied = node.rafts[&1].metrics().borrow().last_applied;
+        let r0_applied = node.rafts[&0].metrics().borrow().last_applied;
+        let r1_idx = r1_applied.expect("range 1 has applied entries").index;
+        assert!(
+            r1_idx > 0,
+            "range 1's raft-r1 advanced last_applied past bootstrap after the write"
+        );
+        // Range 0 only ever applied its single-node bootstrap; the range-1 write
+        // never touched `raft-r0`. Its applied index is strictly below range 1's,
+        // proving the raft keyspaces are isolated too (no shared log/SM state).
+        let r0_idx = r0_applied.map(|l| l.index).unwrap_or(0);
+        assert!(
+            r0_idx < r1_idx,
+            "range 0's raft-r0 did not advance from range 1's write (raft-keyspace isolation)"
+        );
     }
 }
