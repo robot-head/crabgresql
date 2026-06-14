@@ -1068,6 +1068,34 @@ mod tests {
         assert_eq!(last_applied, snapshot.meta.last_log_id);
     }
 
+    /// Mirror the counters precedent: two clog DECISIONS for the same g in ONE apply
+    /// batch must fold write-once (first terminal wins), via the `decided` pending map.
+    #[tokio::test]
+    async fn apply_clog_keeps_first_terminal_same_key_twice_in_one_batch() {
+        use mvcc::clog::{XidStatus, get as clog_get, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let dir = temp();
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+        let sm = DurableStateMachineStore::open(&store, 0).expect("sm open");
+        let g = GLOBAL_XID_BASE + 11;
+        // Apply ONE batch containing BOTH decisions for g (Aborted then a contending
+        // Committed). The `decided` pending map must fold them: first terminal wins.
+        apply_normal(
+            &sm,
+            1,
+            vec![
+                put_op(g, XidStatus::Aborted),
+                put_op(g, XidStatus::Committed),
+            ],
+        )
+        .await;
+        assert_eq!(
+            clog_get(sm.sm_kv().as_ref(), g).expect("get"),
+            XidStatus::Aborted,
+            "first terminal decision wins within a single apply batch (decided pending map)"
+        );
+    }
+
     #[test]
     fn open_range_adds_a_keyspace_pair_after_open() {
         let dir = tempfile::tempdir().expect("tempdir");

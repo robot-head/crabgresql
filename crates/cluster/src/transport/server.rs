@@ -256,6 +256,7 @@ async fn handle_txn(
                 };
                 match e.commit_global_decision(g, status).await {
                     Ok(_eff) => {
+                        // TODO(SP18 T2): honor the effective decision (_eff) — report ROLLBACK when it is Aborted
                         e.finish_global(g); // prune g from in-memory running set
                         TxnResp::Committed
                     }

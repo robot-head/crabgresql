@@ -548,6 +548,17 @@ mod tests {
         assert_eq!(clog_get(&kv, li).expect("get"), XidStatus::Prepared(g));
     }
 
+    #[test]
+    fn is_clog_key_matches_only_clog_keys() {
+        assert!(is_clog_key(&kv::key::clog_key(5)));
+        assert!(is_clog_key(&kv::key::clog_key(1u64 << 63)));
+        // must NOT false-match sibling system keys or user rows:
+        assert!(!is_clog_key(&kv::key::next_xid_key()));
+        assert!(!is_clog_key(&kv::key::seq_key(0)));
+        assert!(!is_clog_key(&kv::key::meta_next_global_xid_key()));
+        assert!(!is_clog_key(b"")); // shorter than the prefix
+    }
+
     /// Build a snapshot from one store, install it into a fresh store, and
     /// assert the KV contents round-trip exactly.
     #[tokio::test]

@@ -70,6 +70,7 @@ impl GlobalCoordinator for LocalCoordinator {
         } else {
             mvcc::clog::XidStatus::Aborted
         };
+        // TODO(SP18 T2): honor the effective decision (_eff) — report ROLLBACK when it is Aborted
         let _eff = self.range0.commit_global_decision(g, status).await?;
         self.range0.finish_global(g);
         Ok(())
