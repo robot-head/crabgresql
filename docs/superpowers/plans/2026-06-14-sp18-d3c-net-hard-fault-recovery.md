@@ -29,6 +29,27 @@
 
 ---
 
+## Review corrections (adversarial plan review, 2026-06-14 — BINDING)
+
+A multi-agent adversarial review (5 lenses + per-finding verification) confirmed these. The fixes below are folded into the tasks; where a code block elsewhere disagrees, **this section wins**. No correctness hole was found in the write-once design itself — the confirmed defects are test-wiring, one decode hazard, and nemesis pacing.
+
+**C1 (the big one) — `#[cfg(test)]` items are INVISIBLE to integration tests.** Integration tests under `crates/cluster/tests/*.rs` are separate crates that link `cluster` built WITHOUT `--cfg test`, so they cannot see `#[cfg(test)]` items (`RangeRouter::staged_global_xid`/`coordinator_engine` at router.rs:236-249; `TxnService::holds` at twopc.rs:298) NOR `pub(crate)` items. Three planned tests break this way. **Fix: relocate each new test into an in-crate `#[cfg(test)] mod tests` block where the seams are visible**, building the test fixtures directly:
+- **T1 Step 8 engine read-back test** — keep in `crates/cluster/tests/crossrange_2pc.rs` (it uses only the public `leader_engine`/`begin_global_durable`/`commit_global_decision` — fine as written).
+- **T2 honesty test (`coordinator_reports_rollback_when_decision_already_aborted`)** — move into `crates/cluster/src/range/router.rs`'s `#[cfg(test)] mod tests` (where `staged_global_xid()` + `coordinator_engine()` are visible), mirroring `crash_after_global_decision_commits` (router.rs ~896). Use `router.staged_global_xid()` for `g` and `router.coordinator_engine().commit_global_decision(g, Aborted)` to pre-write the abort. Do NOT put it in the integration file.
+- **T3 sweeper test (`a_silent_coordinator_is_recovered_by_the_timeout_sweeper`)** — move into `crates/cluster/src/twopc.rs`'s `#[cfg(test)] mod tests` (where `holds` is visible), mirroring `stage_then_release_holds_then_frees_a_per_g_session`. Build the fixture directly: `let (node, _) = crate::server_node::testonly_two_range_node().await; let svc = TxnService::new(node.engines.clone()); let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone());` — then stage via `svc.handle(...)`, `svc.sweep_stale(&client, Duration::ZERO).await`, assert `!svc.holds(g, 1).await`. **Drop the planned `ServerNode::txn_service()`/`twopc_client()` accessors entirely — they are not needed** (the test builds `svc`/`client` directly), and a `#[cfg(test)] pub(crate)` accessor would be doubly invisible anyway.
+- **T4 marker test (`a_durable_prepared_marker_is_finalized_by_the_leadership_sweep`)** — move into `twopc.rs` (or `server_node.rs`) `#[cfg(test)] mod tests`; build `svc` directly as above; it uses the public `in_doubt_globals`/`release_all_for_range`/`commit_global_decision`. The `in_doubt_globals` UNIT test (T4 Step 1) stays in `crates/executor` (in-crate to executor — `SqlEngine` internals visible).
+- **`TxnService::holds`** stays `#[cfg(test)]` (the relocated tests are in-crate, so it remains visible). The production sweeper spawn in `server_node.rs` (T3 Step 5) is unaffected (not a test).
+
+**C2 (MEDIUM) — `mvcc::clog::decode` must map an empty slice to `InProgress`.** `get` maps an ABSENT key (`None`) to `InProgress` at the OUTER match, but its inner byte-match has NO arm for an empty value (`value.first() == None` falls to the `CorruptRow` catch-all). The plan's `get(kv,xid) = decode(&kv.get(...)?.unwrap_or_default())` factoring feeds `decode(&[])` for absent keys — a naive extraction would return `Err(CorruptRow)`, silently flipping absent→InProgress to absent→corruption-error and **breaking every MVCC read**. **Fix:** define `decode` so `value.first() == None ⇒ Ok(XidStatus::InProgress)`, and keep `get`'s absent→InProgress behavior. Add `cargo nextest run -p mvcc` to Task 4's verify (the existing `absent_entry_is_in_progress` test guards it, but the per-task loop must run it). `in_doubt_globals` only calls `decode` on non-empty scanned values, so it is unaffected either way.
+
+**C3 (MEDIUM) — the T5 nemesis must keep quorum + pace on a committed-op signal** (the spec's explicit mandate + the MEMORY "nemesis needs stable windows" rule). The drafted T5 nemesis kills `victim = round % len` (all leaders) with immediate `respawn` and paces only on `workers.all(is_finished)` — this can transiently lose quorum on a range (a respawned-but-catching-up node + a freshly-killed other node) and starve cross-range progress on the 2-core runner, flaking `total_committed > 0`. **Fix: mirror the established `jepsen_bank::cross_range_bank_conserves_total_under_nemesis` nemesis** — use **5 nodes** (`spawn_multirange(5, vec![2])`), compute the current leaders of both ranges and fault only a **non-leader** victim, pace the next fault on a **committed-op progress signal** (a shared `Arc<AtomicU64>`/`Notify` the workers bump on each successful `COMMIT`, with a bounded `timeout` on `notified()`), and await a **recovery condition** (`range_leader(0)` + `range_leader(1)`) between fault rounds before advancing. Keep the kill+respawn / partition+heal alternation and the post-heal recovery-forcing probe. (This still kills coordinators mid-txn — a non-leading gateway IS a coordinator — so the recovery path is exercised, without the quorum-starvation flake.)
+
+**C4 (LOW) — `in_doubt_globals` reads the local range-0 replica unbarriered.** It may classify an already-decided `g` as undecided in the narrow window before this node's range-0 replica applies the decision, producing a redundant abort-race RPC. This is **safe** (write-once makes the redundant `Aborted` a no-op-keep; the effective read-back is authoritative) — note it in a comment; an optional `range0_barrier.ensure_readable()` at the start bounds the fan-out but is not required.
+
+**C5 (prose) — `commit_global_decision` has THREE call sites, not two:** the two that need adaptation (`LocalCoordinator::commit_global` router.rs:73, `handle_txn` server.rs:257) plus a test caller (`crash_after_global_decision_commits`, router.rs:904) that compiles unchanged (`.expect()` on any `Result`). No edit needed at the third; just don't be surprised by it.
+
+---
+
 ## File structure (what changes, and why)
 
 **New files:**
@@ -239,6 +260,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the failing test (coordinator honesty under a pre-written abort)**
 
+**Placement (correction C1):** this test MUST live in `crates/cluster/src/range/router.rs`'s `#[cfg(test)] mod tests` (NOT the integration file `crossrange_2pc.rs`), because `staged_global_xid()`/`coordinator_engine()` are `#[cfg(test)]` and invisible across the crate boundary. Mirror `crash_after_global_decision_commits` (router.rs ~896): build the cluster + router the same way that test does, use `router.staged_global_xid()` to learn `g`, and `router.coordinator_engine().commit_global_decision(g, Aborted)` to pre-write the abort.
+
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_reports_rollback_when_decision_already_aborted() {
@@ -374,14 +397,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the failing test**
 
-The single in-crate `ServerNode` (which leads every range) stages a participant directly via `TxnService`, never sends a decision, and asserts the sweeper self-resolves it (the held session disappears + a blocked writer to the staged row proceeds). Add to `crates/cluster/tests/gateway_local.rs`:
+**Placement (correction C1):** this test MUST live in `crates/cluster/src/twopc.rs`'s `#[cfg(test)] mod tests` (NOT `gateway_local.rs`), because `TxnService::holds` is `#[cfg(test)]` and invisible across the crate boundary. Mirror `stage_then_release_holds_then_frees_a_per_g_session`: build the fixture directly with `let (node, _) = crate::server_node::testonly_two_range_node().await; let svc = TxnService::new(node.engines.clone()); let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone());` — no `ServerNode` test accessors are needed (drop the planned `txn_service()`/`twopc_client()`). The single in-crate node leads every range; the sweeper's abort-race RPC loops back to range 0's leader (self).
+
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_coordinator_is_recovered_by_the_timeout_sweeper() {
     use mvcc::xid::GLOBAL_XID_BASE;
-    let (node, _sql) = start_two_range_node().await;
-    let svc = node.txn_service().expect("static node hosts a TxnService"); // accessor added below
-    let client = node.twopc_client();                                       // accessor added below
+    let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+    let svc = TxnService::new(node.engines.clone());                        // build directly (C1)
+    let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone()); // build directly (C1)
 
     // Seed a row on range 1, then STAGE a held participant for a global xid g that
     // NEVER receives a decision (the coordinator "crashed").
@@ -404,7 +428,7 @@ async fn a_silent_coordinator_is_recovered_by_the_timeout_sweeper() {
     assert_eq!(rows, vec![20], "presumed-abort: the staged update is invisible");
 }
 ```
-(`parse_one`/`scan_i32` helpers: add small local helpers or reuse the in-crate ones. `node.txn_service()`, `node.twopc_client()` accessors are added in Step 4. Driving `sweep_stale` directly with `Duration::ZERO` makes the test deterministic — no waiting on a background interval.)
+(`parse_one` already exists in `twopc.rs`'s `mod tests` (reuse it); add a small `scan_i32`-over-`SqlSession` helper if needed — `session.run(&parse_one(sql)).await` then decode `QueryResult::Rows`. `svc`/`client` are built directly (C1) — no `ServerNode` accessors. Driving `sweep_stale` directly with `Duration::ZERO` makes the test deterministic — no waiting on the background interval.)
 
 - [ ] **Step 2: Run it — expect FAIL** (`HeldEntry`, `sweep_stale`, `resolve_in_doubt`, the accessors do not exist).
 
@@ -477,7 +501,7 @@ Add after `release_all_for_range` (twopc.rs:318). `resolve_in_doubt` writes the 
 ```
 (`TwoPcClient` is `Arc<Self>`-constructed; the sweeper holds an `Arc<TwoPcClient>` and passes `&*client`. Confirm `client.call(0, …)` resolves range 0's leader — it does, per SP17.)
 
-- [ ] **Step 5: Spawn the per-node bounded sweeper (`server_node.rs`) + add the test accessors**
+- [ ] **Step 5: Spawn the per-node bounded sweeper (`server_node.rs`)**
 
 In `crates/cluster/src/server_node.rs` static path (after the `release_on_leadership_loss` spawn loop ~:264, BEFORE `Some(txn)` moves `txn` into `serve_node_protocol` ~:270), spawn the sweeper with a `TwoPcClient` and a clone of `txn`:
 ```rust
@@ -501,20 +525,11 @@ async fn participant_silence_sweeper(
     }
 }
 ```
-Make `PARTICIPANT_SILENCE_TIMEOUT` `pub(crate)` so server_node.rs sees it. Add the `#[cfg(test)]` accessors on `ServerNode` (server_node.rs, near the struct) so the Step-1 test can drive a sweep directly:
-```rust
-    #[cfg(test)]
-    pub(crate) fn txn_service(&self) -> Option<crate::twopc::TxnService> { self.txn.clone() }
-    #[cfg(test)]
-    pub(crate) fn twopc_client(&self) -> std::sync::Arc<crate::twopc::TwoPcClient> {
-        crate::twopc::TwoPcClient::new(self.rafts.clone(), self.partition.clone())
-    }
-```
-(This requires `ServerNode` to RETAIN the `TxnService` — today `txn` is moved into `serve_node_protocol` and not stored. Add a `txn: Option<crate::twopc::TxnService>` field to `ServerNode`, set to `Some(txn.clone())` on the static path / `None` on the replicated path, before the move. `rafts`/`partition` are already `ServerNode` fields per the SP17 map.)
+Make `PARTICIPANT_SILENCE_TIMEOUT` `pub(crate)` so server_node.rs sees it. **No `ServerNode` test accessors are needed (correction C1):** the relocated in-crate T3 sweeper test (Step 1) builds `TxnService`/`TwoPcClient` directly from the node's public `engines`/`rafts`/`partition`, and the production sweeper here uses the local `txn.clone()` before the `Some(txn)` move — so `ServerNode` does NOT need to retain a `txn` field. (Confirm the spawn takes `txn.clone()` BEFORE `serve_node_protocol(... Some(txn))` consumes it, exactly like the `release_on_leadership_loss` loop already does.)
 
 - [ ] **Step 6: Run + regressions**
 
-Run: `cargo nextest run -p cluster --test gateway_local` (incl. the new sweeper test + all SP17 tests), `cargo nextest run -p cluster`, `cargo clippy -p cluster --all-targets -- -D warnings`.
+Run: `cargo nextest run -p cluster --lib twopc::tests::a_silent_coordinator_is_recovered_by_the_timeout_sweeper` (the relocated in-crate test), `cargo nextest run -p cluster --test gateway_local` (SP17 tests still green), `cargo nextest run -p cluster`, `cargo clippy -p cluster --all-targets -- -D warnings`.
 
 - [ ] **Step 7: Commit**
 
@@ -601,7 +616,27 @@ In `crates/executor/src/lib.rs` (near `commit_global_decision`):
         Ok(gs.into_iter().collect())
     }
 ```
-This needs a value-decoder. Add `pub fn decode(value: &[u8]) -> Result<XidStatus, KvError>` to `crates/mvcc/src/clog.rs` (factor it out of `get`, which becomes `get(kv,xid) = decode(&kv.get(clog_key(xid))?.unwrap_or_default())` — or keep `get` and add `decode` that `get` calls). Confirm `self.kv`/`self.catalog_kv` field access compiles inside `lib.rs` (it does — same crate). If the Step-1 test needs `local_store`, add `#[cfg(test)] pub(crate) fn local_store(&self) -> &Arc<dyn Kv> { &self.kv }`.
+This needs a value-decoder. Add to `crates/mvcc/src/clog.rs` a `decode` that **maps an empty slice to `InProgress`** (correction C2 — so it is safe for an absent key), and have `get` delegate to it WITHOUT changing `get`'s absent→InProgress behavior:
+```rust
+/// Decode a clog entry's bytes. An EMPTY slice (an absent key, via
+/// `kv.get(...)?.unwrap_or_default()`) is `InProgress` — preserving `get`'s
+/// absent-key semantics. A non-empty value decodes its status byte.
+pub fn decode(value: &[u8]) -> Result<XidStatus, KvError> {
+    match value.first() {
+        None | Some(&S_IN_PROGRESS) => Ok(XidStatus::InProgress),
+        Some(&S_COMMITTED) => Ok(XidStatus::Committed),
+        Some(&S_ABORTED) => Ok(XidStatus::Aborted),
+        Some(&S_PREPARED) => {
+            let g: [u8; 8] = value.get(1..9)
+                .ok_or_else(|| KvError::CorruptRow("prepared clog missing global xid".into()))?
+                .try_into().expect("slice 1..9 is 8 bytes");
+            Ok(XidStatus::Prepared(u64::from_be_bytes(g)))
+        }
+        _ => Err(KvError::CorruptRow("bad clog status byte".into())),
+    }
+}
+```
+Then `get(kv, xid)` becomes `decode(&kv.get(&kv::key::clog_key(xid))?.unwrap_or_default())` (the existing `absent_entry_is_in_progress` test guards this — DO run `cargo nextest run -p mvcc` in Step 6). `in_doubt_globals` calls `decode` only on non-empty scanned values. Confirm `self.kv`/`self.catalog_kv` field access compiles inside `lib.rs` (it does — same crate). If the Step-1 test needs `local_store`, add `#[cfg(test)] pub(crate) fn local_store(&self) -> &Arc<dyn Kv> { &self.kv }` (the T4 Step-1 unit test is in the `executor` crate, so a `#[cfg(test)]` accessor IS visible to it).
 
 - [ ] **Step 4: The leadership-rise sweep watcher (`server_node.rs`)**
 
@@ -653,12 +688,12 @@ Use the existing RPC directly: `client.call(0, TxnRpc::CommitGlobal { g, commit:
 
 - [ ] **Step 5: Add the durable-marker leadership test**
 
-Add to `crates/cluster/tests/gateway_local.rs` (single node leads everything, so leadership "rises" at bring-up; stage a participant, leave g undecided, then trigger the sweep):
+**Placement (correction C1):** put this in `crates/cluster/src/twopc.rs`'s `#[cfg(test)] mod tests` (build `svc` directly), NOT `gateway_local.rs` — it uses only public `in_doubt_globals`/`release_all_for_range`/`commit_global_decision` but pairs with the in-crate fixture. (Single node leads everything, so leadership "rises" at bring-up; stage a participant, leave g undecided, then trigger the sweep.)
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
     use mvcc::xid::GLOBAL_XID_BASE;
-    let (node, _sql) = start_two_range_node().await;
+    let (node, _sql) = crate::server_node::testonly_two_range_node().await;
     let mut seed = node.engines[&1].connect();
     seed.run(&parse_one("CREATE TABLE b (id int4)")).await.expect("b");
     seed.run(&parse_one("INSERT INTO b VALUES (20)")).await.expect("seed");
@@ -666,7 +701,7 @@ async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
     // Stage a held participant (writes Prepared(Li -> g) durably), then DROP the held
     // session WITHOUT a decision (simulate the participant leader crashing): the
     // durable marker persists, the in-memory session is gone.
-    let svc = node.txn_service().expect("txn service");
+    let svc = TxnService::new(node.engines.clone()); // build directly (C1)
     assert!(matches!(svc.handle(1, TxnRpc::Stage { g, range: 1, sql: "UPDATE b SET id = 21 WHERE id = 20".into() }).await, TxnResp::Staged));
     svc.release_all_for_range(1).await; // drop in-memory session; durable Prepared marker stays
 
@@ -683,7 +718,7 @@ async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
 
 - [ ] **Step 6: Run + regressions**
 
-Run: `cargo nextest run -p executor in_doubt_globals_lists_undecided_prepared_markers`, `cargo nextest run -p cluster --test gateway_local`, `cargo nextest run -p executor`, `cargo nextest run -p cluster`, `cargo clippy -p cluster -p executor -p mvcc -p kv --all-targets -- -D warnings`.
+Run: `cargo nextest run -p executor in_doubt_globals_lists_undecided_prepared_markers`, `cargo nextest run -p mvcc` (guards `get`'s absent→InProgress after the `decode` refactor — correction C2), `cargo nextest run -p cluster` (incl. the relocated T4 marker test), `cargo nextest run -p executor`, `cargo clippy -p cluster -p executor -p mvcc -p kv --all-targets -- -D warnings`.
 
 - [ ] **Step 7: Commit**
 
@@ -722,8 +757,11 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
     const MIN_ROUNDS: usize = 4;
     let seeded_total = 2 * ACCOUNTS * SEED; // two tables, two ranges
 
-    // 3 nodes, boundary [2]: acct_a (id 1) -> range 0, acct_b (id 2) -> range 1.
-    let mut c = Cluster::spawn_multirange(3, vec![2]).await;
+    // 5 nodes, boundary [2] (correction C3 — 5 nodes keep a quorum when a non-leader
+    // is faulted, mirroring jepsen_bank's cross-range nemesis): acct_a (id 1) -> range 0,
+    // acct_b (id 2) -> range 1.
+    let mut c = Cluster::spawn_multirange(5, vec![2]).await;
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)); // committed-op progress signal
     let admin = c.pg(0).await;
     admin.simple_query("CREATE TABLE acct_a (id int8, bal int8)").await.expect("a");
     admin.simple_query("CREATE TABLE acct_b (id int8, bal int8)").await.expect("b");
@@ -739,9 +777,11 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
     let mut workers = Vec::new();
     for process in 0..PROCS {
         let addrs = addrs.clone();
+        let sig = committed.clone();
         workers.push(tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
             let mut rng = Lcg::new(0x9E37_79B9_u64.wrapping_mul(process as u64 + 1));
-            let mut committed = 0usize;
+            let mut n = 0usize;
             for _ in 0..OPS {
                 let node = addrs[process % addrs.len()].clone();
                 let Some(client) = connect(&node).await else { continue };
@@ -749,17 +789,28 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
                 let mut to = (rng.next() % ACCOUNTS as u64) as i64;
                 if to == from { to = (to + 1) % ACCOUNTS; }
                 let amt = 1 + (rng.next() % 20) as i64;
-                if cross_transfer(&client, from, to, amt).await { committed += 1; }
+                if cross_transfer(&client, from, to, amt).await {
+                    n += 1;
+                    sig.fetch_add(1, Ordering::Relaxed); // committed-op progress signal
+                }
             }
-            committed
+            n
         }));
     }
 
-    // Nemesis: kill+respawn / partition+heal a rotating victim (ANY node, incl.
-    // coordinators), paced on worker progress + a MIN_ROUNDS floor. No settle-sleep.
+    // Nemesis (correction C3): fault a NON-LEADER victim only (keep quorum on both
+    // ranges), pace the next fault on a committed-op progress signal (no settle-sleep),
+    // and await a recovered quorum (both ranges have a leader) before advancing. A
+    // killed non-leading gateway is still a crashed COORDINATOR mid-txn, so the recovery
+    // path is exercised. Mirrors jepsen_bank::cross_range_bank_conserves_total_under_nemesis.
+    use std::sync::atomic::Ordering;
     let mut round = 0usize;
     while !workers.iter().all(|w| w.is_finished()) || round < MIN_ROUNDS {
-        let victim = (round % c.len()) as u64;
+        // Pick a victim that leads NEITHER range (5 nodes / 2 ranges always leaves one).
+        let l0 = c.range_leader(0).await;
+        let l1 = c.range_leader(1).await;
+        let victim = (0..c.len() as u64).find(|&i| i != l0 && i != l1).expect("a non-leader exists");
+        let before = committed.load(Ordering::Relaxed);
         if round.is_multiple_of(2) {
             c.kill(victim).await;
             c.respawn(victim);
@@ -769,6 +820,17 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
             for &o in &others { let _ = c.control(o, ctl_set_partition(vec![victim])).await; }
             for id in 0..c.len() as u64 { let _ = c.control(id, ctl_heal()).await; }
         }
+        // Wait for the workload to commit at least one op under the fault OR finish,
+        // bounded (paced on real progress, never the clock); then let quorum recover.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while committed.load(Ordering::Relaxed) == before
+            && !workers.iter().all(|w| w.is_finished())
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await; // harness poll cadence, not a settle-sleep
+        }
+        c.range_leader(0).await; // recovered-quorum gate before the next fault
+        c.range_leader(1).await;
         round += 1;
     }
     let mut total_committed = 0usize;
