@@ -22,6 +22,11 @@ use crate::types::{NodeId, TypeConfig};
 
 const TXN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a participant holds a staged-but-undecided session before it self-
+/// resolves against range 0's global clog (presumed-abort if still in-doubt). Well
+/// above normal commit latency so a healthy txn is never prematurely aborted.
+pub(crate) const PARTICIPANT_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 struct PooledConn {
     addr: String,
@@ -278,10 +283,19 @@ impl GlobalCoordinator for NetCoordinator {
 /// blocks on a row lock held by another g against the Release that frees it).
 type HeldSession = Arc<Mutex<executor::SqlSession>>;
 
+/// A held participant session + the instant it joined `g` (for the coordinator-
+/// silence timeout). `joined_at` is set ONCE at first stage (or_insert_with gives
+/// first-insert semantics); a re-Stage must NOT reset it, or a chatty coordinator
+/// could keep a doomed txn alive forever.
+struct HeldEntry {
+    session: HeldSession,
+    joined_at: tokio::time::Instant,
+}
+
 #[derive(Clone)]
 pub struct TxnService {
     engines: HashMap<RangeId, Arc<SqlEngine>>,
-    held: Arc<Mutex<HashMap<(u64, RangeId), HeldSession>>>,
+    held: Arc<Mutex<HashMap<(u64, RangeId), HeldEntry>>>,
 }
 
 impl TxnService {
@@ -311,10 +325,53 @@ impl TxnService {
             let mut held = self.held.lock().await;
             let keys: Vec<(u64, RangeId)> =
                 held.keys().copied().filter(|&(_, r)| r == range).collect();
-            keys.into_iter().filter_map(|k| held.remove(&k)).collect()
+            keys.into_iter()
+                .filter_map(|k| held.remove(&k).map(|e| e.session))
+                .collect()
         };
         for s in victims {
             s.lock().await.abort_release();
+        }
+    }
+
+    /// Resolve an in-doubt `(g, range)` against range 0 via the WRITE-ONCE abort-race:
+    /// send CommitGlobal{commit:false}; the effective decision comes back (Committed if
+    /// a coordinator already won, Aborted if we won). Release the held session per the
+    /// decision. Idempotent: a missing entry is a no-op; a re-resolve hits write-once.
+    async fn resolve_in_doubt(&self, client: &TwoPcClient, g: u64, range: RangeId) {
+        let committed = match client
+            .call(0, TxnRpc::CommitGlobal { g, commit: false })
+            .await
+        {
+            Ok(TxnResp::Committed) => true,
+            Ok(TxnResp::Aborted) => false,
+            _ => return, // range 0 unreachable: leave it for the next sweep tick
+        };
+        let entry = { self.held.lock().await.remove(&(g, range)) };
+        if let Some(entry) = entry {
+            let mut session = entry.session.lock().await;
+            if committed {
+                session.commit_release()
+            } else {
+                session.abort_release()
+            }
+        }
+    }
+
+    /// Self-resolve every held session older than `timeout` (coordinator-silence
+    /// recovery). Snapshots stale `(g, range)` keys under a brief map lock, drops the
+    /// guard, then resolves each via `resolve_in_doubt`.
+    pub async fn sweep_stale(&self, client: &TwoPcClient, timeout: Duration) {
+        let now = tokio::time::Instant::now();
+        let stale: Vec<(u64, RangeId)> = {
+            let held = self.held.lock().await;
+            held.iter()
+                .filter(|(_, e)| now.duration_since(e.joined_at) >= timeout)
+                .map(|(&k, _)| k)
+                .collect()
+        };
+        for (g, range) in stale {
+            self.resolve_in_doubt(client, g, range).await;
         }
     }
 
@@ -339,7 +396,11 @@ impl TxnService {
         let mut held = self.held.lock().await;
         Some(
             held.entry((g, range))
-                .or_insert_with(|| Arc::new(Mutex::new(engine.connect())))
+                .or_insert_with(|| HeldEntry {
+                    session: Arc::new(Mutex::new(engine.connect())),
+                    joined_at: tokio::time::Instant::now(),
+                })
+                .session
                 .clone(),
         )
     }
@@ -366,9 +427,9 @@ impl TxnService {
     }
 
     async fn release(&self, g: u64, range: RangeId, commit: bool) -> TxnResp {
-        let handle = { self.held.lock().await.remove(&(g, range)) };
-        if let Some(handle) = handle {
-            let mut session = handle.lock().await;
+        let entry = { self.held.lock().await.remove(&(g, range)) };
+        if let Some(entry) = entry {
+            let mut session = entry.session.lock().await;
             if commit {
                 session.commit_release()
             } else {
@@ -396,7 +457,7 @@ mod tests {
     use pgwire::engine::Engine;
 
     use crate::transport::protocol::{NodeRequest, NodeResponse, TxnResp, TxnRpc};
-    use crate::twopc::TxnService;
+    use crate::twopc::{TwoPcClient, TxnService};
 
     fn parse_one(sql: &str) -> pgparser::ast::Statement {
         pgparser::parse(sql)
@@ -464,6 +525,58 @@ mod tests {
             other => panic!("expected Released, got {other:?}"),
         }
         assert!(!svc.holds(g, 1).await, "Release drops the held session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_silent_coordinator_is_recovered_by_the_timeout_sweeper() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let svc = TxnService::new(node.engines.clone());
+        let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone());
+
+        // Seed a row on range 1, then STAGE a held participant for a global xid g that
+        // NEVER receives a decision (the coordinator "crashed"). DDL (CREATE TABLE)
+        // runs through range-0's engine (catalog lives there); a placeholder takes
+        // table id 1 (range 0) so `b` gets id 2, which falls in range 1 (boundary 2).
+        let mut ddl = node.engines[&0].connect();
+        ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
+            .await
+            .expect("create placeholder → table id 1, range 0");
+        ddl.run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("create b → table id 2, range 1");
+        let mut seed = node.engines[&1].connect();
+        seed.run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed b");
+        let g = node.engines[&0]
+            .begin_global_durable()
+            .await
+            .expect("alloc g");
+        assert!(
+            matches!(
+                svc.handle(
+                    1,
+                    TxnRpc::Stage {
+                        g,
+                        range: 1,
+                        sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                    }
+                )
+                .await,
+                TxnResp::Staged
+            ),
+            "stage parks a held participant"
+        );
+        assert!(svc.holds(g, 1).await, "the participant holds g");
+
+        // Drive the sweeper with a ZERO timeout (every held session is "stale"): it
+        // resolves g via the abort-race (no coordinator wrote a decision -> Aborted),
+        // releasing the held session. Assert via the registry condition (no sleep).
+        svc.sweep_stale(&client, std::time::Duration::ZERO).await;
+        assert!(
+            !svc.holds(g, 1).await,
+            "the timeout sweeper self-resolved + released g"
+        );
     }
 
     #[test]

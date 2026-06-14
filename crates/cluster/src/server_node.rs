@@ -262,6 +262,13 @@ impl ServerNode {
                 txn.clone(),
             ));
         }
+        // Coordinator-silence recovery: a per-node heartbeat self-resolves held 2PC
+        // sessions whose coordinator crashed after staging but before deciding. The
+        // sweeper shares the SAME Arc held-map as the listener (TxnService is Clone),
+        // so it sees the sessions the listener parks. `txn.clone()` MUST precede the
+        // `Some(txn)` move below.
+        let sweeper_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        tokio::spawn(participant_silence_sweeper(txn.clone(), sweeper_client));
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
@@ -541,6 +548,22 @@ async fn release_on_leadership_loss(
         if rx.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Periodically self-resolve held 2PC sessions whose coordinator has gone silent
+/// (no decision within `PARTICIPANT_SILENCE_TIMEOUT`) against range 0's global clog.
+/// Bounded cadence (a recovery heartbeat): each tick resolves only sessions already
+/// past the timeout.
+async fn participant_silence_sweeper(
+    txn: crate::twopc::TxnService,
+    client: std::sync::Arc<crate::twopc::TwoPcClient>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    loop {
+        tick.tick().await;
+        txn.sweep_stale(&client, crate::twopc::PARTICIPANT_SILENCE_TIMEOUT)
+            .await;
     }
 }
 
