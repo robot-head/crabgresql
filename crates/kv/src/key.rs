@@ -68,6 +68,14 @@ pub fn next_xid_key() -> Vec<u8> {
     k
 }
 
+/// Key for the GTM's monotonic global-xid counter: `/0/meta/next_global_xid`.
+/// Lives in range 0's store, disjoint from the per-range `next_xid` key.
+pub fn meta_next_global_xid_key() -> Vec<u8> {
+    let mut k = system_prefix("meta");
+    k.extend_from_slice(b"next_global_xid");
+    k
+}
+
 /// Key for a transaction's commit-status-log entry: `/0/clog/<xid>`.
 pub fn clog_key(xid: u64) -> Vec<u8> {
     let mut k = system_prefix("clog");
@@ -137,6 +145,25 @@ mod tests {
         assert_ne!(seq, meta);
         assert_ne!(catalog_key("a"), catalog_key("b"));
         assert_ne!(seq_key(7), seq_key(8));
+    }
+
+    #[test]
+    fn meta_next_global_xid_key_is_distinct_from_all_other_meta_keys() {
+        let gxid = meta_next_global_xid_key();
+        assert_ne!(gxid, next_xid_key(), "distinct from next_xid");
+        assert_ne!(
+            gxid,
+            meta_next_table_id_key(),
+            "distinct from next_table_id"
+        );
+        assert_ne!(gxid, meta_range_map_key(), "distinct from range_map");
+        // Must be under the table-zero system prefix.
+        let zero = {
+            let mut k = Vec::new();
+            crate::keyenc::put_u32(&mut k, 0);
+            k
+        };
+        assert!(gxid.starts_with(&zero), "under table-zero prefix");
     }
 
     #[test]
