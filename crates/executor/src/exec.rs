@@ -1228,4 +1228,189 @@ mod tests {
         let r = run(&engine, "UPDATE t SET id = 9 WHERE id = 1").await;
         assert_eq!(tag_of(&r[0]), "UPDATE 1");
     }
+
+    /// Regression test: `eval_plan_qual` must resolve a `Prepared(LA → g)` deleter
+    /// against the CURRENT global clog (via `settled_global`), NOT the writer's
+    /// pre-lock global snapshot (`gsnap`), which may still list `g` as in-flight.
+    ///
+    /// Scenario (reconstructed without concurrency):
+    ///   - Cross-range txn `LA` (local xid on this range) UPDATE-committed row R
+    ///     from value 100 (v1) to value 70 (v2), leaving local clog entry
+    ///     `LA → Prepared(g1)` and global clog entry `g1 → Committed`.
+    ///   - Writer W took its global snapshot BEFORE `g1` was committed, so that
+    ///     snapshot still lists `g1` as in-flight (stale gsnap).
+    ///   - W now holds the row lock and calls `eval_plan_qual`.
+    ///
+    /// With the fix (`settled_global`):
+    ///   `resolve(LA) == Committed`, `changed_since_snapshot == true`, READ COMMITTED
+    ///   re-finds under a fresh snapshot → returns v2 (value 70). Correct.
+    ///
+    /// Without the fix (using `gsnap` for resolve):
+    ///   `resolve(LA) == InProgress` (g1 still in-doubt in stale gsnap) →
+    ///   `changed_since_snapshot == false` → `find_visible_one` with stale snapshot
+    ///   sees v1 as live (xmax=LA appears uncommitted) → returns v1 (value 100).
+    ///   Lost update across the 2PC boundary.
+    #[test]
+    fn eval_plan_qual_settled_global_sees_committed_cross_range_version() {
+        use std::sync::Arc;
+
+        use super::eval_plan_qual;
+        use catalog::{Column, Table};
+        use kv::{Kv, MemKv};
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::version::{encode_tuple, version_key_xid};
+        use mvcc::visibility::Snapshot;
+        use mvcc::xid::{GLOBAL_XID_BASE, INVALID_XID};
+        use pgtypes::{ColumnType, Datum};
+
+        // ── xid assignments ─────────────────────────────────────────────────────
+        let x0: u64 = 1; // original inserter — settled, committed
+        let la: u64 = 2; // cross-range txn's local xid (Prepared state in local clog)
+        let g1: u64 = GLOBAL_XID_BASE + 1; // global txn id
+        let writer: u64 = 3; // the writer calling eval_plan_qual (current txn)
+
+        // ── stores ──────────────────────────────────────────────────────────────
+        // `kv` holds both the data range's row versions AND the local clog.
+        // `global` holds only range-0's global clog.
+        let kv = Arc::new(MemKv::new());
+        let global = MemKv::new();
+
+        // ── catalog table ────────────────────────────────────────────────────────
+        // Table id 1, single int4 column "val".
+        let table = Table {
+            id: 1,
+            name: "t".into(),
+            columns: vec![Column {
+                name: "val".into(),
+                ty: ColumnType::Int4,
+            }],
+        };
+        let rowid: u64 = 1;
+
+        // ── write two versions of row R ──────────────────────────────────────────
+        // v1: created by x0, deleted (xmax) by la — value 100 (the old row)
+        kv.write_batch(&[kv::WriteOp::Put {
+            key: version_key_xid(table.id, rowid, x0),
+            value: encode_tuple(x0, la, &[Datum::Int4(100)]),
+        }])
+        .expect("write v1");
+        // v2: created by la, live (xmax=INVALID_XID) — value 70 (the updated row)
+        kv.write_batch(&[kv::WriteOp::Put {
+            key: version_key_xid(table.id, rowid, la),
+            value: encode_tuple(la, INVALID_XID, &[Datum::Int4(70)]),
+        }])
+        .expect("write v2");
+
+        // ── local clog in `kv` ───────────────────────────────────────────────────
+        // x0 is settled-committed.  la is in Prepared state → g1.
+        kv.write_batch(&[
+            put_op(x0, XidStatus::Committed),
+            put_op(la, XidStatus::Prepared(g1)),
+        ])
+        .expect("write local clog");
+
+        // ── global clog in `global` ──────────────────────────────────────────────
+        // g1 has committed — but writer's global snapshot is stale (lists g1 as
+        // in-flight), so eval_plan_qual MUST use settled_global, not stale_gsnap.
+        global
+            .write_batch(&[put_op(g1, XidStatus::Committed)])
+            .expect("write global clog");
+
+        // ── stale global snapshot (what the writer held pre-lock) ────────────────
+        // g1 is listed as in-flight — this is the bug trigger.
+        // NOTE: eval_plan_qual no longer accepts gsnap as a parameter (the fix
+        // bakes settled_global internally), so this snapshot is used as the
+        // *local* snapshot below, which represents the writer's view of local xids.
+        // The global staleness is expressed via the local clog's Prepared marker.
+
+        // ── procarray: writer (xid=3) is running; x0 and la are not ────────────
+        // The fresh snapshot produced by procarray.snapshot() inside eval_plan_qual
+        // will have xmax=4, xip=[3] — so la (xid=2) < xmax=4 and not in xip,
+        // meaning satisfies_mvcc will ask the clog for la → Prepared(g1) →
+        // settled_global → Committed → v2 visible. Correct.
+        let procarray = crate::procarray::ProcArray::open(
+            Arc::clone(&kv) as Arc<dyn kv::Kv>,
+            crate::PersistMode::Durable,
+        )
+        .expect("procarray open");
+        // Advance next_xid past x0, la, and writer by allocating writer's slot.
+        // (begin_write allocates sequentially starting at 1.)
+        let _xid_x0 = procarray.begin_write().expect("alloc x0 slot"); // xid=1
+        let _xid_la = procarray.begin_write().expect("alloc la slot"); // xid=2
+        let _xid_w = procarray.begin_write().expect("alloc writer slot"); // xid=3
+        // Mark x0 and la as finished (committed) so they are not in the running set.
+        procarray.finish(_xid_x0);
+        procarray.finish(_xid_la);
+        // writer (xid=3) remains running.
+
+        // ── local (txn) snapshot for the writer ─────────────────────────────────
+        // Taken when the writer began. At that time la (xid=2) was still running
+        // in the local sense because the Prepared marker hadn't been removed yet.
+        // NOTE: in the real 2PC path la is deregistered from procarray at prepare,
+        // so in practice it would not appear in xip here; but eval_plan_qual's
+        // staleness bug is about the GLOBAL snapshot, not the local one. We make
+        // la visible in the local snapshot to keep the test simple and focused:
+        // x0 is settled (xid < xmax, not in xip) and la is settled too (same).
+        // The critical stale element is the global clog Prepared → g1-in-doubt path,
+        // which is exercised via the kv local-clog entry `la → Prepared(g1)`.
+        //
+        // Writer's local snapshot: xmax = writer (3), only writer in xip.
+        // x0=1 < 3 and not in xip → settled; la=2 < 3 and not in xip → settled.
+        // This is the snapshot held when the writer started, BEFORE it blocked on
+        // the row lock. la's Prepared(g1) status makes g1 the relevant global txn.
+        let writer_snapshot = Snapshot {
+            xmin: writer,
+            xmax: writer,      // writer itself started after x0 and la settled locally
+            xip: vec![writer], // writer is the only running local txn
+        };
+
+        // ── call eval_plan_qual ──────────────────────────────────────────────────
+        // With the fix: eval_plan_qual uses settled_global internally, so:
+        //   resolve(la) → Prepared(g1) → g1 not in-doubt in settled_global → Committed
+        //   changed_since_snapshot: xmax=la, la != INVALID_XID, la != writer,
+        //     resolve(la)==Committed, !snapshot_can_see(writer_snapshot, la).
+        //   snapshot_can_see(writer_snapshot, la): la=2 < xmax=3, la not in xip=[3]
+        //     → la IS visible → snapshot_can_see = true → !true = false → NOT changed.
+        //
+        // Wait — if la is visible in writer_snapshot, changed_since_snapshot is false,
+        // so we go to find_visible_one with writer_snapshot and settled_global.
+        // With settled_global: resolve(la) = Committed.
+        // v1: xmin=x0 (committed, visible), xmax=la (committed-visible) → NOT visible.
+        // v2: xmin=la (committed-visible), xmax=INVALID_XID → visible. Returns v2. Correct.
+        //
+        // Without the fix (using stale gsnap where g1 is in-doubt):
+        //   resolve(la) → Prepared(g1) → g1 in-doubt → InProgress
+        //   changed_since_snapshot: resolve(la)==InProgress, not Committed → false
+        //   find_visible_one with writer_snapshot and stale resolver:
+        //     v1: xmin=x0 visible, xmax=la → resolve(la)=InProgress → not committed
+        //         → xmax not committed-visible → v1 appears live → visible!
+        //     v2: xmin=la → committed_visible(la): la not own, la < xmax=3, not in xip
+        //         → NOT running → asks status: InProgress → NOT committed → v2 invisible
+        //   Returns v1 (value 100). Bug.
+        let result = eval_plan_qual(
+            kv.as_ref(),
+            &global,
+            &procarray,
+            &writer_snapshot,
+            &table,
+            rowid,
+            writer,
+            false, // READ COMMITTED
+        )
+        .expect("eval_plan_qual must not error");
+
+        // The fix: must see v2 (xmin=la, value=70), NOT v1 (value=100).
+        let (ret_xmin, ret_row) = result.expect("must find a version (not None)");
+        assert_eq!(
+            ret_xmin, la,
+            "eval_plan_qual must return the cross-range committed version (xmin=la={la}), \
+             not the stale pre-commit version (xmin=x0={x0})"
+        );
+        assert_eq!(
+            ret_row,
+            vec![Datum::Int4(70)],
+            "eval_plan_qual must return value 70 (cross-range committed UPDATE result), \
+             not value 100 (the stale pre-2PC-commit row) — lost-update bug"
+        );
+    }
 }
