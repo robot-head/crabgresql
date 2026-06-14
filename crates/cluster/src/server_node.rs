@@ -421,6 +421,22 @@ mod tests {
             .await
             .expect("range 1 leader");
 
+        // Capture range 0's applied index once it has settled (its single-node
+        // bootstrap entry applied), BEFORE the range-1 write — so the raft-keyspace
+        // isolation check below is deterministic (assert range 0 did NOT advance),
+        // not a brittle cross-range index race that flakes under CPU contention.
+        node.rafts[&0]
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.last_applied.is_some(), "range 0 settled")
+            .await
+            .expect("range 0 settled");
+        let r0_before = node.rafts[&0]
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+
         // Propose a marker row directly through range 1's Raft `client_write`
         // (no SQL gateway yet — that is Task 3). A `WriteBatch` of one Put commits
         // to range 1's group, applies into `data-r1`.
@@ -453,23 +469,30 @@ mod tests {
 
         // Criterion 3 also requires isolation across the RAFT keyspaces, not just
         // `data-r{r}`. The commit appended an entry to range 1's `raft-r1` and
-        // applied it, advancing range 1's `last_applied`; range 0's `raft-r0` saw
-        // only its own bootstrap entries (no data write), so its `last_applied`
-        // did not advance from this write. We read both via openraft metrics — a
-        // borrow of the metrics watch, no sleep.
-        let r1_applied = node.rafts[&1].metrics().borrow().last_applied;
-        let r0_applied = node.rafts[&0].metrics().borrow().last_applied;
-        let r1_idx = r1_applied.expect("range 1 has applied entries").index;
+        // applied it, advancing range 1's `last_applied` past its bootstrap; range
+        // 0's `raft-r0` saw no data write, so its `last_applied` is UNCHANGED from
+        // the value captured before the write. Asserting "range 0 did not advance"
+        // (rather than a cross-range `r0 < r1` index comparison) is deterministic:
+        // a settled single-node group appends nothing without a client write, so
+        // there is no timing race. Read via the metrics watch — no sleep.
+        let r1_idx = node.rafts[&1]
+            .metrics()
+            .borrow()
+            .last_applied
+            .expect("range 1 has applied entries")
+            .index;
         assert!(
             r1_idx > 0,
             "range 1's raft-r1 advanced last_applied past bootstrap after the write"
         );
-        // Range 0 only ever applied its single-node bootstrap; the range-1 write
-        // never touched `raft-r0`. Its applied index is strictly below range 1's,
-        // proving the raft keyspaces are isolated too (no shared log/SM state).
-        let r0_idx = r0_applied.map(|l| l.index).unwrap_or(0);
-        assert!(
-            r0_idx < r1_idx,
+        let r0_after = node.rafts[&0]
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        assert_eq!(
+            r0_after, r0_before,
             "range 0's raft-r0 did not advance from range 1's write (raft-keyspace isolation)"
         );
     }
