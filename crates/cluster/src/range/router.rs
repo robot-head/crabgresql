@@ -170,6 +170,26 @@ impl RangeRouter {
         self.before_global_decision = Some(hook);
     }
 
+    /// Test-only: the global xid this txn has escalated to, if it is currently a
+    /// staged cross-range txn (`Pin::Global`). Used by the crash-before/after-
+    /// decision tests to drive the global decision out-of-band (simulating a
+    /// coordinator that crashes after the decision is durable but before it
+    /// releases the participants) without going through the normal COMMIT close.
+    #[cfg(test)]
+    fn staged_global_xid(&self) -> Option<u64> {
+        match &self.pin {
+            Pin::Global { g, .. } => Some(*g),
+            _ => None,
+        }
+    }
+
+    /// Test-only: the coordinator engine (range 0's GTM-bearing engine), so a crash
+    /// test can write the global decision directly for a known `g`.
+    #[cfg(test)]
+    fn coordinator_engine(&self) -> &SqlEngine {
+        &self.engines[&0]
+    }
+
     /// In-process harness constructor: the harness leads every range from one of
     /// its co-located nodes, so it has a local engine per range and never needs to
     /// forward — delegates to `new` with an `AlwaysLeads` predicate (every local
@@ -704,6 +724,101 @@ mod tests {
             fresh.scan_one_i32("SELECT id FROM b").await,
             Vec::<i32>::new()
         );
+    }
+
+    /// Crash-BEFORE-decision (criterion 5, presumed-abort arm). Both participants
+    /// are staged (each has written its `Prepared(-> g)` marker), then the
+    /// coordinator router is DROPPED before any global decision is written — the
+    /// in-process analog of the coordinator crashing mid-2PC. Dropping the router
+    /// runs each participant session's `Drop` (releases row locks); range 0's
+    /// global clog never records a decision and `g` is never `finish_global`'d, so
+    /// it stays in-doubt forever. A fresh router therefore sees NEITHER row: the
+    /// resolver treats every `Prepared(-> g)` tuple whose `g` is still running as
+    /// invisible. This is presumed-abort without any active recovery sweep (the
+    /// sweep + a durable txn record are SP17's cross-node problem).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_before_global_decision_presumes_abort() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        drop(admin);
+
+        // Stage both participants but DO NOT commit: the second INSERT escalates to
+        // a global txn and both rows now carry `Prepared(-> g)` markers.
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router.simple("INSERT INTO a VALUES (1)").await.expect("a");
+        router.simple("INSERT INTO b VALUES (2)").await.expect("b");
+        assert!(
+            router.staged_global_xid().is_some(),
+            "txn escalated to a staged global txn"
+        );
+        // The coordinator crashes mid-2PC, before writing the decision.
+        drop(router);
+
+        // A fresh router sees neither row — both are in-doubt (no Committed(g),
+        // and g is still in the GTM running-set), so presumed abort.
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM a").await,
+            Vec::<i32>::new(),
+            "range-0 row in-doubt after coordinator crash → invisible"
+        );
+        assert_eq!(
+            fresh.scan_one_i32("SELECT id FROM b").await,
+            Vec::<i32>::new(),
+            "range-1 row in-doubt after coordinator crash → invisible"
+        );
+    }
+
+    /// Crash-AFTER-decision (criterion 5, commit-durable arm). Both participants are
+    /// staged, then the global decision `Committed(g)` is written durably to range
+    /// 0's global clog (and `g` is settled) OUT-OF-BAND — modeling a coordinator
+    /// that crashes the instant after the decision is durable but BEFORE it releases
+    /// the participants (no `commit_release` runs; the router is dropped instead). A
+    /// fresh router still sees BOTH rows: range 0's global clog is the sole arbiter,
+    /// so a durable `Committed(g)` makes both `Prepared(-> g)` tuples visible even
+    /// though the original coordinator never cleaned up. The dropped router's
+    /// session `Drop`s release the (now-committed) locks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_after_global_decision_commits() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        drop(admin);
+
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router.simple("INSERT INTO a VALUES (1)").await.expect("a");
+        router.simple("INSERT INTO b VALUES (2)").await.expect("b");
+        let g = router
+            .staged_global_xid()
+            .expect("txn escalated to a staged global txn");
+
+        // The decision is made durable in range 0's global clog and settled in the
+        // GTM, but the coordinator crashes (is dropped) before releasing the
+        // participants via the normal COMMIT close.
+        router
+            .coordinator_engine()
+            .commit_global_decision(g, mvcc::clog::XidStatus::Committed)
+            .await
+            .expect("durable global Committed(g)");
+        router.coordinator_engine().finish_global(g);
+        drop(router); // crash after decision, before commit_release
+
+        // A fresh router sees BOTH rows: the durable Committed(g) is the global
+        // arbiter; both Prepared(-> g) tuples resolve to it.
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM a").await, vec![1]);
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM b").await, vec![2]);
     }
 }
 
