@@ -26,6 +26,16 @@ use crate::transport::partition::PartitionState;
 use crate::transport::server::{RangeRegistry, ShutdownSignal, serve_node_protocol};
 use crate::types::{NodeId, TypeConfig};
 
+/// A built-but-not-yet-Arc'd data range: `(range, raft, applied store, engine)`.
+/// Collected during bring-up so the range-0 read barrier can be injected on each
+/// engine (with `&mut`) once the per-range `rafts` map is complete.
+type PendingRange = (
+    RangeId,
+    openraft::Raft<TypeConfig>,
+    Arc<dyn kv::Kv>,
+    SqlEngine,
+);
+
 /// Where a node's range layout comes from.
 pub enum RangeLayout {
     /// Static config: the range map is fixed at startup, identical on every node
@@ -204,13 +214,29 @@ impl ServerNode {
         sm_kvs.insert(0, r0_sm_kv);
         engines.insert(0, r0_engine);
 
-        // Data ranges (all ranges except 0).
+        // Data ranges (all ranges except 0). Build each trio FIRST (engines still
+        // un-Arc'd so the range-0 barrier can be injected with `&mut`), collecting
+        // them until `rafts` is complete — the barrier's `TwoPcClient` needs the
+        // full per-range raft map.
+        let mut pending: Vec<PendingRange> = Vec::new();
         for range in map.range_ids().filter(|&r| r != 0) {
             let (raft, sm_kv, engine) =
                 build_range_group(&store, range, cfg.id, &partition, &registry, &catalog_kv).await;
+            rafts.insert(range, raft.clone());
+            pending.push((range, raft, sm_kv, engine));
+        }
+        // Cross-node visibility: every DATA-range engine gets a range-0 read barrier
+        // so its cross-range resolver reads a caught-up local range-0 replica. Range
+        // 0's own engine needs none (it reads its own current store). Built over the
+        // now-complete `rafts` map.
+        let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        for (range, raft, sm_kv, mut engine) in pending {
+            let barrier: Arc<dyn executor::Linearizer> = Arc::new(
+                crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
+            );
+            engine.set_range0_barrier(barrier);
             let engine = Arc::new(engine);
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
-            rafts.insert(range, raft);
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }
@@ -398,17 +424,30 @@ impl ServerNode {
         // decodes the authoritative map.
         let map = wait_for_range_map(&r0_raft, catalog_kv.as_ref(), boot_timeout).await?;
 
-        // Build each data range named by the descriptors.
+        // Build each data range named by the descriptors. Collect the trios FIRST
+        // (engines un-Arc'd) so the range-0 barrier can be injected once `rafts` is
+        // complete — the barrier's `TwoPcClient` needs the full per-range raft map.
+        let mut pending: Vec<PendingRange> = Vec::new();
         for range in map.range_ids().filter(|&r| r != 0) {
             store.open_range(range).expect("open data range keyspace");
             let (raft, sm_kv, engine) =
                 build_range_group(&store, range, cfg.id, &partition, &registry, &catalog_kv).await;
-            let engine = Arc::new(engine);
             if cfg.bootstrap {
                 tokio::spawn(bootstrap(raft.clone(), cfg.peers.clone()));
             }
+            rafts.insert(range, raft.clone());
+            pending.push((range, raft, sm_kv, engine));
+        }
+        // Cross-node visibility: every DATA-range engine gets a range-0 read barrier
+        // (range 0's own engine reads its own current store, so it needs none).
+        let barrier_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        for (range, raft, sm_kv, mut engine) in pending {
+            let barrier: Arc<dyn executor::Linearizer> = Arc::new(
+                crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
+            );
+            engine.set_range0_barrier(barrier);
+            let engine = Arc::new(engine);
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
-            rafts.insert(range, raft);
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
         }

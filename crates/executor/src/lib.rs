@@ -66,6 +66,12 @@ pub struct SqlEngine {
     /// on a single-range engine. Single-range behavior is byte-for-byte unchanged
     /// when `gtm` is `None`.
     pub(crate) gtm: Option<Arc<gtm::Gtm>>,
+    /// A range-0 read barrier, injected by the cluster on every DATA-range engine
+    /// (range != 0) of a multi-range node. Before a cross-range resolver reads
+    /// range 0's global clog, this catches the node's LOCAL range-0 replica up to
+    /// range 0's linearizable applied index. `None` on range 0's own engine (it
+    /// reads its own current store) and on single-range engines.
+    pub(crate) range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
 }
 
 impl Default for SqlEngine {
@@ -102,6 +108,7 @@ impl SqlEngine {
             linearizer: Arc::new(crate::read_gate::LocalLinearizer),
             persist_mode: PersistMode::Durable,
             gtm: None,
+            range0_barrier: None,
         })
     }
 
@@ -133,6 +140,7 @@ impl SqlEngine {
             linearizer,
             persist_mode: PersistMode::Replicated,
             gtm: None,
+            range0_barrier: None,
         })
     }
 
@@ -159,6 +167,7 @@ impl SqlEngine {
             linearizer: Arc::clone(&self.linearizer),
             persist_mode: self.persist_mode,
             gtm: self.gtm.as_ref().map(Arc::clone),
+            range0_barrier: self.range0_barrier.as_ref().map(Arc::clone),
         }
     }
 
@@ -178,6 +187,18 @@ impl SqlEngine {
     /// `other` can be any range's engine.
     pub fn share_gtm_to(&self, other: &mut SqlEngine) {
         other.gtm = self.gtm.as_ref().map(Arc::clone);
+    }
+
+    /// Inject a range-0 read barrier on this (data-range) engine. Called by the
+    /// cluster on every range != 0 engine so its cross-range resolver reads a
+    /// caught-up range-0 replica. Range 0's own engine needs no barrier.
+    pub fn set_range0_barrier(&mut self, b: Arc<dyn crate::read_gate::Linearizer>) {
+        self.range0_barrier = Some(b);
+    }
+
+    /// Copy this engine's range-0 barrier into `other`.
+    pub fn share_range0_barrier_to(&self, other: &mut SqlEngine) {
+        other.range0_barrier = self.range0_barrier.as_ref().map(Arc::clone);
     }
 
     /// Whether this engine carries the shared GTM (so `begin_global_durable` and
@@ -295,6 +316,7 @@ impl Engine for SqlEngine {
             Arc::clone(&self.linearizer),
             self.persist_mode,
             self.gtm.as_ref().map(Arc::clone),
+            self.range0_barrier.as_ref().map(Arc::clone),
         )
     }
 }

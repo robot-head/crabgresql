@@ -45,6 +45,19 @@ enum TxnState {
     Failed(TxnCtx),
 }
 
+/// Reconstruct the global visibility snapshot from range 0's DURABLE state (never
+/// an in-memory running set — correction C2). xmax = next_global_xid; xip = [] (a
+/// g < xmax is resolved by reading range 0's global clog directly). Caller must
+/// have barriered range 0's replica current first.
+pub(crate) fn durable_global_snapshot(range0: &dyn Kv) -> Result<Snapshot, ExecError> {
+    use mvcc::xid::GLOBAL_XID_BASE;
+    Ok(Snapshot {
+        xmin: GLOBAL_XID_BASE,
+        xmax: crate::gtm::read_next_global(range0)?,
+        xip: vec![],
+    })
+}
+
 /// One connection's view of the engine. Holds shared handles to the KV store,
 /// the ProcArray, the SequenceManager, the RowLockManager, and the DDL catalog
 /// lock, plus this connection's transaction state. Not shared between
@@ -65,6 +78,13 @@ pub struct SqlSession {
     /// multi-range cluster (so any range can capture a global snapshot and
     /// resolve a `Prepared` row); `None` on a single-range engine.
     gtm: Option<Arc<crate::gtm::Gtm>>,
+    /// A range-0 read barrier (data-range engines only). Before any read that
+    /// consults range 0's global clog (the cross-range resolver), this catches the
+    /// node's LOCAL range-0 replica up to range 0's linearizable applied index, so a
+    /// `Committed(g)` is actually present when `global_status` reads it. `None` on
+    /// range 0's own engine (it reads its own current store) and on a single-range
+    /// engine.
+    range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
     /// Set when this session is enlisted as a participant in a cross-range global
     /// txn `g` (Task 4's coordinator calls `join_global`). While set, each local
     /// write also stamps a `Prepared(local_xid -> g)` clog marker and deregisters
@@ -89,6 +109,7 @@ impl SqlSession {
         linearizer: Arc<dyn crate::read_gate::Linearizer>,
         persist_mode: crate::PersistMode,
         gtm: Option<Arc<crate::gtm::Gtm>>,
+        range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
     ) -> Self {
         Self {
             kv,
@@ -101,9 +122,21 @@ impl SqlSession {
             linearizer,
             persist_mode,
             gtm,
+            range0_barrier,
             global_xid: None,
             state: TxnState::Idle,
         }
+    }
+
+    /// Catch range 0's LOCAL replica up to its leader's linearizable applied index
+    /// (data-range engines only; a no-op on range 0's own engine and single-range
+    /// engines). Run AFTER the own-range `linearizer.ensure_readable()` and BEFORE
+    /// any read that consults range 0's global clog (the cross-range resolver).
+    async fn ensure_global_readable(&self) -> Result<(), ExecError> {
+        if let Some(b) = &self.range0_barrier {
+            b.ensure_readable().await?;
+        }
+        Ok(())
     }
 
     /// Execute one already-parsed statement (the router parses once, then routes).
@@ -175,13 +208,15 @@ impl SqlSession {
         // it leaves a placeholder here and is not gated at BEGIN.
         if rr {
             self.linearizer.ensure_readable().await?;
+            self.ensure_global_readable().await?; // range 0 caught up before the gsnap
         }
         let snapshot = self.procarray.snapshot();
         // RR fixes its GLOBAL snapshot at BEGIN too (so a Prepared(-> g) row's
         // in-doubt-ness is stable for the whole txn); RC re-captures per statement,
-        // so leave it None here. None on a non-GTM engine.
+        // so leave it None here. Reconstructed from range 0's DURABLE state (after
+        // the barrier above); NO_GLOBAL_SNAPSHOT() on a single-range engine.
         let global_snapshot = if rr {
-            self.gtm.as_ref().map(|g| g.global_snapshot())
+            Some(self.global_read_snapshot(None))
         } else {
             None
         };
@@ -255,11 +290,18 @@ impl SqlSession {
     /// is `NO_GLOBAL_SNAPSHOT()` and the resolver's `Prepared` branch is
     /// unreachable (no `Prepared` tuple ever exists there).
     fn global_read_snapshot(&self, stored: Option<&Snapshot>) -> Snapshot {
-        match (&self.gtm, stored) {
-            (None, _) => crate::NO_GLOBAL_SNAPSHOT(),
-            (Some(_), Some(s)) => s.clone(),
-            (Some(gtm), None) => gtm.global_snapshot(),
+        if let Some(s) = stored {
+            return s.clone(); // RR reuses the durable snapshot taken at BEGIN
         }
+        // Any engine that can see cross-range Prepared rows reconstructs gsnap from
+        // range 0's DURABLE state. The in-memory GTM running set is NEVER consulted
+        // (correction C2): a network commit prunes g on one node only, so a range-0
+        // running-set read would hide its own just-committed row cluster-wide.
+        if self.gtm.is_some() || self.range0_barrier.is_some() {
+            return durable_global_snapshot(&*self.catalog_kv)
+                .unwrap_or_else(|_| crate::NO_GLOBAL_SNAPSHOT());
+        }
+        crate::NO_GLOBAL_SNAPSHOT() // single-range engine: no global xids exist
     }
 
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
@@ -298,6 +340,7 @@ impl SqlSession {
                 if refresh {
                     // Gate before any local work (xid allocation, snapshot).
                     self.linearizer.ensure_readable().await?;
+                    self.ensure_global_readable().await?; // range 0 caught up too
                 }
                 // Allocate an xid if the txn has not done a write yet (a FOR
                 // UPDATE in a read-only txn still needs one, like PG).
@@ -346,6 +389,7 @@ impl SqlSession {
                 // Autocommit read takes a fresh snapshot → gate before any local
                 // work (xid allocation, snapshot).
                 self.linearizer.ensure_readable().await?;
+                self.ensure_global_readable().await?; // range 0 caught up too
                 // Autocommit: allocate an xid, run the locking SELECT, then
                 // immediately release the locks (implicit txn ends at statement
                 // end — there is no open block to hold them).
@@ -404,11 +448,13 @@ impl SqlSession {
         match plan {
             Plan::Auto => {
                 self.linearizer.ensure_readable().await?;
+                self.ensure_global_readable().await?; // range 0 caught up before the gsnap
                 let gsnap = self.global_read_snapshot(None);
                 Ok((self.procarray.snapshot(), None, gsnap))
             }
             Plan::RcRefresh => {
                 self.linearizer.ensure_readable().await?;
+                self.ensure_global_readable().await?; // range 0 caught up before the gsnap
                 let snap = self.procarray.snapshot();
                 // RC re-captures the global snapshot per statement too.
                 let gsnap = self.global_read_snapshot(None);
@@ -447,6 +493,11 @@ impl SqlSession {
         match &self.state {
             TxnState::InTransaction(_) => {
                 self.ensure_write_xid()?;
+                // UPDATE/DELETE's eval_plan_qual re-check reads range 0's global clog
+                // to resolve a cross-range supersede, so catch range 0's replica up
+                // before the gsnap capture. (RR already barriered at BEGIN; the
+                // barrier is idempotent.)
+                self.ensure_global_readable().await?;
                 // RC refreshes the read snapshot used by UPDATE/DELETE's scan.
                 let refresh =
                     matches!(&self.state, TxnState::InTransaction(c) if !c.repeatable_read);
@@ -518,6 +569,9 @@ impl SqlSession {
                 Ok(result)
             }
             TxnState::Idle => {
+                // Autocommit UPDATE/DELETE's eval_plan_qual re-check reads range 0's
+                // global clog, so catch range 0's replica up before the gsnap capture.
+                self.ensure_global_readable().await?;
                 // Autocommit: allocate an xid, execute (taking row locks), and
                 // commit in one atomic batch (versions + clog). No global writer
                 // lock; next_xid was persisted eagerly by begin_write.

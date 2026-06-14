@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use executor::{ExecError, SqlEngine};
+use executor::{ExecError, Linearizer, SqlEngine};
 use pgwire::engine::Engine;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -153,6 +153,50 @@ impl TwoPcClient {
                 Err(())
             }
         }
+    }
+}
+
+/// A follower-capable range-0 read barrier. Fetches range 0's linearizable applied
+/// index from its leader (via the `GlobalBarrier` RPC), then blocks until this
+/// node's local range-0 replica has applied through it — making a participant's
+/// `global_status` reads of range 0's clog correct over the network. If this node
+/// IS range 0's leader, a local `ensure_linearizable()` is authoritative (skip the
+/// RPC).
+pub struct Range0Barrier {
+    range0: openraft::Raft<TypeConfig>,
+    id: NodeId,
+    client: Arc<TwoPcClient>,
+}
+
+impl Range0Barrier {
+    pub fn new(range0: openraft::Raft<TypeConfig>, id: NodeId, client: Arc<TwoPcClient>) -> Self {
+        Self { range0, id, client }
+    }
+}
+
+#[async_trait::async_trait]
+impl Linearizer for Range0Barrier {
+    async fn ensure_readable(&self) -> Result<(), ExecError> {
+        let leads0 = self.range0.metrics().borrow().current_leader == Some(self.id);
+        let barrier_index = if leads0 {
+            self.range0
+                .ensure_linearizable()
+                .await
+                .map(|r| r.map(|l| l.index).unwrap_or(0))
+                .map_err(|_| ExecError::Unavailable)?
+        } else {
+            match self.client.call(0, TxnRpc::GlobalBarrier).await {
+                Ok(TxnResp::Barrier { applied_index }) => applied_index,
+                Ok(TxnResp::NotLeader) => return Err(ExecError::NotLeader),
+                _ => return Err(ExecError::Unavailable),
+            }
+        };
+        self.range0
+            .wait(Some(TXN_TIMEOUT))
+            .applied_index_at_least(Some(barrier_index), "range-0 read barrier")
+            .await
+            .map(|_| ())
+            .map_err(|_| ExecError::Unavailable)
     }
 }
 

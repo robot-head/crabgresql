@@ -199,3 +199,80 @@ fn row_count(msgs: &[tokio_postgres::SimpleQueryMessage]) -> usize {
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_commits_a_cross_range_transaction_atomically() {
+    let (_node, sql_addr) = start_two_range_node().await;
+    let port = sql_addr.rsplit(':').next().expect("port");
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
+    let (client, connection) = connect_with_retry(&conn_str).await;
+    tokio::spawn(connection);
+    client
+        .simple_query("CREATE TABLE a (id int4)")
+        .await
+        .expect("a");
+    client
+        .simple_query("CREATE TABLE b (id int4)")
+        .await
+        .expect("b");
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO a VALUES (1)")
+        .await
+        .expect("pin range 0");
+    client
+        .simple_query("INSERT INTO b VALUES (2)")
+        .await
+        .expect("escalate range 1");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("atomic cross-range commit");
+    let a = client
+        .simple_query("SELECT id FROM a")
+        .await
+        .expect("select a");
+    let b = client
+        .simple_query("SELECT id FROM b")
+        .await
+        .expect("select b");
+    assert_eq!(row_count(&a), 1, "range-0 row committed");
+    assert_eq!(row_count(&b), 1, "range-1 row committed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_rolls_back_a_cross_range_transaction_atomically() {
+    let (_node, sql_addr) = start_two_range_node().await;
+    let port = sql_addr.rsplit(':').next().expect("port");
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
+    let (client, connection) = connect_with_retry(&conn_str).await;
+    tokio::spawn(connection);
+    client
+        .simple_query("CREATE TABLE a (id int4)")
+        .await
+        .expect("a");
+    client
+        .simple_query("CREATE TABLE b (id int4)")
+        .await
+        .expect("b");
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO a VALUES (1)")
+        .await
+        .expect("a");
+    client
+        .simple_query("INSERT INTO b VALUES (2)")
+        .await
+        .expect("b");
+    client.simple_query("ROLLBACK").await.expect("rollback");
+    let a = client
+        .simple_query("SELECT id FROM a")
+        .await
+        .expect("select a");
+    let b = client
+        .simple_query("SELECT id FROM b")
+        .await
+        .expect("select b");
+    assert_eq!(row_count(&a), 0, "range-0 row rolled back");
+    assert_eq!(row_count(&b), 0, "range-1 row rolled back");
+}

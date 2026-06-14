@@ -25,19 +25,31 @@ pub(crate) struct Gtm {
     kv: Arc<dyn Kv>,
 }
 
+/// Decode range 0's durable `next_global_xid` counter. It is written BIG-ENDIAN
+/// (`next_global_xid_op` writes `U64::new(next).as_bytes()`), so it MUST be read
+/// big-endian here — a native-/little-endian decode mis-reads the real allocator's
+/// bytes and clamps every reader's global horizon to `GLOBAL_XID_BASE`, hiding
+/// every committed cross-range row in the wired path (correction C1). ONE decode
+/// site, shared by `Gtm::open` and `session::durable_global_snapshot`. Absent →
+/// `GLOBAL_XID_BASE`; never regresses below the base.
+pub(crate) fn read_next_global(kv: &dyn Kv) -> Result<u64, ExecError> {
+    let next = match kv.get(&kv::key::meta_next_global_xid_key())? {
+        Some(b) => {
+            let (v, _) = U64::read_from_prefix(b.as_slice())
+                .map_err(|_| kv::KvError::CorruptRow("next_global_xid not u64".into()))?;
+            v.get()
+        }
+        None => GLOBAL_XID_BASE,
+    };
+    Ok(next.max(GLOBAL_XID_BASE))
+}
+
 impl Gtm {
     pub fn open(kv: Arc<dyn Kv>) -> Result<Self, ExecError> {
-        let next = match kv.get(&kv::key::meta_next_global_xid_key())? {
-            Some(b) => {
-                let (v, _) = U64::read_from_prefix(b.as_slice())
-                    .map_err(|_| kv::KvError::CorruptRow("next_global_xid not u64".into()))?;
-                v.get()
-            }
-            None => GLOBAL_XID_BASE,
-        };
+        let next = read_next_global(kv.as_ref())?;
         Ok(Self {
             inner: Mutex::new(Inner {
-                next_global: next.max(GLOBAL_XID_BASE),
+                next_global: next,
                 running: BTreeSet::new(),
             }),
             kv,
