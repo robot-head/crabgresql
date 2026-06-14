@@ -3,6 +3,15 @@
 A from-scratch PostgreSQL-compatible distributed database in Rust 2024, built one
 vertical "slice" at a time.
 
+## Test runner: cargo-nextest
+
+Tests run under **cargo-nextest**: `cargo nextest run --workspace` (CI uses
+`--profile ci`). The heavy distributed suites are capped via concurrency groups in
+`.config/nextest.toml` — multi-process suites run serially, in-process cluster
+suites are capped — so they don't starve each other's Raft elections on the 2-core
+runner, while everything else runs at full parallelism. nextest does **not** run
+doctests; run those separately with `cargo test --workspace --doc`.
+
 ## Testing: no `sleep` — make tests deterministic via instrumentation
 
 **Do not write tests (or test harness code) that use `sleep`/`tokio::time::sleep`
