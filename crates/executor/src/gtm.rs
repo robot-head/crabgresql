@@ -88,6 +88,7 @@ impl Gtm {
 
     /// Consumed ONLY by `global_status` (never handed to satisfies_mvcc): xip is
     /// BTreeSet-sorted for the resolver's binary_search; xmin is unused.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn global_snapshot(&self) -> Snapshot {
         let g = self.inner.lock().expect("gtm");
         let xip: Vec<u64> = g.running.iter().copied().collect();

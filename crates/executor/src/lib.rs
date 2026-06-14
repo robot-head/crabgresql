@@ -196,11 +196,6 @@ impl SqlEngine {
         self.range0_barrier = Some(b);
     }
 
-    /// Copy this engine's range-0 barrier into `other`.
-    pub fn share_range0_barrier_to(&self, other: &mut SqlEngine) {
-        other.range0_barrier = self.range0_barrier.as_ref().map(Arc::clone);
-    }
-
     /// Whether this engine carries the shared GTM (so `begin_global_durable` and
     /// global-decision methods are available). `true` on range 0's engine in any
     /// multi-range configuration; `false` on a single-range engine.
@@ -267,15 +262,6 @@ impl SqlEngine {
             .as_ref()
             .expect("finish_global on a non-GTM engine")
             .finish_global(g);
-    }
-
-    /// The current global snapshot (for capturing a cross-range reader's horizon).
-    /// Returns `NO_GLOBAL_SNAPSHOT()` when there is no GTM (single-range engines).
-    pub fn global_snapshot(&self) -> mvcc::visibility::Snapshot {
-        self.gtm
-            .as_ref()
-            .map(|g| g.global_snapshot())
-            .unwrap_or_else(NO_GLOBAL_SNAPSHOT)
     }
 }
 

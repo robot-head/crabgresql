@@ -216,7 +216,7 @@ impl SqlSession {
         // so leave it None here. Reconstructed from range 0's DURABLE state (after
         // the barrier above); NO_GLOBAL_SNAPSHOT() on a single-range engine.
         let global_snapshot = if rr {
-            Some(self.global_read_snapshot(None))
+            Some(self.global_read_snapshot(None)?)
         } else {
             None
         };
@@ -289,19 +289,18 @@ impl SqlSession {
     /// fresh one from the GTM. A non-GTM (single-range) engine has no GTM, so this
     /// is `NO_GLOBAL_SNAPSHOT()` and the resolver's `Prepared` branch is
     /// unreachable (no `Prepared` tuple ever exists there).
-    fn global_read_snapshot(&self, stored: Option<&Snapshot>) -> Snapshot {
+    fn global_read_snapshot(&self, stored: Option<&Snapshot>) -> Result<Snapshot, ExecError> {
         if let Some(s) = stored {
-            return s.clone(); // RR reuses the durable snapshot taken at BEGIN
+            return Ok(s.clone()); // RR reuses the durable snapshot taken at BEGIN
         }
         // Any engine that can see cross-range Prepared rows reconstructs gsnap from
         // range 0's DURABLE state. The in-memory GTM running set is NEVER consulted
         // (correction C2): a network commit prunes g on one node only, so a range-0
         // running-set read would hide its own just-committed row cluster-wide.
         if self.gtm.is_some() || self.range0_barrier.is_some() {
-            return durable_global_snapshot(&*self.catalog_kv)
-                .unwrap_or_else(|_| crate::NO_GLOBAL_SNAPSHOT());
+            return durable_global_snapshot(&*self.catalog_kv);
         }
-        crate::NO_GLOBAL_SNAPSHOT() // single-range engine: no global xids exist
+        Ok(crate::NO_GLOBAL_SNAPSHOT()) // single-range engine: no global xids exist
     }
 
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
@@ -355,9 +354,9 @@ impl SqlSession {
                 // one fixed at BEGIN. NO_GLOBAL_SNAPSHOT() on a non-GTM engine.
                 let gsnap = match &self.state {
                     TxnState::InTransaction(c) if c.repeatable_read => {
-                        self.global_read_snapshot(c.global_snapshot.as_ref())
+                        self.global_read_snapshot(c.global_snapshot.as_ref())?
                     }
-                    _ => self.global_read_snapshot(None),
+                    _ => self.global_read_snapshot(None)?,
                 };
                 let (snapshot, xid, repeatable_read) = match &self.state {
                     TxnState::InTransaction(c) => (
@@ -395,7 +394,7 @@ impl SqlSession {
                 // end — there is no open block to hold them).
                 let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
-                let gsnap = self.global_read_snapshot(None);
+                let gsnap = self.global_read_snapshot(None)?;
                 let kv = Arc::clone(&self.kv);
                 let result = crate::exec::execute_read_locking(
                     &*self.catalog_kv,
@@ -449,7 +448,7 @@ impl SqlSession {
             Plan::Auto => {
                 self.linearizer.ensure_readable().await?;
                 self.ensure_global_readable().await?; // range 0 caught up before the gsnap
-                let gsnap = self.global_read_snapshot(None);
+                let gsnap = self.global_read_snapshot(None)?;
                 Ok((self.procarray.snapshot(), None, gsnap))
             }
             Plan::RcRefresh => {
@@ -457,7 +456,7 @@ impl SqlSession {
                 self.ensure_global_readable().await?; // range 0 caught up before the gsnap
                 let snap = self.procarray.snapshot();
                 // RC re-captures the global snapshot per statement too.
-                let gsnap = self.global_read_snapshot(None);
+                let gsnap = self.global_read_snapshot(None)?;
                 match &mut self.state {
                     TxnState::InTransaction(c) => {
                         c.snapshot = snap.clone();
@@ -468,7 +467,7 @@ impl SqlSession {
             }
             Plan::RrReuse => match &self.state {
                 TxnState::InTransaction(c) => {
-                    let gsnap = self.global_read_snapshot(c.global_snapshot.as_ref());
+                    let gsnap = self.global_read_snapshot(c.global_snapshot.as_ref())?;
                     Ok((c.snapshot.clone(), c.xid, gsnap))
                 }
                 _ => unreachable!(),
@@ -512,9 +511,9 @@ impl SqlSession {
                 // UPDATE/DELETE re-check resolves a cross-range supersede through it.
                 let gsnap = match &self.state {
                     TxnState::InTransaction(c) if c.repeatable_read => {
-                        self.global_read_snapshot(c.global_snapshot.as_ref())
+                        self.global_read_snapshot(c.global_snapshot.as_ref())?
                     }
-                    _ => self.global_read_snapshot(None),
+                    _ => self.global_read_snapshot(None)?,
                 };
                 let (snapshot, xid, repeatable_read) = match &self.state {
                     TxnState::InTransaction(c) => (
@@ -577,7 +576,7 @@ impl SqlSession {
                 // lock; next_xid was persisted eagerly by begin_write.
                 let xid = self.procarray.begin_write()?;
                 let snapshot = self.procarray.snapshot();
-                let gsnap = self.global_read_snapshot(None);
+                let gsnap = self.global_read_snapshot(None)?;
                 let kv = Arc::clone(&self.kv);
                 let outcome = crate::exec::execute_write(
                     &*self.catalog_kv,
