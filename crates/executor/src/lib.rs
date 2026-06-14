@@ -180,6 +180,16 @@ impl SqlEngine {
         other.gtm = self.gtm.as_ref().map(Arc::clone);
     }
 
+    /// Whether this engine carries the shared GTM (so cross-range 2PC can run).
+    /// `true` on every range engine of a multi-range cluster wired via
+    /// `init_gtm_coordinator`/`share_gtm_to`; `false` on a single-range engine or a
+    /// gateway engine built outside that wiring (the cross-node decision path is a
+    /// later slice). The router gates escalation on this: no GTM ⇒ a cross-range txn
+    /// is rejected rather than escalated.
+    pub fn has_gtm(&self) -> bool {
+        self.gtm.is_some()
+    }
+
     /// Allocate a global (cross-range) txn id. Coordinator-only (range 0's engine).
     pub fn begin_global(&self) -> u64 {
         self.gtm
