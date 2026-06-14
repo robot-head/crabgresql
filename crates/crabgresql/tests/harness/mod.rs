@@ -298,16 +298,43 @@ impl Cluster {
         }
     }
 
-    /// Open a tokio-postgres client to node `id`'s SQL port.
+    /// Open a tokio-postgres client to node `id`'s SQL port, retrying until the
+    /// listener accepts (bounded by a deadline).
+    ///
+    /// A one-shot connect races the node's SQL-listener startup: in replicated-meta
+    /// mode (SP15) a node's SQL gateway binds only at the END of its two-phase
+    /// bootstrap (range 0 up → descriptor blob read → data ranges built), which can
+    /// lag `wait_for_leader` (which observes only range 0's control port) on a slow
+    /// runner — so the gateway port may still refuse connections the instant a
+    /// leader is reported. Retry on `ConnectionRefused` until the listener is up,
+    /// using the same bounded cross-process POLL INTERVAL as the other harness waits
+    /// (a poll cadence, not a settle guess); a genuinely dead node fails the test at
+    /// the deadline instead of flaking.
     pub async fn pg(&self, id: u64) -> tokio_postgres::Client {
         let addr = self.sql_addr(id);
         let port = addr.rsplit(':').next().expect("sql_addr has a port");
         let cs = format!("host=127.0.0.1 port={port} user=postgres");
-        let (client, conn) = tokio_postgres::connect(&cs, tokio_postgres::NoTls)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                tokio_postgres::connect(&cs, tokio_postgres::NoTls),
+            )
             .await
-            .expect("pg connect");
-        tokio::spawn(conn);
-        client
+            {
+                Ok(Ok((client, conn))) => {
+                    tokio::spawn(conn);
+                    return client;
+                }
+                _ => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "pg connect to node {id} did not succeed within 30s (listener never came up)"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 
     /// Bounded, condition-driven wait: re-issue `select_sql` through live nodes
