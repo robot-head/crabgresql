@@ -23,6 +23,10 @@ pub trait Kv: Send + Sync {
     /// All (key, value) pairs whose key starts with `prefix`, in key order.
     #[allow(clippy::type_complexity)]
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError>;
+    /// All (key, value) pairs with `start <= key < end`, in key order
+    /// (inclusive start, exclusive end).
+    #[allow(clippy::type_complexity)]
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError>;
     /// Apply all ops atomically and durably (fsync on a durable backend).
     /// All-or-nothing across a crash.
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError>;
@@ -63,6 +67,16 @@ impl Kv for MemKv {
             .expect("kv lock")
             .range(prefix.to_vec()..)
             .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self
+            .map
+            .read()
+            .expect("kv lock")
+            .range(start.to_vec()..end.to_vec())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
     }
@@ -111,6 +125,35 @@ mod tests {
                 (b"t/1/a".to_vec(), b"A".to_vec()),
                 (b"t/1/b".to_vec(), b"B".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn scan_range_returns_inclusive_start_exclusive_end_in_order() {
+        let kv = MemKv::new();
+        for i in [1u8, 3, 5, 7, 9] {
+            kv.put(vec![b'k', i], vec![i]).expect("put");
+        }
+        // [k3, k7) -> k3, k5 (k7 excluded).
+        let got = kv.scan_range(&[b'k', 3], &[b'k', 7]).expect("scan_range");
+        assert_eq!(
+            got,
+            vec![(vec![b'k', 3], vec![3]), (vec![b'k', 5], vec![5])]
+        );
+        // start below all, end above all -> everything.
+        let all = kv.scan_range(&[b'k', 0], &[b'k', 255]).expect("scan_range");
+        assert_eq!(all.len(), 5);
+        // empty range (start == end).
+        assert!(
+            kv.scan_range(&[b'k', 5], &[b'k', 5])
+                .expect("scan")
+                .is_empty()
+        );
+        // start above all.
+        assert!(
+            kv.scan_range(&[b'k', 200], &[b'k', 255])
+                .expect("scan")
+                .is_empty()
         );
     }
 

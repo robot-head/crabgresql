@@ -608,14 +608,38 @@ async fn resolve_in_doubt_on_leadership(
     let mut was_leader = false;
     loop {
         let is_leader = rx.borrow().current_leader == Some(id);
-        if is_leader
-            && !was_leader
-            && let Ok(gs) = engine.in_doubt_globals().await
-        {
-            for g in gs {
-                let _ = client
-                    .call(0, TxnRpc::CommitGlobal { g, commit: false })
-                    .await;
+        if is_leader && !was_leader {
+            // Start the recovery scan at this range's durable watermark, not the whole
+            // clog — bounding the scan to markers at/after the oldest still-in-doubt Li.
+            let scan_lo = engine.clog_scan_lo().unwrap_or(0);
+            if let Ok((gs, new_lo)) = engine.in_doubt_globals_from(scan_lo).await {
+                for g in gs {
+                    // Best-effort: a failed abort-race (range 0 unreachable) leaves `g`
+                    // non-terminal, so `new_lo` does not pass it and it is re-swept next
+                    // rise. Log so a permanently-stuck range-0 is observable.
+                    if let Err(e) = client
+                        .call(0, TxnRpc::CommitGlobal { g, commit: false })
+                        .await
+                    {
+                        tracing::warn!(
+                            g,
+                            ?e,
+                            "recovery abort-race failed; g stays in-doubt, will re-scan next rise"
+                        );
+                    }
+                }
+                // Advance past the contiguous terminal prefix (monotone, durable). Safe:
+                // `new_lo` never passes a marker whose g was non-terminal at scan time,
+                // so every in-doubt g keeps being swept (zombie-commit protection). The
+                // write is best-effort: a NotLeader rejection just leaves the old (lower)
+                // durable value, which only enlarges the next scan — never an unsafe skip.
+                if let Err(e) = engine.advance_clog_scan_lo(new_lo).await {
+                    tracing::debug!(
+                        new_lo,
+                        ?e,
+                        "watermark advance not durable (e.g. NotLeader); next leader re-scans from the old watermark — safe"
+                    );
+                }
             }
         }
         was_leader = is_leader;

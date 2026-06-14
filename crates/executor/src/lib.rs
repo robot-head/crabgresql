@@ -261,9 +261,12 @@ impl SqlEngine {
         Ok(mvcc::clog::get(self.kv.as_ref(), g)?)
     }
 
-    /// Scan THIS range's clog for in-doubt `Prepared(Li -> g)` markers and return the
-    /// distinct `g`s NOT yet decided in range 0's global clog. Used by the leadership-
-    /// rise recovery sweep to finalize a failed-over participant's txns.
+    /// Scan THIS range's clog from `scan_lo` for in-doubt `Prepared(Li -> g)` markers.
+    /// Returns `(in_doubt_gs, new_scan_lo)` where `new_scan_lo` is the smallest scanned
+    /// `Li` whose `g` is NOT durably terminal (so it must keep being swept), or one past
+    /// the largest scanned `Li` if every scanned marker is terminal (or `scan_lo` if the
+    /// range is empty). `new_scan_lo` NEVER passes a non-terminal `g` — the recovery
+    /// (zombie-commit) safety invariant. Markers are never deleted.
     ///
     /// The decidedness check reads `self.catalog_kv` directly (NOT through the range-0
     /// read barrier), so on a lagging local range-0 replica an already-decided `g` may
@@ -271,23 +274,70 @@ impl SqlEngine {
     /// `g` to range 0, and the decision is WRITE-ONCE — racing an already-terminal `g`
     /// is a no-op against the real decision. Do not "fix" this by routing through the
     /// barrier; the staleness is intentional and adds no latency to the hot path.
-    pub async fn in_doubt_globals(&self) -> Result<Vec<u64>, ExecError> {
+    pub async fn in_doubt_globals_from(&self, scan_lo: u64) -> Result<(Vec<u64>, u64), ExecError> {
         use std::collections::BTreeSet;
         let mut gs: BTreeSet<u64> = BTreeSet::new();
-        for (k, v) in self.kv.scan_prefix(&kv::key::clog_prefix())? {
-            if kv::key::clog_xid_of(&k).is_none() {
+        let mut first_undecided: Option<u64> = None;
+        let mut max_li: Option<u64> = None;
+        for (k, v) in self
+            .kv
+            .scan_range(&kv::key::clog_key(scan_lo), &kv::key::clog_scan_end())?
+        {
+            let Some(li) = kv::key::clog_xid_of(&k) else {
                 continue;
-            }
-            if let mvcc::clog::XidStatus::Prepared(g) = mvcc::clog::decode(&v)?
-                && !matches!(
+            };
+            max_li = Some(li);
+            if let mvcc::clog::XidStatus::Prepared(g) = mvcc::clog::decode(&v)? {
+                let terminal = matches!(
                     mvcc::clog::get(self.catalog_kv.as_ref(), g)?,
                     mvcc::clog::XidStatus::Committed | mvcc::clog::XidStatus::Aborted
-                )
-            {
-                gs.insert(g);
+                );
+                if !terminal {
+                    gs.insert(g);
+                    first_undecided.get_or_insert(li);
+                }
             }
         }
-        Ok(gs.into_iter().collect())
+        let new_scan_lo = first_undecided
+            // `max_li` is a local `Li < GLOBAL_XID_BASE` on a real data range, so this
+            // never saturates; `saturating_add` is belt-and-suspenders.
+            .or_else(|| max_li.map(|m| m.saturating_add(1)))
+            .unwrap_or(scan_lo)
+            .max(scan_lo); // monotone
+        Ok((gs.into_iter().collect(), new_scan_lo))
+    }
+
+    /// Back-compat: the full-scan in-doubt set (callers that don't track a watermark).
+    pub async fn in_doubt_globals(&self) -> Result<Vec<u64>, ExecError> {
+        Ok(self.in_doubt_globals_from(0).await?.0)
+    }
+
+    /// Read this range's durable recovery-scan watermark (`0` if absent/unset).
+    pub fn clog_scan_lo(&self) -> Result<u64, ExecError> {
+        match self.kv.get(&kv::key::clog_scan_lo_key())? {
+            Some(b) if b.len() == 8 => Ok(u64::from_be_bytes(b[..8].try_into().expect("8 bytes"))),
+            _ => Ok(0),
+        }
+    }
+
+    /// Durably advance this range's recovery-scan watermark (monotone; a no-op if `lo`
+    /// is not greater than the current value). Proposed through the range committer.
+    ///
+    /// The read-then-write is NOT a CAS: monotonicity relies on the single-writer
+    /// discipline of the edge-triggered per-range leadership-rise sweep (one advance at a
+    /// time). Even a hypothetical interleaving that regressed the value low is
+    /// correctness-preserving — a lower watermark only enlarges the next scan, never skips
+    /// an in-doubt marker.
+    pub async fn advance_clog_scan_lo(&self, lo: u64) -> Result<(), ExecError> {
+        if lo <= self.clog_scan_lo()? {
+            return Ok(());
+        }
+        self.committer
+            .commit(vec![kv::store::WriteOp::Put {
+                key: kv::key::clog_scan_lo_key(),
+                value: lo.to_be_bytes().to_vec(),
+            }])
+            .await
     }
 
     /// Deregister a decided global txn from the in-memory running-set.
@@ -370,5 +420,90 @@ mod tests {
             vec![g_undecided],
             "only undecided Prepared markers are returned"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_doubt_globals_from_bounds_the_scan_and_advances_past_terminal() {
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        // Two stores: sm_kv = this data range's local clog; catalog_kv = range 0's global-G clog.
+        let sm_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let catalog_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let committer = std::sync::Arc::new(crate::commit::LocalCommitter {
+            kv: std::sync::Arc::clone(&sm_kv),
+        });
+        let linearizer = std::sync::Arc::new(crate::read_gate::LocalLinearizer);
+        let engine = SqlEngine::replicated(
+            std::sync::Arc::clone(&catalog_kv),
+            std::sync::Arc::clone(&sm_kv),
+            committer,
+            linearizer,
+        )
+        .expect("engine");
+
+        let (g_term, g_doubt) = (GLOBAL_XID_BASE + 1, GLOBAL_XID_BASE + 2);
+        // Local markers at Li = 10 (terminal G), 11 (in-doubt G), 12 (terminal G) — sm_kv ONLY.
+        sm_kv
+            .write_batch(&[put_op(10, XidStatus::Prepared(g_term))])
+            .expect("p10");
+        sm_kv
+            .write_batch(&[put_op(11, XidStatus::Prepared(g_doubt))])
+            .expect("p11");
+        sm_kv
+            .write_batch(&[put_op(12, XidStatus::Prepared(g_term))])
+            .expect("p12");
+        // Global decisions — catalog_kv ONLY.
+        catalog_kv
+            .write_batch(&[put_op(g_term, XidStatus::Committed)])
+            .expect("decide g_term");
+        // from(0): only g_doubt is in-doubt; watermark stops at the in-doubt Li (11).
+        let (gs, lo) = engine.in_doubt_globals_from(0).await.expect("scan");
+        assert_eq!(gs, vec![g_doubt]);
+        assert_eq!(lo, 11, "watermark = smallest in-doubt Li");
+        // Decide g_doubt; from(11) finds nothing in-doubt -> watermark = one past the largest local Li (12).
+        catalog_kv
+            .write_batch(&[put_op(g_doubt, XidStatus::Aborted)])
+            .expect("decide g_doubt");
+        let (gs2, lo2) = engine.in_doubt_globals_from(11).await.expect("scan");
+        assert!(gs2.is_empty());
+        assert_eq!(
+            lo2, 13,
+            "all terminal -> watermark = one past the largest local Li (12)"
+        );
+        // Edge: scan_lo above all markers -> empty scan -> watermark unchanged.
+        assert_eq!(engine.in_doubt_globals_from(99).await.expect("scan").1, 99);
+        // Edge: an in-doubt marker at the HIGHEST Li (terminals below) holds the
+        // watermark exactly there (the ascending scan stops at the first undecided).
+        sm_kv
+            .write_batch(&[put_op(20, XidStatus::Prepared(GLOBAL_XID_BASE + 3))])
+            .expect("high in-doubt marker");
+        let (gs3, lo3) = engine.in_doubt_globals_from(0).await.expect("scan");
+        assert_eq!(gs3, vec![GLOBAL_XID_BASE + 3]);
+        assert_eq!(
+            lo3, 20,
+            "in-doubt at the highest Li holds the watermark there"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clog_scan_lo_persists_and_is_monotone() {
+        let sm_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let catalog_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let committer = std::sync::Arc::new(crate::commit::LocalCommitter {
+            kv: std::sync::Arc::clone(&sm_kv),
+        });
+        let linearizer = std::sync::Arc::new(crate::read_gate::LocalLinearizer);
+        let engine = SqlEngine::replicated(
+            catalog_kv,
+            std::sync::Arc::clone(&sm_kv),
+            committer,
+            linearizer,
+        )
+        .expect("engine");
+        assert_eq!(engine.clog_scan_lo().expect("lo"), 0); // absent -> 0
+        engine.advance_clog_scan_lo(5).await.expect("advance");
+        assert_eq!(engine.clog_scan_lo().expect("lo"), 5);
+        engine.advance_clog_scan_lo(3).await.expect("no-op"); // lower -> no-op
+        assert_eq!(engine.clog_scan_lo().expect("lo"), 5, "monotone");
     }
 }

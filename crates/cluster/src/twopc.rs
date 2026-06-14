@@ -761,4 +761,20 @@ mod tests {
             "expected NotLeader for an unregistered range, got {resp:?}"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_scan_watermark_advances_and_persists() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let eng = &node.engines[&1]; // a data range
+        assert_eq!(eng.clog_scan_lo().expect("lo"), 0, "watermark starts at 0");
+        // advance_clog_scan_lo persists and is monotone (a lower value is a no-op).
+        eng.advance_clog_scan_lo(5).await.expect("advance");
+        assert_eq!(eng.clog_scan_lo().expect("lo"), 5);
+        eng.advance_clog_scan_lo(3).await.expect("no-op");
+        assert_eq!(eng.clog_scan_lo().expect("lo"), 5, "watermark is monotone");
+        // An empty clog scan from the current watermark leaves it unchanged.
+        let (gs, new_lo) = eng.in_doubt_globals_from(5).await.expect("scan");
+        assert!(gs.is_empty());
+        assert_eq!(new_lo, 5, "empty scan -> watermark unchanged");
+    }
 }

@@ -61,6 +61,15 @@ impl Kv for KeyspaceKv {
         Ok(out)
     }
 
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        let mut out = Vec::new();
+        for guard in self.ks.range(start.to_vec()..end.to_vec()) {
+            let (k, v) = guard.into_inner().map_err(io)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         let mut batch = self.db.batch();
         for op in ops {
@@ -115,6 +124,10 @@ impl Kv for FjallKv {
         self.inner.scan_prefix(prefix)
     }
 
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        self.inner.scan_range(start, end)
+    }
+
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         self.inner.write_batch(ops)
     }
@@ -154,6 +167,36 @@ mod tests {
                 (b"t/1/b".to_vec(), b"B".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn scan_range_inclusive_start_exclusive_end_on_fjall() {
+        // Pin the [start, end) semantics DIRECTLY on the durable backend (not just
+        // transitively via MemKv) — the whole recovery-scan watermark relies on the
+        // two backends agreeing on the half-open interval.
+        let dir = temp();
+        let kv = FjallKv::open(dir.path()).expect("open");
+        for i in [1u8, 3, 5, 7, 9] {
+            kv.put(vec![b'k', i], vec![i]).expect("put");
+        }
+        assert_eq!(
+            kv.scan_range(&[b'k', 3], &[b'k', 7]).expect("scan_range"),
+            vec![(vec![b'k', 3], vec![3]), (vec![b'k', 5], vec![5])], // k7 excluded
+        );
+        assert_eq!(
+            kv.scan_range(&[b'k', 0], &[b'k', 255]).expect("scan").len(),
+            5
+        );
+        assert!(
+            kv.scan_range(&[b'k', 5], &[b'k', 5])
+                .expect("scan")
+                .is_empty()
+        ); // empty
+        assert!(
+            kv.scan_range(&[b'k', 200], &[b'k', 255])
+                .expect("scan")
+                .is_empty()
+        ); // above all
     }
 
     #[test]
