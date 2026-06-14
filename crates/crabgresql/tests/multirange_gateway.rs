@@ -5,7 +5,14 @@
 //!
 //! Per-range progress is observed at the SQL level (a committed read-back THROUGH
 //! the owning range), because the harness control protocol is node-global (no
-//! per-range applied index). Every wait is bounded + condition-driven; no sleeps.
+//! per-range applied index). Every wait is bounded + condition-driven.
+//!
+//! This is intentionally ONE test. Each scenario spawns a 3-node × 2-range cluster
+//! = 6 Raft instances; libtest runs a binary's tests concurrently, so two such
+//! clusters at once (12 Raft instances) starve each other's Raft progress past the
+//! bounded deadlines on a constrained (2-core / coverage-instrumented) runner.
+//! Keeping a single test caps the binary at one cluster at a time — the routing and
+//! failover assertions are both exercised within it.
 mod harness;
 use std::time::Duration;
 
@@ -27,36 +34,32 @@ fn first_col(msgs: &[SimpleQueryMessage]) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// (1) Rows land only in their table's range and read back through ANY node.
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rows_route_by_range_and_read_back_through_any_node() {
+async fn d3a_net_routes_by_range_and_survives_per_range_failover() {
     // Boundary at table_id 2: table `a` (first user table, id 1) -> range 0;
     // table `b` (id 2) -> range 1. Both ranges replicated to all 3 nodes.
-    let c = Cluster::spawn_multirange(3, vec![2]).await;
-    let _leader = c.wait_for_leader().await;
+    let mut c = Cluster::spawn_multirange(3, vec![2]).await;
+    c.wait_for_leader().await;
 
-    // Connect to an ARBITRARY node (node 0 — not necessarily any range's leader)
-    // and create + insert across two ranges through that single gateway.
-    let gw = c.pg(0).await;
-    gw.simple_query("CREATE TABLE a (id int4)")
-        .await
-        .expect("create a (range 0)");
-    gw.simple_query("CREATE TABLE b (id int4)")
-        .await
-        .expect("create b (range 1)");
-    gw.simple_query("INSERT INTO a VALUES (10)")
-        .await
-        .expect("insert a");
-    gw.simple_query("INSERT INTO b VALUES (20)")
-        .await
-        .expect("insert b");
-
-    // Read each table back through EVERY node — the gateway on each node forwards
-    // the SELECT to the owning range's leader and relays the row back. `a`'s row is
-    // in range 0; `b`'s row is in range 1; each must be visible through any node.
+    // --- Routing correctness: write across two ranges through ONE arbitrary gateway
+    // (node 0 — not necessarily any range's leader), then read each back through
+    // EVERY node. Each node's gateway forwards the SELECT to the owning range's
+    // leader and relays the row back. ---
+    {
+        let gw = c.pg(0).await;
+        gw.simple_query("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a (range 0)");
+        gw.simple_query("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b (range 1)");
+        gw.simple_query("INSERT INTO a VALUES (10)")
+            .await
+            .expect("insert a");
+        gw.simple_query("INSERT INTO b VALUES (20)")
+            .await
+            .expect("insert b");
+    }
     for id in 0..c.len() as u64 {
         let client = c.pg(id).await;
         let ra = client
@@ -80,62 +83,28 @@ async fn rows_route_by_range_and_read_back_through_any_node() {
             "node {id}: b.id == 20"
         );
     }
-}
 
-// ---------------------------------------------------------------------------
-// (2) Killing one range's leader keeps the OTHER range serving while the
-//     killed range re-elects and resumes.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn killing_one_range_leader_keeps_other_range_serving() {
-    let mut c = Cluster::spawn_multirange(3, vec![2]).await;
-    c.wait_for_leader().await;
-
-    // Set up: `a` -> range 0, `b` -> range 1. Drive through an arbitrary gateway.
-    {
-        let gw = c.pg(0).await;
-        gw.simple_query("CREATE TABLE a (id int4)")
-            .await
-            .expect("create a");
-        gw.simple_query("CREATE TABLE b (id int4)")
-            .await
-            .expect("create b");
-        gw.simple_query("INSERT INTO a VALUES (1)")
-            .await
-            .expect("seed a");
-        gw.simple_query("INSERT INTO b VALUES (1)")
-            .await
-            .expect("seed b");
-    }
-
-    // Gate the crash nemesis on SQL-observable per-range progress: a fresh write to
-    // range 1 (`b`) is read back THROUGH range 1 before we crash range 1's leader.
-    // This guarantees range 1 had a working leader+commit pipeline at crash time
-    // (no per-range applied-index signal exists over the node-global control proto).
-    {
-        let gw = c.pg(0).await;
-        gw.simple_query("INSERT INTO b VALUES (2)")
-            .await
-            .expect("range-1 write before crash");
-    }
-    c.wait_select_value("SELECT id FROM b WHERE id = 2", "2")
+    // --- Per-range failover. Gate the crash on SQL-observable per-range progress: a
+    // fresh range-1 write read back THROUGH range 1 proves range 1 had a working
+    // leader+commit pipeline at crash time (no per-range applied-index signal exists
+    // over the node-global control protocol). ---
+    c.pg(0)
+        .await
+        .simple_query("INSERT INTO b VALUES (30)")
+        .await
+        .expect("range-1 write before crash");
+    c.wait_select_value("SELECT id FROM b WHERE id = 30", "30")
         .await;
 
-    // Identify range 1's current leader by SQL-level probing: the node whose LOCAL
-    // (non-forwarded) execution owns range 1 is range 1's leader. We don't have a
-    // per-range control RPC, so we crash the NODE-GLOBAL leader and rely on the
-    // co-located placement: whichever node leads range 1 is a node; killing it
-    // forces range 1 to re-elect. To target range 1 specifically without a
-    // per-range signal, kill the single node-global leader (it leads at least one
-    // range); the OTHER range, if led elsewhere, must keep serving, and the killed
-    // range must re-elect. We then assert BOTH ranges serve again post-failover.
+    // Kill the node-global leader. Control resolves range 0, so this is range 0's
+    // leader; co-located placement means that node also hosts a range-1 replica.
+    // Whichever range it led must re-elect; a range led by a survivor keeps serving.
     let victim = c.wait_for_leader().await;
     c.kill(victim).await;
 
-    // A new node-global leader emerges among the survivors (bounded, condition-
-    // driven — no sleep): re-issue status() until some surviving node reports a
-    // leader != victim.
+    // A new node-global leader emerges among the survivors (bounded, condition-driven
+    // — re-probe status() on the harness poll cadence until some surviving node
+    // reports a leader != victim).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let mut found = false;
@@ -153,35 +122,25 @@ async fn killing_one_range_leader_keeps_other_range_serving() {
             tokio::time::Instant::now() < deadline,
             "no new leader after killing the old one"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // BOTH ranges must serve again through a surviving node: range 0 (`a`) — which
-    // may have been led by a survivor and never lost its leader — keeps serving;
-    // range 1 (`b`) — whose leader we may have killed — re-elects and resumes.
-    // `wait_select_value` round-robins across LIVE nodes until each range answers,
-    // so it tolerates the killed node being unreachable and the brief re-election.
-    let survivor = (0..c.len() as u64)
-        .find(|&i| i != victim)
-        .expect("a survivor");
-    c.wait_select_value("SELECT id FROM a WHERE id = 1", "1")
+    // BOTH ranges serve again through surviving nodes: the prior rows stay readable
+    // (round-robin past the killed node), and a FRESH write to EACH range commits.
+    // We retry the writes through live nodes until they commit: during the brief
+    // re-election window a forward to the just-deposed leader returns a RETRYABLE
+    // 40001, which a correct client retries — the assertion is that the range
+    // RESUMES, not that the first attempt mid-election wins. The read-backs prove the
+    // writes are durable. (Re-applying an `INSERT (id)` is harmless: the read-back
+    // asserts the value is present, not a row count.)
+    c.wait_select_value("SELECT id FROM a WHERE id = 10", "10")
         .await;
-    c.wait_select_value("SELECT id FROM b WHERE id = 2", "2")
+    c.wait_select_value("SELECT id FROM b WHERE id = 20", "20")
         .await;
-
-    // A fresh write to EACH range succeeds post-failover through a surviving gateway,
-    // proving both ranges have a live leader again (the other range never stopped;
-    // the killed range resumed).
-    let client = c.pg(survivor).await;
-    client
-        .simple_query("INSERT INTO a VALUES (3)")
-        .await
-        .expect("range 0 serves a fresh write after failover");
-    client
-        .simple_query("INSERT INTO b VALUES (4)")
-        .await
-        .expect("range 1 resumed and serves a fresh write after re-election");
-    c.wait_select_value("SELECT id FROM a WHERE id = 3", "3")
+    c.exec_until_ok("INSERT INTO a VALUES (11)").await;
+    c.exec_until_ok("INSERT INTO b VALUES (40)").await;
+    c.wait_select_value("SELECT id FROM a WHERE id = 11", "11")
         .await;
-    c.wait_select_value("SELECT id FROM b WHERE id = 4", "4")
+    c.wait_select_value("SELECT id FROM b WHERE id = 40", "40")
         .await;
 }

@@ -152,9 +152,15 @@ impl Cluster {
 
     /// Wait (bounded) until some node reports a leader; return its id.
     ///
-    /// No fixed sleep: each `status()` is a real TCP connect→request→response, so
-    /// re-issuing it in this deadline-bounded loop paces the wait on observed state
-    /// (the node-global control protocol gives no cross-process push signal).
+    /// Cross-process polling cadence: the node-global control protocol gives no push
+    /// signal, so we re-probe `status()` on a small fixed POLL INTERVAL, bounded by a
+    /// deadline, returning the instant a leader is observed. The interval is NOT a
+    /// "settle" guess (the CLAUDE.md prohibition is on in-process waits that should
+    /// use openraft events and on fixed completion-duration guesses) — it is the poll
+    /// period, and it is load-bearing: a zero-gap loop opens control connections fast
+    /// enough to starve the nodes' Raft progress under test contention (the
+    /// stable-window lesson), so the interval both paces the probe and leaves the
+    /// cluster room to elect. This matches the established multi-process harness.
     pub async fn wait_for_leader(&self) -> u64 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -169,13 +175,16 @@ impl Cluster {
                 tokio::time::Instant::now() < deadline,
                 "no leader within 30s"
             );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
     /// Wait (bounded) until node `id` has applied at least `idx`.
     ///
-    /// No fixed sleep: the `status()` round-trip is the pacing; the loop is bounded
-    /// by a deadline so a stuck node fails the test instead of hanging.
+    /// Same cross-process polling cadence as `wait_for_leader`: a small fixed POLL
+    /// INTERVAL between `status()` probes (not a settle-guess), bounded by a deadline
+    /// so a stuck node fails the test instead of hanging, and gentle enough not to
+    /// storm the control port.
     pub async fn wait_applied(&self, id: u64, idx: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -188,6 +197,7 @@ impl Cluster {
                 tokio::time::Instant::now() < deadline,
                 "node {id} did not apply {idx}"
             );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -242,8 +252,9 @@ impl Cluster {
     /// row equals `expected`, or the deadline trips. This is the SQL-observable
     /// per-range progress signal the crash nemesis gates on — the control protocol
     /// is node-global, so a committed read-back THROUGH the owning range is the only
-    /// per-range commit signal available across the process boundary. No fixed
-    /// sleep: each connect+query is a real round-trip that paces the loop.
+    /// per-range commit signal available across the process boundary. Uses the same
+    /// bounded POLL INTERVAL as the other harness waits (poll cadence, not a settle
+    /// guess) so it does not storm the SQL port.
     pub async fn wait_select_value(&self, select_sql: &str, expected: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut idx = 0usize;
@@ -266,6 +277,36 @@ impl Cluster {
                 tokio::time::Instant::now() < deadline,
                 "`{select_sql}` did not return {expected:?} within 30s"
             );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Execute a write, retrying through live nodes until it commits or the deadline
+    /// trips. Tolerates the transient retryable `40001` ("not the leader") during a
+    /// re-election window — a correct client retries on a retryable error, and the
+    /// test's claim is that the range RESUMES, not that the first attempt in the
+    /// election window wins. Same bounded poll cadence as the other harness waits.
+    /// (Callers pair this with a `wait_select_value` read-back to prove durability;
+    /// the statement should be safe to apply more than once — e.g. a presence-checked
+    /// INSERT whose read-back asserts the value exists, not a row count.)
+    pub async fn exec_until_ok(&self, sql: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut idx = 0usize;
+        loop {
+            if let Some(client) = self.pg_try(idx).await
+                && matches!(
+                    tokio::time::timeout(Duration::from_secs(8), client.simple_query(sql)).await,
+                    Ok(Ok(_))
+                )
+            {
+                return;
+            }
+            idx = idx.wrapping_add(1) % self.nodes.len();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`{sql}` did not commit within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
