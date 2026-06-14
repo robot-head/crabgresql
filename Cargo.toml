@@ -61,6 +61,7 @@ serde_json = "1"
 tokio-postgres = "0.7"
 proptest = "1"
 openraft = { version = "0.9", features = ["serde"] }
+arc-swap = "1"
 async-trait = "0.1"
 stateright = "0.31"
 zerocopy = { version = "0.8", features = ["derive"] }

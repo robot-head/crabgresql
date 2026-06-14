@@ -16,6 +16,7 @@ executor = { workspace = true }
 pgparser = { workspace = true }
 openraft = { workspace = true, features = ["storage-v2"] }
 pgwire = { workspace = true }
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

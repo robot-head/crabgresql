@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use executor::{ExecError, Linearizer, SqlEngine};
 use pgwire::engine::Engine;
 use tokio::net::TcpStream;
@@ -294,20 +295,36 @@ struct HeldEntry {
 
 #[derive(Clone)]
 pub struct TxnService {
-    engines: HashMap<RangeId, Arc<SqlEngine>>,
+    engines: Arc<ArcSwap<HashMap<RangeId, Arc<SqlEngine>>>>,
     held: Arc<Mutex<HashMap<(u64, RangeId), HeldEntry>>>,
 }
 
 impl TxnService {
     pub fn new(engines: HashMap<RangeId, Arc<SqlEngine>>) -> Self {
         Self {
-            engines,
+            engines: Arc::new(ArcSwap::from_pointee(engines)),
             held: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn engine(&self, range: RangeId) -> Option<&Arc<SqlEngine>> {
-        self.engines.get(&range)
+    /// Look up the engine for `range`. Returns an OWNED `Arc` (lock-free snapshot via
+    /// `arc-swap`); `None` if this node does not (yet) host that range. `load()` yields a
+    /// `Guard` that auto-derefs to `&Arc<HashMap>`; `get()` + `cloned()` produce an owned
+    /// `Arc<SqlEngine>` and the `Guard` drops at end-of-expression — so no guard is ever
+    /// held across an `await` (the load-bearing arc-swap discipline).
+    pub fn engine(&self, range: RangeId) -> Option<Arc<SqlEngine>> {
+        self.engines.load().get(&range).cloned()
+    }
+
+    /// Register a data-range engine so this node can serve `Stage`/`Release` for it.
+    /// Copy-on-write (`rcu`) so concurrent lock-free readers never block; idempotent
+    /// (re-registering replaces the entry). The `rcu` closure receives `&Arc<HashMap>`.
+    pub fn register_engine(&self, range: RangeId, engine: Arc<SqlEngine>) {
+        self.engines.rcu(|cur| {
+            let mut m = (**cur).clone();
+            m.insert(range, engine.clone());
+            m
+        });
     }
 
     #[cfg(test)]
@@ -392,7 +409,7 @@ impl TxnService {
     /// Get-or-create the held session for `(g, range)` under a BRIEF map lock,
     /// returning a clone of its `Arc<Mutex>` (map guard dropped before any await).
     async fn session_handle(&self, g: u64, range: RangeId) -> Option<HeldSession> {
-        let engine = self.engines.get(&range)?.clone();
+        let engine = self.engine(range)?;
         let mut held = self.held.lock().await;
         Some(
             held.entry((g, range))
@@ -406,12 +423,15 @@ impl TxnService {
     }
 
     async fn stage(&self, g: u64, range: RangeId, sql: &str) -> TxnResp {
+        // Resolve the participant engine FIRST. An unregistered range means this node is
+        // still mid-bootstrap on the replicated layout — RETRYABLE: return NotLeader (the
+        // coordinator re-resolves) instead of a hard Err, and skip parsing entirely.
+        let Some(handle) = self.session_handle(g, range).await else {
+            return TxnResp::NotLeader;
+        };
         let stmt = match pgparser::parse(sql) {
             Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
             _ => return TxnResp::Err("stage expects exactly one statement".into()),
-        };
-        let Some(handle) = self.session_handle(g, range).await else {
-            return TxnResp::Err(format!("no engine for range {range}"));
         };
         let mut session = handle.lock().await; // per-session lock only; map lock dropped
         if let Err(e) = session.ensure_began().await {
@@ -685,6 +705,47 @@ mod tests {
         assert!(
             gs2.is_empty(),
             "after the write-once Aborted decision, g is no longer in-doubt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_engine_makes_a_range_servable() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let mut only0 = std::collections::HashMap::new();
+        only0.insert(0u32, node.engines[&0].clone());
+        let svc = TxnService::new(only0);
+        assert!(
+            svc.engine(1).is_none(),
+            "range 1 absent before registration"
+        );
+        svc.register_engine(1, node.engines[&1].clone());
+        assert!(
+            svc.engine(1).is_some(),
+            "range 1 present after registration"
+        );
+        svc.register_engine(1, node.engines[&1].clone()); // idempotent
+        assert!(svc.engine(1).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_for_an_unregistered_range_is_retryable_not_a_hard_err() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let mut only0 = std::collections::HashMap::new();
+        only0.insert(0u32, node.engines[&0].clone());
+        let svc = TxnService::new(only0);
+        let resp = svc
+            .handle(
+                7,
+                TxnRpc::Stage {
+                    g: 1_000_000,
+                    range: 7,
+                    sql: "UPDATE b SET id = 1 WHERE id = 0".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(resp, TxnResp::NotLeader),
+            "expected NotLeader for an unregistered range, got {resp:?}"
         );
     }
 }
