@@ -50,7 +50,8 @@
 //! in `tokio::time::timeout`, and a stuck/erroring commit becomes an `info`
 //! (indeterminate) history entry rather than a hang.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use executor::{SqlEngine, SqlSession};
@@ -119,12 +120,45 @@ impl Outcome {
 
 /// One recorded history entry: which process, what it attempted, how it ended.
 /// (We fold invoke+return into a single completed entry; the process id plus the
-/// op/outcome pair is all an Elle/EDN export would need.)
+/// op/outcome pair is all an Elle/EDN export would need.) This folded form is fine
+/// for the bank *invariant* check, but NOT for the register *linearizability*
+/// check, which needs real-time invoke/return ordering — see [`RegEvent`].
 #[derive(Debug, Clone)]
 struct HistEntry {
+    /// Recorded for a future Elle/EDN export (see module docs); not otherwise read
+    /// — the register linearizability check uses the real-time [`RegEvent`] log.
+    #[allow(dead_code)]
     process: usize,
     op: OpKind,
     outcome: Outcome,
+}
+
+/// A timed register operation event for the linearizability checker. The global
+/// `seq` is assigned at the *instant* of the invoke or the return; feeding events
+/// in `seq` order reconstructs the real-time partial order, so concurrent ops
+/// across processes overlap and a read that legally observed another process's
+/// just-committed write is recognised as linearizable. (A folded per-process
+/// history imposes a false total order and mis-flags such reads — the original
+/// source of this test's flakiness.) `thread` is a unique per-op id (the invoke
+/// seq), mirroring the jepsen_elle recorder, so an indeterminate write's stranded
+/// invoke never collides with the same process's next op.
+enum RegEvent {
+    Invoke {
+        seq: u64,
+        thread: u64,
+        op: RegisterOp<i64>,
+    },
+    Return {
+        seq: u64,
+        thread: u64,
+        ret: RegisterRet<i64>,
+    },
+}
+
+fn reg_seq(e: &RegEvent) -> u64 {
+    match e {
+        RegEvent::Invoke { seq, .. } | RegEvent::Return { seq, .. } => *seq,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,13 +670,14 @@ async fn bank_conserves_total_under_crash_restart() {
 /// invoke with NO matching return, which the tester treats as an in-flight op it
 /// may place anywhere or omit — the honest modeling of an unknown outcome.
 async fn run_register_workload() -> (Vec<HistEntry>, bool) {
-    // The linearizability premise requires the leader to stay FIXED for the whole
-    // run (an ungated stale read on a *deposed* leader is the documented D5 gap, out
-    // of scope here). Stable timers (`new_stable_leader`) make a spurious election
-    // rare, but under an extremely CPU-starved coverage run one can still occur.
-    // Rather than sleep-and-hope, make the test DETERMINISTIC: if the leader's term
-    // advanced during a run (i.e. an election happened), discard that run and retry
-    // on a fresh cluster. Converges; no `sleep`.
+    // Determinism comes primarily from feeding the history to the checker in
+    // real-time order (see `try_register_run` / [`RegEvent`]), so a legal
+    // concurrent read is never mis-flagged. As a secondary guard the premise also
+    // wants the leader FIXED for the run; the nemesis only faults a follower so the
+    // leader keeps quorum, but an extremely CPU-starved runner could still stall it
+    // into an election. Rather than sleep-and-hope, if a run's leader term advanced
+    // (an election happened) we discard it and retry on a fresh cluster. No `sleep`;
+    // with no election the first attempt succeeds.
     const ATTEMPTS: usize = 10;
     for _ in 0..ATTEMPTS {
         if let Some(result) = try_register_run().await {
@@ -724,9 +759,16 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
     // cheap. Each process alternates writes and reads.
     const PROCS: usize = 3;
     const OPS: usize = 6;
+    // Global sequence + shared event log. Each op timestamps its invoke and (if
+    // determinate) its return with a fresh `seq`, so the events sort into the true
+    // real-time order across all processes.
+    let seq = Arc::new(AtomicU64::new(0));
+    let events: Arc<Mutex<Vec<RegEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let mut workers = Vec::new();
     for process in 0..PROCS {
         let engine = Arc::clone(&engine);
+        let seq = Arc::clone(&seq);
+        let events = Arc::clone(&events);
         workers.push(tokio::spawn(async move {
             let mut local: Vec<HistEntry> = Vec::new();
             let mut rng = Lcg::new(0x1234_5678 ^ process as u64);
@@ -735,6 +777,14 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
                 // Alternate: even k → write a process-tagged value, odd k → read.
                 if k % 2 == 0 {
                     let val = (process as i64 + 1) * 100 + k as i64;
+                    // Stamp the invoke the instant the op starts; `thread` (the
+                    // invoke seq) is a unique per-op id.
+                    let thread = seq.fetch_add(1, Ordering::SeqCst);
+                    events.lock().expect("events").push(RegEvent::Invoke {
+                        seq: thread,
+                        thread,
+                        op: RegisterOp::Write(val),
+                    });
                     let sql = format!("UPDATE reg SET v = {val} WHERE id = 0");
                     let r =
                         tokio::time::timeout(Duration::from_secs(10), s.simple_query(&sql)).await;
@@ -743,12 +793,28 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
                         // A write that did not clearly succeed is indeterminate.
                         _ => Outcome::Info,
                     };
+                    // Only a definite commit returns; an indeterminate write leaves
+                    // its invoke in-flight (the tester may linearize it or drop it).
+                    if matches!(outcome, Outcome::Ok { .. }) {
+                        let rseq = seq.fetch_add(1, Ordering::SeqCst);
+                        events.lock().expect("events").push(RegEvent::Return {
+                            seq: rseq,
+                            thread,
+                            ret: RegisterRet::WriteOk,
+                        });
+                    }
                     local.push(HistEntry {
                         process,
                         op: OpKind::RegWrite(val),
                         outcome,
                     });
                 } else {
+                    let thread = seq.fetch_add(1, Ordering::SeqCst);
+                    events.lock().expect("events").push(RegEvent::Invoke {
+                        seq: thread,
+                        thread,
+                        op: RegisterOp::Read,
+                    });
                     let r = tokio::time::timeout(
                         Duration::from_secs(10),
                         s.simple_query("SELECT v FROM reg WHERE id = 0"),
@@ -761,6 +827,16 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
                         },
                         _ => Outcome::Info,
                     };
+                    // A read that observed a value returns it; a read with no value
+                    // is left in-flight (no observation to constrain linearization).
+                    if let Outcome::Ok { value: Some(v), .. } = outcome {
+                        let rseq = seq.fetch_add(1, Ordering::SeqCst);
+                        events.lock().expect("events").push(RegEvent::Return {
+                            seq: rseq,
+                            thread,
+                            ret: RegisterRet::ReadOk(v),
+                        });
+                    }
                     local.push(HistEntry {
                         process,
                         op: OpKind::RegRead,
@@ -773,8 +849,8 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
         }));
     }
 
-    // Preserve per-process order (each process's ops are sequential), which is
-    // what the linearizability tester needs (one in-flight op per thread).
+    // Each worker's HistEntry list (used only for the observed-reads count); the
+    // real-time event log in `events` is what the linearizability check consumes.
     let mut by_process: Vec<Vec<HistEntry>> = vec![Vec::new(); PROCS];
     for (process, w) in workers.into_iter().enumerate() {
         by_process[process] = w.await.expect("worker joined");
@@ -784,11 +860,13 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
     nemesis.await.expect("nemesis joined");
     c.heal();
 
-    // Did the leader stay fixed for the whole run? If its term advanced or it is no
-    // longer leader, a spurious election happened mid-run and the linearizability
-    // premise (no ungated stale read on a deposed leader) was void — discard this
-    // run so the caller retries on a fresh cluster. This is what makes the test
-    // deterministic instead of timing-dependent.
+    // Secondary guard on the fixed-leader premise: the nemesis only faults a
+    // follower, so the leader keeps quorum and its term should not change — but an
+    // extremely CPU-starved runner could still stall the leader into an election,
+    // and an ungated stale read on the *deposed* leader (the documented D5 gap) is
+    // out of scope here. If the term advanced or the leader moved, discard this run
+    // so the caller retries on a fresh cluster. (Ordinary concurrency is handled by
+    // the real-time modeling below, not by this guard.)
     {
         let m = c.node(leader).raft.metrics();
         let m = m.borrow();
@@ -797,44 +875,31 @@ async fn try_register_run() -> Option<(Vec<HistEntry>, bool)> {
         }
     }
 
-    // Flatten for the returned history (process order is preserved within each
-    // thread, which is all the checker requires).
+    // Flatten for the returned history (used by the test only to assert the
+    // workload actually observed some reads).
     let history: Vec<HistEntry> = by_process.iter().flatten().cloned().collect();
 
-    // Feed the history into stateright's LinearizabilityTester. Thread id = the
-    // process id (Copy + Ord + Debug). The register starts at 0.
-    let mut tester: LinearizabilityTester<usize, Register<i64>> =
+    // Feed the events into stateright's LinearizabilityTester IN REAL-TIME ORDER
+    // (sorted by the global seq stamped at each invoke/return). Concurrent ops
+    // across processes then overlap, so a read that legally observed another
+    // process's just-committed write is recognised as linearizable — the per-process
+    // feed this replaced imposed a false total order and mis-flagged such reads.
+    // Thread id = the unique per-op invoke seq. The register starts at 0.
+    let mut evs = events.lock().expect("events");
+    evs.sort_by_key(reg_seq);
+    let mut tester: LinearizabilityTester<u64, Register<i64>> =
         LinearizabilityTester::new(Register(0));
-    for thread in &by_process {
-        for e in thread {
-            match (&e.op, &e.outcome) {
-                (OpKind::RegWrite(v), Outcome::Ok { .. }) => {
-                    tester
-                        .on_invoke(e.process, RegisterOp::Write(*v))
-                        .expect("valid invoke")
-                        .on_return(e.process, RegisterRet::WriteOk)
-                        .expect("valid return");
-                }
-                (OpKind::RegWrite(v), Outcome::Info) => {
-                    // Indeterminate write: record the invoke but NO return, so the
-                    // tester treats it as in-flight (it may linearize it anywhere
-                    // or leave it out) — the honest modeling of an unknown effect.
-                    tester
-                        .on_invoke(e.process, RegisterOp::Write(*v))
-                        .expect("valid invoke");
-                }
-                (OpKind::RegRead, Outcome::Ok { value: Some(v), .. }) => {
-                    tester
-                        .on_invoke(e.process, RegisterOp::Read)
-                        .expect("valid invoke")
-                        .on_return(e.process, RegisterRet::ReadOk(*v))
-                        .expect("valid return");
-                }
-                // A read with no value is dropped (nothing observed to constrain).
-                _ => {}
+    for e in evs.drain(..) {
+        match e {
+            RegEvent::Invoke { thread, op, .. } => {
+                tester.on_invoke(thread, op).expect("valid invoke");
+            }
+            RegEvent::Return { thread, ret, .. } => {
+                tester.on_return(thread, ret).expect("valid return");
             }
         }
     }
+    drop(evs);
 
     Some((history, tester.is_consistent()))
 }
