@@ -43,8 +43,10 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
     }
     drop(admin);
 
-    // Workers connect round-robin across all nodes (so a coordinator is often a
-    // NON-leading gateway, and the nemesis kills coordinators mid-txn).
+    // Workers are spread one-per-node across nodes 0..PROCS (each worker pins to its
+    // own gateway for the whole run), so a coordinator is often a NON-leading gateway
+    // and the nemesis kills coordinators mid-txn. PROCS < node count is fine — the
+    // point is only that some worker sits on a non-leading gateway under fault.
     let addrs: Vec<String> = (0..c.len())
         .map(|i| c.sql_addr(i as u64).to_string())
         .collect();
