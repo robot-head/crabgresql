@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use executor::SqlEngine;
+use executor::{ExecError, SqlEngine};
 use pgwire::engine::Engine;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::range::RangeId;
+use crate::range::router::GlobalCoordinator;
 use crate::transport::frame::{read_msg, write_msg};
 use crate::transport::partition::PartitionState;
 use crate::transport::protocol::{NodeRequest, NodeResponse, TxnResp, TxnRpc};
@@ -87,9 +88,8 @@ impl TwoPcClient {
 
     /// Send one `TxnRpc` to `target_range`'s leader, bounded re-resolve+retry once
     /// on `NotLeader`/wire failure.
-    // Err(()) = transport/leader-resolution failure; a participant-level retryable is carried as Ok(TxnResp::Retryable). T4 maps these to ExecError.
-    // used in SP17 T4
-    #[allow(dead_code)]
+    // Err(()) = transport/leader-resolution failure; a participant-level retryable is
+    // carried as Ok(TxnResp::Retryable). NetCoordinator maps these to ExecError.
     pub async fn call(&self, target_range: RangeId, rpc: TxnRpc) -> Result<TxnResp, ()> {
         for attempt in 0..2 {
             let (leader, addr) = self.await_leader(target_range).await.ok_or(())?;
@@ -152,6 +152,72 @@ impl TwoPcClient {
                 }
                 Err(())
             }
+        }
+    }
+}
+
+/// Networked coordinator: every global op is an RPC to the relevant range's
+/// leader (range 0 for begin/commit, the participant range for stage/release).
+/// Always RPCs — even to self via loopback — so the path is uniform.
+pub struct NetCoordinator {
+    client: Arc<TwoPcClient>,
+}
+
+impl NetCoordinator {
+    pub fn new(client: Arc<TwoPcClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl GlobalCoordinator for NetCoordinator {
+    async fn begin_global(&self) -> Result<u64, ExecError> {
+        match self.client.call(0, TxnRpc::BeginGlobal).await {
+            Ok(TxnResp::Began { g }) => Ok(g),
+            Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
+            _ => Err(ExecError::Unavailable),
+        }
+    }
+    async fn stage_remote(&self, g: u64, range: RangeId, sql: &str) -> Result<(), ExecError> {
+        match self
+            .client
+            .call(
+                range,
+                TxnRpc::Stage {
+                    g,
+                    range,
+                    sql: sql.to_string(),
+                },
+            )
+            .await
+        {
+            Ok(TxnResp::Staged) => Ok(()),
+            Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
+            Ok(TxnResp::Retryable) => Err(ExecError::SerializationFailure), // preserve 40001 retryability
+            Ok(TxnResp::Err(e)) => Err(ExecError::Unsupported(e)),
+            _ => Err(ExecError::Unavailable),
+        }
+    }
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError> {
+        match self
+            .client
+            .call(0, TxnRpc::CommitGlobal { g, commit })
+            .await
+        {
+            Ok(TxnResp::Committed) => Ok(()),
+            Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
+            _ => Err(ExecError::Unavailable),
+        }
+    }
+    async fn release_remote(&self, g: u64, range: RangeId, commit: bool) -> Result<(), ExecError> {
+        match self
+            .client
+            .call(range, TxnRpc::Release { g, range, commit })
+            .await
+        {
+            Ok(TxnResp::Released) => Ok(()),
+            Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
+            _ => Err(ExecError::Unavailable),
         }
     }
 }

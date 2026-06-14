@@ -313,6 +313,12 @@ impl ServerNode {
             rafts: rafts.clone(),
             id,
         });
+        // Cross-range 2PC over the network: every global op (begin/stage/commit/
+        // release) is an RPC to the relevant range's leader — even to self via
+        // loopback — so the path is uniform whether or not this gateway leads it.
+        let client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        let coordinator: Arc<dyn crate::range::router::GlobalCoordinator> =
+            Arc::new(crate::twopc::NetCoordinator::new(client));
         tokio::spawn(crate::route::serve_range_routed(
             sql_listener,
             map.clone(),
@@ -320,6 +326,7 @@ impl ServerNode {
             leads,
             catalog_kv.clone(),
             forward,
+            coordinator,
             sql_config,
         ));
     }
@@ -356,24 +363,10 @@ impl ServerNode {
         sm_kvs.insert(0, r0_sm_kv);
         engines.insert(0, r0_engine);
 
-        // Bind the node listener BEFORE blocking on the blob, so peers can reach us
-        // (range 0 needs a quorum to elect, and a joining node needs to receive the
-        // seed via replication). At this point only range 0's engine is built; the
-        // TxnService will be created with the full engines map below after all data
-        // ranges are built. For the replicated phase-1 node listener we pass None
-        // (no participant sessions possible until all engines are ready, which is
-        // after the blob wait — the final listener is spawned in start_replicated
-        // with Some(txn) only if we re-spawn, but this first listener is replaced
-        // after the data ranges come up).
-        //
-        // DESIGN NOTE: the replicated path binds once with None here (phase 1, only
-        // range 0 ready) and again with Some(txn) after data ranges are built. The
-        // second bind would conflict on the same addr, so instead we build the full
-        // TxnService now with engines as it grows and pass Some(txn) for the SINGLE
-        // listener that serves the entire lifetime of this node.
-        //
-        // Implementation: pass None here because the full engines map is not yet
-        // built; T4 will wire participants correctly after the full map is ready.
+        // Replicated path: the node listener binds before the full engines map is
+        // built (only range 0 is ready), so it hosts no 2PC service yet — cross-range
+        // 2PC over the replicated layout is future work. The static path (used by the
+        // multi-process e2e) wires Some(txn).
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,

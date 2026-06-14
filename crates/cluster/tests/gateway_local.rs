@@ -157,7 +157,7 @@ async fn begin_global_durable_persists_next_global() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_rejects_a_cross_range_transaction_with_0a000() {
+async fn gateway_escalates_a_cross_range_transaction_without_0a000() {
     let (_node, sql_addr) = start_two_range_node().await;
     let port = sql_addr.rsplit(':').next().expect("port");
     let conn_str = format!("host=127.0.0.1 port={port} user=postgres");
@@ -177,16 +177,25 @@ async fn gateway_rejects_a_cross_range_transaction_with_0a000() {
         .simple_query("INSERT INTO a VALUES (1)")
         .await
         .expect("first DML pins range 0");
-    // A second statement on a DIFFERENT range inside the same txn is rejected.
-    let err = client
+    client
         .simple_query("INSERT INTO b VALUES (2)")
         .await
-        .expect_err("a transaction may not span ranges (D3b)");
-    let db_err = err.as_db_error().expect("a server SQLSTATE error");
-    assert_eq!(
-        db_err.code().code(),
-        "0A000",
-        "cross-range txn → feature_not_supported"
-    );
-    let _ = client.simple_query("ROLLBACK").await;
+        .expect("second range escalates, no 0A000");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("atomic cross-range commit succeeds");
+
+    let a = client
+        .simple_query("SELECT id FROM a")
+        .await
+        .expect("select a");
+    assert_eq!(row_count(&a), 1, "range-0 row committed and visible");
+}
+
+// Counts SimpleQueryMessage::Row entries (reused by T5's full-visibility tests).
+fn row_count(msgs: &[tokio_postgres::SimpleQueryMessage]) -> usize {
+    msgs.iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count()
 }
