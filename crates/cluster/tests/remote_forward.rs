@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use cluster::forward::{ForwardPool, RetryCounter};
 use cluster::range::map::{RangeId, RangeMap};
-use cluster::server_node::{NodeConfig, ServerNode};
+use cluster::server_node::{NodeConfig, RangeLayout, ServerNode};
 
 /// Bind an ephemeral loopback port, read its address, drop the listener so the
 /// address is free for the node to rebind.
@@ -59,7 +59,7 @@ async fn try_two_node_cluster() -> std::io::Result<(ServerNode, ServerNode)> {
         data_dir: d0,
         peers: peers.clone(),
         bootstrap: true,
-        range_map: map.clone(),
+        layout: RangeLayout::Static(map.clone()),
     })
     .await?;
     let n1 = ServerNode::start(NodeConfig {
@@ -69,7 +69,7 @@ async fn try_two_node_cluster() -> std::io::Result<(ServerNode, ServerNode)> {
         data_dir: d1,
         peers,
         bootstrap: false,
-        range_map: map,
+        layout: RangeLayout::Static(map),
     })
     .await?;
     Ok((n0, n1))

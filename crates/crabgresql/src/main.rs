@@ -186,7 +186,7 @@ async fn run_node(a: NodeArgs) -> std::io::Result<()> {
         data_dir: a.data_dir,
         peers,
         bootstrap: a.bootstrap,
-        range_map,
+        layout: cluster::server_node::RangeLayout::Static(range_map),
     };
 
     let node = cluster::server_node::ServerNode::start(cfg).await?;
