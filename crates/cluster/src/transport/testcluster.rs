@@ -12,7 +12,7 @@ use super::client::TcpRaftNetwork;
 use super::frame::{read_msg, write_msg};
 use super::partition::PartitionState;
 use super::protocol::{ControlRequest, ControlResponse, NodeRequest, NodeResponse, NodeStatus};
-use super::server::{ShutdownSignal, serve_node_protocol};
+use super::server::{RangeRegistry, ShutdownSignal, serve_node_protocol};
 use crate::store::{LogStore, StateMachineStore};
 use crate::types::{NodeId, TypeConfig, WriteBatch};
 
@@ -53,6 +53,7 @@ impl TcpCluster {
             let partition = PartitionState::default();
             let net = TcpRaftNetwork {
                 from: id,
+                range: 0,
                 partition: partition.clone(),
             };
             let log = Arc::new(LogStore::default());
@@ -61,9 +62,11 @@ impl TcpCluster {
                 .await
                 .expect("raft");
             let listener = listeners.remove(0);
+            let registry = RangeRegistry::new();
+            registry.register(0, id, raft.clone());
             tokio::spawn(serve_node_protocol(
                 listener,
-                raft.clone(),
+                registry,
                 partition.clone(),
                 ShutdownSignal::default(),
             ));

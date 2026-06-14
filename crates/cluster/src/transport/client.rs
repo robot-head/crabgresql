@@ -15,12 +15,15 @@ use tokio::net::TcpStream;
 use super::frame::{read_msg, write_msg};
 use super::partition::PartitionState;
 use super::protocol::{NodeRequest, NodeResponse, RaftRpc, RaftRpcResp};
+use crate::range::RangeId;
 use crate::types::{NodeId, TypeConfig};
 
-/// One factory per node; mints a [`TcpConn`] per peer.
+/// One factory per `(node, range)`; mints a [`TcpConn`] per peer that tags every
+/// RPC with `range` so the peer's server resolves the matching co-located group.
 #[derive(Clone)]
 pub struct TcpRaftNetwork {
     pub from: NodeId,
+    pub range: RangeId,
     pub partition: PartitionState,
 }
 
@@ -30,6 +33,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetwork {
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> TcpConn {
         TcpConn {
             from: self.from,
+            range: self.range,
             target,
             addr: crate::addr::node_dial_addr(&node.addr).to_string(),
             partition: self.partition.clone(),
@@ -39,9 +43,11 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetwork {
 }
 
 /// A connection to one peer. `RaftNetwork` methods take `&mut self`, so calls are
-/// serialized — one in-flight request over the held stream at a time.
+/// serialized — one in-flight request over the held stream at a time. Every RPC is
+/// tagged with `range` so the peer dispatches to the matching co-located group.
 pub struct TcpConn {
     from: NodeId,
+    range: RangeId,
     target: NodeId,
     addr: String,
     partition: PartitionState,
@@ -65,6 +71,7 @@ impl TcpConn {
             let s = self.stream.as_mut().expect("connected");
             let req = NodeRequest::Raft {
                 from: self.from,
+                range: self.range,
                 rpc: rpc.clone(),
             };
             let exchange = async {

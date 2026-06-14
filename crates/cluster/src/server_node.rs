@@ -76,18 +76,22 @@ impl ServerNode {
         let partition = PartitionState::default();
         let net = TcpRaftNetwork {
             from: cfg.id,
+            range: 0,
             partition: partition.clone(),
         };
         let raft = openraft::Raft::new(cfg.id, raft_config(), net, log, sm)
             .await
             .expect("raft::new");
 
-        // Node-protocol listener (Raft RPCs + control).
+        // Node-protocol listener (Raft RPCs + control). Single-range: one group at
+        // (range 0, id) in the registry; T2 turns this into the per-range loop.
         let node_listener = TcpListener::bind(&cfg.node_addr).await?;
         let shutdown = ShutdownSignal::default();
+        let registry = crate::transport::server::RangeRegistry::new();
+        registry.register(0, cfg.id, raft.clone());
         tokio::spawn(serve_node_protocol(
             node_listener,
-            raft.clone(),
+            registry,
             partition.clone(),
             shutdown.clone(),
         ));

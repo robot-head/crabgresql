@@ -6,6 +6,7 @@ use openraft::raft::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::range::RangeId;
 use crate::types::{NodeId, TypeConfig};
 
 /// One of the three Raft RPCs, as sent from a peer.
@@ -58,7 +59,15 @@ pub enum ControlResponse {
 /// Top-level request envelope on the node port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeRequest {
-    Raft { from: NodeId, rpc: RaftRpc },
+    /// A Raft RPC for the `range`-th co-located group on this node. `range` is
+    /// `#[serde(default)]` so a range-unaware payload (pre-D3a-net, or a peer
+    /// that never sets it) decodes to range 0 — the single-range fast path.
+    Raft {
+        from: NodeId,
+        #[serde(default)]
+        range: RangeId,
+        rpc: RaftRpc,
+    },
     Control(ControlRequest),
 }
 
