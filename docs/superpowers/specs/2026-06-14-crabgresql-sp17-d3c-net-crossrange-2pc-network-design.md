@@ -137,3 +137,25 @@ Tables `acct_x` (range 1) and `acct_y` (range 2); the client connects to **node 
 - **Range-0 funnel + per-statement ReadIndex latency.** Every cross-range commit and every foreign-xid-resolving read touches range 0's leader. Accepted (the documented single-global-clog cost); the ReadIndex is amortized once per statement, not per tuple.
 - **The structured RPC is the node port's first non-Raft/non-Control request.** Mitigated by mirroring the existing `Control` precedent (a structured request/response already dispatched node-globally) and the `RangeRegistry` group resolution.
 - **Scope creep toward SP18** (durable record, recovery sweep, nemesis, self-heal): fenced in Non-goals; T1–T6 build only the leader-stable mechanism + release-on-leadership-loss.
+
+## Traceability (as built)
+
+Implemented across commits T1–T8 on branch `sp17-d3c-net-crossrange-2pc-network`. Full workspace gauntlet green: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace` (380/380), `cargo test --workspace --doc`, `cargo deny check`.
+
+| # | Success criterion | Task | Test(s) |
+|---|---|---|---|
+| 1 | `NodeRequest::Txn` round-trips; `BeginGlobal` returns `g ≥ GLOBAL_XID_BASE` durably; `CommitGlobal` writes the decision | T1, T2 | `twopc::tests::txn_rpc_round_trips_through_json`; `gateway_local::begin_global_durable_persists_next_global` |
+| 2 | `Stage`/`Release` hold then free a per-`(G,range)` session across connections | T3 | `twopc::tests::stage_then_release_holds_then_frees_a_per_g_session` |
+| 3 | Cross-range commit through a non-leading gateway is atomic; `ROLLBACK` leaves neither | T4, T5, T7 | `gateway_local::gateway_escalates_..._without_0a000`, `gateway_commits_..._atomically`; `crossrange_2pc_net::cross_range_txn_commits_atomically_through_a_nonleading_gateway`, `..._rolls_back_atomically` |
+| 4 | No partial visibility: a committed cross-range version resolves; an in-doubt one is invisible (the durable-`gsnap` + range-0 barrier) | T5 | `exec::tests::durable_global_snapshot_resolves_committed_against_range0` + the T7 read-back through every node |
+| 5 | `gateway_local`'s former `0A000` rejection now asserts atomic cross-range commit | T4, T5 | `gateway_local::gateway_commits_a_cross_range_transaction_atomically` |
+| 6 | Leadership loss releases held sessions; per-range leaders queryable | T6 | `gateway_local::range_leaders_control_reports_each_range` + `release_on_leadership_loss` (exercised by T7 failover) |
+| 7 | All prior suites green; no new shipped dependency; full gauntlet | T8 | `cargo nextest run --workspace` 380/380; clippy/fmt/doc/deny green |
+| 8 | Cross-node transfer commits + reads back through any node; per-range failover keeps serving | T7 | `crossrange_2pc_net::cross_range_commit_survives_a_participant_leader_failover` |
+
+**Reconciliation with the spec's stated mechanism.** Three corrections (from the adversarial plan review) refined the design during build, all consistent with the spec's intent:
+- **Global-xid allocation is durable** (`begin_global_durable` persists `next_global` at allocation, not lazily) — prevents global-xid reuse across a range-0 leader change. Strengthens the spec's "single GTM authority."
+- **Visibility `gsnap` is reconstructed from range-0 DURABLE state at every read site** (never the in-memory running set), so `finish_global` is a visibility no-op and a range-0 leader change is transparent — this is exactly the spec's "global snapshot reconstructed from range 0's durable clog state."
+- **The range-0 read barrier is a follower ReadIndex** (`GlobalBarrier` RPC for the leader's applied index + a local `wait().applied_index_at_least`), because openraft's `ensure_linearizable` is leader-only; a participant that does not lead range 0 catches its local replica up rather than erroring. This realizes the spec's "per-statement range-0 ReadIndex gate."
+
+**SP18 (deferred, per Non-goals).** The crash/partition-nemesis cross-range `jepsen_bank`; the durable `/0/txn/<G>` record + active recovery sweep; full failover-survival (re-stage on a mid-txn leader move; participant self-heal + a lingering-lock timeout after a coordinator crash); cross-range 2PC over the *replicated* node layout (the static layout hosts the 2PC service; the replicated bring-up wires `None`); SSI.
