@@ -11,11 +11,13 @@ pub enum XidStatus {
     InProgress,
     Committed,
     Aborted,
+    Prepared(u64),
 }
 
 const S_IN_PROGRESS: u8 = 0;
 const S_COMMITTED: u8 = 1;
 const S_ABORTED: u8 = 2;
+const S_PREPARED: u8 = 3;
 
 /// Read an xid's status. An absent entry is treated as `InProgress`
 /// (aborted-equivalent once the xid is in no live snapshot — see recovery).
@@ -26,6 +28,14 @@ pub fn get(kv: &dyn Kv, xid: u64) -> Result<XidStatus, KvError> {
             Some(&S_COMMITTED) => Ok(XidStatus::Committed),
             Some(&S_ABORTED) => Ok(XidStatus::Aborted),
             Some(&S_IN_PROGRESS) => Ok(XidStatus::InProgress),
+            Some(&S_PREPARED) => {
+                let g: [u8; 8] = b
+                    .get(1..9)
+                    .ok_or_else(|| KvError::CorruptRow("prepared clog missing global xid".into()))?
+                    .try_into()
+                    .expect("slice 1..9 is 8 bytes");
+                Ok(XidStatus::Prepared(u64::from_be_bytes(g)))
+            }
             _ => Err(KvError::CorruptRow("bad clog status byte".into())),
         },
     }
@@ -33,14 +43,20 @@ pub fn get(kv: &dyn Kv, xid: u64) -> Result<XidStatus, KvError> {
 
 /// A write-batch op recording an xid's final status.
 pub fn put_op(xid: u64, status: XidStatus) -> WriteOp {
-    let byte = match status {
-        XidStatus::InProgress => S_IN_PROGRESS,
-        XidStatus::Committed => S_COMMITTED,
-        XidStatus::Aborted => S_ABORTED,
+    let value = match status {
+        XidStatus::InProgress => vec![S_IN_PROGRESS],
+        XidStatus::Committed => vec![S_COMMITTED],
+        XidStatus::Aborted => vec![S_ABORTED],
+        XidStatus::Prepared(g) => {
+            let mut v = Vec::with_capacity(9);
+            v.push(S_PREPARED);
+            v.extend_from_slice(&g.to_be_bytes());
+            v
+        }
     };
     WriteOp::Put {
         key: kv::key::clog_key(xid),
-        value: vec![byte],
+        value,
     }
 }
 
@@ -72,6 +88,30 @@ mod tests {
         kv.write_batch(&[kv::WriteOp::Put {
             key: kv::key::clog_key(9),
             value: vec![99],
+        }])
+        .expect("put");
+        assert!(get(&kv, 9).is_err());
+    }
+
+    #[test]
+    fn prepared_carries_global_xid_roundtrip() {
+        let kv = MemKv::new();
+        kv.write_batch(&[put_op(
+            7,
+            XidStatus::Prepared(crate::xid::GLOBAL_XID_BASE + 3),
+        )])
+        .expect("put");
+        assert_eq!(
+            get(&kv, 7).expect("get"),
+            XidStatus::Prepared(crate::xid::GLOBAL_XID_BASE + 3)
+        );
+    }
+    #[test]
+    fn truncated_prepared_value_errors_not_panics() {
+        let kv = MemKv::new();
+        kv.write_batch(&[kv::WriteOp::Put {
+            key: kv::key::clog_key(9),
+            value: vec![3],
         }])
         .expect("put");
         assert!(get(&kv, 9).is_err());
