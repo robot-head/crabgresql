@@ -244,13 +244,14 @@ impl GlobalCoordinator for NetCoordinator {
             _ => Err(ExecError::Unavailable),
         }
     }
-    async fn commit_global(&self, g: u64, commit: bool) -> Result<(), ExecError> {
+    async fn commit_global(&self, g: u64, commit: bool) -> Result<bool, ExecError> {
         match self
             .client
             .call(0, TxnRpc::CommitGlobal { g, commit })
             .await
         {
-            Ok(TxnResp::Committed) => Ok(()),
+            Ok(TxnResp::Committed) => Ok(true),
+            Ok(TxnResp::Aborted) => Ok(false),
             Ok(TxnResp::NotLeader) => Err(ExecError::NotLeader),
             _ => Err(ExecError::Unavailable),
         }
@@ -509,6 +510,7 @@ mod tests {
             TxnResp::Began { g: 1 << 63 },
             TxnResp::Staged,
             TxnResp::Committed,
+            TxnResp::Aborted,
             TxnResp::Released,
             TxnResp::Barrier { applied_index: 7 },
             TxnResp::NotLeader,
