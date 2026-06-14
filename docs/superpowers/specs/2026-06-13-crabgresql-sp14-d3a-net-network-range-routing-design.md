@@ -142,8 +142,19 @@ os error 740 (`ERROR_ELEVATION_REQUIRED`) is Windows' **UAC installer-detection*
 - **Scope creep toward D3b** (structured RPC, prepared statements, meta range, per-range control): fenced in Non-goals; T2/T4 must not balloon.
 - **os-740 is silent until a Windows spawn fails**: a future trigger-substring binary won't fail on CI Linux; the `CLAUDE.md` hard rule + the T5/T6 name-grep are the only guard. The harness path `env!(CARGO_BIN_EXE_crabgresql)` stays safe only while the binary is named `crabgresql`.
 
-## Traceability (filled in at finish — one row per success criterion 1–10)
+## Traceability (implemented)
 
 | # | Criterion | Verified by |
 |---|---|---|
-| … | (completed during T7) | |
+| 1 | range-unaware `NodeRequest::Raft` decodes (serde default → 0); range-tagged round-trips | `cluster::transport::server::range_aware::raft_envelope_range_serde_default_and_round_trip` (T1) |
+| 2 | range-1 `AppendEntries` dispatched to range-1 Raft; unregistered range → `Unreachable` | `cluster::transport::server::range_aware::loopback_dispatches_by_range_and_rejects_unregistered` (T1) |
+| 3 | multi-range `ServerNode` elects per range; range-1 write isolated to `data-r1`/`raft-r1`, not range 0 | `cluster::server_node::tests::{multi_range_node_elects_a_leader_per_range, a_write_to_range1_is_isolated_to_data_r1}` (T2) |
+| 4 | SP9/SP10 single-range suites pass under default `RangeMap::single()` | `cluster::{scenarios,sql_over_raft,durable_scenarios,sql_durable}` + `crabgresql::{multiprocess,jepsen_elle}` green (T2 gate; full `cargo test --workspace`) |
+| 5 | CREATE+INSERT+SELECT through a multi-range node; cross-range txn → `0A000` | `crates/cluster/tests/gateway_local.rs` (T3) |
+| 6 | follower-gateway write forwards to remote leader + visible on replicas; one re-resolve+retry (counter == 1) | `crates/cluster/tests/remote_forward.rs` (T4) |
+| 7 | multi-process: rows route by range + read back through any node; per-range failover independence | `crates/crabgresql/tests/multirange_gateway.rs::d3a_net_routes_by_range_and_survives_per_range_failover` (T6) |
+| 8 | cross-range transaction rejected `0A000` end-to-end | `crates/cluster/tests/gateway_local.rs` (cross-range-transaction case, T3) |
+| 9 | no UAC-trigger target names; `mutation_semantics` builds/runs; `CLAUDE.md` policy + audit | `cargo test -p executor --test mutation_semantics` + the filename grep + `CLAUDE.md` (T5) |
+| 10 | no new shipped dependency; `#![forbid(unsafe_code)]`; full gauntlet green | `cargo deny` ok + `cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (0 failures) (T7) |
+
+**Note (deviations from the plan, recorded):** T2's election + storage-isolation tests landed inline in `server_node.rs` (`mod tests`), not a separate `tests/durable_multirange.rs` file. T6's two e2e tests were merged into a single test (`d3a_net_routes_by_range_and_survives_per_range_failover`) so libtest never runs two 6-Raft clusters concurrently on a 2-core runner. The `route_one` gateway needed a **leadership-aware** routing decision (`RangeRouter` gained a `LeadsRange` seam) so a follower-with-a-local-engine forwards instead of running locally — a T3/T4 gap surfaced by T6's co-located multi-process topology.

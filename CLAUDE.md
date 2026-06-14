@@ -58,9 +58,9 @@ matters. When in doubt, name the data-mutation test after what it asserts
 
 plus a scan of every crate's `[[test]]/[[bin]]/[[example]] name = "…"` entries.
 
-**SP14 audit (2026-06-13):** all 24 integration-test binaries pass — cluster
-`{durable_scenarios, jepsen_bank, model, multirange, scenarios, sql_durable,
-sql_over_raft}`; crabgresql `{jepsen_elle, multiprocess}` plus the new T6
+**SP14 audit (2026-06-13):** every integration-test binary passes — cluster
+`{durable_scenarios, gateway_local, jepsen_bank, model, multirange, remote_forward,
+scenarios, sql_durable, sql_over_raft}`; crabgresql `{jepsen_elle, multiprocess}` plus the new T6
 `multirange_gateway`; executor `{concurrency, durability, end_to_end,
 linearizable_reads, recovery, transactions, mutation_semantics}`; pgparser
 `{libpg_query_oracle}`; pgwire `{cancel, extended_query, golden_trace, scram_auth,
