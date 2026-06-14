@@ -134,3 +134,17 @@ No interleaving yields a half-applied transfer: the single write-once `clog[G]` 
 - **The nemesis must pace on progress, not sleep.** A zero-gap or settle-sleep nemesis starves recovery on the 2-core CI runner (the documented lesson). Mitigated by pacing the next fault on a committed-op progress signal and waiting on the workload-completes condition with a bounded deadline.
 - **Determinism of the conditional apply across replicas.** The keep-existing check must read only the applied state machine (no wall-clock, no per-node state) so every replica computes the identical decision. Mitigated by implementing it as a pure function of `clog[G]`'s current applied value + the incoming op.
 - **Scope creep toward mid-txn re-stage / a durable record:** fenced in Non-goals; T1–T5 build only the write-once decision + participant self-resolve + the nemesis proof.
+
+## Traceability (criterion → task → proving test)
+
+Each success criterion above is proven by the concrete test(s) below (all shipped and green at the SP18 gauntlet).
+
+| # | Criterion | Task | Proving test(s) |
+|---|---|---|---|
+| 1 | Write-once global decision (first-writer-wins; effective read-back; idempotent same-status) | T1 | `cluster::store::tests::clog_decision_is_write_once_first_writer_wins`; `cluster::store::tests::is_clog_key_matches_only_clog_keys`; `cluster::durable::…::apply_clog_keeps_first_terminal_same_key_twice_in_one_batch` (durable intra-batch fold) |
+| 2 | Resolver returns the effective decision; a contending coordinator-commit loses to a participant-abort by log order | T1/T2 | Write-once tests (criterion 1) establish the first-writer-wins arbiter; `cluster::range::router::tests::coordinator_reports_rollback_when_decision_already_aborted` exercises the contending-write outcome end to end |
+| 3 | Coordinator crash after `Stage` strands no lock: the alive participant self-resolves within `T`, frees its lock, nothing half-applied | T3 | `cluster::twopc::tests::a_silent_coordinator_is_recovered_by_the_timeout_sweeper` |
+| 4 | An in-doubt `g` whose participant leader crashed is finalized on the new leader's rise (durable-marker sweep); rows resolve rather than staying in-doubt | T4 | `cluster::twopc::tests::a_durable_prepared_marker_is_finalized_by_the_leadership_sweep`; `executor::tests::in_doubt_globals_lists_undecided_prepared_markers` (the scan that drives the sweep) |
+| 5 | A coordinator whose intended `Committed` lost the abort-race reports `ROLLBACK`/retryable and abort-releases — never a false `COMMIT` | T2 | `cluster::range::router::tests::coordinator_reports_rollback_when_decision_already_aborted` |
+| 6 | The cross-range bank total is conserved under a multi-process crash/partition nemesis (incl. mid-txn coordinator kills), and the cluster makes progress (no permanent stranding) | T5 | `crabgresql::crossrange_2pc_nemesis::cross_range_bank_conserves_total_under_crash_nemesis` (conservation oracle + all-pairs post-heal recovery round + non-vacuity) |
+| 7 | All SP16/SP17 in-process + networked cross-range suites pass unchanged; no new shipped dependency; `#![forbid(unsafe_code)]`; full gauntlet green; traceability | T6 | `cluster::crossrange_2pc` + `cluster::jepsen_bank` cross-range conservation (regression gate, incl. the bounded-retry flake fix on the authoritative read); `crabgresql::crossrange_2pc_net`; full gauntlet (`cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo nextest run --workspace`; `cargo test --workspace --doc`; `cargo deny check`); UAC guard; this table |
