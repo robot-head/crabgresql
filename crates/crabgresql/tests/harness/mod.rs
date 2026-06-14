@@ -455,6 +455,61 @@ impl Cluster {
             child,
         });
     }
+
+    /// A node id that leads NONE of `ranges` (so the gateway must coordinate
+    /// remotely), or node 0 if no such node exists.
+    pub async fn pick_nonleading_gateway(&self, ranges: &[u32]) -> u64 {
+        for n in &self.nodes {
+            if let Some(ControlResponse::RangeLeaders(v)) =
+                self.control(n.id, ControlRequest::RangeLeaders).await
+            {
+                let leads_any = v
+                    .iter()
+                    .any(|(r, l)| ranges.contains(r) && *l == Some(n.id));
+                if !leads_any {
+                    return n.id;
+                }
+            }
+        }
+        0
+    }
+
+    /// The current leader of `range` (polls live nodes' RangeLeaders, bounded).
+    pub async fn range_leader(&self, range: u32) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            for n in &self.nodes {
+                if let Some(ControlResponse::RangeLeaders(v)) =
+                    self.control(n.id, ControlRequest::RangeLeaders).await
+                    && let Some((_, Some(l))) = v.iter().find(|(r, l)| *r == range && l.is_some())
+                {
+                    return *l;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no leader for range {range} within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// First node that answers status (a live gateway to issue SQL through).
+    pub async fn pick_live_gateway(&self) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            for n in &self.nodes {
+                if self.status(n.id).await.is_some() {
+                    return n.id;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no live gateway within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 /// Convenience: an `AddLearner` control request.
