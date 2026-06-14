@@ -4,35 +4,64 @@
 //! `StateMachineStore` share the Database (Task 3), so an apply commits data +
 //! metadata in one cross-keyspace batch + one fsync.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use kv::KeyspaceKv;
 
-/// One node's on-disk store: a shared `Database` plus its two keyspaces.
+use crate::range::map::{RangeId, RangeMap};
+
+/// One range's on-disk keyspace pair within a node's shared `Database`:
+/// `data-r{r}` (state-machine application KV) and `raft-r{r}` (log entries, vote,
+/// committed, last_applied, membership). fjall keyspaces are isolated by
+/// construction, so two ranges can never alias each other's state.
+#[derive(Clone)]
+pub struct RangeKeyspaces {
+    pub data: fjall::Keyspace,
+    pub raft: fjall::Keyspace,
+}
+
+/// One node's on-disk store: a shared `Database` plus, for each range it hosts,
+/// a `data-r{r}` / `raft-r{r}` keyspace pair. A single-range node has exactly the
+/// `data-r0` / `raft-r0` pair.
 pub struct NodeStore {
     pub(crate) db: Arc<Database>,
-    pub(crate) data: fjall::Keyspace,
-    pub(crate) raft: fjall::Keyspace,
+    ranges: BTreeMap<RangeId, RangeKeyspaces>,
 }
 
 impl NodeStore {
-    /// Open (or recover) a node store at `dir`. fjall journal-replays on open.
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self, kv::KvError> {
+    /// Open (or recover) a node store at `dir` hosting every range in `map`.
+    /// fjall journal-replays on open. For each range `r` this opens the suffixed
+    /// keyspaces `data-r{r}` and `raft-r{r}`.
+    pub fn open(dir: impl AsRef<Path>, map: &RangeMap) -> Result<Self, kv::KvError> {
         let db = Arc::new(open_database_with_retry(dir.as_ref())?);
-        let data = db
-            .keyspace("data", KeyspaceCreateOptions::default)
-            .map_err(|e| kv::KvError::Io(e.to_string()))?;
-        let raft = db
-            .keyspace("raft", KeyspaceCreateOptions::default)
-            .map_err(|e| kv::KvError::Io(e.to_string()))?;
-        Ok(Self { db, data, raft })
+        let mut ranges = BTreeMap::new();
+        for r in map.range_ids() {
+            let data = db
+                .keyspace(&format!("data-r{r}"), KeyspaceCreateOptions::default)
+                .map_err(|e| kv::KvError::Io(e.to_string()))?;
+            let raft = db
+                .keyspace(&format!("raft-r{r}"), KeyspaceCreateOptions::default)
+                .map_err(|e| kv::KvError::Io(e.to_string()))?;
+            ranges.insert(r, RangeKeyspaces { data, raft });
+        }
+        Ok(Self { db, ranges })
     }
 
-    /// A `Kv` view over the `data` keyspace for the SQL engine + SM reads.
-    pub fn data_kv(&self) -> Arc<KeyspaceKv> {
-        Arc::new(KeyspaceKv::new(self.db.clone(), self.data.clone()))
+    /// The keyspace pair for `range` (panics if `range` was not in the `RangeMap`
+    /// this store was opened with — a construction bug, never user input).
+    pub(crate) fn keyspaces(&self, range: RangeId) -> &RangeKeyspaces {
+        self.ranges
+            .get(&range)
+            .unwrap_or_else(|| panic!("range {range} not opened on this NodeStore"))
+    }
+
+    /// A `Kv` view over `range`'s `data-r{range}` keyspace for SQL/SM reads.
+    pub fn data_kv(&self, range: RangeId) -> Arc<KeyspaceKv> {
+        let ks = self.keyspaces(range);
+        Arc::new(KeyspaceKv::new(self.db.clone(), ks.data.clone()))
     }
 }
 
@@ -112,12 +141,12 @@ struct LogCache {
 }
 
 impl DurableLogStore {
-    /// Open the durable log over `store`'s `raft` keyspace, reconstructing the
-    /// `last_log_id` / `last_purged` cache from disk (fjall already replayed).
+    /// Open the durable log over `range`'s `raft-r{range}` keyspace, reconstructing
+    /// the `last_log_id` / `last_purged` cache from disk (fjall already replayed).
     #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
-    pub fn open(store: &NodeStore) -> Result<Arc<Self>, StorageError<NodeId>> {
+    pub fn open(store: &NodeStore, range: RangeId) -> Result<Arc<Self>, StorageError<NodeId>> {
         let db = store.db.clone();
-        let ks = store.raft.clone();
+        let ks = store.keyspaces(range).raft.clone();
         let last_purged: Option<LogId<NodeId>> = read_json(&ks, PURGED_KEY)?;
         let last_log_id = highest_log_id(&ks)?.or(last_purged);
         Ok(Arc::new(Self {
@@ -403,28 +432,29 @@ impl std::fmt::Debug for DurableStateMachineStore {
 }
 
 impl DurableStateMachineStore {
-    /// Open the durable state machine over `store`, reconstructing the
-    /// `last_applied` / `last_membership` cache from the `raft` keyspace (fjall
-    /// already replayed its journal on open). An absent `SM_APPLIED_KEY` means a
-    /// never-applied state machine (`last_applied = None`).
+    /// Open the durable state machine over `range`'s `data-r{range}` /
+    /// `raft-r{range}` keyspaces, reconstructing the `last_applied` /
+    /// `last_membership` cache from the `raft` keyspace (fjall already replayed).
+    /// An absent `SM_APPLIED_KEY` means a never-applied state machine.
     #[allow(clippy::result_large_err)] // `StorageError` is openraft's error type.
-    pub fn open(store: &NodeStore) -> Result<Arc<Self>, StorageError<NodeId>> {
+    pub fn open(store: &NodeStore, range: RangeId) -> Result<Arc<Self>, StorageError<NodeId>> {
+        let ks = store.keyspaces(range);
         // `SM_APPLIED_KEY` stores `Option<LogId>`; `read_json::<Option<LogId>>`
         // therefore yields `Option<Option<LogId>>` — an absent key flattens to
         // `None` last_applied.
         let last_applied: Option<LogId<NodeId>> =
-            read_json::<Option<LogId<NodeId>>>(&store.raft, SM_APPLIED_KEY)?.unwrap_or(None);
+            read_json::<Option<LogId<NodeId>>>(&ks.raft, SM_APPLIED_KEY)?.unwrap_or(None);
         let last_membership: StoredMembership<NodeId, BasicNode> =
-            read_json(&store.raft, SM_MEMBERSHIP_KEY)?.unwrap_or_default();
+            read_json(&ks.raft, SM_MEMBERSHIP_KEY)?.unwrap_or_default();
         let meta = StateMachineMeta {
             last_applied,
             last_membership,
         };
         Ok(Arc::new(Self {
             db: store.db.clone(),
-            data: store.data.clone(),
-            raft: store.raft.clone(),
-            data_kv: store.data_kv(),
+            data: ks.data.clone(),
+            raft: ks.raft.clone(),
+            data_kv: store.data_kv(range),
             meta: RwLock::new(meta),
             snapshot_idx: RwLock::new(0),
             current_snapshot: RwLock::new(None),
@@ -688,16 +718,16 @@ mod tests {
     async fn append_then_reopen_recovers_entries() {
         let dir = temp();
         {
-            let store = NodeStore::open(dir.path()).expect("open");
-            let mut log = DurableLogStore::open(&store).expect("log open");
+            let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+            let mut log = DurableLogStore::open(&store, 0).expect("log open");
             for i in 1..=3 {
                 append_blank(&mut log, i).await;
             }
             log.save_vote(&a_vote()).await.expect("save vote");
             // Everything dropped here — must have fsynced before each ack.
         }
-        let store = NodeStore::open(dir.path()).expect("reopen");
-        let mut log = DurableLogStore::open(&store).expect("log reopen");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("reopen");
+        let mut log = DurableLogStore::open(&store, 0).expect("log reopen");
         let state = log.get_log_state().await.expect("state");
         assert_eq!(
             state.last_log_id.map(|l| l.index),
@@ -716,8 +746,8 @@ mod tests {
     #[tokio::test]
     async fn truncate_removes_tail() {
         let dir = temp();
-        let store = NodeStore::open(dir.path()).expect("open");
-        let mut log = DurableLogStore::open(&store).expect("log open");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+        let mut log = DurableLogStore::open(&store, 0).expect("log open");
         for i in 1..=5 {
             append_blank(&mut log, i).await;
         }
@@ -736,8 +766,8 @@ mod tests {
         // Survives reopen.
         drop(log);
         drop(store);
-        let store = NodeStore::open(dir.path()).expect("reopen");
-        let mut log = DurableLogStore::open(&store).expect("log reopen");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("reopen");
+        let mut log = DurableLogStore::open(&store, 0).expect("log reopen");
         assert_eq!(
             log.get_log_state()
                 .await
@@ -751,8 +781,8 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_head_and_sets_purged() {
         let dir = temp();
-        let store = NodeStore::open(dir.path()).expect("open");
-        let mut log = DurableLogStore::open(&store).expect("log open");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+        let mut log = DurableLogStore::open(&store, 0).expect("log open");
         for i in 1..=5 {
             append_blank(&mut log, i).await;
         }
@@ -771,8 +801,8 @@ mod tests {
         // Survives reopen: purged head stays gone, last_purged reconstructed.
         drop(log);
         drop(store);
-        let store = NodeStore::open(dir.path()).expect("reopen");
-        let mut log = DurableLogStore::open(&store).expect("log reopen");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("reopen");
+        let mut log = DurableLogStore::open(&store, 0).expect("log reopen");
         let state = log.get_log_state().await.expect("state");
         assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(2));
         assert_eq!(state.last_log_id.map(|l| l.index), Some(5));
@@ -818,10 +848,10 @@ mod tests {
         ) -> Result<((), Arc<DurableLogStore>, Arc<DurableStateMachineStore>), StorageError<NodeId>>
         {
             let dir = tempfile::tempdir().expect("tempdir");
-            let store =
-                NodeStore::open(dir.path()).map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let log = DurableLogStore::open(&store)?;
-            let sm = DurableStateMachineStore::open(&store)?;
+            let store = NodeStore::open(dir.path(), &RangeMap::single())
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let log = DurableLogStore::open(&store, 0)?;
+            let sm = DurableStateMachineStore::open(&store, 0)?;
             self.tmp.lock().expect("tmp").push(dir);
             Ok(((), log, sm))
         }
@@ -843,8 +873,8 @@ mod tests {
         let row = kv::key::row_key(1, 1);
         let xid = kv::key::next_xid_key();
         {
-            let store = NodeStore::open(dir.path()).expect("open");
-            let sm = DurableStateMachineStore::open(&store).expect("sm open");
+            let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+            let sm = DurableStateMachineStore::open(&store, 0).expect("sm open");
             apply_normal(
                 &sm,
                 7,
@@ -862,8 +892,8 @@ mod tests {
             .await;
             // Dropped here — must have fsynced before apply returned.
         }
-        let store = NodeStore::open(dir.path()).expect("reopen");
-        let mut sm = DurableStateMachineStore::open(&store).expect("sm reopen");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("reopen");
+        let mut sm = DurableStateMachineStore::open(&store, 0).expect("sm reopen");
 
         assert_eq!(
             sm.sm_kv().get(&row).expect("get row"),
@@ -888,8 +918,8 @@ mod tests {
     #[tokio::test]
     async fn apply_counter_max_merges_same_key_twice_in_one_batch() {
         let dir = temp();
-        let store = NodeStore::open(dir.path()).expect("open");
-        let sm = DurableStateMachineStore::open(&store).expect("sm open");
+        let store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+        let sm = DurableStateMachineStore::open(&store, 0).expect("sm open");
         let k = kv::key::next_xid_key();
         // Two puts to the same counter key in ONE apply, higher then lower.
         apply_normal(
@@ -934,8 +964,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_round_trip_overwrites() {
         let src_dir = temp();
-        let src_store = NodeStore::open(src_dir.path()).expect("src open");
-        let mut src = DurableStateMachineStore::open(&src_store).expect("src sm");
+        let src_store = NodeStore::open(src_dir.path(), &RangeMap::single()).expect("src open");
+        let mut src = DurableStateMachineStore::open(&src_store, 0).expect("src sm");
         apply_normal(
             &src,
             1,
@@ -957,8 +987,8 @@ mod tests {
 
         // Fresh store with pre-existing junk that must be overwritten.
         let dst_dir = temp();
-        let dst_store = NodeStore::open(dst_dir.path()).expect("dst open");
-        let mut dst = DurableStateMachineStore::open(&dst_store).expect("dst sm");
+        let dst_store = NodeStore::open(dst_dir.path(), &RangeMap::single()).expect("dst open");
+        let mut dst = DurableStateMachineStore::open(&dst_store, 0).expect("dst sm");
         // Seed junk directly into the keyspace (bypassing the Raft apply path) to
         // simulate pre-existing state that install_snapshot must authoritatively clear.
         dst.sm_kv()
@@ -982,8 +1012,8 @@ mod tests {
         // Install survives reopen (data + metadata both durable).
         drop(dst);
         drop(dst_store);
-        let dst_store = NodeStore::open(dst_dir.path()).expect("dst reopen");
-        let mut dst = DurableStateMachineStore::open(&dst_store).expect("dst sm reopen");
+        let dst_store = NodeStore::open(dst_dir.path(), &RangeMap::single()).expect("dst reopen");
+        let mut dst = DurableStateMachineStore::open(&dst_store, 0).expect("dst sm reopen");
         assert_eq!(
             dst.sm_kv().scan_prefix(&[]).expect("scan"),
             expected,

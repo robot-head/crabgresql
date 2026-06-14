@@ -1,0 +1,36 @@
+# cargo-nextest configuration.
+#
+# nextest runs every test across all crates in ONE parallel pool — faster than
+# `cargo test`, which serializes test binaries. To get that speed without the
+# distributed suites starving each other's Raft elections on a small CI runner,
+# we cap the concurrency of the heavy suites with test groups; every other (fast,
+# isolated) test still runs at full parallelism.
+
+[test-groups]
+# Multi-PROCESS integration suites (the `crabgresql` crate): each test spawns
+# several OS processes that talk over real TCP. The most contention-prone — run
+# them one at a time so elections and forwarding are not starved.
+multiprocess = { max-threads = 1 }
+
+# In-process cluster integration suites (the `cluster` crate): each test spins up
+# a multi-node Raft cluster (in-memory or durable, over loopback TCP). Lighter than
+# a multi-process test, but still cap how many run at once on a constrained runner.
+cluster = { max-threads = 4 }
+
+[[profile.default.overrides]]
+# crabgresql's integration tests are the multi-process e2e suites
+# (multiprocess, jepsen_elle, multirange_gateway).
+filter = 'package(crabgresql) & kind(test)'
+test-group = 'multiprocess'
+
+[[profile.default.overrides]]
+# The cluster crate's integration tests (remote_forward, gateway_local, multirange,
+# jepsen_bank, durable_scenarios, sql_durable, sql_over_raft, scenarios, model).
+filter = 'package(cluster) & kind(test)'
+test-group = 'cluster'
+
+# CI profile (selected with `--profile ci`): the test-group caps above apply to
+# every profile; here we just surface every failure instead of stopping at the
+# first, so one flake doesn't hide the rest of the run.
+[profile.ci]
+fail-fast = false

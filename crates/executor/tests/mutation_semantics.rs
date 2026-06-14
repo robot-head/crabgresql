@@ -1,5 +1,11 @@
-//! UPDATE / DELETE semantics over MVCC: autocommit and in-transaction,
-//! read-your-writes, tombstone hiding, command tags.
+//! Data-mutation (UPDATE / DELETE) semantics over MVCC: autocommit and
+//! in-transaction, read-your-writes, tombstone hiding, command tags.
+//!
+//! NOTE: this file is named `mutation_semantics.rs` (not `update_delete.rs`) so
+//! its compiled test binary does not contain the substring `update`, which
+//! Windows UAC installer-detection rejects with os error 740
+//! (ERROR_ELEVATION_REQUIRED). See the "UAC-safe target names" policy in
+//! CLAUDE.md.
 
 use executor::SqlEngine;
 use pgwire::engine::{Cell, Engine, QueryResult, Session};

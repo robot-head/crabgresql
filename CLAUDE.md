@@ -3,6 +3,15 @@
 A from-scratch PostgreSQL-compatible distributed database in Rust 2024, built one
 vertical "slice" at a time.
 
+## Test runner: cargo-nextest
+
+Tests run under **cargo-nextest**: `cargo nextest run --workspace` (CI uses
+`--profile ci`). The heavy distributed suites are capped via concurrency groups in
+`.config/nextest.toml` — multi-process suites run serially, in-process cluster
+suites are capped — so they don't starve each other's Raft elections on the 2-core
+runner, while everything else runs at full parallelism. nextest does **not** run
+doctests; run those separately with `cargo test --workspace --doc`.
+
 ## Testing: no `sleep` — make tests deterministic via instrumentation
 
 **Do not write tests (or test harness code) that use `sleep`/`tokio::time::sleep`
@@ -35,3 +44,38 @@ lacks the instrumentation a deterministic test needs — **add the instrumentati
 
 The goal: every test is deterministic and never flaky — it passes or fails on
 behavior, never on timing.
+
+## Windows UAC-safe target names (os error 740)
+
+Windows UAC **installer-detection** refuses to launch (un-elevated) any executable
+whose **filename** contains `setup`, `install`, `update`, `patch`, or `upgrad`
+(matches `upgrade`), failing with os error 740 (`ERROR_ELEVATION_REQUIRED`). Cargo
+derives a test/bin/example binary's filename from its **target name**, and an
+integration-test file's name *is* its target name. So:
+
+**Rule:** No `[[test]]` / `[[bin]]` / `[[example]]` target **name** — and no
+integration-test **filename** under `crates/*/tests/` (which becomes a binary
+target) — may contain the substrings `setup`, `install`, `update`, `patch`, or
+`upgrad`. This is a **filename/target-name** constraint, not a content one: SQL
+`UPDATE`/`DELETE` inside a test body is fine; only the compiled binary's name
+matters. When in doubt, name the data-mutation test after what it asserts
+(`mutation_semantics`), not the SQL keyword (`update_delete`).
+
+**Guard (returns empty when clean):**
+
+    git ls-files 'crates/*/tests/*.rs' | grep -iE 'setup|install|update|patch|upgrad'
+
+plus a scan of every crate's `[[test]]/[[bin]]/[[example]] name = "…"` entries.
+
+**SP14 audit (2026-06-13):** every integration-test binary passes — cluster
+`{durable_scenarios, gateway_local, jepsen_bank, model, multirange, remote_forward,
+scenarios, sql_durable, sql_over_raft}`; crabgresql `{jepsen_elle, multiprocess}` plus the new T6
+`multirange_gateway`; executor `{concurrency, durability, end_to_end,
+linearizable_reads, recovery, transactions, mutation_semantics}`; pgparser
+`{libpg_query_oracle}`; pgwire `{cancel, extended_query, golden_trace, scram_auth,
+simple_query, sqlx_driver, tls}` — and the four fuzz `[[bin]]` names (`parse_sql`,
+`wire_decode`, `decode_row`, `decode_key`) and the shipped `crabgresql` binary. The
+only file that previously tripped the guard, `update_delete.rs`, was renamed to
+`mutation_semantics.rs` in this slice. The multi-process harness resolves children
+via `env!("CARGO_BIN_EXE_crabgresql")`, which stays UAC-safe only while the binary
+is named `crabgresql` — do not rename it.

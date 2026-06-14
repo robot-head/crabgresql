@@ -6,6 +6,7 @@ pub mod addr;
 mod cluster;
 mod committer;
 mod durable;
+pub mod forward;
 mod linearizer;
 mod network;
 mod node;

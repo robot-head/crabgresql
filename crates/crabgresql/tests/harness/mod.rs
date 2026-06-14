@@ -36,6 +36,7 @@ pub struct Cluster {
     pub nodes: Vec<ProcNode>,
     _tmp: TempDir, // base dir for all node data dirs; kept alive for the test
     peers_arg: Vec<String>,
+    boundaries: Vec<u32>, // multi-range RangeMap boundaries (empty ⇒ single range)
 }
 
 async fn free_port() -> u16 {
@@ -65,7 +66,7 @@ impl Cluster {
         for (id, node_addr, sql_addr) in &info {
             let dir = tmp.path().join(format!("node-{id}"));
             std::fs::create_dir_all(&dir).expect("create node dir");
-            let child = spawn_node(*id, node_addr, sql_addr, &dir, &peers_arg, *id == 0);
+            let child = spawn_node(*id, node_addr, sql_addr, &dir, &peers_arg, &[], *id == 0);
             nodes.push(ProcNode {
                 id: *id,
                 node_addr: node_addr.clone(),
@@ -78,6 +79,55 @@ impl Cluster {
             nodes,
             _tmp: tmp,
             peers_arg,
+            boundaries: Vec::new(),
+        };
+        c.wait_for_leader().await;
+        c
+    }
+
+    /// Spawn `n` node processes that each host EVERY range of a multi-range
+    /// `RangeMap` built from `boundaries` (table-id split points, the same on all
+    /// nodes). Node 0 bootstraps; waits until *some* node reports a leader (each
+    /// range elects independently — per-range readiness is confirmed by the test
+    /// via an SQL read-back, since the control protocol is node-global).
+    pub async fn spawn_multirange(n: u64, boundaries: Vec<u32>) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut info = Vec::new();
+        for id in 0..n {
+            let node_addr = format!("127.0.0.1:{}", free_port().await);
+            let sql_addr = format!("127.0.0.1:{}", free_port().await);
+            info.push((id, node_addr, sql_addr));
+        }
+        let peers_arg: Vec<String> = info
+            .iter()
+            .map(|(id, na, sa)| format!("{id}@{na}|{sa}"))
+            .collect();
+        let mut nodes = Vec::new();
+        for (id, node_addr, sql_addr) in &info {
+            let dir = tmp.path().join(format!("node-{id}"));
+            std::fs::create_dir_all(&dir).expect("create node dir");
+            let child = spawn_node(
+                *id,
+                node_addr,
+                sql_addr,
+                &dir,
+                &peers_arg,
+                &boundaries,
+                *id == 0,
+            );
+            nodes.push(ProcNode {
+                id: *id,
+                node_addr: node_addr.clone(),
+                sql_addr: sql_addr.clone(),
+                dir,
+                child,
+            });
+        }
+        let c = Self {
+            nodes,
+            _tmp: tmp,
+            peers_arg,
+            boundaries,
         };
         c.wait_for_leader().await;
         c
@@ -101,6 +151,16 @@ impl Cluster {
     }
 
     /// Wait (bounded) until some node reports a leader; return its id.
+    ///
+    /// Cross-process polling cadence: the node-global control protocol gives no push
+    /// signal, so we re-probe `status()` on a small fixed POLL INTERVAL, bounded by a
+    /// deadline, returning the instant a leader is observed. The interval is NOT a
+    /// "settle" guess (the CLAUDE.md prohibition is on in-process waits that should
+    /// use openraft events and on fixed completion-duration guesses) — it is the poll
+    /// period, and it is load-bearing: a zero-gap loop opens control connections fast
+    /// enough to starve the nodes' Raft progress under test contention (the
+    /// stable-window lesson), so the interval both paces the probe and leaves the
+    /// cluster room to elect. This matches the established multi-process harness.
     pub async fn wait_for_leader(&self) -> u64 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -120,6 +180,11 @@ impl Cluster {
     }
 
     /// Wait (bounded) until node `id` has applied at least `idx`.
+    ///
+    /// Same cross-process polling cadence as `wait_for_leader`: a small fixed POLL
+    /// INTERVAL between `status()` probes (not a settle-guess), bounded by a deadline
+    /// so a stuck node fails the test instead of hanging, and gentle enough not to
+    /// storm the control port.
     pub async fn wait_applied(&self, id: u64, idx: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -182,6 +247,69 @@ impl Cluster {
         client
     }
 
+    /// Bounded, condition-driven wait: re-issue `select_sql` through live nodes
+    /// (round-robin, advancing past unreachable ones) until column 0 of the first
+    /// row equals `expected`, or the deadline trips. This is the SQL-observable
+    /// per-range progress signal the crash nemesis gates on — the control protocol
+    /// is node-global, so a committed read-back THROUGH the owning range is the only
+    /// per-range commit signal available across the process boundary. Uses the same
+    /// bounded POLL INTERVAL as the other harness waits (poll cadence, not a settle
+    /// guess) so it does not storm the SQL port.
+    pub async fn wait_select_value(&self, select_sql: &str, expected: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut idx = 0usize;
+        loop {
+            if let Some(client) = self.pg_try(idx).await
+                && let Ok(Ok(msgs)) =
+                    tokio::time::timeout(Duration::from_secs(8), client.simple_query(select_sql))
+                        .await
+            {
+                let got = msgs.iter().find_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(|s| s.to_string()),
+                    _ => None,
+                });
+                if got.as_deref() == Some(expected) {
+                    return;
+                }
+            }
+            idx = idx.wrapping_add(1) % self.nodes.len();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`{select_sql}` did not return {expected:?} within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Execute a write, retrying through live nodes until it commits or the deadline
+    /// trips. Tolerates the transient retryable `40001` ("not the leader") during a
+    /// re-election window — a correct client retries on a retryable error, and the
+    /// test's claim is that the range RESUMES, not that the first attempt in the
+    /// election window wins. Same bounded poll cadence as the other harness waits.
+    /// (Callers pair this with a `wait_select_value` read-back to prove durability;
+    /// the statement should be safe to apply more than once — e.g. a presence-checked
+    /// INSERT whose read-back asserts the value exists, not a row count.)
+    pub async fn exec_until_ok(&self, sql: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut idx = 0usize;
+        loop {
+            if let Some(client) = self.pg_try(idx).await
+                && matches!(
+                    tokio::time::timeout(Duration::from_secs(8), client.simple_query(sql)).await,
+                    Ok(Ok(_))
+                )
+            {
+                return;
+            }
+            idx = idx.wrapping_add(1) % self.nodes.len();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`{sql}` did not commit within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Hard-kill node `id` (SIGKILL / TerminateProcess).
     pub async fn kill(&mut self, id: u64) {
         let _ = self.nodes[id as usize].child.start_kill();
@@ -190,6 +318,7 @@ impl Cluster {
 
     /// Respawn node `id` from its existing data dir (bootstrap=false; it recovers).
     pub fn respawn(&mut self, id: u64) {
+        let boundaries = self.boundaries.clone();
         let n = &mut self.nodes[id as usize];
         n.child = spawn_node(
             id,
@@ -197,6 +326,7 @@ impl Cluster {
             &n.sql_addr,
             &n.dir,
             &self.peers_arg,
+            &boundaries,
             false,
         );
     }
@@ -215,7 +345,16 @@ impl Cluster {
         let sql_addr = format!("127.0.0.1:{}", free_port().await);
         let dir = self._tmp.path().join(format!("node-{id}"));
         std::fs::create_dir_all(&dir).expect("create node dir");
-        let child = spawn_node(id, &node_addr, &sql_addr, &dir, &self.peers_arg, false);
+        let boundaries = self.boundaries.clone();
+        let child = spawn_node(
+            id,
+            &node_addr,
+            &sql_addr,
+            &dir,
+            &self.peers_arg,
+            &boundaries,
+            false,
+        );
         self.nodes.push(ProcNode {
             id,
             node_addr,
@@ -242,6 +381,7 @@ fn spawn_node(
     sql_addr: &str,
     dir: &std::path::Path,
     peers: &[String],
+    boundaries: &[u32],
     bootstrap: bool,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crabgresql"));
@@ -256,6 +396,9 @@ fn spawn_node(
         .arg(dir);
     for p in peers {
         cmd.arg("--peer").arg(p);
+    }
+    for b in boundaries {
+        cmd.arg("--range-boundaries").arg(b.to_string());
     }
     if bootstrap {
         cmd.arg("--bootstrap");
