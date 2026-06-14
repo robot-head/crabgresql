@@ -192,7 +192,6 @@ pub(crate) async fn execute_write(
                 let Some((cur_xmin, cur_row)) = eval_plan_qual(
                     kv,
                     global,
-                    gsnap,
                     procarray,
                     snapshot,
                     &t,
@@ -265,7 +264,6 @@ pub(crate) async fn execute_write(
                 let Some((cur_xmin, cur_row)) = eval_plan_qual(
                     kv,
                     global,
-                    gsnap,
                     procarray,
                     snapshot,
                     &t,
@@ -380,7 +378,6 @@ fn find_visible_one(
 fn eval_plan_qual(
     kv: &dyn Kv,
     global: &dyn Kv,
-    gsnap: &mvcc::visibility::Snapshot,
     procarray: &crate::procarray::ProcArray,
     snapshot: &mvcc::visibility::Snapshot, // the txn snapshot (RR) used to detect "changed since"
     table: &catalog::Table,
@@ -396,11 +393,33 @@ fn eval_plan_qual(
         let (xmn, xmx, row) = mvcc::version::decode_tuple(v)?;
         versions.push((xmn, xmx, row));
     }
+    // Resolve this row's `Prepared(Li -> g)` markers against a SETTLED global view
+    // — range 0's global clog read directly — NOT the statement's pre-lock global
+    // snapshot (`gsnap`). We hold this row's lock, and a cross-range participant
+    // releases a row's lock only AFTER its global decision is durable
+    // (commit_release/abort_release run post-decision). So every global txn `g`
+    // with a `Prepared` marker on THIS row's versions has already settled in
+    // range 0's global clog; a still-in-doubt `g` could not have left a marker
+    // here (it would still hold this lock, so we could not have acquired it).
+    // Reading the global clog directly under the lock is therefore exact — and is
+    // the read-committed-under-lock analogue of how the LOCAL clog is read
+    // directly. Using `gsnap` would be stale: a `g` that committed while we were
+    // blocked on the lock still appears in-doubt in `gsnap.xip`, hiding its just-
+    // committed supersede and losing the update across the 2PC boundary. A settled
+    // Snapshot (xmin 0, xmax MAX, empty xip) drives `global_status`'s in-doubt gate
+    // (`g >= xmax || xip.contains(g)`) always false, so it reads `clog::get` for g.
+    // The LOCAL `snapshot`/`fresh` handling below is unchanged — it is about local
+    // creation ordering and is already correct.
+    let settled_global = mvcc::visibility::Snapshot {
+        xmin: 0,
+        xmax: u64::MAX,
+        xip: Vec::new(),
+    };
     // Is the row's latest committed version deleted/superseded by a transaction
     // NOT visible to our txn snapshot (committed AFTER it), other than ourselves?
     // The resolver derefs a Prepared(xmx -> g) deleter to range 0's global
     // decision so a cross-range supersede is detected exactly when it commits.
-    let resolve = global_status(kv, global, gsnap);
+    let resolve = global_status(kv, global, &settled_global);
     let changed_since_snapshot = versions.iter().any(|&(_xmn, xmx, _)| {
         xmx != mvcc::xid::INVALID_XID
             && xmx != xid
@@ -413,10 +432,10 @@ fn eval_plan_qual(
         }
         // READ COMMITTED: re-find the latest live version under a FRESH snapshot.
         let fresh = procarray.snapshot();
-        return find_visible_one(kv, global, gsnap, &fresh, Some(xid), &versions);
+        return find_visible_one(kv, global, &settled_global, &fresh, Some(xid), &versions);
     }
     // No concurrent committed change: find the version visible to our snapshot.
-    find_visible_one(kv, global, gsnap, snapshot, Some(xid), &versions)
+    find_visible_one(kv, global, &settled_global, snapshot, Some(xid), &versions)
 }
 
 /// Coerce an evaluated value into a target column type (assignment context).
@@ -585,7 +604,6 @@ pub(crate) async fn execute_read_locking(
         let Some((_cur_xmin, cur_row)) = eval_plan_qual(
             kv,
             global,
-            gsnap,
             procarray,
             snapshot,
             &t,

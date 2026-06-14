@@ -1378,9 +1378,13 @@ async fn cross_range_bank_conserves_total_serial() {
 ///
 /// The conservation checker below is intentionally NOT weakened and has NO retry
 /// masking — per the slice's guardrail, a non-conserved total is a real signal.
-#[ignore = "BLOCKED: real Task-3 isolation bug — eval_plan_qual uses a stale pre-lock \
-            global snapshot, losing a concurrent cross-range commit (lost update). \
-            Un-ignore once the global snapshot is re-captured under the row lock."]
+///
+/// FIXED (SP16 D3c): `eval_plan_qual` now resolves a locked row's
+/// `Prepared(Li -> g)` markers against a SETTLED global view (range 0's global
+/// clog read directly), not the statement's stale pre-lock global snapshot. Under
+/// the row lock every concurrent global txn that touched the row has already
+/// settled, so the direct read is exact and the lost update is gone — this test
+/// conserves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_range_bank_conserves_total_under_nemesis() {
     let (history, final_total, seeded_total) = run_cross_range_bank(
