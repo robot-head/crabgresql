@@ -50,6 +50,27 @@ impl NodeStore {
         Ok(Self { db, ranges })
     }
 
+    /// Open (creating if absent) `range`'s `data-r{range}` / `raft-r{range}`
+    /// keyspace pair on an already-open store, reusing the shared `Database`.
+    /// Idempotent: a range already hosted is left as-is. Replicated-mode bring-up
+    /// (SP15) calls this for each data range after reading the descriptor blob;
+    /// Static mode never calls it (every range is opened up front by `open`).
+    pub fn open_range(&mut self, range: RangeId) -> Result<(), kv::KvError> {
+        if self.ranges.contains_key(&range) {
+            return Ok(());
+        }
+        let data = self
+            .db
+            .keyspace(&format!("data-r{range}"), KeyspaceCreateOptions::default)
+            .map_err(|e| kv::KvError::Io(e.to_string()))?;
+        let raft = self
+            .db
+            .keyspace(&format!("raft-r{range}"), KeyspaceCreateOptions::default)
+            .map_err(|e| kv::KvError::Io(e.to_string()))?;
+        self.ranges.insert(range, RangeKeyspaces { data, raft });
+        Ok(())
+    }
+
     /// The keyspace pair for `range` (panics if `range` was not in the `RangeMap`
     /// this store was opened with — a construction bug, never user input).
     pub(crate) fn keyspaces(&self, range: RangeId) -> &RangeKeyspaces {
@@ -1021,5 +1042,31 @@ mod tests {
         );
         let (last_applied, _) = dst.applied_state().await.expect("applied_state");
         assert_eq!(last_applied, snapshot.meta.last_log_id);
+    }
+
+    #[test]
+    fn open_range_adds_a_keyspace_pair_after_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Open with the single-range map: only data-r0 / raft-r0 exist.
+        let mut store = NodeStore::open(dir.path(), &RangeMap::single()).expect("open");
+        // Range 1 is not yet hosted — its keyspaces do not exist.
+        assert!(
+            !store.ranges.contains_key(&1),
+            "range 1 absent before open_range"
+        );
+        // Add range 1 on demand.
+        store.open_range(1).expect("open_range 1");
+        assert!(
+            store.ranges.contains_key(&1),
+            "range 1 present after open_range"
+        );
+        // data_kv(1) now works (would panic before).
+        let kv1 = store.data_kv(1);
+        kv1.put(b"k".to_vec(), b"v".to_vec()).expect("put r1");
+        assert_eq!(kv1.get(b"k").expect("get r1"), Some(b"v".to_vec()));
+        // Idempotent: opening an already-open range is a no-op, not an error.
+        store
+            .open_range(1)
+            .expect("open_range 1 again (idempotent)");
     }
 }

@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use cluster::range::map::RangeMap;
-use cluster::server_node::{NodeConfig, ServerNode};
+use cluster::server_node::{NodeConfig, RangeLayout, ServerNode};
 use openraft::ServerState;
 use tokio::net::TcpListener;
 
@@ -60,7 +60,7 @@ async fn start_two_range_node() -> (ServerNode, String) {
             data_dir: tempfile::tempdir().expect("tempdir").keep(),
             peers: vec![(0, node_addr.clone())],
             bootstrap: true,
-            range_map: RangeMap::with_boundaries(vec![2]),
+            layout: RangeLayout::Static(RangeMap::with_boundaries(vec![2])),
         })
         .await
         {

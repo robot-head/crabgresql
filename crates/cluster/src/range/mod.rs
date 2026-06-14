@@ -3,6 +3,7 @@
 
 pub mod cluster;
 pub mod map;
+pub mod meta;
 pub mod router;
 
 pub use cluster::MultiRangeCluster;
