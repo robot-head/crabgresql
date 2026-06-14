@@ -138,9 +138,9 @@ async fn cross_range_bank_conserves_total_under_crash_nemesis() {
     }
 
     // CONSERVATION oracle: sum both tables across both ranges == seeded total.
-    let gw = c.pick_live_gateway().await;
-    let reader = c.pg(gw).await;
-    let total = read_total_cross(&reader, ACCOUNTS).await;
+    // Bounded-retry the authoritative read (re-resolve a live gateway per attempt) so a
+    // transient failure under heavy CI contention does not panic — the PR #34 flake class.
+    let total = read_total_cross_until_ok(&c, ACCOUNTS).await;
     assert_eq!(
         total, seeded_total,
         "cross-range transfers conserve the bank total under crash+partition nemesis (got {total}, want {seeded_total})"
@@ -253,16 +253,42 @@ fn first_i64(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<i64> {
 /// Read the cross-range bank total by summing each account's balance over BOTH tables
 /// (`acct_a` in range 0 + `acct_b` in range 1) for ids `0..accounts`. (`SUM` is not in
 /// the SQL subset yet, so add the balances in Rust.)
-async fn read_total_cross(client: &tokio_postgres::Client, accounts: i64) -> i64 {
-    let mut total = 0;
+/// Authoritative cross-range conservation read, bounded-retry. Re-resolves a LIVE
+/// gateway each attempt; on any connect/read failure (transient `08006`, a gateway
+/// caught mid-fault, heavy CI contention) it re-resolves and retries, bounded by a 30s
+/// deadline. No settle-sleep — paced by the real round-trip + a short poll. Replaces an
+/// unretried one-shot read that could panic on a transient failure (the PR #34 flake).
+async fn read_total_cross_until_ok(c: &Cluster, accounts: i64) -> i64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(total) = try_read_total_cross(c, accounts).await {
+            return total;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "conservation read did not succeed within 30s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// One attempt: pick a live gateway, sum every account over both tables; `None` on any
+/// failure (so the caller re-resolves and retries — never a partial/fabricated total).
+async fn try_read_total_cross(c: &Cluster, accounts: i64) -> Option<i64> {
+    let gw = c.pick_live_gateway().await;
+    let client = connect(c.sql_addr(gw)).await?;
+    let mut total = 0i64;
     for table in ["acct_a", "acct_b"] {
         for id in 0..accounts {
-            let r = client
-                .simple_query(&format!("SELECT bal FROM {table} WHERE id = {id}"))
-                .await
-                .expect("read balance");
-            total += first_i64(&r).expect("balance row");
+            let rows = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.simple_query(&format!("SELECT bal FROM {table} WHERE id = {id}")),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            total += first_i64(&rows)?;
         }
     }
-    total
+    Some(total)
 }
