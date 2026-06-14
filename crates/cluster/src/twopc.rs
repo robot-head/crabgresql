@@ -423,15 +423,22 @@ impl TxnService {
     }
 
     async fn stage(&self, g: u64, range: RangeId, sql: &str) -> TxnResp {
-        // Resolve the participant engine FIRST. An unregistered range means this node is
-        // still mid-bootstrap on the replicated layout — RETRYABLE: return NotLeader (the
-        // coordinator re-resolves) instead of a hard Err, and skip parsing entirely.
-        let Some(handle) = self.session_handle(g, range).await else {
+        // Check the participant engine is hosted FIRST (a presence check only — does NOT
+        // create a held session). An unregistered range means this node is still mid-
+        // bootstrap on the replicated layout — RETRYABLE: return NotLeader (the coordinator
+        // re-resolves) instead of a hard Err, and skip parsing entirely.
+        if self.engine(range).is_none() {
             return TxnResp::NotLeader;
-        };
+        }
         let stmt = match pgparser::parse(sql) {
             Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
             _ => return TxnResp::Err("stage expects exactly one statement".into()),
+        };
+        // Only NOW get-or-create the held session — so a parse failure above never orphans
+        // an idle held entry. (Re-checks the engine; a NotLeader here means the range was
+        // deregistered in the race window — still retryable.)
+        let Some(handle) = self.session_handle(g, range).await else {
+            return TxnResp::NotLeader;
         };
         let mut session = handle.lock().await; // per-session lock only; map lock dropped
         if let Err(e) = session.ensure_began().await {
