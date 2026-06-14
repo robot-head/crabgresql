@@ -1035,11 +1035,37 @@ async fn read_total_cross(router: &mut RangeRouter, accounts: i64) -> i64 {
     let mut total = 0;
     for (table, ids) in [("acct_a", accounts), ("acct_b", accounts)] {
         for id in 0..ids {
-            let r = router
-                .simple(&format!("SELECT bal FROM {table} WHERE id = {id}"))
-                .await
-                .expect("read balance");
-            total += first_i64(&r).expect("balance row");
+            let sql = format!("SELECT bal FROM {table} WHERE id = {id}");
+            // Authoritative post-heal conservation read. Leaders were just
+            // re-resolved (see `run_cross_range_bank`), but a transient
+            // unavailable-class error (`40001` not-leader/serialization, `40P01`,
+            // `08*`) can still surface here while an in-flight 2PC recovery settles
+            // right after leaders re-resolve. Bounded-retry the read on such an
+            // error rather than panicking on the first transient failure.
+            //
+            // This does NOT weaken the conservation oracle: every account's REAL
+            // balance is still read and summed; we never fabricate, default, or skip
+            // a balance. A read genuinely stuck past the 30s deadline still panics
+            // and fails the test. No sleep — each attempt is a real, bounded engine
+            // round-trip (`router.simple` under a 10s timeout), naturally paced by
+            // the I/O, with an optional bounded ROLLBACK between attempts to clear
+            // any lingering aborted block (the established `recover_router` pattern).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let bal = loop {
+                match tokio::time::timeout(Duration::from_secs(10), router.simple(&sql)).await {
+                    Ok(Ok(r)) => break first_i64(&r).expect("balance row"),
+                    Ok(Err(e))
+                        if is_unavailable_class(&e.code)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        recover_router(router).await;
+                    }
+                    Ok(Err(e)) => panic!("read balance for {table}[{id}]: {e:?}"),
+                    Err(_) if tokio::time::Instant::now() < deadline => {}
+                    Err(_) => panic!("read balance for {table}[{id}] timed out past deadline"),
+                }
+            };
+            total += bal;
         }
     }
     total
