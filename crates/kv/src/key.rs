@@ -245,5 +245,11 @@ mod tests {
         assert!(clog_scan_end() > clog_key(u64::MAX));
         // The watermark key is NOT inside the clog prefix (a clog scan won't return it).
         assert!(!clog_scan_lo_key().starts_with(&clog_prefix()));
+        // Pin the recovery-scan window `[clog_prefix(), clog_scan_end())`: every clog
+        // key falls inside it, and the watermark key falls OUTSIDE it (so a range scan
+        // of the clog can never sweep the watermark, regardless of meta-key ordering).
+        assert!(clog_key(0) >= clog_prefix() && clog_key(0) < clog_scan_end());
+        let lo = clog_scan_lo_key();
+        assert!(lo < clog_prefix() || lo >= clog_scan_end());
     }
 }

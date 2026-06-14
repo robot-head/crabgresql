@@ -170,6 +170,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_range_inclusive_start_exclusive_end_on_fjall() {
+        // Pin the [start, end) semantics DIRECTLY on the durable backend (not just
+        // transitively via MemKv) — the whole recovery-scan watermark relies on the
+        // two backends agreeing on the half-open interval.
+        let dir = temp();
+        let kv = FjallKv::open(dir.path()).expect("open");
+        for i in [1u8, 3, 5, 7, 9] {
+            kv.put(vec![b'k', i], vec![i]).expect("put");
+        }
+        assert_eq!(
+            kv.scan_range(&[b'k', 3], &[b'k', 7]).expect("scan_range"),
+            vec![(vec![b'k', 3], vec![3]), (vec![b'k', 5], vec![5])], // k7 excluded
+        );
+        assert_eq!(
+            kv.scan_range(&[b'k', 0], &[b'k', 255]).expect("scan").len(),
+            5
+        );
+        assert!(
+            kv.scan_range(&[b'k', 5], &[b'k', 5])
+                .expect("scan")
+                .is_empty()
+        ); // empty
+        assert!(
+            kv.scan_range(&[b'k', 200], &[b'k', 255])
+                .expect("scan")
+                .is_empty()
+        ); // above all
+    }
+
+    #[test]
     fn write_batch_is_atomic() {
         let dir = temp();
         let kv = FjallKv::open(dir.path()).expect("open");
