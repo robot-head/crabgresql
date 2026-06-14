@@ -78,7 +78,7 @@ Implement for `MemKv` (mirroring `scan_prefix`):
 
 - [ ] **Step 4: Implement `scan_range` for the fjall backend(s)**
 
-In `crates/kv/src/fjall_store.rs`, add a `scan_range` impl next to EACH `scan_prefix` (there are two — the keyspace wrapper and the raw store). Mirror the existing `scan_prefix` body but use fjall's bounded range query over `start..end` (inclusive start, exclusive end) instead of the prefix iterator. Match the existing error handling and `(Vec<u8>, Vec<u8>)` collection exactly. (Read the current `scan_prefix` impls at `:55` and `:114` and mirror their structure.)
+In `crates/kv/src/fjall_store.rs`, add `scan_range` next to each `scan_prefix`. The real impl is in the keyspace wrapper (`KeyspaceKv`, `:55`): mirror its `scan_prefix` body but use fjall's bounded range query — `self.<keyspace>.range(start.to_vec()..end.to_vec())` (fjall 3.x `Keyspace::range<K, R: RangeBounds<K>>` returns the SAME `Iter` type as the prefix query, with `[start, end)` semantics) — matching the existing error handling and `(Vec<u8>, Vec<u8>)` collection exactly. The other `scan_prefix` (`FjallKv`, `:114`) just **delegates** to the inner `KeyspaceKv`; add a one-line `scan_range` delegate there too. (Read both at `:55`/`:114` and mirror their structure.)
 
 - [ ] **Step 5: Add the watermark key + clog scan-end helpers (`crates/kv/src/key.rs`)**
 
@@ -96,14 +96,18 @@ pub fn clog_scan_lo_key() -> Vec<u8> {
 
 /// Exclusive upper bound for a scan over the whole `/0/clog/` keyspace: the clog
 /// prefix with its trailing byte incremented (the prefix's successor). `clog_prefix`
-/// ends in ASCII `clog`, so the last byte (`'g'`) never overflows.
+/// is `system_prefix("clog")`, i.e. `…clog` followed by the `/` separator, so the
+/// last byte `0x2f` increments to `0x30` with no carry. This is strictly greater than
+/// `clog_key(u64::MAX)`, so it covers every clog entry. (Relies on the prefix never
+/// ending in `0xFF` — true for the `/`-separated system prefixes.)
 pub fn clog_scan_end() -> Vec<u8> {
     let mut p = clog_prefix();
     let last = p.last_mut().expect("clog prefix is non-empty");
-    *last += 1; // 'g' (0x67) -> 0x68; no carry
+    *last += 1; // 0x2f ('/') -> 0x30; no carry
     p
 }
 ```
+Add a Task 1 unit assertion (in `key.rs` tests or the store tests): `assert!(clog_scan_end() > clog_key(u64::MAX));` so the bound is pinned above every clog key.
 
 - [ ] **Step 6: Run + verify**
 
@@ -127,32 +131,41 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the failing unit tests**
 
-Add to the `executor` `#[cfg(test)] mod tests` (mirror `in_doubt_globals_lists_undecided_prepared_markers`; build an in-memory engine where `kv == catalog_kv`):
+Use a **two-store** engine that mirrors a real DATA range — `kv`/`sm_kv` holds ONLY this range's local-`Li` markers; `catalog_kv` is a SEPARATE store holding the global-`G` decisions. (A single-store `with_kv` engine where `kv == catalog_kv` would put the global-`G` clog keys, at `G ≥ GLOBAL_XID_BASE = 2⁶³`, into the SAME clog the scan walks, so the scan would visit them and `max_li` would leap to ~2⁶³ — the cost-bound assertion would pass for the wrong reason. Do NOT use a single-store engine here.) Build the two-store engine via `SqlEngine::replicated(catalog_kv, sm_kv, committer, linearizer)` (`lib.rs:122-144`), reusing the same `LocalCommitter`/linearizer that `with_kv` builds internally (`lib.rs:96-107`) but passing **distinct** `catalog_kv` and `sm_kv`:
 ```rust
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_doubt_globals_from_bounds_the_scan_and_advances_past_terminal() {
         use mvcc::clog::{put_op, XidStatus};
         use mvcc::xid::GLOBAL_XID_BASE;
-        let engine = SqlEngine::with_kv(std::sync::Arc::new(kv::MemKv::new()));
-        let kv = engine.local_store(); // #[cfg(test)] accessor (add if absent)
+        // Two stores: sm_kv = this data range's local clog; catalog_kv = range 0's
+        // global-G clog. (Mirror with_kv's internal LocalCommitter + linearizer, but
+        // with DISTINCT stores — confirm the exact committer/linearizer types at lib.rs:96-107.)
+        let sm_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let catalog_kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let committer = std::sync::Arc::new(crate::commit::LocalCommitter { kv: std::sync::Arc::clone(&sm_kv) });
+        let linearizer = std::sync::Arc::new(crate::read_gate::NoopLinearizer); // the test linearizer with_kv uses
+        let engine = SqlEngine::replicated(std::sync::Arc::clone(&catalog_kv), std::sync::Arc::clone(&sm_kv), committer, linearizer).expect("engine");
+
         let (g_term, g_doubt) = (GLOBAL_XID_BASE + 1, GLOBAL_XID_BASE + 2);
-        // Markers at Li = 10 (terminal G), 11 (in-doubt G), 12 (terminal G).
-        kv.write_batch(&[put_op(10, XidStatus::Prepared(g_term))]).unwrap();
-        kv.write_batch(&[put_op(11, XidStatus::Prepared(g_doubt))]).unwrap();
-        kv.write_batch(&[put_op(12, XidStatus::Prepared(g_term))]).unwrap();
-        kv.write_batch(&[put_op(g_term, XidStatus::Committed)]).unwrap(); // decide g_term
+        // Local markers at Li = 10 (terminal G), 11 (in-doubt G), 12 (terminal G) — sm_kv ONLY.
+        sm_kv.write_batch(&[put_op(10, XidStatus::Prepared(g_term))]).unwrap();
+        sm_kv.write_batch(&[put_op(11, XidStatus::Prepared(g_doubt))]).unwrap();
+        sm_kv.write_batch(&[put_op(12, XidStatus::Prepared(g_term))]).unwrap();
+        // Global decisions — catalog_kv ONLY (the range-0 clog).
+        catalog_kv.write_batch(&[put_op(g_term, XidStatus::Committed)]).unwrap();
         // from(0): only g_doubt is in-doubt; watermark stops at the in-doubt Li (11).
         let (gs, lo) = engine.in_doubt_globals_from(0).await.expect("scan");
         assert_eq!(gs, vec![g_doubt]);
         assert_eq!(lo, 11, "watermark = smallest in-doubt Li");
-        // Decide g_doubt; now from(11) finds nothing in-doubt and advances past the end.
-        kv.write_batch(&[put_op(g_doubt, XidStatus::Aborted)]).unwrap();
+        // Decide g_doubt; now from(11) finds nothing in-doubt and advances to ONE PAST
+        // the largest local Li (12) — proving the scan saw only local markers, not G keys.
+        catalog_kv.write_batch(&[put_op(g_doubt, XidStatus::Aborted)]).unwrap();
         let (gs2, lo2) = engine.in_doubt_globals_from(11).await.expect("scan");
         assert!(gs2.is_empty());
-        assert!(lo2 > 12, "all terminal -> watermark advances past the last marker (got {lo2})");
+        assert_eq!(lo2, 13, "all terminal -> watermark = one past the largest local Li (12)");
     }
 ```
-(If `local_store`/`with_kv` differ from the SP18 `in_doubt_globals` test's setup, mirror that test exactly — it already constructs an in-memory engine and writes markers. Use the SAME constructor.)
+(Confirm the exact `LocalCommitter` field and the test linearizer type against `with_kv`'s body at `lib.rs:96-107` — if `NoopLinearizer` is named differently, use whatever `with_kv` constructs. If the `replicated(...)` wiring is awkward to call directly, add a small `#[cfg(test)]` two-store helper in the executor test module; do NOT fall back to a single-store engine for this assertion — the exact `lo2 == 13` is what proves success criterion 3.)
 
 - [ ] **Step 2: Run it — expect FAIL** (`in_doubt_globals_from` does not exist).
 
@@ -193,7 +206,9 @@ In `crates/executor/src/lib.rs`, replace `in_doubt_globals` (`:274-291`) with a 
         // Advance only past the contiguous terminal prefix: stop at the first undecided
         // Li, else one past the largest scanned Li, else leave scan_lo unchanged.
         let new_scan_lo = first_undecided
-            .or_else(|| max_li.map(|m| m + 1))
+            // `max_li` is a local `Li < GLOBAL_XID_BASE` on a real data range, so this
+            // never saturates; `saturating_add` is belt-and-suspenders.
+            .or_else(|| max_li.map(|m| m.saturating_add(1)))
             .unwrap_or(scan_lo)
             .max(scan_lo); // monotone
         Ok((gs.into_iter().collect(), new_scan_lo))
@@ -260,14 +275,21 @@ In `resolve_in_doubt_on_leadership` (`crates/cluster/src/server_node.rs:600-626`
             let scan_lo = engine.clog_scan_lo().unwrap_or(0);
             if let Ok((gs, new_lo)) = engine.in_doubt_globals_from(scan_lo).await {
                 for g in gs {
-                    let _ = client
-                        .call(0, TxnRpc::CommitGlobal { g, commit: false })
-                        .await;
+                    // Best-effort: a failed abort-race (range 0 unreachable) leaves `g`
+                    // non-terminal, so `new_lo` does not pass it and it is re-swept next
+                    // rise. Log so a permanently-stuck range-0 is observable.
+                    if let Err(e) = client.call(0, TxnRpc::CommitGlobal { g, commit: false }).await {
+                        tracing::warn!(g, ?e, "recovery abort-race failed; g stays in-doubt, will re-scan next rise");
+                    }
                 }
                 // Advance past the contiguous terminal prefix (monotone, durable). Safe:
                 // `new_lo` never passes a marker whose g was non-terminal at scan time,
-                // so every in-doubt g keeps being swept (zombie-commit protection).
-                let _ = engine.advance_clog_scan_lo(new_lo).await;
+                // so every in-doubt g keeps being swept (zombie-commit protection). The
+                // write is best-effort: a NotLeader rejection just leaves the old (lower)
+                // durable value, which only enlarges the next scan — never an unsafe skip.
+                if let Err(e) = engine.advance_clog_scan_lo(new_lo).await {
+                    tracing::debug!(new_lo, ?e, "watermark advance not durable (e.g. NotLeader); next leader re-scans from the old watermark — safe");
+                }
             }
         }
 ```

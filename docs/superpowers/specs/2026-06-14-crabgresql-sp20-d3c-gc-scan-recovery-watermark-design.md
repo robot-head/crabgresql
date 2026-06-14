@@ -102,8 +102,9 @@ clog_prefix_end)`.
 
 ### 2. Durable per-range watermark key (`crates/kv/src/key.rs`, written via the range committer)
 
-A system key outside the clog prefix — e.g. `clog_gc_lo_key()` = `system_prefix("clog_gc_lo")` — so
-it is never itself returned by a clog scan. Value = `Li` big-endian (`u64`). Read with the range's
+A system key in the `meta` namespace (disjoint from the clog prefix, so it is never returned by a
+clog scan) — `clog_scan_lo_key()` = `system_prefix("meta") ++ b"clog_scan_lo"`, a sibling of
+`meta_next_global_xid_key`. Value = `Li` big-endian (`u64`). Read with the range's
 applied store; written through the data range's Raft committer (the same durable path SQL writes
 use), so it is replicated and survives restart/failover. Absent ⇒ `scan_lo = 0` (scan from the
 start — safe, just the current full-scan behavior).
