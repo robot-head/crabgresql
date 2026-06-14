@@ -73,6 +73,13 @@ struct NodeArgs {
     #[arg(long = "peer", value_name = "ID@NODE_ADDR|SQL_ADDR")]
     peers: Vec<String>,
 
+    /// Repeatable range split point (a table id): every boundary starts a new
+    /// range, so N boundaries ⇒ N+1 ranges. An empty list ⇒ `RangeMap::single()`
+    /// (one range covering every table — the single-range default). Boundaries
+    /// must be strictly increasing and nonzero (range 0 always starts at table 0).
+    #[arg(long = "range-boundaries", value_name = "TABLE_ID")]
+    range_boundaries: Vec<u32>,
+
     /// When set, this node initializes the voting group once every peer is up.
     #[arg(long)]
     bootstrap: bool,
@@ -164,6 +171,14 @@ async fn run_node(a: NodeArgs) -> std::io::Result<()> {
         "crabgresql node starting"
     );
 
+    // An empty `--range-boundaries` list is the single-range fast path; any
+    // boundaries build a multi-range map where every node hosts every range.
+    let range_map = if a.range_boundaries.is_empty() {
+        cluster::range::RangeMap::single()
+    } else {
+        cluster::range::RangeMap::with_boundaries(a.range_boundaries.clone())
+    };
+
     let cfg = cluster::server_node::NodeConfig {
         id: a.id,
         node_addr: a.node_addr,
@@ -171,7 +186,7 @@ async fn run_node(a: NodeArgs) -> std::io::Result<()> {
         data_dir: a.data_dir,
         peers,
         bootstrap: a.bootstrap,
-        range_map: cluster::range::RangeMap::single(),
+        range_map,
     };
 
     let node = cluster::server_node::ServerNode::start(cfg).await?;
