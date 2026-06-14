@@ -73,6 +73,17 @@ impl RangeRegistry {
             .next()
             .map(|&(_, id)| id)
     }
+
+    /// `(range, current_leader)` for every group registered on this node, sorted by range.
+    pub fn group_leaders(&self) -> Vec<(RangeId, Option<NodeId>)> {
+        let map = self.handles.lock().expect("range registry");
+        let mut out: Vec<(RangeId, Option<NodeId>)> = map
+            .iter()
+            .map(|(&(range, _id), raft)| (range, raft.metrics().borrow().current_leader))
+            .collect();
+        out.sort_by_key(|&(r, _)| r);
+        out
+    }
 }
 
 /// Resolve `(range, node)`'s group, or `None` for an unregistered range (the
@@ -133,6 +144,9 @@ pub async fn serve_node_protocol(
                         };
                         NodeResponse::Raft(dispatch_raft(&raft, rpc).await)
                     }
+                    NodeRequest::Control(ControlRequest::RangeLeaders) => NodeResponse::Control(
+                        ControlResponse::RangeLeaders(registry.group_leaders()),
+                    ),
                     NodeRequest::Control(c) => {
                         // Control is node-global: answer against the range-0 group.
                         match resolve(&registry, 0) {
@@ -174,6 +188,9 @@ async fn handle_control(
     req: ControlRequest,
 ) -> ControlResponse {
     match req {
+        // RangeLeaders is special-cased in serve_node_protocol before this function
+        // is called (it needs the whole registry, not just range 0's raft).
+        ControlRequest::RangeLeaders => unreachable!("RangeLeaders handled before handle_control"),
         ControlRequest::GetStatus => {
             let m = raft.metrics().borrow().clone();
             let members: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();

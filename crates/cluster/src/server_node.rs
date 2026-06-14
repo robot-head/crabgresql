@@ -88,6 +88,8 @@ pub struct ServerNode {
     sm_kvs: HashMap<RangeId, Arc<dyn kv::Kv>>,
     /// This node's id (`cfg.id`), exposed via `id()` for Task 4's leader resolution.
     id: NodeId,
+    /// `host:port` the node-protocol listener is bound to (`cfg.node_addr`).
+    node_addr: String,
     /// The authoritative range map this node brought up (Static config or the
     /// committed Replicated descriptor blob). Exposed so tests can assert a node
     /// derived its layout from the meta range rather than its own seed.
@@ -104,6 +106,11 @@ impl ServerNode {
     /// This node's id.
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// The `host:port` address the node-protocol listener is bound to.
+    pub fn node_addr(&self) -> &str {
+        &self.node_addr
     }
 }
 
@@ -243,6 +250,18 @@ impl ServerNode {
 
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         let txn = crate::twopc::TxnService::new(engines.clone());
+        // Spawn a per-range leadership-loss watcher: on the falling edge of this
+        // node's leadership for a range, release (presumed-abort) every held 2PC
+        // session for that range so locks are freed promptly. TxnService is Clone
+        // (shares its Arc held-map), so every watcher shares the same registry.
+        for (&range, raft) in &rafts {
+            tokio::spawn(release_on_leadership_loss(
+                raft.clone(),
+                range,
+                cfg.id,
+                txn.clone(),
+            ));
+        }
         tokio::spawn(serve_node_protocol(
             node_listener,
             registry.clone(),
@@ -277,6 +296,7 @@ impl ServerNode {
             shutdown,
             sm_kvs,
             id: cfg.id,
+            node_addr: cfg.node_addr,
             range_map: map,
         })
     }
@@ -475,6 +495,7 @@ impl ServerNode {
             shutdown,
             sm_kvs,
             id: cfg.id,
+            node_addr: cfg.node_addr,
             range_map: map,
         })
     }
@@ -496,6 +517,30 @@ impl crate::range::router::LeadsRange for NodeLeadership {
             .get(&range)
             .map(|r| r.metrics().borrow().current_leader == Some(self.id))
             .unwrap_or(false)
+    }
+}
+
+/// Drop every held 2PC session for `range` on the FALLING edge of this node's
+/// leadership (follower/candidate after having been leader). Sessions are presumed-
+/// aborted; the global clog remains the sole arbiter of commit/abort status. No
+/// sleep — mirrors `reseed_on_leadership`'s `raft.metrics()` + `rx.changed()` loop.
+async fn release_on_leadership_loss(
+    raft: openraft::Raft<TypeConfig>,
+    range: RangeId,
+    id: NodeId,
+    txn: crate::twopc::TxnService,
+) {
+    let mut rx = raft.metrics();
+    let mut was_leader = false;
+    loop {
+        let is_leader = rx.borrow().current_leader == Some(id);
+        if was_leader && !is_leader {
+            txn.release_all_for_range(range).await; // free held locks; global clog is the arbiter
+        }
+        was_leader = is_leader;
+        if rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 

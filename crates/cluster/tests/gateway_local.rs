@@ -193,6 +193,34 @@ async fn gateway_escalates_a_cross_range_transaction_without_0a000() {
     assert_eq!(row_count(&a), 1, "range-0 row committed and visible");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_leaders_control_reports_each_range() {
+    use cluster::transport::frame::{read_msg, write_msg};
+    use cluster::transport::protocol::{
+        ControlRequest, ControlResponse, NodeRequest, NodeResponse,
+    };
+    let (node, _sql) = start_two_range_node().await;
+    let mut s = tokio::net::TcpStream::connect(node.node_addr())
+        .await
+        .expect("dial node port");
+    write_msg(&mut s, &NodeRequest::Control(ControlRequest::RangeLeaders))
+        .await
+        .expect("send");
+    let resp: NodeResponse = read_msg(&mut s).await.expect("recv");
+    let leaders = match resp {
+        NodeResponse::Control(ControlResponse::RangeLeaders(v)) => v,
+        other => panic!("expected RangeLeaders, got {other:?}"),
+    };
+    assert_eq!(leaders.len(), 2, "two ranges reported");
+    for (_r, leader) in leaders {
+        assert_eq!(
+            leader,
+            Some(0),
+            "single self-bootstrapping node leads every range"
+        );
+    }
+}
+
 // Counts SimpleQueryMessage::Row entries (reused by T5's full-visibility tests).
 fn row_count(msgs: &[tokio_postgres::SimpleQueryMessage]) -> usize {
     msgs.iter()

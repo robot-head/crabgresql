@@ -31,9 +31,14 @@ pub enum RaftRpcResp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     GetStatus,
+    /// Returns `(range, current_leader)` for every Raft group registered on this node.
+    RangeLeaders,
     SetPartition(Vec<NodeId>),
     Heal,
-    AddLearner { id: NodeId, addr: String },
+    AddLearner {
+        id: NodeId,
+        addr: String,
+    },
     ChangeMembership(Vec<NodeId>),
     Shutdown,
 }
@@ -52,6 +57,8 @@ pub struct NodeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
     Status(NodeStatus),
+    /// `(range, current_leader)` for every Raft group on this node, sorted by range.
+    RangeLeaders(Vec<(RangeId, Option<NodeId>)>),
     Ok,
     Err(String),
 }
