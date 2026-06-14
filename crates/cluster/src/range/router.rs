@@ -111,14 +111,12 @@ pub struct RangeRouter {
     catalog_kv: Arc<dyn kv::Kv>,
     /// Forwards a statement whose range has no local engine.
     forward: Arc<dyn RemoteForward>,
-    /// The text of the in-flight `simple_query` — what the forward seam relays.
+    /// The EXACT source text of the statement currently being dispatched (set per
+    /// statement from `parse_with_source`) — what the forward seam relays for a
+    /// non-local range. Per-statement, NOT the whole `;`-separated frame, so a frame
+    /// mixing a local and a remote range forwards only the remote statement and never
+    /// re-runs the local one on the remote node.
     cur_sql: String,
-    /// True while executing a MULTI-statement simple-query frame. The forward seam
-    /// relays the whole `cur_sql` frame, so forwarding one statement of a
-    /// multi-statement frame would re-execute the others on the remote leader; such a
-    /// forward is rejected with `0A000` (a per-statement-text relay is D3b). A
-    /// single-statement frame — the routed surface — forwards correctly.
-    frame_multi: bool,
 }
 
 impl RangeRouter {
@@ -141,7 +139,6 @@ impl RangeRouter {
             catalog_kv,
             forward,
             cur_sql: String::new(),
-            frame_multi: false,
         }
     }
 
@@ -284,22 +281,15 @@ impl RangeRouter {
     /// forwarded. `leads` borrows a metrics watch and drops the `Ref` before
     /// returning (synchronous — no `Ref` held across the `.await` below).
     ///
-    /// The forward seam relays the whole in-flight `cur_sql` frame — exact for a
-    /// single-statement frame (the routed surface), but forwarding from within a
-    /// MULTI-statement frame would re-execute the frame's other statements on the
-    /// remote leader, so it is rejected with `0A000` (consistent with the cross-range
-    /// non-goal; full multi-statement forwarding via per-statement text is D3b).
+    /// `cur_sql` is the EXACT source of the statement currently being dispatched (set
+    /// per statement from `parse_with_source`), so the forward relays only this
+    /// statement: a `;`-separated frame mixing a local and a remote range forwards
+    /// only the remote statement and never re-runs the local one on the remote node.
     async fn run_on(&mut self, range: RangeId, stmt: &Statement) -> Result<QueryResult, ExecError> {
         if self.engines.contains_key(&range) && self.leads.leads(range) {
             return self.session_mut(range).run(stmt).await;
         }
-        // Not the local leader of this range → remote.
-        if self.frame_multi {
-            return Err(ExecError::Unsupported(
-                "a multi-statement simple query may not be forwarded across ranges yet (D3b)"
-                    .into(),
-            ));
-        }
+        // Not the local leader of this range → forward this statement's text.
         let sql = self.cur_sql.clone();
         self.forward.forward(range, &sql).await
     }
@@ -321,11 +311,11 @@ impl RangeRouter {
     /// Parse `sql` and run each statement in order; return the last result. The
     /// raw text is recorded so the forward seam can relay the exact `Query`.
     pub async fn simple(&mut self, sql: &str) -> Result<QueryResult, PgError> {
-        let stmts = pgparser::parse(sql).map_err(|e| ExecError::Parse(e).into_pg())?;
-        self.cur_sql = sql.to_string();
-        self.frame_multi = stmts.len() > 1;
+        let stmts = pgparser::parse_with_source(sql).map_err(|e| ExecError::Parse(e).into_pg())?;
         let mut last = QueryResult::Command { tag: "OK".into() };
-        for stmt in &stmts {
+        for (stmt, src) in &stmts {
+            // Record THIS statement's exact source so a forward relays only it.
+            self.cur_sql = src.clone();
             last = self.dispatch(stmt).await.map_err(ExecError::into_pg)?;
         }
         Ok(last)
@@ -340,14 +330,14 @@ impl pgwire::engine::Session for RangeRouter {
         if sql.trim().is_empty() {
             return Ok(vec![QueryResult::Empty]);
         }
-        let stmts = pgparser::parse(sql).map_err(|e| ExecError::from(e).into_pg())?;
+        let stmts = pgparser::parse_with_source(sql).map_err(|e| ExecError::from(e).into_pg())?;
         if stmts.is_empty() {
             return Ok(vec![QueryResult::Empty]);
         }
-        self.cur_sql = sql.to_string();
-        self.frame_multi = stmts.len() > 1;
         let mut results = Vec::with_capacity(stmts.len());
-        for stmt in &stmts {
+        for (stmt, src) in &stmts {
+            // Record THIS statement's exact source so a forward relays only it.
+            self.cur_sql = src.clone();
             results.push(self.dispatch(stmt).await.map_err(ExecError::into_pg)?);
         }
         Ok(results)
@@ -504,26 +494,44 @@ mod gateway_seam_tests {
         assert_eq!(err.code, "0A000", "RejectForward stub surfaces 0A000");
     }
 
-    /// A forward seam that always succeeds — lets us prove the multi-statement guard
-    /// fires BEFORE forwarding (a 0A000 with this seam can only be the guard).
-    struct OkForward;
-    impl RemoteForward for OkForward {
+    /// A forward seam that executes the forwarded statement on the target range's
+    /// real leader engine — the in-process analog of forwarding to the remote leader.
+    /// Lets us assert a mixed-range multi-statement frame applies each statement
+    /// exactly once (no double-apply from relaying the whole frame).
+    struct EngineForward {
+        engines: HashMap<RangeId, SqlEngine>,
+    }
+    impl RemoteForward for EngineForward {
         fn forward<'a>(
             &'a self,
-            _range: RangeId,
-            _sql: &'a str,
+            range: RangeId,
+            sql: &'a str,
         ) -> FuturePin<
             Box<dyn std::future::Future<Output = Result<QueryResult, ExecError>> + Send + 'a>,
         > {
-            Box::pin(async { Ok(QueryResult::Command { tag: "OK".into() }) })
+            Box::pin(async move {
+                let mut s = self
+                    .engines
+                    .get(&range)
+                    .expect("engine for forwarded range")
+                    .connect();
+                let stmts = pgparser::parse(sql).map_err(ExecError::Parse)?;
+                let mut last = QueryResult::Command { tag: "OK".into() };
+                for stmt in &stmts {
+                    last = s.run(stmt).await?;
+                }
+                Ok(last)
+            })
         }
     }
 
-    /// A single-statement frame to a non-local range forwards; a MULTI-statement
-    /// frame is rejected with 0A000 (the guard) rather than re-executing the whole
-    /// frame on the remote leader (which would duplicate the other statements).
+    /// A single autocommit simple-query frame mixing a LOCAL-leader range (`a`) and a
+    /// REMOTE range (`b`) applies each statement EXACTLY ONCE: `a` runs locally and
+    /// only `b`'s statement text is forwarded — so `a` is not duplicated by re-running
+    /// the whole frame on `b`'s leader. (Regression for the whole-frame-forward bug.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_multi_statement_frame_is_not_forwarded_across_ranges() {
+    async fn a_multi_statement_frame_forwards_each_statement_individually() {
+        // boundary at 2: a (id 1) -> range 0 (local), b (id 2) -> range 1 (forwarded).
         let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
         for r in c.range_map().range_ids() {
             c.wait_for_leader(r).await;
@@ -532,30 +540,44 @@ mod gateway_seam_tests {
         admin.simple("CREATE TABLE a (id int4)").await.expect("a");
         admin.simple("CREATE TABLE b (id int4)").await.expect("b");
         c.wait_for_replication(0).await;
+        c.wait_for_replication(1).await;
 
-        let mut engines = HashMap::new();
-        engines.insert(0, c.leader_engine(0).await);
+        // Router holds range 0 locally; range 1 forwards to its real leader engine.
+        let mut local = HashMap::new();
+        local.insert(0, c.leader_engine(0).await);
+        let mut remote = HashMap::new();
+        remote.insert(1u32, c.leader_engine(1).await);
         let mut router = RangeRouter::new(
             c.range_map().clone(),
-            engines,
+            local,
             Arc::new(AlwaysLeads),
             c.catalog_kv().await,
-            Arc::new(OkForward),
+            Arc::new(EngineForward { engines: remote }),
         );
-        // Single-statement forward to the non-local range succeeds (OkForward).
+
         router
-            .simple("INSERT INTO b VALUES (1)")
+            .simple("INSERT INTO a VALUES (1); INSERT INTO b VALUES (2)")
             .await
-            .expect("single-statement forward succeeds");
-        // A multi-statement frame whose statements target the non-local range is
-        // rejected by the guard, before the (succeeding) forward.
-        let err = router
-            .simple("INSERT INTO b VALUES (2); INSERT INTO b VALUES (3)")
-            .await
-            .expect_err("multi-statement forward is rejected");
+            .expect("mixed-range multi-statement frame");
+
+        // Exactly one row in each table — the local statement was NOT re-run on the
+        // remote node (which a whole-frame forward would have done).
         assert_eq!(
-            err.code, "0A000",
-            "multi-statement forward guard surfaces 0A000"
+            row_count(&mut router, "SELECT id FROM a").await,
+            1,
+            "a: exactly one row"
         );
+        assert_eq!(
+            row_count(&mut router, "SELECT id FROM b").await,
+            1,
+            "b: exactly one row"
+        );
+    }
+
+    async fn row_count(r: &mut RangeRouter, sql: &str) -> usize {
+        match r.simple(sql).await.expect("select") {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 }

@@ -153,8 +153,21 @@ impl Parser {
     }
 
     pub(crate) fn program(&mut self) -> Result<Vec<crate::ast::Statement>, ParseError> {
+        Ok(self
+            .program_spanned()?
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect())
+    }
+
+    /// Like `program`, but pairs each statement with the byte range of its source in
+    /// the original input — from its first token's offset up to the trailing `;`
+    /// (or end of input). Powers [`parse_with_source`].
+    pub(crate) fn program_spanned(
+        &mut self,
+    ) -> Result<Vec<(crate::ast::Statement, std::ops::Range<usize>)>, ParseError> {
         use crate::ast::Statement;
-        let mut stmts: Vec<Statement> = Vec::new();
+        let mut stmts: Vec<(Statement, std::ops::Range<usize>)> = Vec::new();
         loop {
             while *self.peek() == Token::Semicolon {
                 self.bump();
@@ -162,7 +175,10 @@ impl Parser {
             if *self.peek() == Token::Eof {
                 break;
             }
-            stmts.push(self.statement()?);
+            let start = self.peek_pos();
+            let s = self.statement()?;
+            let end = self.peek_pos();
+            stmts.push((s, start..end));
             match self.peek() {
                 Token::Semicolon => {
                     self.bump();
@@ -479,6 +495,19 @@ pub fn parse(sql: &str) -> Result<Vec<crate::ast::Statement>, ParseError> {
     p.program()
 }
 
+/// Parse `sql` into statements, each paired with its EXACT source text — the byte
+/// slice of `sql` spanning that statement, trimmed of surrounding whitespace. The
+/// multi-range gateway uses this to forward an INDIVIDUAL statement (not the whole
+/// `;`-separated simple-query frame) to a remote range's leader, so a frame mixing a
+/// local and a remote range never re-runs the local statement on the remote node.
+pub fn parse_with_source(sql: &str) -> Result<Vec<(crate::ast::Statement, String)>, ParseError> {
+    let mut p = Parser::new(lex(sql)?);
+    Ok(p.program_spanned()?
+        .into_iter()
+        .map(|(s, r)| (s, sql[r].trim().to_string()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +519,20 @@ mod tests {
         let mut v = parse(sql).expect("parse");
         assert_eq!(v.len(), 1);
         v.pop().expect("one statement")
+    }
+
+    #[test]
+    fn parse_with_source_pairs_each_statement_with_its_exact_text() {
+        let v =
+            parse_with_source("INSERT INTO a VALUES (1); INSERT INTO b VALUES (2)").expect("parse");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].1, "INSERT INTO a VALUES (1)");
+        assert_eq!(v[1].1, "INSERT INTO b VALUES (2)");
+        // Surrounding whitespace (and the trailing `;`) is trimmed; a single
+        // statement yields its own exact text.
+        let solo = parse_with_source("  SELECT 1 ;  ").expect("parse one");
+        assert_eq!(solo.len(), 1);
+        assert_eq!(solo[0].1, "SELECT 1");
     }
 
     #[test]
