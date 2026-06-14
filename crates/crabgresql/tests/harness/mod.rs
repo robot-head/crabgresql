@@ -66,7 +66,16 @@ impl Cluster {
         for (id, node_addr, sql_addr) in &info {
             let dir = tmp.path().join(format!("node-{id}"));
             std::fs::create_dir_all(&dir).expect("create node dir");
-            let child = spawn_node(*id, node_addr, sql_addr, &dir, &peers_arg, &[], *id == 0);
+            let child = spawn_node(
+                *id,
+                node_addr,
+                sql_addr,
+                &dir,
+                &peers_arg,
+                &[],
+                false,
+                *id == 0,
+            );
             nodes.push(ProcNode {
                 id: *id,
                 node_addr: node_addr.clone(),
@@ -113,6 +122,7 @@ impl Cluster {
                 &dir,
                 &peers_arg,
                 &boundaries,
+                false,
                 *id == 0,
             );
             nodes.push(ProcNode {
@@ -123,6 +133,59 @@ impl Cluster {
                 child,
             });
         }
+        let c = Self {
+            nodes,
+            _tmp: tmp,
+            peers_arg,
+            boundaries,
+        };
+        c.wait_for_leader().await;
+        c
+    }
+
+    /// Spawn `n` Replicated-mode node processes. Node 0 bootstraps WITH
+    /// `boundaries` (it seeds the descriptor blob); nodes 1.. start with NO
+    /// boundaries and learn the layout from the meta range. All pass
+    /// `--replicated-ranges`.
+    pub async fn spawn_multirange_replicated(n: u64, boundaries: Vec<u32>) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut info = Vec::new();
+        for id in 0..n {
+            let node_addr = format!("127.0.0.1:{}", free_port().await);
+            let sql_addr = format!("127.0.0.1:{}", free_port().await);
+            info.push((id, node_addr, sql_addr));
+        }
+        let peers_arg: Vec<String> = info
+            .iter()
+            .map(|(id, na, sa)| format!("{id}@{na}|{sa}"))
+            .collect();
+        let mut nodes = Vec::new();
+        for (id, node_addr, sql_addr) in &info {
+            let dir = tmp.path().join(format!("node-{id}"));
+            std::fs::create_dir_all(&dir).expect("create node dir");
+            // Only the bootstrap node (0) carries the boundaries seed.
+            let node_boundaries: &[u32] = if *id == 0 { &boundaries } else { &[] };
+            let child = spawn_node(
+                *id,
+                node_addr,
+                sql_addr,
+                &dir,
+                &peers_arg,
+                node_boundaries,
+                true,
+                *id == 0,
+            );
+            nodes.push(ProcNode {
+                id: *id,
+                node_addr: node_addr.clone(),
+                sql_addr: sql_addr.clone(),
+                dir,
+                child,
+            });
+        }
+        // `boundaries` is retained for respawn parity, but a respawned replicated
+        // node also reads its layout from the meta range, so its boundaries are
+        // irrelevant after the first boot.
         let c = Self {
             nodes,
             _tmp: tmp,
@@ -328,6 +391,7 @@ impl Cluster {
             &self.peers_arg,
             &boundaries,
             false,
+            false,
         );
     }
 
@@ -354,6 +418,7 @@ impl Cluster {
             &self.peers_arg,
             &boundaries,
             false,
+            false,
         );
         self.nodes.push(ProcNode {
             id,
@@ -375,6 +440,7 @@ pub fn ctl_change_membership(ids: Vec<u64>) -> ControlRequest {
     ControlRequest::ChangeMembership(ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_node(
     id: u64,
     node_addr: &str,
@@ -382,6 +448,7 @@ fn spawn_node(
     dir: &std::path::Path,
     peers: &[String],
     boundaries: &[u32],
+    replicated: bool,
     bootstrap: bool,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crabgresql"));
@@ -399,6 +466,9 @@ fn spawn_node(
     }
     for b in boundaries {
         cmd.arg("--range-boundaries").arg(b.to_string());
+    }
+    if replicated {
+        cmd.arg("--replicated-ranges");
     }
     if bootstrap {
         cmd.arg("--bootstrap");
