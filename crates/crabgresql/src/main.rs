@@ -83,6 +83,13 @@ struct NodeArgs {
     /// When set, this node initializes the voting group once every peer is up.
     #[arg(long)]
     bootstrap: bool,
+
+    /// Source the range layout from the replicated meta range (range 0) instead of
+    /// trusting `--range-boundaries`. The bootstrap node seeds the layout from its
+    /// `--range-boundaries`; a joining node needs no boundaries — it reads them
+    /// from the meta range.
+    #[arg(long)]
+    replicated_ranges: bool,
 }
 
 fn tls_acceptor(
@@ -171,12 +178,18 @@ async fn run_node(a: NodeArgs) -> std::io::Result<()> {
         "crabgresql node starting"
     );
 
-    // An empty `--range-boundaries` list is the single-range fast path; any
-    // boundaries build a multi-range map where every node hosts every range.
-    let range_map = if a.range_boundaries.is_empty() {
+    let seed = if a.range_boundaries.is_empty() {
         cluster::range::RangeMap::single()
     } else {
         cluster::range::RangeMap::with_boundaries(a.range_boundaries.clone())
+    };
+    let layout = if a.replicated_ranges {
+        // Only the bootstrap node carries a seed; a joining node learns the layout
+        // from the meta range.
+        let seed = if a.bootstrap { Some(seed) } else { None };
+        cluster::server_node::RangeLayout::Replicated { seed }
+    } else {
+        cluster::server_node::RangeLayout::Static(seed)
     };
 
     let cfg = cluster::server_node::NodeConfig {
@@ -186,7 +199,7 @@ async fn run_node(a: NodeArgs) -> std::io::Result<()> {
         data_dir: a.data_dir,
         peers,
         bootstrap: a.bootstrap,
-        layout: cluster::server_node::RangeLayout::Static(range_map),
+        layout,
     };
 
     let node = cluster::server_node::ServerNode::start(cfg).await?;
