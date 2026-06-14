@@ -1,7 +1,9 @@
-//! Networked cross-range 2PC: a pooled node-port client (coordinator side). The
-//! participant-side held-session registry (`TxnService`) and `NetCoordinator` land
-//! in later SP17 tasks. Mirrors `forward::ForwardPool`'s leader-resolution +
-//! bounded retry, but speaks the structured node protocol instead of pgwire.
+//! Networked cross-range 2PC. This module holds the coordinator-side pooled
+//! node-port client (`TwoPcClient`, mirroring `forward::ForwardPool`'s
+//! leader-resolution + bounded retry but speaking the structured node protocol
+//! instead of pgwire), the `GlobalCoordinator` impl that drives it
+//! (`NetCoordinator`), the participant-side held-session registry (`TxnService`),
+//! and the follower-ReadIndex range-0 read barrier (`Range0Barrier`).
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
