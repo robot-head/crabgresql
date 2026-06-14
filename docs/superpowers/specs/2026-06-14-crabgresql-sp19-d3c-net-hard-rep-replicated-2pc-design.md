@@ -312,4 +312,14 @@ condition), not a fixed sleep.
 
 ## Traceability
 
-(Appended at finish — maps each success criterion 1–7 to its proving test.)
+Each success criterion (1–7) maps to its concrete proving test (all shipped and green at the SP19 gauntlet).
+
+| # | Criterion | Task | Proving test(s) |
+|---|---|---|---|
+| 1 | A replicated node serves every Txn RPC (no more `None` 2PC service) | T2/T3 | `crabgresql::crossrange_2pc_replicated::replicated_cross_range_bank_conserves_under_nemesis_and_restart` (the workload commits cross-range transfers through replicated gateways — impossible if Txn RPCs returned `Err("node hosts no 2PC service")`) |
+| 2 | `TxnService`'s engines map is growable (register/lookup, lock-free reads, CoW preserves prior entries) | T1 | `cluster::twopc::tests::register_engine_makes_a_range_servable` |
+| 3 | The full recovery set (`release_on_leadership_loss`, `resolve_in_doubt_on_leadership`, `participant_silence_sweeper`) runs on the replicated path | T2/T3 | `crossrange_2pc_replicated` recovery under the nemesis (post-heal all-pairs round commits — a stranded lock would block it); wired in `start_replicated` mirroring `start_static` |
+| 4 | A `Stage` for an unregistered range returns retryable `TxnResp::NotLeader`, not a hard `Err` | T1 | `cluster::twopc::tests::stage_for_an_unregistered_range_is_retryable_not_a_hard_err` |
+| 5 | Cross-range bank total conserved under a multi-process crash/partition nemesis on the **replicated** boot path; workload makes progress | T3 | `crossrange_2pc_replicated` nemesis conservation `assert_eq!` + `assert!(total_committed > 0)` |
+| 6 | Conservation + recovery survive a **full-cluster restart** (descriptor blob re-read via `start_replicated`/`wait_for_range_map` + durable 2PC state) | T3 | `crossrange_2pc_replicated` restart round (kill-all → respawn-all through the replicated path → post-restart recovery round + conservation `assert_eq!`) |
+| 7 | All SP16/SP17/SP18 suites pass unchanged; `arc-swap` the only new dependency; `#![forbid(unsafe_code)]`; full gauntlet green; traceability | T4 | regression gate (`cluster::crossrange_2pc`, `cluster::jepsen_bank` cross-range, `crabgresql::crossrange_2pc_net`/`crossrange_2pc_nemesis`); full gauntlet (`cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo nextest run --workspace`; `cargo test --workspace --doc`; `cargo deny check` accepts `arc-swap`); UAC guard; this table |
