@@ -185,12 +185,23 @@ impl ServerNode {
         let sql_listener = TcpListener::bind(&cfg.sql_addr).await?;
         let sql_config = Arc::new(pgwire::session::SessionConfig::trust());
         if cfg.range_map.range_count() > 1 {
+            // The remote arm of the gateway: a pooled pgwire forwarding client over
+            // this node's per-range raft handles + partition state. A statement
+            // whose range this node does not lead is forwarded to that range's
+            // remote leader (with a bounded one re-resolve+retry on NotLeader).
+            let pool = crate::forward::ForwardPool::new(
+                rafts.clone(),
+                partition.clone(),
+                crate::forward::RetryCounter::default(),
+            );
+            let forward: Arc<dyn crate::range::router::RemoteForward> =
+                Arc::new(crate::forward::PgwireForward { pool });
             tokio::spawn(crate::route::serve_range_routed(
                 sql_listener,
                 cfg.range_map.clone(),
                 engines.clone(),
                 catalog_kv.clone(),
-                Arc::new(crate::range::router::RejectForward),
+                forward,
                 sql_config,
             ));
         } else {

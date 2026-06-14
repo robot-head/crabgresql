@@ -89,7 +89,14 @@ async fn route_one(
                 if Instant::now() >= deadline {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // No leader yet: await the next metrics change (bounded by the
+                // deadline) instead of busy-sleeping. `changed()` resolves the
+                // instant `current_leader` updates.
+                let mut rx = raft.metrics();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+                    return; // deadline elapsed with no leader
+                }
             }
         }
     }
