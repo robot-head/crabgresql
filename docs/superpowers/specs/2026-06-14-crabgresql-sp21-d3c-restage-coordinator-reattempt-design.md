@@ -2,7 +2,59 @@
 
 **Date:** 2026-06-14
 **Slice:** SP21 (D3c-restage)
-**Status:** design
+**Status:** SUPERSEDED — see the CORRECTION below. The fresh-`g'` re-attempt design in this
+document was abandoned during implementation; what actually shipped is different.
+
+---
+
+## CORRECTION (as-shipped) — read this first
+
+**The re-attempt design below was based on a wrong hypothesis and was NOT shipped.** During
+implementation, the multi-process participant-leader-kill nemesis — driven by SP21's own new
+`find_visible_one`/`scan_live` at-most-one-live `debug_assert!` — proved that:
+
+1. **The re-attempt never fires on the motivating fault.** A killed participant leader
+   surfaces as `ExecError::Unavailable` (a transport error), not `ExecError::NotLeader`, so
+   `reattempt_under_fresh_g` was dead code on that path (confirmed: it fired 0× across
+   instrumented runs).
+2. **The real defects were PRE-EXISTING (SP18-era), not a missing re-attempt.** Two distinct
+   safety bugs, both reproduced on the SP20 base with all SP21 code removed:
+   - **Non-idempotent participant `Stage`.** `TwoPcClient::call` retries `Stage` on a
+     transport failure; `TxnService::stage` allocated a fresh local xid per call, so a retry
+     across a leader failover wrote a SECOND `Prepared(-> g)` version → two live versions on
+     commit (torn/doubled balances).
+   - **Pre-decision lock release.** On leadership loss, `release_all_for_range` freed a held
+     row lock with its `g` still in-doubt (violating the `eval_plan_qual` invariant), letting
+     a concurrent writer create a second, non-superseding version of the row.
+
+### What shipped (this slice)
+
+- **T1 — MVCC hardening / the detector:** `find_visible_one` + `scan_live` select the
+  greatest-xmin live version explicitly and `debug_assert!` at-most-one-live. This is what
+  caught the entire cascade.
+- **Idempotent participant `Stage` per `(g, range)`:** `SqlEngine::staged_local_for` + a
+  held-session-aware check in `TxnService::stage` (a cross-leader retry that finds an existing
+  durable `Prepared(-> g)` is a no-op). Verified by a deterministic unit test (red→green) + a
+  Stateright model with teeth (`crates/cluster/tests/crossrange_2pc_model.rs`).
+- **Leadership-loss resolve-then-release:** `TxnService::resolve_and_release_for_range` drives
+  each held `(g, range)` through its write-once decision before releasing, so a lock is never
+  freed pre-decision.
+- The fresh-`g'` re-attempt (the original design, T2/T3) was implemented, reviewed, then
+  **reverted** as the wrong root cause.
+
+### Deferred to a dedicated future slice
+
+**Full participant-leader-kill multi-process recovery robustness.** A KILLED leader (process
+death, no graceful handler) leaves a *session-less* in-doubt marker on the new leader; a
+writer that touches that row before the marker settles can still create a duplicate.
+Incremental patches (a periodic session-less in-doubt sweep + an executor in-doubt writer
+guard) eliminate the crash/hang but do not converge to a conserved total. The correct fix is
+structural — **settle-before-serve**: gate a range's writes on its leadership-rise in-doubt
+sweep (with an apply-wait) so no writer reads an unsettled inherited marker. That redesign
+gets its own spec + adversarial plan review. The participant-leader-kill nemesis is not
+committed until that lands.
+
+---
 
 ## Summary
 
