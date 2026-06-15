@@ -1,43 +1,56 @@
-//! SP23: cross-range 2PC conserves the bank total under a multi-process nemesis that
-//! kills the RANGE-0 leader (the GTM/coordinator home AND `acct_a`'s participant) each
-//! round, with a FULL-DRAIN stable window between kills so single-failover GTM-reseed
-//! recovery is exercised in isolation (the deferred cascading/overlapping-failover case
-//! is a spec non-goal). Validates the reseed-before-allocate fix: a freshly-risen range-0
-//! leader reseeds the GTM counter (apply-waited) before serving `BeginGlobal`, so no
-//! global xid is ever reused and no duplicate MVCC version is created.
+//! SP23: cross-range 2PC conserves the bank total across a range-0 leadership change,
+//! exercised as a TRUE single-failover STABLE-WINDOW nemesis. Each round drives a batch of
+//! cross-range transfers to completion (fully settled), QUIESCES, then kills the range-0
+//! leader (the GTM/coordinator home AND `acct_a`'s participant) with NO transfer in flight,
+//! waits for recovery, and drives a FRESH batch. Because the kill lands on a quiescent
+//! cluster, this isolates single-failover GTM-reseed recovery (the in-scope case) from the
+//! deferred cascading/overlapping mid-2PC failover case (a spec non-goal — partition + mid-
+//! flight coverage lives in `jepsen_bank` / `multiprocess`). This is the EMPIRICAL
+//! end-to-end complement to the SP23 reseed-before-allocate fix: it exercises the real
+//! 5-process system (TCP + durable Raft + 2PC + the range-0 rise sweep that reseeds the GTM
+//! before reopening the gate) and asserts money is conserved across each range-0 failover.
+//!
+//! The DETERMINISTIC teeth for the fix live in the Stateright model
+//! `cluster::crossrange_2pc_gtm_reuse_model` (its `no_reseed_*` teeth test catches the broken
+//! variant). This e2e cannot carry those teeth: the apply-lag that triggers a reused global
+//! xid only opens when `BeginGlobal` is served WHILE a prior commit is still applying on a
+//! fresh leader — and forcing that empirically requires in-flight 2PC across the kill, which
+//! is the deferred cascading/overlapping-failover case. Quiescing to stay in-scope (and
+//! converge) necessarily closes that window, so this test is a CONVERGENCE / conservation
+//! regression guard, not a teeth test. (Confirmed: with the rise-sweep reseed disabled, a
+//! quiesced run still passes on a fast host — the model is what catches that regression.)
 mod harness;
 use harness::Cluster;
 use std::time::Duration;
 
-use cluster::transport::protocol::ControlRequest;
-
-/// SP23 Task 5: kill the RANGE-0 leader each round and assert the cross-range bank
-/// total is conserved. Range 0 is the GTM/coordinator home AND `acct_a`'s participant,
-/// so each kill churns the coordinator + the participant together. The g-reuse fix's
-/// reseed-before-allocate range-0 rise sweep (apply-wait -> reseed_gtm -> settle -> open)
-/// recovers the GTM so a reused global xid never duplicates a live version. A FULL-DRAIN
-/// stable window between kills isolates SINGLE-failover recovery (the in-scope case) from
-/// the deferred cascading (overlapping) failover gap.
+/// SP23 Task 5: change the RANGE-0 leader each round on a QUIESCENT cluster and assert the
+/// cross-range bank total is conserved. Range 0 is the GTM/coordinator home AND `acct_a`'s
+/// participant. Each round: (1) commit a pre-kill batch (allocates global xids), (2) quiesce
+/// barrier, (3) hard-kill+respawn the range-0 leader (forces a leadership RISE with zero
+/// in-flight 2PC), (4) wait for recovery + prove range 0 serves `BeginGlobal` again, (5)
+/// commit a post-recovery batch — the FIRST allocations after the failover, which MUST read
+/// a reseeded GTM. With the reseed-before-allocate rise sweep (apply-wait -> reseed_gtm ->
+/// settle -> mark_served) a reused global xid never duplicates a live version, so the total
+/// is conserved. Non-vacuity is structural: every driven transfer is committed or the run
+/// panics, so a passing run provably moved money across the failover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn range0_participant_leader_kill_conserves_total() {
     const ACCOUNTS: i64 = 4;
     const SEED: i64 = 100;
-    const PROCS: usize = 3;
-    const OPS: usize = 8;
-    const MIN_ROUNDS: usize = 4;
+    const ROUNDS: usize = 4;
+    const BATCH: usize = 3;
     let seeded_total = 2 * ACCOUNTS * SEED; // two tables, two ranges
 
-    // 5 nodes, boundary [2] (correction C3 — 5 nodes keep a quorum when a non-leader
-    // is faulted, mirroring jepsen_bank's cross-range nemesis): acct_a (id 1) -> range 0,
-    // acct_b (id 2) -> range 1.
+    // 5 nodes, boundary [2] (5 nodes keep a quorum when one node is faulted): acct_a
+    // (table id 1) -> range 0, acct_b (id 2) -> range 1.
     let mut c = Cluster::spawn_multirange(5, vec![2]).await;
-    let committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)); // committed-op progress signal
+
     // Seed via `exec_until_ok` (bounded retry across nodes): right after bring-up the
-    // gateway we land on may not yet have a quorum view, so an unretried first DDL can
-    // hit a transient `08006 no-quorum`. Sequential `exec_until_ok` calls each commit
-    // before the next begins, so acct_a (table id 1 -> range 0) is still created before
-    // acct_b (id 2 -> range 1). Setup is fault-free, so a retried statement was cleanly
-    // rejected, never double-applied.
+    // gateway we land on may not yet have a quorum view, so an unretried first DDL can hit a
+    // transient `08006 no-quorum`. Sequential `exec_until_ok` calls each commit before the
+    // next begins, so acct_a (id 1 -> range 0) is still created before acct_b (id 2 ->
+    // range 1). Setup is fault-free, so a retried statement was cleanly rejected, never
+    // double-applied.
     c.exec_until_ok("CREATE TABLE acct_a (id int8, bal int8)")
         .await;
     c.exec_until_ok("CREATE TABLE acct_b (id int8, bal int8)")
@@ -49,113 +62,74 @@ async fn range0_participant_leader_kill_conserves_total() {
             .await;
     }
 
-    // Workers are spread one-per-node across nodes 0..PROCS (each worker pins to its
-    // own gateway for the whole run), so a coordinator is often a NON-leading gateway
-    // and the nemesis kills coordinators mid-txn. PROCS < node count is fine — the
-    // point is only that some worker sits on a non-leading gateway under fault.
-    let addrs: Vec<String> = (0..c.len())
-        .map(|i| c.sql_addr(i as u64).to_string())
-        .collect();
-    let mut workers = Vec::new();
-    for process in 0..PROCS {
-        let addrs = addrs.clone();
-        let sig = committed.clone();
-        workers.push(tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
-            let mut rng = Lcg::new(0x9E37_79B9_u64.wrapping_mul(process as u64 + 1));
-            let mut n = 0usize;
-            for _ in 0..OPS {
-                let node = addrs[process % addrs.len()].clone();
-                let Some(client) = connect(&node).await else {
-                    continue;
-                };
-                let from = (rng.next() % ACCOUNTS as u64) as i64;
-                let mut to = (rng.next() % ACCOUNTS as u64) as i64;
-                if to == from {
-                    to = (to + 1) % ACCOUNTS;
-                }
-                let amt = 1 + (rng.next() % 20) as i64;
-                if cross_transfer(&client, from, to, amt).await {
-                    n += 1;
-                    sig.fetch_add(1, Ordering::Relaxed); // committed-op progress signal
-                }
-            }
-            n
-        }));
-    }
+    // Deterministic-in-spirit transfer stream (no `rand`, no wall clock); rotates gateways
+    // so coordinators are often NON-leading gateways (forwarded 2PC).
+    let mut rng = Lcg::new(0x5DEE_CE66_D1A4_2B3C);
+    let mut gw = 0u64;
+    let mut total_committed = 0usize;
 
-    // Nemesis (SP23 Task 5): fault the RANGE-0 LEADER victim each round (the GTM/
-    // coordinator home AND acct_a's participant), pace the next fault on a committed-op
-    // progress signal (no settle-sleep), and await a recovered quorum (both ranges have a
-    // leader) before advancing. Killing the range-0 leader churns the coordinator + the
-    // participant together — the g-reuse fix's reseed-before-allocate rise sweep handles it.
-    use std::sync::atomic::Ordering;
-    let mut round = 0usize;
-    while !workers.iter().all(|w| w.is_finished()) || round < MIN_ROUNDS {
-        // Victim = the RANGE-0 leader (GTM/coordinator home + acct_a participant).
-        let victim = c.range_leader(0).await;
-        let before = committed.load(Ordering::Relaxed);
-        if round.is_multiple_of(2) {
-            c.kill(victim).await;
-            c.respawn(victim);
-        } else {
-            let others: Vec<u64> = (0..c.len() as u64).filter(|&i| i != victim).collect();
-            let _ = c.control(victim, ctl_set_partition(others.clone())).await;
-            for &o in &others {
-                let _ = c.control(o, ctl_set_partition(vec![victim])).await;
-            }
-            for id in 0..c.len() as u64 {
-                let _ = c.control(id, ctl_heal()).await;
-            }
+    for _round in 0..ROUNDS {
+        // (1) PRE-KILL batch: commit BATCH cross-range transfers to completion, each
+        // awaited and fully settled. Every transfer escalates to global 2PC, so begin_global
+        // advances the GTM `next_global` to quorum — establishing the pre-failover
+        // allocation that a broken reseed could later regress below and REUSE.
+        for _ in 0..BATCH {
+            let (from, to, amt) = pick(&mut rng, ACCOUNTS);
+            commit_one_transfer(&c, gw, from, to, amt).await;
+            total_committed += 1;
+            gw = gw.wrapping_add(1);
         }
-        // Wait for the workload to commit at least one op under the fault OR finish,
-        // bounded (paced on real progress, never the clock); then let quorum recover.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while committed.load(Ordering::Relaxed) == before
-            && !workers.iter().all(|w| w.is_finished())
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await; // harness poll cadence, not a settle-sleep
-        }
-        c.range_leader(0).await; // recovered-quorum gate before the next fault
-        c.range_leader(1).await;
 
-        // FULL-DRAIN stable window: ensure the previous range-0 failover (coordinator +
-        // participant) is FULLY drained before the next kill, isolating single-failover
-        // recovery from the deferred cascading (overlapping) failover case.
-        // (a) Settle-aware zero-sum cross-range barrier: confirms BOTH ranges admit writes
-        //     + the GTM re-resolved + reseeded. Amount 0 conserves the total.
+        // (2) QUIESCE barrier: a settle-aware zero-sum cross-range write confirms BOTH ranges
+        // admit writes and nothing is in flight before the kill. Amount 0 conserves the total.
         c.exec_until_ok(
             "BEGIN; UPDATE acct_a SET bal = bal - 0 WHERE id = 0; UPDATE acct_b SET bal = bal + 0 WHERE id = 0; COMMIT",
         )
         .await;
-        // (b) Generous stable window paced on real committed-op progress (NOT a settle-sleep).
-        const STABLE_WINDOW_OPS: u64 = 5;
-        let window_start = committed.load(Ordering::Relaxed);
-        let window_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while committed.load(Ordering::Relaxed) < window_start + STABLE_WINDOW_OPS
-            && !workers.iter().all(|w| w.is_finished())
-            && tokio::time::Instant::now() < window_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await; // harness poll cadence, not a settle-sleep
+
+        // (3) SINGLE-FAILOVER fault on the QUIESCENT cluster: hard-kill the range-0 leader
+        // (GTM/coordinator/participant home) with NO transfer in flight, then respawn it.
+        // This forces a range-0 leadership RISE with zero in-flight 2PC, isolating
+        // single-failover GTM-reseed recovery from the deferred cascading (overlapping
+        // mid-2PC) failover case.
+        let victim = c.range_leader(0).await;
+        c.kill(victim).await;
+        c.respawn(victim);
+
+        // (4) RECOVERY GATE: wait for a leader on BOTH ranges, then prove range 0 SERVES
+        // `BeginGlobal` again with a cross-range barrier write. The barrier only commits once
+        // the freshly-risen range-0 leader has finished its rise sweep (apply-wait ->
+        // reseed_gtm -> settle -> mark_served) and reopened the gate — the multi-process
+        // witness that recovery completed BEFORE we allocate fresh global xids.
+        c.range_leader(0).await;
+        c.range_leader(1).await;
+        c.exec_until_ok(
+            "BEGIN; UPDATE acct_a SET bal = bal - 0 WHERE id = 0; UPDATE acct_b SET bal = bal + 0 WHERE id = 0; COMMIT",
+        )
+        .await;
+
+        // (5) POST-RECOVERY batch: the FIRST cross-range allocations after the range-0
+        // failover. begin_global here MUST read a RESEEDED GTM counter; if reseed lagged the
+        // applied store (the SP23 bug) it would reuse a pre-failover global xid ->
+        // staged_local_for aliases a stale Prepared(->g) marker -> a duplicate live MVCC
+        // version -> money created. With reseed-before-allocate there is no reuse, so these
+        // commit and the total stays conserved.
+        for _ in 0..BATCH {
+            let (from, to, amt) = pick(&mut rng, ACCOUNTS);
+            commit_one_transfer(&c, gw, from, to, amt).await;
+            total_committed += 1;
+            gw = gw.wrapping_add(1);
         }
-        round += 1;
-    }
-    let mut total_committed = 0usize;
-    for w in workers {
-        total_committed += w.await.expect("worker");
     }
 
-    // Heal; wait for leaders on both ranges.
-    for id in 0..c.len() as u64 {
-        let _ = c.control(id, ctl_heal()).await;
-    }
+    // Wait for leaders on both ranges (the cluster is already healed — kill/respawn leaves
+    // no partition state).
     c.range_leader(0).await;
     c.range_leader(1).await;
 
-    // RECOVERY-REQUIRED check: a post-heal transfer touching EVERY account pair must
-    // commit within bound. A coordinator-crash-stranded lock that recovery failed to
-    // free would block this forever -> exec_until_ok panics at its deadline -> fail.
+    // RECOVERY-REQUIRED check: a transfer touching EVERY account pair must commit within
+    // bound — a coordinator-crash-stranded lock that recovery failed to free would wedge
+    // this forever -> exec_until_ok panics at its deadline -> fail.
     for id in 0..ACCOUNTS {
         let other = (id + 1) % ACCOUNTS;
         c.exec_until_ok(&format!(
@@ -163,17 +137,21 @@ async fn range0_participant_leader_kill_conserves_total() {
         )).await; // amount 0: touches+locks both rows, conserves total, requires no funds
     }
 
-    // CONSERVATION oracle: sum both tables across both ranges == seeded total.
-    // Bounded-retry the authoritative read (re-resolve a live gateway per attempt) so a
-    // transient failure under heavy CI contention does not panic — the PR #34 flake class.
+    // CONSERVATION oracle: sum both tables across both ranges == seeded total. Bounded-retry
+    // the authoritative read (re-resolve a live gateway per attempt) so a transient failure
+    // under heavy CI contention does not panic — the PR #34 flake class.
     let total = read_total_cross_until_ok(&c, ACCOUNTS).await;
     assert_eq!(
         total, seeded_total,
-        "cross-range transfers conserve the bank total under crash+partition nemesis (got {total}, want {seeded_total})"
+        "cross-range transfers conserve the bank total across range-0 single-failover GTM reseed (got {total}, want {seeded_total})"
     );
-    assert!(
-        total_committed > 0,
-        "the workload must commit at least one transfer (non-vacuous)"
+    // NON-VACUITY (structural): every driven transfer is committed (or `commit_one_transfer`
+    // panics), so a passing run provably moved money across each range-0 failover. The assert
+    // documents the count and guards a future refactor that stops driving commits.
+    assert_eq!(
+        total_committed,
+        ROUNDS * 2 * BATCH,
+        "the workload must commit every driven transfer (non-vacuous): got {total_committed}"
     );
 }
 
@@ -181,19 +159,44 @@ async fn range0_participant_leader_kill_conserves_total() {
 // Module-local helpers.
 // ---------------------------------------------------------------------------
 
-/// Thin wrapper: a `SetPartition` control request isolating this node from `ids`.
-fn ctl_set_partition(ids: Vec<u64>) -> ControlRequest {
-    ControlRequest::SetPartition(ids)
+/// Pick a `(from, to, amt)` cross-range transfer (distinct accounts, amount in `1..=20`).
+fn pick(rng: &mut Lcg, accounts: i64) -> (i64, i64, i64) {
+    let from = (rng.next() % accounts as u64) as i64;
+    let mut to = (rng.next() % accounts as u64) as i64;
+    if to == from {
+        to = (to + 1) % accounts;
+    }
+    let amt = 1 + (rng.next() % 20) as i64;
+    (from, to, amt)
 }
 
-/// Thin wrapper: a `Heal` control request (clears all partitions on this node).
-fn ctl_heal() -> ControlRequest {
-    ControlRequest::Heal
+/// Drive ONE cross-range transfer to a definite COMMIT, bounded-retry across rotating
+/// gateways. Called only inside QUIESCENT (non-faulted) or just-recovered windows, so it
+/// commits quickly; the bounded retry only absorbs a transient `08006`/gate-settle right
+/// after a failover (a CLEAN pre-work rejection — `cross_transfer` only returns `false`
+/// without committing, never half-applies). Panics if it cannot commit within the deadline:
+/// a quiescent, recovered cluster MUST accept a cross-range transfer, so that is a real
+/// liveness failure, not a flake to swallow.
+async fn commit_one_transfer(c: &Cluster, gw_seed: u64, from: i64, to: i64, amt: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut idx = (gw_seed % c.len() as u64) as usize;
+    loop {
+        if let Some(client) = connect(c.sql_addr(idx as u64)).await
+            && cross_transfer(&client, from, to, amt).await
+        {
+            return;
+        }
+        idx = (idx + 1) % c.len();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a quiescent recovered cluster must commit a cross-range transfer within 30s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await; // harness poll cadence, not a settle-sleep
+    }
 }
 
-/// A tiny deterministic LCG so the workload is varied yet reproducible-in-spirit
-/// without pulling in `rand` or depending on the wall clock. (Same shape as
-/// `multiprocess.rs`.)
+/// A tiny deterministic LCG so the workload is varied yet reproducible-in-spirit without
+/// pulling in `rand` or depending on the wall clock. (Same shape as `multiprocess.rs`.)
 struct Lcg(u64);
 impl Lcg {
     fn new(seed: u64) -> Self {
@@ -208,10 +211,9 @@ impl Lcg {
     }
 }
 
-/// Resilient connect: unlike `multiprocess.rs` (which connects once to a fixed LIVE
-/// leader), HERE the nemesis kills the very gateways workers connect to. So this
-/// returns `None` on any connection failure or timeout — the worker just `continue`s
-/// to its next op rather than panicking. Bounded by a 10s timeout.
+/// Resilient connect: the nemesis kills the very gateways we may connect to, so this returns
+/// `None` on any connection failure or timeout — the caller rotates to the next gateway
+/// rather than panicking. Bounded by a 10s timeout.
 async fn connect(addr: &str) -> Option<tokio_postgres::Client> {
     let port = addr.rsplit(':').next()?;
     let cs = format!("host=127.0.0.1 port={port} user=postgres");
@@ -235,8 +237,8 @@ async fn connect(addr: &str) -> Option<tokio_postgres::Client> {
 ///
 /// Each statement is bounded by a 10s timeout (like `multiprocess::transfer`). On any
 /// error/timeout the transfer is INDETERMINATE: issue a best-effort bounded `ROLLBACK`
-/// (ignore its result) and return `false`. A transfer nets zero, so only
-/// definitely-committed ones move money — and they conserve the total.
+/// (ignore its result) and return `false`. A transfer nets zero, so only definitely-
+/// committed ones move money — and they conserve the total.
 async fn cross_transfer(client: &tokio_postgres::Client, from: i64, to: i64, amt: i64) -> bool {
     async fn stmt(client: &tokio_postgres::Client, sql: &str) -> bool {
         matches!(
@@ -276,14 +278,11 @@ fn first_i64(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<i64> {
     })
 }
 
-/// Read the cross-range bank total by summing each account's balance over BOTH tables
-/// (`acct_a` in range 0 + `acct_b` in range 1) for ids `0..accounts`. (`SUM` is not in
-/// the SQL subset yet, so add the balances in Rust.)
-/// Authoritative cross-range conservation read, bounded-retry. Re-resolves a LIVE
-/// gateway each attempt; on any connect/read failure (transient `08006`, a gateway
-/// caught mid-fault, heavy CI contention) it re-resolves and retries, bounded by a 30s
-/// deadline. No settle-sleep — paced by the real round-trip + a short poll. Replaces an
-/// unretried one-shot read that could panic on a transient failure (the PR #34 flake).
+/// Authoritative cross-range conservation read, bounded-retry. Re-resolves a LIVE gateway
+/// each attempt; on any connect/read failure (transient `08006`, a gateway caught mid-fault,
+/// heavy CI contention) it re-resolves and retries, bounded by a 30s deadline. No settle-
+/// sleep — paced by the real round-trip + a short poll. Replaces an unretried one-shot read
+/// that could panic on a transient failure (the PR #34 flake).
 async fn read_total_cross_until_ok(c: &Cluster, accounts: i64) -> i64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -298,8 +297,9 @@ async fn read_total_cross_until_ok(c: &Cluster, accounts: i64) -> i64 {
     }
 }
 
-/// One attempt: pick a live gateway, sum every account over both tables; `None` on any
-/// failure (so the caller re-resolves and retries — never a partial/fabricated total).
+/// One attempt: pick a live gateway, sum every account over both tables (`acct_a` in range 0,
+/// `acct_b` in range 1); `None` on any failure (so the caller re-resolves and retries — never
+/// a partial/fabricated total). (`SUM` is not in the SQL subset yet, so add in Rust.)
 async fn try_read_total_cross(c: &Cluster, accounts: i64) -> Option<i64> {
     let gw = c.pick_live_gateway().await;
     let client = connect(c.sql_addr(gw)).await?;
