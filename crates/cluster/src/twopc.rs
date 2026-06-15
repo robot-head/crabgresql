@@ -332,11 +332,11 @@ impl TxnService {
         self.held.lock().await.contains_key(&(g, range))
     }
 
-    /// Drop every held session for `range` (presumed-abort), freeing its locks.
-    /// Called on the loss of `range` leadership. Always safe: the global clog is
-    /// the sole arbiter (a committed g's durable Prepared rows stay visible; an
-    /// undecided g's rows are invisible). Sessions taken out under a brief map
-    /// lock, guard dropped, THEN aborted.
+    /// Drop every held session for `range` WITHOUT consulting the global clog
+    /// (presumed-abort, freeing locks immediately). This frees a lock while its `g` may
+    /// still be in-doubt, so it is NOT used on leadership loss anymore (see
+    /// `resolve_and_release_for_range` for that path + the invariant it preserves); it
+    /// remains the explicit "drop-as-if-crashed" primitive used by recovery tests.
     pub async fn release_all_for_range(&self, range: RangeId) {
         let victims: Vec<HeldSession> = {
             let mut held = self.held.lock().await;
@@ -348,6 +348,28 @@ impl TxnService {
         };
         for s in victims {
             s.lock().await.abort_release();
+        }
+    }
+
+    /// On leadership LOSS of `range`, resolve every held `(g, range)` session through its
+    /// WRITE-ONCE global decision and release per that decision — NOT a blind
+    /// `abort_release`. This preserves the load-bearing invariant `eval_plan_qual` relies
+    /// on (a participant frees a row's lock only AFTER its global decision is durable, so
+    /// every `g` with a `Prepared` marker on a locked row has already settled). Freeing the
+    /// lock while `g` is still in-doubt lets a concurrent writer acquire it and write a
+    /// SECOND, non-superseding version of the row, so TWO versions resolve live when both
+    /// `g`s later commit (the at-most-one-live violation that crashes reads). Reuses
+    /// `resolve_in_doubt` (the same per-decision release the silence sweep uses), so a lock
+    /// is never freed pre-decision. Best-effort: a session whose range 0 is momentarily
+    /// unreachable stays held (lock retained — correct) and is resolved by the silence
+    /// sweep or the next leadership loss.
+    pub async fn resolve_and_release_for_range(&self, client: &TwoPcClient, range: RangeId) {
+        let keys: Vec<(u64, RangeId)> = {
+            let held = self.held.lock().await;
+            held.keys().copied().filter(|&(_, r)| r == range).collect()
+        };
+        for (g, r) in keys {
+            self.resolve_in_doubt(client, g, r).await;
         }
     }
 
