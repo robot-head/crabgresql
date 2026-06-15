@@ -45,6 +45,40 @@ lacks the instrumentation a deterministic test needs — **add the instrumentati
 The goal: every test is deterministic and never flaky — it passes or fails on
 behavior, never on timing.
 
+## Testing: model-check every new feature with Stateright
+
+**Every new feature gets a Stateright model that exhaustively checks its core safety
+invariant** — alongside the empirical tests, not instead of them. The multi-process
+nemeses and jepsen suites only *sample* fault interleavings; a `stateright::Model`
+explores *every* interleaving up to a bounded step budget, so it finds the adversarial
+ordering a sampled run misses and reports a *minimal, deterministic* counterexample.
+This is not optional polish: SP21's torn-commit (a participant `Stage` double-staged
+across a leader failover) slipped past the in-process tests entirely, and a Stateright
+model — exhaustive over begin/stage/retry/decide — pinned it deterministically.
+
+The discipline (mirror `crates/cluster/tests/model.rs` and
+`crates/cluster/tests/crossrange_2pc_model.rs`):
+
+- **Abstract, not the runtime.** Model the *logic* (the state machine + its invariant)
+  as a pure `Model` — no openraft, no SQL engine, no I/O — so the BFS is fast and total.
+  Keep every `Vec` canonical (sorted) so logically-equal states fingerprint equally and
+  the search dedups + terminates. Bound the search with a `max_steps` budget.
+- **A boolean toggle for the broken variant.** Express the fix as a config flag
+  (`reseed`, `fold_on_commit`, `idempotent_stage`): `true` is the real system, `false`
+  is the deliberately-broken one.
+- **Teeth tests are MANDATORY.** A passing `assert_properties()` is meaningless unless
+  you also prove the checker CATCHES the bug: a teeth test runs the broken variant and
+  asserts `!checker.discoveries().is_empty()` AND that `discoveries()` names the specific
+  safety property. A model with no teeth is worse than no model — it gives false
+  confidence. Also assert `unique_state_count() > 1` so a "passing" run is not vacuous.
+- **Never weaken a property to make a model pass.** A counterexample in the *correct*
+  variant is a genuine design finding — investigate it, do not relax the invariant.
+
+Scale the model to the feature — a pure-data or single-node refactor with no
+concurrency/fault dimension may not warrant one — but anything touching 2PC,
+replication, recovery, leadership, locking, MVCC visibility, or cross-range consistency
+does, and gets a model with teeth as part of the slice.
+
 ## Windows UAC-safe target names (os error 740)
 
 Windows UAC **installer-detection** refuses to launch (un-elevated) any executable
@@ -91,3 +125,5 @@ is named `crabgresql` — do not rename it.
 **SP19 (2026-06-14):** one new binary — `crabgresql::crossrange_2pc_replicated` (multi-process cross-range 2PC over the replicated meta-range layout, nemesis + full-cluster restart) — UAC-safe (no `setup/install/update/patch/upgrad` substring). The crabgresql list now reads `{crossrange_2pc_net, crossrange_2pc_nemesis, crossrange_2pc_replicated, jepsen_elle, meta_range_gateway, multiprocess, multirange_gateway}`. SP19 added the `arc-swap` dependency (growable `TxnService` engines registry) and no test target with a forbidden substring; the full guard `git ls-files 'crates/*/tests/*.rs' | grep -iE 'setup|install|update|patch|upgrad'` returns empty.
 
 **SP20 (2026-06-14):** NO new test binary — the recovery-scan watermark (`clog_scan_lo`, bounds the leadership-rise in-doubt scan) is proven by in-crate `kv`/`executor`/`cluster` unit tests + the existing `crossrange_2pc_{replicated,nemesis}` e2e. No new dependency. The crabgresql binary list is unchanged. The full guard `git ls-files 'crates/*/tests/*.rs' | grep -iE 'setup|install|update|patch|upgrad'` returns empty.
+
+**SP21 (2026-06-14):** one new test binary — `cluster::crossrange_2pc_model` (Stateright model of cross-range 2PC participant-`Stage` idempotency) — UAC-safe (no `setup/install/update/patch/upgrad`). No new `crabgresql` binary; no new dependency. The cross-range 2PC fixes — idempotent participant `Stage` per `(g, range)` (`executor::SqlEngine::staged_local_for` + the held-session-aware check in `twopc::TxnService::stage`) and the leadership-loss **resolve-then-release** (`twopc::resolve_and_release_for_range`) — are proven by in-crate `executor`/`cluster` unit tests + the Stateright model + the existing `crossrange_2pc_{nemesis,replicated}` e2e (regression). The full guard returns empty. **NOTE:** SP21's original "fresh-`g'` re-attempt" design was abandoned after the multi-process participant-leader-kill nemesis (driven by SP21's own `find_visible_one`/`scan_live` at-most-one-live `debug_assert!`) proved the real defects were PRE-EXISTING (SP18-era) — non-idempotent stage + pre-decision lock release — not a missing re-attempt. Full participant-leader-kill recovery robustness (a "settle-before-serve" redesign that gates a range's writes on its leadership-rise in-doubt sweep) is **deferred to a dedicated future slice**; the participant-leader-kill multi-process nemesis is not committed (it does not yet pass reliably against the deferred gap).
