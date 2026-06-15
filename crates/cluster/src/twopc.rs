@@ -297,13 +297,22 @@ struct HeldEntry {
 pub struct TxnService {
     engines: Arc<ArcSwap<HashMap<RangeId, Arc<SqlEngine>>>>,
     held: Arc<Mutex<HashMap<(u64, RangeId), HeldEntry>>>,
+    /// Settle-before-serve gate (SP22): `Some` on a real node, `None` for in-process /
+    /// never-recovering test harnesses (treated as always-serving).
+    // `#[allow(dead_code)]` until Task 4 reads it in the `stage` gate check; removed then.
+    #[allow(dead_code)]
+    gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
 }
 
 impl TxnService {
-    pub fn new(engines: HashMap<RangeId, Arc<SqlEngine>>) -> Self {
+    pub fn new(
+        engines: HashMap<RangeId, Arc<SqlEngine>>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
+    ) -> Self {
         Self {
             engines: Arc::new(ArcSwap::from_pointee(engines)),
             held: Arc::new(Mutex::new(HashMap::new())),
+            gate,
         }
     }
 
@@ -539,7 +548,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage_then_release_holds_then_frees_a_per_g_session() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
 
         // DDL (CREATE TABLE) must run through range-0's engine (catalog lives there).
         // Table id 2 is assigned by the counter → falls in range 1 (boundary at 2).
@@ -599,7 +608,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_silent_coordinator_is_recovered_by_the_timeout_sweeper() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone());
 
         // Seed a row on range 1, then STAGE a held participant for a global xid g that
@@ -709,7 +718,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         // Seed a row on range 1 (create a placeholder table id 1 on range 0 first so b gets id 2).
         let mut seed0 = node.engines[&0].connect();
         seed0
@@ -765,7 +774,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage_is_idempotent_across_a_participant_leader_failover() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         let mut ddl = node.engines[&0].connect();
         ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
             .await
@@ -849,7 +858,7 @@ mod tests {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
         let mut only0 = std::collections::HashMap::new();
         only0.insert(0u32, node.engines[&0].clone());
-        let svc = TxnService::new(only0);
+        let svc = TxnService::new(only0, None);
         assert!(
             svc.engine(1).is_none(),
             "range 1 absent before registration"
@@ -874,7 +883,7 @@ mod tests {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
         let mut only0 = std::collections::HashMap::new();
         only0.insert(0u32, node.engines[&0].clone());
-        let svc = TxnService::new(only0);
+        let svc = TxnService::new(only0, None);
         let resp = svc
             .handle(
                 7,

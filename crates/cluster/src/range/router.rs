@@ -170,6 +170,10 @@ pub struct RangeRouter {
     /// Whether THIS node currently leads a range. A statement runs locally only
     /// when `engines` holds the range AND this returns true; otherwise it forwards.
     leads: Arc<dyn LeadsRange>,
+    /// Settle-before-serve gate (SP22): `None` for the in-process harness (always serving).
+    // `#[allow(dead_code)]` until Task 4 reads it in the `dispatch` write check; removed then.
+    #[allow(dead_code)]
+    gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     /// Range-0 catalog store (schema resolution). For a range-0 follower gateway
     /// Task 4 makes this a wire-read handle; here it is the local range-0 store.
     catalog_kv: Arc<dyn kv::Kv>,
@@ -206,6 +210,7 @@ impl RangeRouter {
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
         coordinator: Option<Arc<dyn GlobalCoordinator>>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     ) -> Self {
         Self {
             sessions: HashMap::new(),
@@ -213,6 +218,7 @@ impl RangeRouter {
             map,
             engines,
             leads,
+            gate,
             catalog_kv,
             forward,
             coordinator,
@@ -272,6 +278,7 @@ impl RangeRouter {
             c.catalog_kv().await,
             Arc::new(RejectForward),
             Some(coordinator),
+            None,
         )
     }
 
@@ -1016,6 +1023,7 @@ mod gateway_seam_tests {
             c.catalog_kv().await,
             Arc::new(RejectForward),
             None,
+            None,
         );
         // Range-0 work runs locally.
         router
@@ -1089,6 +1097,7 @@ mod gateway_seam_tests {
             Arc::new(AlwaysLeads),
             c.catalog_kv().await,
             Arc::new(EngineForward { engines: remote }),
+            None,
             None,
         );
 

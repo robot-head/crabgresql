@@ -240,12 +240,20 @@ impl ServerNode {
         // Cross-range recovery: a per-DATA-range client the leadership-rise sweep uses
         // to abort-race in-doubt `Prepared(-> g)` markers against range 0 (write-once).
         let sweep_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
+        // Settle-before-serve gate (SP22): ONE gate per bring-up, shared via `Arc` into
+        // the TxnService, the gateway router, and (Task 3) the rise sweeps. Each data
+        // range is registered (gated-by-default) BELOW, BEFORE its rise-sweep spawn.
+        let gate = crate::recovery_gate::RecoveryGate::new(cfg.id);
         for (range, raft, sm_kv, mut engine) in pending {
             let barrier: Arc<dyn executor::Linearizer> = Arc::new(
                 crate::twopc::Range0Barrier::new(rafts[&0].clone(), cfg.id, barrier_client.clone()),
             );
             engine.set_range0_barrier(barrier);
             let engine = Arc::new(engine);
+            // Register the range (gated-by-default) BEFORE spawning its rise sweep, so a
+            // sweep's `mark_served` never no-ops on an unregistered range and wedges the
+            // gate closed forever on a stable single leader (no second rising edge).
+            gate.register_range(range, raft.clone());
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             // On THIS data-range's leadership rising edge, finalize a failed-over
             // participant's durable in-doubt markers (range 0 holds only global xids).
@@ -260,7 +268,7 @@ impl ServerNode {
         }
 
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
-        let txn = crate::twopc::TxnService::new(engines.clone());
+        let txn = crate::twopc::TxnService::new(engines.clone(), Some(gate.clone()));
         // Spawn a per-range leadership-loss watcher: on the falling edge of this node's
         // leadership for a range, resolve-then-release every held 2PC session for that
         // range (drive each `g` to its global decision, then release per the decision) so
@@ -308,6 +316,7 @@ impl ServerNode {
             &catalog_kv,
             cfg.id,
             sql_config,
+            Some(gate.clone()),
         );
 
         Ok(Self {
@@ -334,6 +343,7 @@ impl ServerNode {
         catalog_kv: &Arc<dyn kv::Kv>,
         id: NodeId,
         sql_config: Arc<pgwire::session::SessionConfig>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     ) {
         if map.range_count() > 1 {
             Self::spawn_sql_gateway(
@@ -345,8 +355,11 @@ impl ServerNode {
                 catalog_kv,
                 id,
                 sql_config,
+                gate,
             );
         } else {
+            // Single-range byte-proxy fast path: no gateway router → ungated.
+            let _ = gate;
             tokio::spawn(crate::route::serve_routed(
                 sql_listener,
                 rafts[&0].clone(),
@@ -368,6 +381,7 @@ impl ServerNode {
         catalog_kv: &Arc<dyn kv::Kv>,
         id: NodeId,
         sql_config: Arc<pgwire::session::SessionConfig>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     ) {
         let pool = crate::forward::ForwardPool::new(
             rafts.clone(),
@@ -395,6 +409,7 @@ impl ServerNode {
             forward,
             coordinator,
             sql_config,
+            gate,
         ));
     }
 
@@ -435,7 +450,11 @@ impl ServerNode {
         // coordinator ops (Begin/Commit/GlobalBarrier — they need only engine(0)) work
         // immediately, and data ranges are registered live in Phase 2. The listener
         // must stay bound throughout Phase 2 to serve range-0 Raft RPCs.
-        let txn = crate::twopc::TxnService::new(engines.clone());
+        // Settle-before-serve gate (SP22): ONE growable gate, constructed here with only
+        // range 0 known; each data range is registered live in the Phase-2 loop. Shared
+        // via `Arc` into the TxnService, the gateway router, and (Task 3) the rise sweeps.
+        let gate = crate::recovery_gate::RecoveryGate::new(cfg.id);
+        let txn = crate::twopc::TxnService::new(engines.clone(), Some(gate.clone()));
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
@@ -493,6 +512,10 @@ impl ServerNode {
             );
             engine.set_range0_barrier(barrier);
             let engine = Arc::new(engine);
+            // Register this data range (gated-by-default) in the SP22 gate BEFORE both
+            // `register_engine` and the rise-sweep spawn, so a sweep's `mark_served`
+            // never no-ops on an unregistered range and wedges the gate closed forever.
+            gate.register_range(range, raft.clone());
             // Register this data range so the listener can serve Stage/Release for it.
             txn.register_engine(range, engine.clone());
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
@@ -541,6 +564,7 @@ impl ServerNode {
             &catalog_kv,
             cfg.id,
             sql_config,
+            Some(gate.clone()),
         );
 
         Ok(Self {

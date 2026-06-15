@@ -1025,6 +1025,7 @@ fn router_over(
         Arc::clone(catalog_kv),
         Arc::new(RejectForward),
         Some(coordinator),
+        None,
     )
 }
 
