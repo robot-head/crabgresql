@@ -133,4 +133,29 @@ mod tests {
         gtm.reseed_from_applied().expect("reseed");
         assert_eq!(gtm.begin_global(), GLOBAL_XID_BASE + 50);
     }
+
+    #[test]
+    fn stale_in_memory_counter_reuses_g_until_reseed() {
+        let kv = std::sync::Arc::new(MemKv::new());
+        let gtm = Gtm::open(kv.clone() as Arc<dyn Kv>).expect("open"); // in-memory next_global == BASE
+        // A PRIOR leader durably allocated through BASE+4 (begin_global_durable committed next=BASE+5).
+        kv.put(
+            kv::key::meta_next_global_xid_key(),
+            (GLOBAL_XID_BASE + 5).to_be_bytes().to_vec(),
+        )
+        .expect("put");
+        // TEETH: a new leader that does NOT reseed re-hands-out BASE (already allocated by the prior leader).
+        assert_eq!(
+            gtm.begin_global(),
+            GLOBAL_XID_BASE,
+            "without reseed, the stale counter reuses g (the bug)"
+        );
+        gtm.finish_global(GLOBAL_XID_BASE);
+        // POSITIVE: after reseed_from_applied (durable value current), the next g is past every allocation.
+        gtm.reseed_from_applied().expect("reseed");
+        assert!(
+            gtm.begin_global() >= GLOBAL_XID_BASE + 5,
+            "after reseed, g is never reused"
+        );
+    }
 }

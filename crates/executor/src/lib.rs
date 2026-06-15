@@ -279,10 +279,10 @@ impl SqlEngine {
         let mut gs: BTreeSet<u64> = BTreeSet::new();
         let mut first_undecided: Option<u64> = None;
         let mut max_li: Option<u64> = None;
-        for (k, v) in self
-            .kv
-            .scan_range(&kv::key::clog_key(scan_lo), &kv::key::clog_scan_end())?
-        {
+        for (k, v) in self.kv.scan_range(
+            &kv::key::clog_key(scan_lo),
+            &kv::key::clog_key(mvcc::xid::GLOBAL_XID_BASE),
+        )? {
             let Some(li) = kv::key::clog_xid_of(&k) else {
                 continue;
             };
@@ -326,10 +326,10 @@ impl SqlEngine {
     /// advances past a non-terminal `g`).
     pub async fn staged_local_for(&self, g: u64) -> Result<Option<u64>, ExecError> {
         let scan_lo = self.clog_scan_lo()?;
-        for (k, v) in self
-            .kv
-            .scan_range(&kv::key::clog_key(scan_lo), &kv::key::clog_scan_end())?
-        {
+        for (k, v) in self.kv.scan_range(
+            &kv::key::clog_key(scan_lo),
+            &kv::key::clog_key(mvcc::xid::GLOBAL_XID_BASE),
+        )? {
             let Some(li) = kv::key::clog_xid_of(&k) else {
                 continue;
             };
@@ -539,6 +539,47 @@ mod tests {
         assert_eq!(
             lo3, 20,
             "in-doubt at the highest Li holds the watermark there"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_doubt_scan_watermark_stays_below_global_xid_base_on_range_0() {
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        // A terminal LOCAL entry (so the scan has a local row) and a GLOBAL-decision entry keyed
+        // high in the global-xid space (range 0 mixes participant markers with the global clog).
+        // NO in-doubt local marker → first_undecided == None → the watermark is max_li+1, which the
+        // bound must keep below GLOBAL_XID_BASE.
+        kv.write_batch(&[
+            mvcc::clog::put_op(5, mvcc::clog::XidStatus::Committed),
+            mvcc::clog::put_op(GLOBAL_XID_BASE + 3, mvcc::clog::XidStatus::Committed),
+        ])
+        .expect("seed");
+        let engine = SqlEngine::with_kv(kv.clone()).expect("engine"); // catalog_kv == kv (range-0 self)
+        let (gs, new_lo) = engine.in_doubt_globals_from(0).await.expect("scan");
+        assert!(gs.is_empty(), "no in-doubt markers → empty (got {gs:?})");
+        assert!(
+            new_lo < GLOBAL_XID_BASE,
+            "the watermark never jumps into the global-xid space (got {new_lo})"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_doubt_scan_returns_only_local_participant_markers_on_range_0() {
+        use mvcc::xid::GLOBAL_XID_BASE;
+        let kv: std::sync::Arc<dyn kv::Kv> = std::sync::Arc::new(kv::MemKv::new());
+        let g_indoubt = GLOBAL_XID_BASE + 7; // its decision is absent → in-doubt
+        kv.write_batch(&[
+            mvcc::clog::put_op(5, mvcc::clog::XidStatus::Prepared(g_indoubt)),
+            mvcc::clog::put_op(GLOBAL_XID_BASE + 3, mvcc::clog::XidStatus::Committed),
+        ])
+        .expect("seed");
+        let engine = SqlEngine::with_kv(kv.clone()).expect("engine");
+        let (gs, _new_lo) = engine.in_doubt_globals_from(0).await.expect("scan");
+        assert_eq!(
+            gs,
+            vec![g_indoubt],
+            "only the in-doubt local participant g is returned, never a global decision"
         );
     }
 

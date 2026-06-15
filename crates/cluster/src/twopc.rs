@@ -323,6 +323,12 @@ impl TxnService {
         self.engines.load().get(&range).cloned()
     }
 
+    /// SP23: is `range` currently serving WRITES/ALLOCATION (its rise sweep settled the current
+    /// term)? `true` when no gate is wired (in-process / never-recovering harness).
+    pub fn is_serving(&self, range: RangeId) -> bool {
+        self.gate.as_ref().is_none_or(|g| g.is_serving(range))
+    }
+
     /// Register a data-range engine so this node can serve `Stage`/`Release` for it.
     /// Copy-on-write (`rcu`) so concurrent lock-free readers never block; idempotent
     /// (re-registering replaces the entry). The `rcu` closure receives `&Arc<HashMap>`.
@@ -668,6 +674,36 @@ mod tests {
                 TxnResp::Staged
             ),
             "after the gate opens, the stage proceeds"
+        );
+    }
+
+    /// SP23: BeginGlobal (GTM allocation) is rejected (retryable NotLeader) while range 0's rise
+    /// sweep has not settled the current term; admitted once the gate opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_global_is_gated_until_range_0_is_settled() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let gate = crate::recovery_gate::RecoveryGate::new(node.id());
+        gate.register_range(0, node.rafts[&0].clone());
+        let svc = TxnService::new(node.engines.clone(), Some(gate.clone()));
+
+        // Gate closed (sentinel term) → BeginGlobal is rejected, retryable.
+        assert!(
+            matches!(
+                crate::transport::server::handle_txn_for_test(&svc, 0, TxnRpc::BeginGlobal).await,
+                TxnResp::NotLeader
+            ),
+            "BeginGlobal is gated while range 0 is unsettled"
+        );
+
+        // Open the gate for the current term → BeginGlobal proceeds.
+        let term = node.rafts[&0].metrics().borrow().current_term;
+        gate.mark_served(0, term);
+        assert!(
+            matches!(
+                crate::transport::server::handle_txn_for_test(&svc, 0, TxnRpc::BeginGlobal).await,
+                TxnResp::Began { .. }
+            ),
+            "after the gate opens, BeginGlobal allocates"
         );
     }
 

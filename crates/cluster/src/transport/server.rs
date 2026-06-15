@@ -239,14 +239,23 @@ async fn handle_txn(
     rpc: TxnRpc,
 ) -> TxnResp {
     match rpc {
-        TxnRpc::BeginGlobal => match svc.engine(0) {
-            Some(e) => match e.begin_global_durable().await {
-                Ok(g) => TxnResp::Began { g },
-                Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
-                Err(e) => TxnResp::Err(format!("{e:?}")),
-            },
-            None => TxnResp::Err("no range-0 engine".into()),
-        },
+        TxnRpc::BeginGlobal => {
+            // SP23: gate GTM allocation until range 0's rise sweep has reseeded the counter +
+            // settled (retryable — the coordinator re-resolves + retries on NotLeader). Prevents
+            // handing out a global xid from a stale (pre-reseed) counter on a freshly-risen leader.
+            if !svc.is_serving(0) {
+                TxnResp::NotLeader
+            } else {
+                match svc.engine(0) {
+                    Some(e) => match e.begin_global_durable().await {
+                        Ok(g) => TxnResp::Began { g },
+                        Err(executor::ExecError::NotLeader) => TxnResp::NotLeader,
+                        Err(e) => TxnResp::Err(format!("{e:?}")),
+                    },
+                    None => TxnResp::Err("no range-0 engine".into()),
+                }
+            }
+        }
         TxnRpc::CommitGlobal { g, commit } => match svc.engine(0) {
             Some(e) => {
                 let status = if commit {
@@ -282,6 +291,17 @@ async fn handle_txn(
         },
         rpc @ (TxnRpc::Stage { .. } | TxnRpc::Release { .. }) => svc.handle(range, rpc).await,
     }
+}
+
+/// SP23 test shim: drives `handle_txn` (a private free fn) with an empty `RangeRegistry`.
+/// The `BeginGlobal` arm never consults `registry`, so an empty one is safe for gating tests.
+#[cfg(test)]
+pub(crate) async fn handle_txn_for_test(
+    svc: &crate::twopc::TxnService,
+    range: RangeId,
+    rpc: TxnRpc,
+) -> TxnResp {
+    handle_txn(&RangeRegistry::new(), svc, range, rpc).await
 }
 
 #[cfg(test)]

@@ -281,6 +281,24 @@ impl ServerNode {
             engines.insert(range, engine);
         }
 
+        // SP23: register range 0 in the gate and spawn its rise sweep, mirroring the data
+        // ranges above. Range 0 is built specially OUTSIDE the pending loop, so its
+        // registration happens here, AFTER `gate`/`sweep_client` exist and (load-bearing)
+        // BEFORE `serve_node_protocol` below — so a node that becomes range-0 leader can never
+        // serve `BeginGlobal` while its gate reads the unregistered-default `true` (ungated).
+        // The GTM coordinator path (Begin/CommitGlobal/GlobalBarrier in handle_txn) does NOT go
+        // through the gated stage/dispatch DML, so a closed range-0 gate cannot deadlock it; it
+        // gates only range-0 PARTICIPANT writes (the SP22 stage/dispatch checks).
+        gate.register_range(0, rafts[&0].clone());
+        tokio::spawn(resolve_in_doubt_on_leadership(
+            rafts[&0].clone(),
+            0,
+            cfg.id,
+            engines[&0].clone(),
+            sweep_client.clone(),
+            gate.clone(),
+        ));
+
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         let txn = crate::twopc::TxnService::new(engines.clone(), Some(gate.clone()));
         // Spawn a per-range leadership-loss watcher: on the falling edge of this node's
@@ -469,6 +487,30 @@ impl ServerNode {
         // via `Arc` into the TxnService, the gateway router, and (Task 3) the rise sweeps.
         let gate = crate::recovery_gate::RecoveryGate::new(cfg.id);
         let txn = crate::twopc::TxnService::new(engines.clone(), Some(gate.clone()));
+
+        // SP23 (LOAD-BEARING): register range 0 in the gate and spawn its rise sweep BEFORE
+        // `serve_node_protocol` below binds the listener that serves `BeginGlobal`. The Phase-2
+        // all-ranges `sweep_client` is not built until much later (after `wait_for_range_map`),
+        // which would leave `BeginGlobal` UNGATED across that whole window — a node that becomes
+        // range-0 leader there would read the unregistered-default `is_serving(0) == true` and
+        // hand out a reused global xid. Range 0's sweep only resolves range 0 (self-loopback
+        // abort-races against its own clog), so a range-0-ONLY `TwoPcClient` suffices here. The
+        // GTM coordinator path (Begin/CommitGlobal/GlobalBarrier in handle_txn) bypasses the
+        // gated stage/dispatch DML, so a closed range-0 gate cannot deadlock the coordinator.
+        let r0_sweep_client = crate::twopc::TwoPcClient::new(
+            HashMap::from([(0, r0_raft.clone())]),
+            partition.clone(),
+        );
+        gate.register_range(0, r0_raft.clone());
+        tokio::spawn(resolve_in_doubt_on_leadership(
+            r0_raft.clone(),
+            0,
+            cfg.id,
+            engines[&0].clone(),
+            r0_sweep_client,
+            gate.clone(),
+        ));
+
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         tokio::spawn(serve_node_protocol(
             node_listener,
@@ -694,6 +736,15 @@ async fn resolve_in_doubt_on_leadership(
                     .applied_index_at_least(wait_to, "settle-before-serve")
                     .await
                     .map_err(|_| ())?;
+                // SP23: reseed the GTM (and local) counters from the now-applied store BEFORE
+                // opening the gate, so a range-0 leader never hands out a reused global xid. The
+                // apply-wait above guarantees the applied store reflects every committed
+                // begin_global_durable advance. reseed_* is lift-only (never regresses). FAIL-CLOSED:
+                // a reseed error aborts the settle so the gate stays CLOSED and retries — a
+                // silently-failed reseed must NOT let `mark_served` open the gate against a
+                // possibly-regressed counter.
+                engine.reseed_gtm().map_err(|_| ())?;
+                engine.reseed_counters().map_err(|_| ())?;
                 let scan_lo = engine.clog_scan_lo().unwrap_or(0);
                 let (gs, new_lo) = engine
                     .in_doubt_globals_from(scan_lo)
