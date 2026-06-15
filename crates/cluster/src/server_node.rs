@@ -26,6 +26,17 @@ use crate::transport::partition::PartitionState;
 use crate::transport::server::{RangeRegistry, ShutdownSignal, serve_node_protocol};
 use crate::types::{NodeId, TypeConfig};
 
+/// Bound for the settle-before-serve apply-wait (and the linearizable read that derives its
+/// target) on a leadership rise. On timeout the gate stays CLOSED (writes keep getting a
+/// retryable NotLeader) and the sweep RE-TRIES on the next wake — never open the gate after a
+/// failed settle.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Retry cadence for a CLOSED gate under continuous leadership. The rise sweep normally wakes
+/// on a metrics change, but a FAILED settle may leave no further metrics change to wake it; this
+/// caps the wait so a wedged-closed gate keeps retrying its settle. A recovery heartbeat (cf.
+/// `participant_silence_sweeper`'s 500ms tick), NOT a settle-sleep.
+const SETTLE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A built-but-not-yet-Arc'd data range: `(range, raft, applied store, engine)`.
 /// Collected during bring-up so the range-0 read barrier can be injected on each
 /// engine (with `&mut`) once the per-range `rafts` map is complete.
@@ -256,12 +267,15 @@ impl ServerNode {
             gate.register_range(range, raft.clone());
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             // On THIS data-range's leadership rising edge, finalize a failed-over
-            // participant's durable in-doubt markers (range 0 holds only global xids).
+            // participant's durable in-doubt markers (range 0 holds only global xids),
+            // then OPEN the recovery gate for the settled term.
             tokio::spawn(resolve_in_doubt_on_leadership(
                 raft.clone(),
+                range,
                 cfg.id,
                 engine.clone(),
                 sweep_client.clone(),
+                gate.clone(),
             ));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
@@ -520,12 +534,15 @@ impl ServerNode {
             txn.register_engine(range, engine.clone());
             tokio::spawn(reseed_on_leadership(raft.clone(), engine.clone()));
             // On THIS data-range's leadership rising edge, finalize a failed-over
-            // participant's durable in-doubt markers.
+            // participant's durable in-doubt markers, then OPEN the recovery gate for
+            // the settled term.
             tokio::spawn(resolve_in_doubt_on_leadership(
                 raft.clone(),
+                range,
                 cfg.id,
                 engine.clone(),
                 sweep_client.clone(),
+                gate.clone(),
             ));
             sm_kvs.insert(range, sm_kv);
             engines.insert(range, engine);
@@ -629,59 +646,80 @@ async fn release_on_leadership_loss(
     }
 }
 
-/// On the RISING edge of this node's leadership for `range`, finalize any in-doubt
-/// `Prepared(-> g)` markers in this range's durable clog whose coordinator died:
-/// abort-race each undecided `g` against range 0 (write-once). Heals a failed-over
-/// participant so its rows resolve (invisible for presumed-abort) rather than
-/// staying in-doubt forever. No sleep — mirrors `release_on_leadership_loss`.
+/// Settle-before-serve rise sweep (SP22). While this node leads `range` but its recovery
+/// gate is still closed for the current term, apply-wait through this term's committed index,
+/// then finalize any in-doubt `Prepared(-> g)` markers in this range's durable clog whose
+/// coordinator died: abort-race each undecided `g` against range 0 (write-once). On a clean
+/// settle, `mark_served` OPENS the gate so writes to `range` are admitted; on any error or
+/// timeout the gate stays CLOSED and the sweep retries on the next wake — never opened after a
+/// failed settle. Heals a failed-over participant so its rows resolve (invisible for
+/// presumed-abort) rather than staying in-doubt forever. No sleep — wakes on a metrics change,
+/// capped at `SETTLE_RETRY_INTERVAL` so a wedged-closed gate keeps retrying.
 async fn resolve_in_doubt_on_leadership(
     raft: openraft::Raft<TypeConfig>,
+    range: RangeId,
     id: NodeId,
     engine: Arc<SqlEngine>,
     client: std::sync::Arc<crate::twopc::TwoPcClient>,
+    gate: Arc<crate::recovery_gate::RecoveryGate>,
 ) {
     use crate::transport::protocol::TxnRpc;
     let mut rx = raft.metrics();
-    let mut was_leader = false;
     loop {
+        // Re-fire while we lead `range` but its gate is still closed for the CURRENT term —
+        // covers a fresh rise (sentinel != term) AND a FAILED prior settle (a wedged gate must
+        // keep retrying under continuous leadership, or it deadlocks every write to `range`).
+        // `is_serving` re-reads the live term, so a flap to a new term re-closes + re-settles.
         let is_leader = rx.borrow().current_leader == Some(id);
-        if is_leader && !was_leader {
-            // Start the recovery scan at this range's durable watermark, not the whole
-            // clog — bounding the scan to markers at/after the oldest still-in-doubt Li.
-            let scan_lo = engine.clog_scan_lo().unwrap_or(0);
-            if let Ok((gs, new_lo)) = engine.in_doubt_globals_from(scan_lo).await {
+        if is_leader && !gate.is_serving(range) {
+            // The leadership term we are settling (read + drop the Ref before awaiting).
+            let term = { rx.borrow().current_term };
+            // Apply-wait: settle through this term's committed index so the durable clog
+            // scan below sees EVERY inherited marker (closes the apply-lag miss). The
+            // `ensure_linearizable` index is the committed no-op for this term. BOTH the
+            // linearizable read and the apply-wait are bounded by SETTLE_TIMEOUT — a node that
+            // wins then loses quorum must not freeze here. On any error / timeout, leave the
+            // gate CLOSED and retry on the next wake — never open it after a failed settle.
+            let settled = async {
+                let wait_to = tokio::time::timeout(SETTLE_TIMEOUT, raft.ensure_linearizable())
+                    .await
+                    .map_err(|_| ())? // timed out
+                    .map_err(|_| ())? // RaftError
+                    .map(|l| l.index);
+                raft.wait(Some(SETTLE_TIMEOUT))
+                    .applied_index_at_least(wait_to, "settle-before-serve")
+                    .await
+                    .map_err(|_| ())?;
+                let scan_lo = engine.clog_scan_lo().unwrap_or(0);
+                let (gs, new_lo) = engine
+                    .in_doubt_globals_from(scan_lo)
+                    .await
+                    .map_err(|_| ())?;
                 for g in gs {
-                    // Best-effort: a failed abort-race (range 0 unreachable) leaves `g`
-                    // non-terminal, so `new_lo` does not pass it and it is re-swept next
-                    // rise. Log so a permanently-stuck range-0 is observable.
                     if let Err(e) = client
                         .call(0, TxnRpc::CommitGlobal { g, commit: false })
                         .await
                     {
-                        tracing::warn!(
-                            g,
-                            ?e,
-                            "recovery abort-race failed; g stays in-doubt, will re-scan next rise"
-                        );
+                        tracing::warn!(g, ?e, "recovery abort-race failed; g stays in-doubt");
                     }
                 }
-                // Advance past the contiguous terminal prefix (monotone, durable). Safe:
-                // `new_lo` never passes a marker whose g was non-terminal at scan time,
-                // so every in-doubt g keeps being swept (zombie-commit protection). The
-                // write is best-effort: a NotLeader rejection just leaves the old (lower)
-                // durable value, which only enlarges the next scan — never an unsafe skip.
                 if let Err(e) = engine.advance_clog_scan_lo(new_lo).await {
-                    tracing::debug!(
-                        new_lo,
-                        ?e,
-                        "watermark advance not durable (e.g. NotLeader); next leader re-scans from the old watermark — safe"
-                    );
+                    tracing::debug!(new_lo, ?e, "watermark advance not durable; safe to re-scan");
                 }
+                Ok::<(), ()>(())
+            }
+            .await;
+            if settled.is_ok() {
+                // Every inherited marker for `term` is now terminal → open the gate.
+                gate.mark_served(range, term);
             }
         }
-        was_leader = is_leader;
-        if rx.changed().await.is_err() {
-            return;
+        // Wake on the next metrics change, but cap the wait so a FAILED settle is retried even
+        // when no further metrics change arrives. A dropped sender (raft shutdown) ends the
+        // task. The cap is a recovery heartbeat, not a settle-sleep — a successful settle
+        // leaves `is_serving` true so the body no-ops.
+        if let Ok(Err(_)) = tokio::time::timeout(SETTLE_RETRY_INTERVAL, rx.changed()).await {
+            return; // metrics sender dropped → raft gone
         }
     }
 }
