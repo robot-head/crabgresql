@@ -2,7 +2,8 @@
 
 **Date:** 2026-06-14
 **Slice:** SP22 (D3c-settle-before-serve)
-**Status:** design
+**Status:** as-shipped (data-range settle-before-serve; range-0 participant + multi-process
+participant-leader-kill nemesis DEFERRED — see "CORRECTION (as-shipped)")
 **Stacked on:** SP21 (PR #37, unmerged) — needs SP21's idempotent `Stage`, resolve-then-release,
 and the `find_visible_one`/`scan_live` at-most-one-live detector. Rebase `--onto origin/main`
 once SP21 squash-merges.
@@ -23,6 +24,36 @@ for that range until its leadership-rise in-doubt sweep — preceded by an apply
 sees every inherited marker — has settled all of them. A per-range **term-based recovery gate**
 enforces this. No writer ever reads an unsettled inherited marker, so no duplicate is ever
 created.
+
+## CORRECTION (as-shipped)
+
+**SP22 ships the settle-before-serve gate proven for DATA ranges; the range-0 participant
+extension and the multi-process participant-leader-kill nemesis are DEFERRED.** The slice's own
+multi-process nemesis (`crossrange_2pc_restage`, kill `range_leader(1)` every round) did not
+converge, and root-cause digging (2026-06-15) found the participant-leader-kill problem has more
+layers than settle-before-serve alone closes:
+
+- **Range 0 is a 2PC participant on every cross-range transfer** (acct_a lives in range 0) but was
+  ungated/unswept (the bring-up loops `filter(|&r| r != 0)`). The "range 0 = non-goal" justification
+  ("the nemesis only kills `range_leader(1)`") is **unsound**: killing the range-1 leader kills a
+  node that is also a range-0 voter/sometimes-leader, so the nemesis churns range 0 too. A correct
+  range-0 extension also needs the recovery scan bounded at `GLOBAL_XID_BASE` (range 0's clog mixes
+  participant markers with the global decision clog).
+- **An idempotency no-op on the gateway-local participant stage is UNSAFE under global-xid reuse**
+  (a GTM reseed across range-0 churn can reuse a `g`, so `staged_local_for(g)` matches a stale
+  marker → a committed-with-missing-half tear). The gate, not idempotency, is the load-bearing
+  local-stage protection.
+- Even with range 0 gated+swept and that no-op removed, a **residual conservation tear + recovery
+  wedge** persist under kill-every-round — a deeper 2PC-atomicity-under-cascading-failover gap whose
+  failure mode shifts (wedge↔tear) without converging, exactly the incremental-patch anti-pattern.
+
+**As-shipped, SP22 = T1–T5:** `RecoveryGate` + the leadership-rise apply-wait/settle/`mark_served`
+sweep + the two write-path checks + the Stateright settle model, proven by in-crate unit tests, the
+model-with-teeth, and the existing `crossrange_2pc_nemesis`/`crossrange_2pc_replicated` regression
+(all green). Deferred to a dedicated slice (chip-tracked): the range-0 participant gate+sweep+scan-
+bound, and a *converging* participant-leader-kill nemesis (with stable windows, per the no-starve
+rule) for the cascading-failover 2PC gap. The deferred design is captured in the plan's "Task 6.5"
+section; do NOT re-attempt the incremental approach.
 
 ## Why incremental patches failed (do not repeat)
 
@@ -139,14 +170,20 @@ and replicated bring-up paths wire it identically.
 
 ## Success criteria
 
-| # | Criterion | Verified by |
-|---|---|---|
-| 1 | A participant-range leader killed during STAGE no longer corrupts a row: the cross-range bank total is conserved. | multi-process `crossrange_2pc_restage` nemesis |
-| 2 | That nemesis passes **3× non-flaky** (no 2-live crash, no recovery hang, no conservation tear). | repeated runs |
-| 3 | The gate rejects writes to a range whose current-term rise sweep has not completed, and admits them once it has. | in-process unit test on `RecoveryGate` + the rise path |
-| 4 | The settle-before-serve invariant holds under all interleavings; the no-gate variant is caught. | Stateright model with teeth (`crossrange_2pc_settle_model.rs`) |
-| 5 | Reads are never gated; the happy path and existing cross-range suites are unchanged. | regression gate |
-| 6 | Full gauntlet green; no new dependency; `#![forbid(unsafe_code)]`; traceability. | gauntlet + traceability |
+| # | Criterion | Verified by | Status |
+|---|---|---|---|
+| 1 | A participant-range leader killed during STAGE no longer corrupts a row: the cross-range bank total is conserved. | multi-process participant-leader-kill nemesis | **DEFERRED** — the kill-every-round nemesis did not converge; the participant-leader-kill problem has more layers than the data-range gate closes (range-0 participant gap + cascading-failover 2PC). Deferred to a dedicated slice. |
+| 2 | That nemesis passes **3× non-flaky**. | repeated runs | **DEFERRED** (with #1). |
+| 3 | The gate rejects writes to a range whose current-term rise sweep has not completed, and admits them once it has. | unit test on `RecoveryGate` + `TxnService::stage` gate test + the router real-gate test | **MET** |
+| 4 | The settle-before-serve invariant holds under all interleavings; the no-gate variant is caught. | Stateright model with teeth (`crossrange_2pc_settle_model.rs`) | **MET** |
+| 5 | Reads are never gated; the happy path and existing cross-range suites are unchanged. | regression gate (`crossrange_2pc_{nemesis,replicated}` + full suite) | **MET** |
+| 6 | Full gauntlet green; no new dependency; `#![forbid(unsafe_code)]`; traceability. | gauntlet + traceability | **MET** |
+
+The *rise-path* opening (a genuine leadership rise calling `mark_served`) is exercised end-to-end
+only by the multi-process suites; the in-process gate tests open the gate by calling `mark_served`
+directly. With the participant-leader-kill nemesis deferred, the existing `crossrange_2pc_nemesis`
+(kill a non-participant-leader) + `crossrange_2pc_replicated` provide the multi-process rise-path
+coverage that stays green with the gate enforced.
 
 ## Test plan
 
@@ -162,10 +199,9 @@ CLAUDE.md.
 2. **`RecoveryGate` unit test** (in-process) — construct a gate over a single-node Raft; assert
    `is_serving` is false at a fresh term and true after `mark_served(term)`; assert a write path
    wired to a closed gate returns the retryable error and a post-`mark_served` write proceeds.
-3. **Multi-process kill-during-stage nemesis** — `crates/crabgresql/tests/crossrange_2pc_restage.rs`
-   (UAC-safe name — no `setup/install/update/patch/upgrad`), copied from `crossrange_2pc_nemesis.rs`
-   with the victim changed to `let victim = c.range_leader(1).await;` (kill the acct_b participant
-   leader every round). Must pass conservation + non-vacuity, **3× non-flaky**.
+3. **Multi-process kill-during-stage nemesis** — **DEFERRED** (did not converge; see "CORRECTION
+   (as-shipped)"). The data-range rise path stays covered by the existing `crossrange_2pc_nemesis`
+   + `crossrange_2pc_replicated` regression with the gate enforced.
 4. **Regression** — `crossrange_2pc_{nemesis,replicated}`, the in-process cross-range suites, and
    the SP21 idempotent-Stage / find_visible_one tests stay green.
 5. **Gauntlet** — `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D
@@ -180,13 +216,15 @@ CLAUDE.md.
   at-most-one-live detector.
 - **Coordinator/gateway-crash re-stage** — handled by the SP18 participant self-resolve; SP22 is
   only about a *participant range leader* dying while the coordinator stays alive.
-- **Range 0 as a 2PC participant.** The bring-up loops register/sweep only data ranges (`r != 0`);
-  range 0 (the GTM/global-clog home) gets no recovery gate or rise sweep, so a cross-range txn
-  whose participant write lands on range 0 is ungated. The proving nemesis kills only
-  `range_leader(1)`, so this is not a gap for SP22's criteria, but a killed **range-0** leader
-  mid-stage is out of scope here. Registering range 0 naively (without also spawning a range-0
-  rise sweep to call `mark_served`) would wedge range 0 closed forever — so closing this needs a
-  range-0 sweep, deferred to a later slice.
+- **Range 0 as a 2PC participant — DEFERRED (not, as originally claimed, harmless).** The bring-up
+  loops register/sweep only data ranges (`r != 0`); range 0 (the GTM/global-clog home) gets no
+  recovery gate or rise sweep, so a cross-range txn whose participant write lands on range 0 is
+  ungated. The original "harmless because the nemesis kills only `range_leader(1)`" claim was
+  **wrong** (see "CORRECTION (as-shipped)"): killing the range-1 leader kills a node that is also a
+  range-0 voter/sometimes-leader. A correct range-0 extension (register + spawn its sweep; bound the
+  recovery scan at `GLOBAL_XID_BASE`; gate the gateway-local participant write WITHOUT the unsafe
+  `staged_local_for` no-op) is the first half of the deferred dedicated slice; the cascading-failover
+  2PC-atomicity gap is the second half.
 
 ## Risks (and mitigations)
 
@@ -205,4 +243,16 @@ CLAUDE.md.
 
 ## Traceability
 
-(Appended at finish — maps each success criterion 1–6 to its proving test.)
+| # | Criterion | Proving artifact | Status |
+|---|---|---|---|
+| 1 | Conservation under participant-leader kill | (multi-process participant-leader-kill nemesis) | DEFERRED |
+| 2 | Nemesis 3× non-flaky | (repeated runs) | DEFERRED |
+| 3 | Gate rejects pre-settle, admits post-settle | `cluster::recovery_gate::tests::gate_is_closed_at_a_fresh_term_and_opens_on_mark_served` + `cluster::twopc` `stage_is_gated_until_the_range_is_settled` + the `range::router` real-gate test (`MultiRangeCluster::leader_raft`) | MET |
+| 4 | Settle-before-serve invariant, no-gate caught | `cluster::tests::crossrange_2pc_settle_model` (positive + teeth) | MET |
+| 5 | Reads ungated; existing suites unchanged | `crossrange_2pc_{nemesis,replicated}` + the in-process cross-range suites + full workspace nextest | MET |
+| 6 | Gauntlet green, no new dep, UAC-safe | T7 gauntlet (`fmt`/`clippy -D warnings`/`nextest`/doctests/`deny`/UAC guard) | MET |
+
+**As-shipped scope:** the settle-before-serve `RecoveryGate` (one new dependency-free `cluster`
+module) + rise-sweep apply-wait/`mark_served` + the two write-path checks + one new Stateright test
+binary (`crossrange_2pc_settle_model`). No new runtime dependency. Criteria 1–2 (the multi-process
+participant-leader-kill empirical proof) are deferred to the dedicated follow-up slice.

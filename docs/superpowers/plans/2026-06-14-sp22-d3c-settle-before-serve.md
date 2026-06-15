@@ -587,6 +587,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Task 6: Multi-process participant-leader-kill nemesis
 
+> **DEFERRED (did not converge).** The kill-`range_leader(1)`-every-round nemesis exposed that
+> the participant-leader-kill problem has more layers than the data-range gate closes (range-0
+> participant gap + an unsafe local-stage idempotency no-op + a residual cascading-failover 2PC
+> tear/wedge that does NOT converge with incremental patches). Per the user's decision, SP22 ships
+> the proven T1–T5 and DEFERS this nemesis + Task 6.5 to a dedicated slice. See the spec's
+> "CORRECTION (as-shipped)" and the `sp22-range0-participant-gap-and-unsafe-local-stage-noop` memory.
+> The recipe below is retained for the dedicated slice (and MUST use stable windows, not
+> kill-every-round, per the no-starve rule).
+
 **Files:** Create `crates/crabgresql/tests/crossrange_2pc_restage.rs` (UAC-safe); Modify `CLAUDE.md`
 
 - [ ] **Step 1: Create the nemesis by copying + adapting.** Copy `crates/crabgresql/tests/crossrange_2pc_nemesis.rs` VERBATIM (the whole file — module-local helper block included; this verbatim duplication is the established convention). Then TWO edits:
@@ -633,6 +642,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Task 6.5: Extend settle-before-serve to range 0 (the participant gap the T6 nemesis exposed)
 
+> **DEFERRED to a dedicated slice.** The range-0 gate+sweep+scan-bound is structurally correct and
+> regression-clean, but it is necessary-not-sufficient: with it (and the unsafe `staged_local_for`
+> local-stage no-op removed), a residual cascading-failover conservation tear + recovery wedge
+> persist under kill-every-round. The empirically-validated learnings (range-0 scan must bound at
+> `GLOBAL_XID_BASE`; the local-stage no-op is UNSAFE under xid-reuse; the gate — not idempotency —
+> is the load-bearing local-stage protection; the GTM ops are NOT gated) are recorded for the
+> dedicated slice. This section is retained as that slice's starting design.
+
 **Why this exists.** T6's first run BLOCKED: the participant-leader-kill nemesis tore the bank total (e.g. 804 vs 800) and crash-looped the 2-live `debug_assert` (surfacing as the barrier timeout). Two independent investigations converged on the root cause: **range 0 is a 2PC participant on EVERY cross-range transfer** (`acct_a` lives in range 0) but it is **ungated and unswept** — both bring-up loops `filter(|&r| r != 0)` for gate registration and the rise-sweep spawn, so `is_serving(0)` returns the unregistered-range default `true` and neither write check ever gates a range-0 write. The spec listed "range 0 as a 2PC participant" as a non-goal, justified by "the nemesis only kills `range_leader(1)`" — but that is **unsound**: killing the range-1 leader kills a whole *node*, which is also a range-0 voter (and ~1/5 of the time its leader), so the nemesis churns range 0 onto an ungated/unswept leader and a subsequent range-0 participant write supersedes an unsettled inherited `Prepared(L0 -> g)` marker → the duplicate-version / torn-total bug, on range 0. Separately, the gateway-LOCAL participant stage path (`RangeRouter::stage_on`'s local branch) bypasses the SP21 `staged_local_for(g)` idempotency that the remote `TxnService::stage` path has. The user chose the **complete fix**: bring range 0 under the same settle-before-serve discipline + make the local participant stage idempotent.
 
 **The GTM subtlety (why range 0 isn't just "another data range").** Range 0 hosts the global decision clog: `commit_global_decision` writes `clog[g]` at `clog_key(g)` for `g >= mvcc::xid::GLOBAL_XID_BASE` (`1<<63`), in the SAME keyspace as range-0 participant markers `Prepared(L0 -> g)` at `clog_key(L0)` (`L0 < GLOBAL_XID_BASE`). The rise sweep's `in_doubt_globals_from` scans `clog_key(scan_lo)..clog_scan_end()` and advances the watermark to `max_li + 1`; on range 0 `max_li` would pick up a GLOBAL xid and jump the watermark past `GLOBAL_XID_BASE`, then miss every future participant marker. So the recovery scan must be **bounded to the local-participant xid space** before range 0 can be swept. (The GTM ops `begin_global_durable`/`commit_global_decision` are coordinator RPCs handled by `TxnService`'s `Begin`/`CommitGlobal` arms — NOT the `stage`/`dispatch` DML path — so gating range-0 WRITES does NOT gate the GTM; verify this so the gate cannot deadlock the coordinator.)
@@ -654,28 +671,28 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   (Use the actual `r0_raft`/`r0_engine` bindings if they're still in scope at that point, else `rafts[&0]`/`engines[&0]`.) Range 0's sweep abort-races inherited `Prepared(L0 -> g)` markers via `client.call(0, CommitGlobal{g, false})` — the authoritative global-decision write, write-once-safe.
 - [ ] **Verify the GTM is not gated:** confirm `begin_global_durable`/`commit_global_decision` reach range 0 via `TxnService`'s `Begin`/`CommitGlobal` handlers (NOT `stage`), so a closed range-0 gate never blocks the coordinator. (Read `TxnService::handle` / the coordinator path.) If any GTM op DID route through the gated `stage`/`dispatch` DML path, STOP and report — gating range 0 would deadlock 2PC.
 
-### Part C — Gate + idempotent the gateway-local participant stage (router)
-- [ ] In `RangeRouter::stage_on`'s LOCAL branch (`crates/cluster/src/range/router.rs:522-526`), before `join_global`/`run`, add (mirroring `TxnService::stage`):
+### Part C — Gate the gateway-local participant stage (router) — GATE ONLY, NO idempotency no-op
+> **CORRECTED after T6 digging:** the originally-planned `staged_local_for(g)` idempotency no-op on
+> the local branch is **UNSAFE** and must NOT be added. The router coordinates with a FRESH `g` per
+> escalation, so it never legitimately re-stages the same `g` locally; and under GTM **xid reuse** (a
+> range-0 reseed across churn can reuse a `g`), `staged_local_for(g)` matches a STALE marker → the
+> no-op returns success-without-staging → the coordinator commits `g` with a missing half → a
+> money-creating tear (confirmed: removing the no-op eliminated the frequent +N tears). The GATE
+> alone is the correct, load-bearing local-stage protection.
+- [ ] In `RangeRouter::stage_on`'s LOCAL branch (`crates/cluster/src/range/router.rs:522-526`), before `join_global`/`run`, add ONLY the gate check:
   ```rust
       if self.engines.contains_key(&range) && self.leads.leads(range) {
-          // SP22: gate the local participant write on an unsettled freshly-risen leader.
+          // Gate the local participant version-creating write on a freshly-risen, unsettled
+          // leader (retryable NotLeader -> 40001 -> client retries). NO staged_local_for no-op
+          // here — see the CORRECTED note above (unsafe under GTM xid reuse).
           if self.gate.as_ref().is_some_and(|g_| !g_.is_serving(range)) {
               return Err(ExecError::NotLeader);
-          }
-          // SP22: idempotent local Stage — a durable Prepared(-> g) inherited from a dead
-          // leader means this g is already staged on `range`; re-running would double-version.
-          if let Some(engine) = self.engines.get(&range)
-              && engine.staged_local_for(g).await.map_err(...)?.is_some()
-              && /* no in-router session has already joined g on this range */
-          {
-              return Ok(QueryResult::Command { tag: "OK".into() });
           }
           self.ensure_began_on(range).await?;
           self.session_mut(range).join_global(g).await?;
           return self.session_mut(range).run(stmt).await;
       }
   ```
-  Read the real `stage_on` + `session_mut`/`SessionEntry` to express "no in-router session has already joined g on this range" correctly (the in-process/same-router case must still run normally — the idempotency no-op is only for an inherited marker with NO live router session for g). The GATE check is the load-bearing part (it blocks the version-creating write until settle); the `staged_local_for` no-op mirrors the remote path for uniformity/defense. `self.engines` here is `HashMap<RangeId, SqlEngine>` (router-owned), so `engine.staged_local_for(g)` is callable. Match the real `ExecError` mapping.
 
 ### Part D — Re-run the nemesis 3× (the proof)
 - [ ] `cargo nextest run -p crabgresql --test crossrange_2pc_restage` THREE times → PASS all 3 (conservation holds, no 2-live crash-loop, non-vacuous). If it STILL tears, STOP and report with output — do NOT weaken any assert.
@@ -698,25 +715,19 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Task 7: Gauntlet, traceability, finish
 
+> **As-shipped (T6/T6.5 DEFERRED):** the gauntlet runs over the proven T1–T5 only; there is no
+> `crossrange_2pc_restage` in the tree (it didn't converge and was not committed). The spec's
+> Traceability + Success-criteria tables are already filled with the as-shipped status (3–6 MET,
+> 1–2 DEFERRED).
+
 - [ ] **Step 1: Full-workspace gauntlet.**
 - `cargo fmt --all --check` → clean (else `cargo fmt --all`).
 - `cargo clippy --workspace --all-targets -- -D warnings` → clean.
-- `cargo nextest run --workspace` → all pass (run the multi-process suites; confirm `crossrange_2pc_restage` is green).
+- `cargo nextest run --workspace` → all pass (incl. the existing `crossrange_2pc_{nemesis,replicated}` multi-process regression with the gate enforced).
 - `cargo test --workspace --doc` → pass.
 - `cargo deny check` → ok (no new dependency).
 
-- [ ] **Step 2: Fill the spec Traceability section.** Replace the placeholder with criterion → test:
-
-| # | Criterion | Test |
-|---|---|---|
-| 1 | Conservation under participant-leader kill | `crossrange_2pc_restage::cross_range_bank_conserves_total_under_participant_leader_kill` |
-| 2 | Nemesis 3× non-flaky | Task 6 Step 2 |
-| 3 | Gate rejects pre-settle, admits post-settle | `recovery_gate::tests::gate_is_closed_…` + `twopc::tests::stage_is_gated_until_the_range_is_settled` + the router gate test |
-| 4 | Settle-before-serve invariant, no-gate caught | `crossrange_2pc_settle_model` (teeth + positive) |
-| 5 | Reads ungated; existing suites unchanged | regression (`crossrange_2pc_{nemesis,replicated}` + full suite) |
-| 6 | Gauntlet green, no new dep, UAC-safe | this task |
-
-Note for criterion 3: the gate **unit/seam** tests open the gate by calling `mark_served` manually (they assert the gate's reject/admit logic). The genuine *leadership-rise* opening path — `resolve_in_doubt_on_leadership` apply-waiting, settling, then calling `mark_served` on a real rise — is exercised end-to-end only by the T6 multi-process nemesis (and the T4 `crossrange_2pc_nemesis` smoke run). Record that rise-path coverage is the multi-process suites, not the unit tests.
+- [ ] **Step 2: (Done above)** The spec Traceability + Success-criteria tables are filled with the as-shipped status. Criterion 3 (the gate reject/admit) is proven by `recovery_gate::tests` + `twopc` `stage_is_gated_until_the_range_is_settled` + the router real-gate test; criterion 4 by `crossrange_2pc_settle_model`; criteria 1–2 (the multi-process participant-leader-kill empirical proof) are DEFERRED.
 
 - [ ] **Step 3: Commit traceability.**
 ```bash
