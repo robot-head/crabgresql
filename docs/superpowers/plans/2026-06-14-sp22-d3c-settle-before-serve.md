@@ -631,6 +631,71 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Task 6.5: Extend settle-before-serve to range 0 (the participant gap the T6 nemesis exposed)
+
+**Why this exists.** T6's first run BLOCKED: the participant-leader-kill nemesis tore the bank total (e.g. 804 vs 800) and crash-looped the 2-live `debug_assert` (surfacing as the barrier timeout). Two independent investigations converged on the root cause: **range 0 is a 2PC participant on EVERY cross-range transfer** (`acct_a` lives in range 0) but it is **ungated and unswept** — both bring-up loops `filter(|&r| r != 0)` for gate registration and the rise-sweep spawn, so `is_serving(0)` returns the unregistered-range default `true` and neither write check ever gates a range-0 write. The spec listed "range 0 as a 2PC participant" as a non-goal, justified by "the nemesis only kills `range_leader(1)`" — but that is **unsound**: killing the range-1 leader kills a whole *node*, which is also a range-0 voter (and ~1/5 of the time its leader), so the nemesis churns range 0 onto an ungated/unswept leader and a subsequent range-0 participant write supersedes an unsettled inherited `Prepared(L0 -> g)` marker → the duplicate-version / torn-total bug, on range 0. Separately, the gateway-LOCAL participant stage path (`RangeRouter::stage_on`'s local branch) bypasses the SP21 `staged_local_for(g)` idempotency that the remote `TxnService::stage` path has. The user chose the **complete fix**: bring range 0 under the same settle-before-serve discipline + make the local participant stage idempotent.
+
+**The GTM subtlety (why range 0 isn't just "another data range").** Range 0 hosts the global decision clog: `commit_global_decision` writes `clog[g]` at `clog_key(g)` for `g >= mvcc::xid::GLOBAL_XID_BASE` (`1<<63`), in the SAME keyspace as range-0 participant markers `Prepared(L0 -> g)` at `clog_key(L0)` (`L0 < GLOBAL_XID_BASE`). The rise sweep's `in_doubt_globals_from` scans `clog_key(scan_lo)..clog_scan_end()` and advances the watermark to `max_li + 1`; on range 0 `max_li` would pick up a GLOBAL xid and jump the watermark past `GLOBAL_XID_BASE`, then miss every future participant marker. So the recovery scan must be **bounded to the local-participant xid space** before range 0 can be swept. (The GTM ops `begin_global_durable`/`commit_global_decision` are coordinator RPCs handled by `TxnService`'s `Begin`/`CommitGlobal` arms — NOT the `stage`/`dispatch` DML path — so gating range-0 WRITES does NOT gate the GTM; verify this so the gate cannot deadlock the coordinator.)
+
+**Files:** `crates/executor/src/lib.rs` (scan bound + test), `crates/cluster/src/server_node.rs` (range-0 gate+sweep, all bring-up paths), `crates/cluster/src/range/router.rs` (local-stage gate+idempotency), `crates/crabgresql/tests/crossrange_2pc_restage.rs` (re-run).
+
+### Part A — Range-0-safe recovery scan (executor)
+- [ ] In `in_doubt_globals_from` (`crates/executor/src/lib.rs:277`) AND `staged_local_for` (`:327`), change the scan upper bound from `kv::key::clog_scan_end()` to `kv::key::clog_key(mvcc::xid::GLOBAL_XID_BASE)` so the scan covers only local-participant xids (`< GLOBAL_XID_BASE`) and never the global-decision entries. On a data range this is a no-op (no global xids exist there); on range 0 it keeps `max_li`/the watermark in the local space. Add `use mvcc::xid::GLOBAL_XID_BASE;` or fully-qualify.
+- [ ] **Unit test** (`#[cfg(test)]` in the executor, mirroring the existing recovery-scan tests): build a range-0-style engine (or seed a `kv` directly) with a MIX of `Prepared(L0 -> g)` participant markers at `L0 < GLOBAL_XID_BASE` AND global-decision entries `Committed`/`Aborted` at `g >= GLOBAL_XID_BASE`; assert `in_doubt_globals_from(0)` returns ONLY the in-doubt participant `g`s and that `new_scan_lo < GLOBAL_XID_BASE` (the watermark never jumps into the global space). This is the new-logic teeth for Part A.
+
+### Part B — Register range 0 in the gate + spawn its rise sweep (server_node, EVERY bring-up path)
+- [ ] In `start_static` AND `start_replicated` (and any other path that builds ranges — grep `resolve_in_doubt_on_leadership` spawn sites and `register_range` call sites), register range 0 in the gate and spawn its rise sweep, with the SAME register-before-spawn ordering as data ranges. Range 0 is built specially (before/outside the `filter(|&r| r != 0)` pending loop), so add explicitly after the gate + `sweep_client` exist:
+  ```rust
+  gate.register_range(0, rafts[&0].clone());
+  tokio::spawn(resolve_in_doubt_on_leadership(
+      rafts[&0].clone(), 0, cfg.id, engines[&0].clone(), sweep_client.clone(), gate.clone(),
+  ));
+  ```
+  (Use the actual `r0_raft`/`r0_engine` bindings if they're still in scope at that point, else `rafts[&0]`/`engines[&0]`.) Range 0's sweep abort-races inherited `Prepared(L0 -> g)` markers via `client.call(0, CommitGlobal{g, false})` — the authoritative global-decision write, write-once-safe.
+- [ ] **Verify the GTM is not gated:** confirm `begin_global_durable`/`commit_global_decision` reach range 0 via `TxnService`'s `Begin`/`CommitGlobal` handlers (NOT `stage`), so a closed range-0 gate never blocks the coordinator. (Read `TxnService::handle` / the coordinator path.) If any GTM op DID route through the gated `stage`/`dispatch` DML path, STOP and report — gating range 0 would deadlock 2PC.
+
+### Part C — Gate + idempotent the gateway-local participant stage (router)
+- [ ] In `RangeRouter::stage_on`'s LOCAL branch (`crates/cluster/src/range/router.rs:522-526`), before `join_global`/`run`, add (mirroring `TxnService::stage`):
+  ```rust
+      if self.engines.contains_key(&range) && self.leads.leads(range) {
+          // SP22: gate the local participant write on an unsettled freshly-risen leader.
+          if self.gate.as_ref().is_some_and(|g_| !g_.is_serving(range)) {
+              return Err(ExecError::NotLeader);
+          }
+          // SP22: idempotent local Stage — a durable Prepared(-> g) inherited from a dead
+          // leader means this g is already staged on `range`; re-running would double-version.
+          if let Some(engine) = self.engines.get(&range)
+              && engine.staged_local_for(g).await.map_err(...)?.is_some()
+              && /* no in-router session has already joined g on this range */
+          {
+              return Ok(QueryResult::Command { tag: "OK".into() });
+          }
+          self.ensure_began_on(range).await?;
+          self.session_mut(range).join_global(g).await?;
+          return self.session_mut(range).run(stmt).await;
+      }
+  ```
+  Read the real `stage_on` + `session_mut`/`SessionEntry` to express "no in-router session has already joined g on this range" correctly (the in-process/same-router case must still run normally — the idempotency no-op is only for an inherited marker with NO live router session for g). The GATE check is the load-bearing part (it blocks the version-creating write until settle); the `staged_local_for` no-op mirrors the remote path for uniformity/defense. `self.engines` here is `HashMap<RangeId, SqlEngine>` (router-owned), so `engine.staged_local_for(g)` is callable. Match the real `ExecError` mapping.
+
+### Part D — Re-run the nemesis 3× (the proof)
+- [ ] `cargo nextest run -p crabgresql --test crossrange_2pc_restage` THREE times → PASS all 3 (conservation holds, no 2-live crash-loop, non-vacuous). If it STILL tears, STOP and report with output — do NOT weaken any assert.
+- [ ] Regression: `cargo nextest run -p crabgresql --test crossrange_2pc_nemesis --test crossrange_2pc_replicated` and `cargo nextest run -p cluster` and `-p executor` → green (range-0 gating must not regress the happy path or the existing nemeses).
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all`.
+
+### Part E — Model coverage note
+The existing T5 Stateright model proves "an unsettled inherited marker + an un-gated write → duplicate; gated → safe" for a generic participant range. Range 0 is now just another gated participant range, so the model's invariant covers it; Part A's range-0 scan-bound is proven by its dedicated executor unit test (the only genuinely new logic). Record this in the traceability note rather than adding a redundant model.
+
+### Part F — Commit + reconcile the spec non-goal
+- [ ] Commit the fix across the three crates. Then UPDATE the spec: REMOVE "Range 0 as a 2PC participant" from Non-goals (it is now in scope and fixed) and add a short "Range-0 participant gap (found + fixed in T6.5)" note to the design's risk/decision history.
+```bash
+git add crates/executor/src/lib.rs crates/cluster/src/server_node.rs crates/cluster/src/range/router.rs docs/superpowers/specs/2026-06-14-crabgresql-sp22-d3c-settle-before-serve-design.md
+git commit -m "fix(sp22): bring range 0 under settle-before-serve (gate+sweep+range-0-safe scan) + idempotent local stage
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Task 7: Gauntlet, traceability, finish
 
 - [ ] **Step 1: Full-workspace gauntlet.**
