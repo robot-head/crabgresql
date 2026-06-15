@@ -180,6 +180,13 @@ CLAUDE.md.
   at-most-one-live detector.
 - **Coordinator/gateway-crash re-stage** — handled by the SP18 participant self-resolve; SP22 is
   only about a *participant range leader* dying while the coordinator stays alive.
+- **Range 0 as a 2PC participant.** The bring-up loops register/sweep only data ranges (`r != 0`);
+  range 0 (the GTM/global-clog home) gets no recovery gate or rise sweep, so a cross-range txn
+  whose participant write lands on range 0 is ungated. The proving nemesis kills only
+  `range_leader(1)`, so this is not a gap for SP22's criteria, but a killed **range-0** leader
+  mid-stage is out of scope here. Registering range 0 naively (without also spawning a range-0
+  rise sweep to call `mark_served`) would wedge range 0 closed forever — so closing this needs a
+  range-0 sweep, deferred to a later slice.
 
 ## Risks (and mitigations)
 
