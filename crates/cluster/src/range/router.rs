@@ -325,6 +325,10 @@ impl RangeRouter {
         // SP22 settle-before-serve: reject a locally-led WRITE (Insert/Update/Delete) on a
         // range whose rise sweep has not settled the current term. Reads (Select) and
         // DDL/txn-control pass ungated. Retryable NotLeader -> 40001 -> client retries.
+        // A locking SELECT (FOR UPDATE/FOR SHARE) is intentionally ungated: it creates no new
+        // row version or Prepared(-> g) marker, so it cannot produce the duplicate-version
+        // hazard the gate prevents, and it resolves any inherited in-doubt row via the
+        // under-lock global-clog read in eval_plan_qual — exact regardless of settle state.
         if matches!(
             stmt,
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
