@@ -671,6 +671,10 @@ async fn resolve_in_doubt_on_leadership(
         // keep retrying under continuous leadership, or it deadlocks every write to `range`).
         // `is_serving` re-reads the live term, so a flap to a new term re-closes + re-settles.
         let is_leader = rx.borrow().current_leader == Some(id);
+        // In the transiently-deposed window (`current_leader` still names self but
+        // `state != Leader`) the body may fire, but `is_serving`'s stricter `state == Leader`
+        // check keeps the gate closed and `ensure_linearizable` fast-fails (returns
+        // `ForwardToLeader` once a higher term is seen) — a cheap no-op retry, not a hang.
         if is_leader && !gate.is_serving(range) {
             // The leadership term we are settling (read + drop the Ref before awaiting).
             let term = { rx.borrow().current_term };
@@ -712,6 +716,16 @@ async fn resolve_in_doubt_on_leadership(
             if settled.is_ok() {
                 // Every inherited marker for `term` is now terminal → open the gate.
                 gate.mark_served(range, term);
+            } else {
+                // Settle failed (apply-wait timeout / not-yet-quorum / scan error): the gate
+                // stays CLOSED and we retry on the next wake. Logged so a permanently-wedged
+                // range (a leader that can never linearize) is observable rather than silently
+                // rejecting every write.
+                tracing::debug!(
+                    range,
+                    term,
+                    "settle-before-serve did not complete; gate stays closed, will retry"
+                );
             }
         }
         // Wake on the next metrics change, but cap the wait so a FAILED settle is retried even
