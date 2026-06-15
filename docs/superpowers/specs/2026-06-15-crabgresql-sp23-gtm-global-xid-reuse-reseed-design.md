@@ -112,6 +112,14 @@ own `CommitGlobal` abort-races are never gated, so a closed range-0 gate cannot 
   `CommitGlobal` abort-races and the coordinator's commit/release run ungated.
 - **Durable counter already monotone.** The state machine max-merges `next_global`, so the *durable*
   value never regresses; SP23 only closes the *in-memory* regression window on a new leader.
+- **The pre-existing rising-edge reseed is retained and harmless.** Both bring-up paths already spawn
+  `reseed_on_leadership` for range 0 (the un-apply-waited rising-edge `reseed_gtm` — the bug). SP23
+  keeps it (it also reseeds the local procarray/seq counters): `reseed_from_applied` is lift-only
+  (`max`, never regresses), and since `begin_global` is gated until the apply-waited sweep reseed +
+  `mark_served`, no allocation can ever observe a stale-but-lifted counter. Only the *networked*
+  allocation path (`handle_txn`'s `BeginGlobal`) is gated; the in-process `LocalCoordinator` path is
+  not, which is safe because the in-process harness wires a `None` gate and never regresses the
+  counter (it does not kill the range-0 leader).
 
 ## Success criteria
 
