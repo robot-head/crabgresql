@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-15
 **Slice:** SP23 (range-0 leadership-rise recovery — the root cause of the deferred participant-leader-kill non-convergence)
-**Status:** design
+**Status:** as-shipped (all 6 criteria MET; the range-0-leader-kill nemesis converges 3× non-flaky)
 **Stacked on:** SP22 (PR #38, unmerged) — needs SP22's `RecoveryGate` + rise-sweep + write checks.
 Rebase `--onto origin/main` once SP22 squash-merges.
 
@@ -181,4 +181,13 @@ watch, the multi-process harness's bounded poll cadence) — no `sleep`-to-settl
 
 ## Traceability
 
-(Appended at finish — maps each success criterion 1–6 to its proving test.)
+| # | Criterion | Proving test | Status |
+|---|---|---|---|
+| 1 | No global-xid reuse across a range-0 leadership change | `executor::gtm::tests::stale_in_memory_counter_reuses_g_until_reseed` (teeth: reuse-without-reseed; positive: reseed prevents it) + the range-0 rise-sweep apply-wait → `reseed_gtm` (`server_node::resolve_in_doubt_on_leadership`) | MET |
+| 2 | `begin_global` rejected (retryable) until range-0 settled, admitted once settled | `cluster::twopc::tests::begin_global_is_gated_until_range_0_is_settled` (closed → `NotLeader`; `mark_served` → `Began`) | MET |
+| 3 | reseed-before-allocate invariant under all interleavings; no-reseed variant caught | `cluster::tests::crossrange_2pc_gtm_reuse_model` — `reseed_before_allocate_upholds_at_most_one_live` (positive) + `no_reseed_reuses_global_xid_and_double_lives_is_caught` (teeth, names "at most one live version per row") | MET |
+| 4 | Range-0-leader-kill stable-window nemesis conserves the bank total, 3× non-flaky | `crabgresql::range0_leader_kill_drain::range0_participant_leader_kill_conserves_total` (kill `range_leader(0)` + full-drain; 6 green runs across implementer + independent review) | MET |
+| 5 | Range-0-safe scan bound; recovery paths (`CommitGlobal`/`Barrier`/`Release`) ungated; existing suites unchanged | `executor::in_doubt_scan_watermark_stays_below_global_xid_base_on_range_0` + `in_doubt_scan_returns_only_local_participant_markers_on_range_0` + the full regression suite | MET |
+| 6 | Full gauntlet green; no new dependency; `#![forbid(unsafe_code)]`; UAC-safe | `cargo fmt`/`clippy -D warnings`/`nextest --workspace --profile ci` (416/416)/doctests/`deny`/UAC guard | MET |
+
+**As-shipped:** the range-0 settle-before-serve extension + the GTM reseed-before-allocate gate, two new test binaries (`cluster::crossrange_2pc_gtm_reuse_model`, `crabgresql::range0_leader_kill_drain`), no new runtime dependency. The range-0-leader-kill nemesis — which SP22 could not converge without the reseed fix — passes 3× non-flaky, empirically confirming the probe's root cause. The deferred cascading-failover (overlapping-failover) 2PC gap remains a spec non-goal for a future slice.
