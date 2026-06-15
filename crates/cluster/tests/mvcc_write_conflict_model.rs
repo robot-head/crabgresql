@@ -274,11 +274,10 @@ impl Model for WriteConflictModel {
             // un-superseded; if both writers committed and both versions are live, the second
             // failed to supersede the first — the lost update.
             Property::<Self>::always("no lost update (first-committer-wins)", |_, s| {
-                let both_live = WRITERS.iter().filter(|&&x| {
-                    s.versions
-                        .iter()
-                        .any(|v| v.creator == x && s.live(v))
-                }).count();
+                let both_live = WRITERS
+                    .iter()
+                    .filter(|&&x| s.versions.iter().any(|v| v.creator == x && s.live(v)))
+                    .count();
                 both_live <= 1
             }),
         ]
