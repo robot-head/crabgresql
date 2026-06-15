@@ -186,6 +186,13 @@ pub struct RangeRouter {
     /// mixing a local and a remote range forwards only the remote statement and never
     /// re-runs the local one on the remote node.
     cur_sql: String,
+    /// Per-txn cross-range write-set: every held table-bearing DML of a `BEGIN..COMMIT`
+    /// block as `(target range, parsed statement, exact source SQL)`, in execution
+    /// order. The replay log for the SP21 fresh-`g'` re-attempt; empty outside an
+    /// escalatable cross-range txn, cleared at `finish_txn`. Carries the source `String`
+    /// because the remote stage path relays `cur_sql` text while the local path runs the
+    /// parsed `Statement`.
+    restage_buf: Vec<(RangeId, Statement, String)>,
     /// Test-only coordinator pause seam: invoked inside the global COMMIT/ROLLBACK
     /// path AFTER every participant has staged (joined `g`) and BEFORE
     /// `commit_global_decision` writes the global decision. A crash test installs a
@@ -217,6 +224,7 @@ impl RangeRouter {
             forward,
             coordinator,
             cur_sql: String::new(),
+            restage_buf: Vec::new(),
             #[cfg(test)]
             before_global_decision: None,
         }
@@ -241,6 +249,12 @@ impl RangeRouter {
             Pin::Global { g, .. } => Some(*g),
             _ => None,
         }
+    }
+
+    /// Test-only: the ordered target ranges currently in the re-stage write-set buffer.
+    #[cfg(test)]
+    fn restage_buf_ranges(&self) -> Vec<RangeId> {
+        self.restage_buf.iter().map(|(r, _, _)| *r).collect()
     }
 
     /// Test-only: the coordinator engine (range 0's GTM-bearing engine), so a crash
@@ -350,6 +364,9 @@ impl RangeRouter {
                         // is held until COMMIT.
                         self.pin = Pin::Range(r);
                         self.ensure_began_on(r).await?;
+                        if self.can_escalate() {
+                            self.record_write(r, stmt);
+                        }
                         return self.run_on(r, stmt).await;
                     }
                     // The very first participant is remote: escalate now and stage it.
@@ -367,6 +384,7 @@ impl RangeRouter {
                     let mut ranges = std::collections::BTreeSet::new();
                     ranges.insert(r);
                     self.pin = Pin::Global { ranges, g };
+                    self.record_write(r, stmt);
                     self.stage_on(r, g, stmt).await
                 }
                 None => self.run_on(0, stmt).await, // DDL / FROM-less SELECT: range 0, stay unpinned.
@@ -397,9 +415,13 @@ impl RangeRouter {
                     ranges.insert(p);
                     ranges.insert(r);
                     self.pin = Pin::Global { ranges, g };
+                    self.record_write(r, stmt);
                     return self.stage_on(r, g, stmt).await;
                 }
                 // Same range (or no-table statement): run on the pinned session.
+                if pinning == Some(p) && self.can_escalate() {
+                    self.record_write(p, stmt);
+                }
                 self.run_on(p, stmt).await
             }
             // Already global: a table-bearing statement on any range is staged into
@@ -412,7 +434,10 @@ impl RangeRouter {
                     {
                         ranges.insert(r);
                     }
-                    return self.stage_on(r, g, stmt).await;
+                    return {
+                        self.record_write(r, stmt);
+                        self.stage_on(r, g, stmt).await
+                    };
                 }
                 // A no-table statement (DDL / FROM-less SELECT) runs on range 0.
                 self.run_on(0, stmt).await
@@ -424,6 +449,7 @@ impl RangeRouter {
     /// Under `Pin::Global` this drives the single global decision through range 0;
     /// otherwise it is the unchanged single-range close.
     async fn finish_txn(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        self.restage_buf.clear();
         match std::mem::replace(&mut self.pin, Pin::None) {
             Pin::Global { ranges, g } => {
                 let commit = matches!(stmt, Statement::Commit);
@@ -487,6 +513,14 @@ impl RangeRouter {
     /// single-range non-range-0 first-DML case and for cross-range escalation.
     async fn ensure_began_on(&mut self, range: RangeId) -> Result<(), ExecError> {
         self.session_mut(range).ensure_began().await
+    }
+
+    /// Record one held table-bearing DML into the per-txn re-stage write-set buffer.
+    /// Called at every point a DML is held (run locally OR staged) inside a txn that
+    /// can escalate, so a fresh-`g'` re-attempt can replay the complete write-set.
+    fn record_write(&mut self, range: RangeId, stmt: &Statement) {
+        self.restage_buf
+            .push((range, stmt.clone(), self.cur_sql.clone()));
     }
 
     /// Run a participant statement on `range` inside global txn `g`: locally if led,
@@ -774,6 +808,51 @@ mod tests {
         let mut after = RangeRouter::connect(&c).await;
         assert_eq!(after.scan_one_i32("SELECT id FROM a").await, vec![1]);
         assert_eq!(after.scan_one_i32("SELECT id FROM b").await, vec![2]);
+    }
+
+    /// The write-set buffer captures EVERY held cross-range DML, including the
+    /// led-local first DML that ran before `g` existed (the silent-data-loss trap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restage_buffer_captures_full_cross_range_write_set() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        admin
+            .simple("INSERT INTO a VALUES (10)")
+            .await
+            .expect("seed a");
+        admin
+            .simple("INSERT INTO b VALUES (20)")
+            .await
+            .expect("seed b");
+        drop(admin);
+
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("UPDATE a SET id = 11 WHERE id = 10")
+            .await
+            .expect("a pins range 0");
+        router
+            .simple("UPDATE b SET id = 21 WHERE id = 20")
+            .await
+            .expect("b escalates");
+        // The buffer holds both held DMLs, range 0's FIRST (pre-escalation) then range 1's.
+        assert_eq!(
+            router.restage_buf_ranges(),
+            vec![0, 1],
+            "buffer must capture the pre-escalation local DML (range 0) AND the staged DML (range 1)"
+        );
+        router.simple("COMMIT").await.expect("commit");
+        // Cleared at txn close.
+        assert!(
+            router.restage_buf_ranges().is_empty(),
+            "buffer cleared on finish_txn"
+        );
     }
 
     /// The ROLLBACK sibling: the same cross-range txn rolled back leaves NEITHER row
