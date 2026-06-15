@@ -284,10 +284,10 @@ impl Model for SettleModel {
                 n.served_term = n.current_term;
             }
             Action::Rise => {
-                // A new leadership term re-closes the gate (served_term now lags) until the
-                // next Settle. A fresh rise also re-presents the (already-resolved-or-not)
-                // inherited marker as un-swept for the new term: model the conservative case
-                // by leaving `inherited_resolved` as-is but re-closing the gate.
+                // A new leadership term: bump current_term so served_term now lags and
+                // gate_open() is false again until the next Settle. The durable inherited marker
+                // persists across the rise (inherited_resolved unchanged) — a re-risen leader
+                // re-gates on the term alone, exactly as is_serving re-reads the live term.
                 n.current_term += 1;
             }
         }
