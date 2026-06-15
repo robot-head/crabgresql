@@ -430,6 +430,26 @@ impl TxnService {
         if self.engine(range).is_none() {
             return TxnResp::NotLeader;
         }
+        // IDEMPOTENCY: when there is NO in-memory held session for (g, range) but a durable
+        // `Prepared(Li -> g)` marker already exists on this range, this is a Stage(g) RETRY
+        // that landed on a NEW leader after the original leader staged-then-died (the held-
+        // session map is per-process and was lost with the old leader). The first attempt's
+        // row version is durable + replicated; staging again would write a SECOND
+        // `Prepared(-> g)` version → two live versions when g commits. Return Staged (no-op).
+        // When a held session DOES exist, this is the SAME leader handling another statement of
+        // the same txn — fall through and run it on that session (preserves multi-statement
+        // participants). KNOWN-SCOPE: a multi-statement-same-range txn whose leader fails over
+        // mid-way then retries a LATER statement would be short-circuited here; the bank
+        // workload (one statement per range per txn) never hits this, matching the slice scope.
+        let has_held = { self.held.lock().await.contains_key(&(g, range)) };
+        if !has_held {
+            let engine = self.engine(range).expect("engine present (checked above)");
+            match engine.staged_local_for(g).await {
+                Ok(Some(_)) => return TxnResp::Staged,
+                Ok(None) => {}
+                Err(e) => return map_exec_err(e),
+            }
+        }
         let stmt = match pgparser::parse(sql) {
             Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
             _ => return TxnResp::Err("stage expects exactly one statement".into()),
@@ -712,6 +732,93 @@ mod tests {
         assert!(
             gs2.is_empty(),
             "after the write-once Aborted decision, g is no longer in-doubt"
+        );
+    }
+
+    /// Participant `Stage` is IDEMPOTENT across a leader failover: a retried `Stage(g)` that
+    /// lands on a new leader (no in-memory held session, but the durable `Prepared(-> g)`
+    /// marker from the first attempt persists) must NOT write a second row version. After
+    /// committing g, the row reads its single updated value (no double-apply, exactly one live
+    /// version — a second would trip the executor's at-most-one-live debug_assert on read).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_is_idempotent_across_a_participant_leader_failover() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let svc = TxnService::new(node.engines.clone());
+        let mut ddl = node.engines[&0].connect();
+        ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
+            .await
+            .expect("placeholder"); // id 1 -> range 0
+        ddl.run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("b"); // id 2 -> range 1
+        let mut seed = node.engines[&1].connect();
+        seed.run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed");
+        let g = node.engines[&0].begin_global_durable().await.expect("g");
+
+        // First stage: durably writes Prepared(Li -> g) + the updated row version.
+        assert!(matches!(
+            svc.handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                }
+            )
+            .await,
+            TxnResp::Staged
+        ));
+        // The participant leader 'dies': drop the in-memory held session; the durable marker stays.
+        svc.release_all_for_range(1).await;
+        assert!(
+            !svc.holds(g, 1).await,
+            "held session dropped (leader 'died')"
+        );
+
+        // RETRY the SAME Stage(g) on the 'new leader': durable marker present, no held session
+        // -> idempotent no-op, NO second version.
+        assert!(matches!(
+            svc.handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                }
+            )
+            .await,
+            TxnResp::Staged
+        ));
+
+        // Commit g globally; read b: exactly one application (21), exactly one live version.
+        node.engines[&0]
+            .commit_global_decision(g, mvcc::clog::XidStatus::Committed)
+            .await
+            .expect("commit");
+        let mut read = node.engines[&1].connect();
+        let result = read
+            .run(&parse_one("SELECT id FROM b"))
+            .await
+            .expect("read b");
+        // Extract column 0 of every row as i32 and assert exactly [21] (NOT doubled / not 2 rows).
+        let ids = match result {
+            pgwire::engine::QueryResult::Rows { rows, .. } => rows
+                .iter()
+                .map(|r| {
+                    std::str::from_utf8(&r[0].as_ref().expect("non-null").text)
+                        .expect("utf8")
+                        .parse::<i32>()
+                        .expect("i32")
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(
+            ids,
+            vec![21],
+            "b updated exactly once (no double-apply across the stage retry)"
         );
     }
 
