@@ -6,8 +6,32 @@
 //! config. One test (a 3-node × 2-range cluster = 6 Raft instances) to keep the
 //! binary from running two such clusters at once on a constrained runner.
 mod harness;
+use std::time::Duration;
+
 use harness::Cluster;
 use tokio_postgres::SimpleQueryMessage;
+
+/// Bounded-retry a write on `gw`, retrying ONLY on the retryable `40001` a freshly-risen
+/// range leader returns while its settle-before-serve `RecoveryGate` is still closed (the gate
+/// rejects BEFORE executing, so the row is never inserted — safe to retry on the SAME
+/// connection without double-applying, which an exact `row_count == 1` read-back requires).
+/// Bounded poll cadence (the allowed multi-process harness cadence), never a settle-sleep.
+async fn write_until_served(gw: &tokio_postgres::Client, sql: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match gw.simple_query(sql).await {
+            Ok(_) => return,
+            Err(e) if e.code().map(|c| c.code()) == Some("40001") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "`{sql}` not served within 30s (gate stayed closed)"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("`{sql}` failed (non-retryable): {e}"),
+        }
+    }
+}
 
 fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
     msgs.iter()
@@ -42,9 +66,9 @@ async fn replicated_layout_is_learned_from_the_meta_range() {
         gw.simple_query("INSERT INTO a VALUES (10)")
             .await
             .expect("insert a");
-        gw.simple_query("INSERT INTO b VALUES (20)")
-            .await
-            .expect("insert b");
+        // INSERT INTO b lands on range 1's leader, which may still be inside its
+        // settle-before-serve window on a freshly-risen leader (retryable 40001) — bounded-retry.
+        write_until_served(&gw, "INSERT INTO b VALUES (20)").await;
     }
 
     // Read both back through node 2 (also never given boundaries).

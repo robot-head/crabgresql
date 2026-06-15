@@ -297,13 +297,20 @@ struct HeldEntry {
 pub struct TxnService {
     engines: Arc<ArcSwap<HashMap<RangeId, Arc<SqlEngine>>>>,
     held: Arc<Mutex<HashMap<(u64, RangeId), HeldEntry>>>,
+    /// Settle-before-serve gate (SP22): `Some` on a real node, `None` for in-process /
+    /// never-recovering test harnesses (treated as always-serving).
+    gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
 }
 
 impl TxnService {
-    pub fn new(engines: HashMap<RangeId, Arc<SqlEngine>>) -> Self {
+    pub fn new(
+        engines: HashMap<RangeId, Arc<SqlEngine>>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
+    ) -> Self {
         Self {
             engines: Arc::new(ArcSwap::from_pointee(engines)),
             held: Arc::new(Mutex::new(HashMap::new())),
+            gate,
         }
     }
 
@@ -452,6 +459,13 @@ impl TxnService {
         if self.engine(range).is_none() {
             return TxnResp::NotLeader;
         }
+        // SP22 settle-before-serve: reject a stage to a range whose rise sweep has not yet
+        // settled the current term (retryable — the coordinator re-resolves + retries on
+        // NotLeader). Placed before the idempotency clog read, which is unsafe on an
+        // unsettled range.
+        if self.gate.as_ref().is_some_and(|g_| !g_.is_serving(range)) {
+            return TxnResp::NotLeader;
+        }
         // IDEMPOTENCY: when there is NO in-memory held session for (g, range) but a durable
         // `Prepared(Li -> g)` marker already exists on this range, this is a Stage(g) RETRY
         // that landed on a NEW leader after the original leader staged-then-died (the held-
@@ -539,7 +553,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage_then_release_holds_then_frees_a_per_g_session() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
 
         // DDL (CREATE TABLE) must run through range-0's engine (catalog lives there).
         // Table id 2 is assigned by the counter → falls in range 1 (boundary at 2).
@@ -596,10 +610,71 @@ mod tests {
         assert!(!svc.holds(g, 1).await, "Release drops the held session");
     }
 
+    /// SP22: a participant Stage to a range whose rise sweep has not settled the current term is
+    /// rejected (retryable NotLeader); once the gate is opened for the term, the stage proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_is_gated_until_the_range_is_settled() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let gate = crate::recovery_gate::RecoveryGate::new(node.id());
+        gate.register_range(1, node.rafts[&1].clone());
+        let svc = TxnService::new(node.engines.clone(), Some(gate.clone()));
+
+        // DDL so table b lands in range 1, seed a row (these go through the engines directly, not
+        // the gated stage path).
+        let mut ddl = node.engines[&0].connect();
+        ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
+            .await
+            .expect("placeholder");
+        ddl.run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("b");
+        let mut seed = node.engines[&1].connect();
+        seed.run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed");
+        let g = node.engines[&0].begin_global_durable().await.expect("g");
+
+        // Gate closed (sentinel term) → Stage is rejected, retryable.
+        assert!(
+            matches!(
+                svc.handle(
+                    1,
+                    TxnRpc::Stage {
+                        g,
+                        range: 1,
+                        sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                    }
+                )
+                .await,
+                TxnResp::NotLeader
+            ),
+            "a stage to an unsettled range is gated (retryable)"
+        );
+
+        // Open the gate for the current term → Stage proceeds.
+        let term = node.rafts[&1].metrics().borrow().current_term;
+        gate.mark_served(1, term);
+        assert!(
+            matches!(
+                svc.handle(
+                    1,
+                    TxnRpc::Stage {
+                        g,
+                        range: 1,
+                        sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                    }
+                )
+                .await,
+                TxnResp::Staged
+            ),
+            "after the gate opens, the stage proceeds"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_silent_coordinator_is_recovered_by_the_timeout_sweeper() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         let client = TwoPcClient::new(node.rafts.clone(), node.partition.clone());
 
         // Seed a row on range 1, then STAGE a held participant for a global xid g that
@@ -709,7 +784,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_durable_prepared_marker_is_finalized_by_the_leadership_sweep() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         // Seed a row on range 1 (create a placeholder table id 1 on range 0 first so b gets id 2).
         let mut seed0 = node.engines[&0].connect();
         seed0
@@ -765,7 +840,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage_is_idempotent_across_a_participant_leader_failover() {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
-        let svc = TxnService::new(node.engines.clone());
+        let svc = TxnService::new(node.engines.clone(), None);
         let mut ddl = node.engines[&0].connect();
         ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
             .await
@@ -849,7 +924,7 @@ mod tests {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
         let mut only0 = std::collections::HashMap::new();
         only0.insert(0u32, node.engines[&0].clone());
-        let svc = TxnService::new(only0);
+        let svc = TxnService::new(only0, None);
         assert!(
             svc.engine(1).is_none(),
             "range 1 absent before registration"
@@ -874,7 +949,7 @@ mod tests {
         let (node, _sql) = crate::server_node::testonly_two_range_node().await;
         let mut only0 = std::collections::HashMap::new();
         only0.insert(0u32, node.engines[&0].clone());
-        let svc = TxnService::new(only0);
+        let svc = TxnService::new(only0, None);
         let resp = svc
             .handle(
                 7,

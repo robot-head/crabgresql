@@ -133,6 +133,8 @@ pub struct RangeGatewayEngine {
     forward: Arc<dyn RemoteForward>,
     /// The cross-range 2PC coordinator, cloned into every connection's router.
     coordinator: Arc<dyn GlobalCoordinator>,
+    /// Settle-before-serve gate (SP22), cloned into every connection's router.
+    gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
 }
 
 impl RangeGatewayEngine {
@@ -143,6 +145,7 @@ impl RangeGatewayEngine {
         catalog_kv: Arc<dyn kv::Kv>,
         forward: Arc<dyn RemoteForward>,
         coordinator: Arc<dyn GlobalCoordinator>,
+        gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     ) -> Self {
         Self {
             map,
@@ -151,6 +154,7 @@ impl RangeGatewayEngine {
             catalog_kv,
             forward,
             coordinator,
+            gate,
         }
     }
 }
@@ -174,6 +178,7 @@ impl pgwire::engine::Engine for RangeGatewayEngine {
             Arc::clone(&self.catalog_kv),
             Arc::clone(&self.forward),
             Some(Arc::clone(&self.coordinator)),
+            self.gate.clone(),
         )
     }
 }
@@ -192,6 +197,7 @@ pub async fn serve_range_routed(
     forward: Arc<dyn RemoteForward>,
     coordinator: Arc<dyn GlobalCoordinator>,
     config: Arc<SessionConfig>,
+    gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
 ) -> std::io::Result<()> {
     let engine = Arc::new(RangeGatewayEngine::new(
         map,
@@ -200,6 +206,7 @@ pub async fn serve_range_routed(
         catalog_kv,
         forward,
         coordinator,
+        gate,
     ));
     let registry = Arc::new(CancelRegistry::default());
     loop {

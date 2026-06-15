@@ -150,10 +150,30 @@ async fn write_at_follower_gateway_forwards_to_remote_leader() {
         .expect("create b -> range 0"); // table id 2 -> range 1
 
     // INSERT into b: the gateway is a range-1 follower, so this forwards to the
-    // remote range-1 leader over the pooled pgwire client.
-    pool.forward(1, "INSERT INTO b VALUES (42)".into())
-        .await
-        .expect("insert b -> forwarded to range 1 leader");
+    // remote range-1 leader over the pooled pgwire client. That leader may still be
+    // inside its settle-before-serve window (its leadership-rise sweep hasn't opened the
+    // `RecoveryGate` yet), so the forwarded WRITE can see a retryable `NotLeader`/40001.
+    // Bounded-retry it, waiting on the LEADER raft's metrics events between attempts (the
+    // gate opens right after the leader applies its leadership no-op) — a real condition,
+    // never a settle-sleep. (Authoritative writes must be bounded-retry, never one-shot
+    // `.expect` — the SP19/PR#34 flake class.)
+    let leader_node = if r1_leader == 0 { &n0 } else { &n1 };
+    let mut rx = leader_node.rafts.get(&1).expect("range-1 raft").metrics();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match pool.forward(1, "INSERT INTO b VALUES (42)".into()).await {
+            Ok(_) => break,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "insert b -> range 1 leader not served within bound: {e:?}"
+                );
+                // Cap the wait on the next leader metrics event so a missed event still
+                // re-issues the real forward; this is an event wait, not a fixed sleep.
+                let _ = tokio::time::timeout(Duration::from_secs(2), rx.changed()).await;
+            }
+        }
+    }
 
     // The row is replicated to every range-1 replica (event-based wait, no sleep).
     wait_for_replication(&n0, &n1, 1).await;
