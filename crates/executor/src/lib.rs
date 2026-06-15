@@ -312,6 +312,36 @@ impl SqlEngine {
         Ok(self.in_doubt_globals_from(0).await?.0)
     }
 
+    /// Scan THIS range's clog (from the recovery watermark) for an existing durable
+    /// `Prepared(Li -> g)` marker for the given in-doubt global xid `g`; return the local
+    /// xid `Li` of the first such marker, or `None`.
+    ///
+    /// Makes participant `Stage` IDEMPOTENT per `(g, range)`. A `Stage(g)` RPC retried across
+    /// a participant-leader failover (the original leader durably staged then died; the retry
+    /// lands on the new leader, whose in-memory held-session map is empty) must NOT write a
+    /// SECOND `Prepared(-> g)` version of the row. The first attempt's marker was
+    /// Raft-committed before the old leader died, so the new leader — which won election with
+    /// that entry in its log — finds it here and the retry becomes a no-op. Bounded by the
+    /// watermark: an in-doubt `g`'s marker is never below `clog_scan_lo` (the watermark never
+    /// advances past a non-terminal `g`).
+    pub async fn staged_local_for(&self, g: u64) -> Result<Option<u64>, ExecError> {
+        let scan_lo = self.clog_scan_lo()?;
+        for (k, v) in self
+            .kv
+            .scan_range(&kv::key::clog_key(scan_lo), &kv::key::clog_scan_end())?
+        {
+            let Some(li) = kv::key::clog_xid_of(&k) else {
+                continue;
+            };
+            if let mvcc::clog::XidStatus::Prepared(pg) = mvcc::clog::decode(&v)?
+                && pg == g
+            {
+                return Ok(Some(li));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read this range's durable recovery-scan watermark (`0` if absent/unset).
     pub fn clog_scan_lo(&self) -> Result<u64, ExecError> {
         match self.kv.get(&kv::key::clog_scan_lo_key())? {
@@ -419,6 +449,33 @@ mod tests {
             got,
             vec![g_undecided],
             "only undecided Prepared markers are returned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staged_local_for_finds_an_existing_prepared_marker() {
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        // Single-store in-memory engine: `self.kv == self.catalog_kv` (both the same `Arc`
+        // per `with_kv`), so `MemKv` here is this range's local clog.
+        let kv = Arc::new(MemKv::new());
+        let engine = SqlEngine::with_kv(Arc::clone(&kv) as Arc<dyn Kv>).expect("engine");
+        let g = GLOBAL_XID_BASE + 1;
+        // A durable Prepared(Li=11 -> g) marker exists on this range.
+        kv.write_batch(&[put_op(11, XidStatus::Prepared(g))])
+            .expect("stage marker");
+        assert_eq!(
+            engine.staged_local_for(g).await.expect("scan"),
+            Some(11),
+            "finds the existing Prepared(-> g) marker's local xid"
+        );
+        assert_eq!(
+            engine
+                .staged_local_for(GLOBAL_XID_BASE + 2)
+                .await
+                .expect("scan"),
+            None,
+            "no marker for a different global xid"
         );
     }
 

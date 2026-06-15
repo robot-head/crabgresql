@@ -332,11 +332,11 @@ impl TxnService {
         self.held.lock().await.contains_key(&(g, range))
     }
 
-    /// Drop every held session for `range` (presumed-abort), freeing its locks.
-    /// Called on the loss of `range` leadership. Always safe: the global clog is
-    /// the sole arbiter (a committed g's durable Prepared rows stay visible; an
-    /// undecided g's rows are invisible). Sessions taken out under a brief map
-    /// lock, guard dropped, THEN aborted.
+    /// Drop every held session for `range` WITHOUT consulting the global clog
+    /// (presumed-abort, freeing locks immediately). This frees a lock while its `g` may
+    /// still be in-doubt, so it is NOT used on leadership loss anymore (see
+    /// `resolve_and_release_for_range` for that path + the invariant it preserves); it
+    /// remains the explicit "drop-as-if-crashed" primitive used by recovery tests.
     pub async fn release_all_for_range(&self, range: RangeId) {
         let victims: Vec<HeldSession> = {
             let mut held = self.held.lock().await;
@@ -348,6 +348,28 @@ impl TxnService {
         };
         for s in victims {
             s.lock().await.abort_release();
+        }
+    }
+
+    /// On leadership LOSS of `range`, resolve every held `(g, range)` session through its
+    /// WRITE-ONCE global decision and release per that decision — NOT a blind
+    /// `abort_release`. This preserves the load-bearing invariant `eval_plan_qual` relies
+    /// on (a participant frees a row's lock only AFTER its global decision is durable, so
+    /// every `g` with a `Prepared` marker on a locked row has already settled). Freeing the
+    /// lock while `g` is still in-doubt lets a concurrent writer acquire it and write a
+    /// SECOND, non-superseding version of the row, so TWO versions resolve live when both
+    /// `g`s later commit (the at-most-one-live violation that crashes reads). Reuses
+    /// `resolve_in_doubt` (the same per-decision release the silence sweep uses), so a lock
+    /// is never freed pre-decision. Best-effort: a session whose range 0 is momentarily
+    /// unreachable stays held (lock retained — correct) and is resolved by the silence
+    /// sweep or the next leadership loss.
+    pub async fn resolve_and_release_for_range(&self, client: &TwoPcClient, range: RangeId) {
+        let keys: Vec<(u64, RangeId)> = {
+            let held = self.held.lock().await;
+            held.keys().copied().filter(|&(_, r)| r == range).collect()
+        };
+        for (g, r) in keys {
+            self.resolve_in_doubt(client, g, r).await;
         }
     }
 
@@ -429,6 +451,26 @@ impl TxnService {
         // re-resolves) instead of a hard Err, and skip parsing entirely.
         if self.engine(range).is_none() {
             return TxnResp::NotLeader;
+        }
+        // IDEMPOTENCY: when there is NO in-memory held session for (g, range) but a durable
+        // `Prepared(Li -> g)` marker already exists on this range, this is a Stage(g) RETRY
+        // that landed on a NEW leader after the original leader staged-then-died (the held-
+        // session map is per-process and was lost with the old leader). The first attempt's
+        // row version is durable + replicated; staging again would write a SECOND
+        // `Prepared(-> g)` version → two live versions when g commits. Return Staged (no-op).
+        // When a held session DOES exist, this is the SAME leader handling another statement of
+        // the same txn — fall through and run it on that session (preserves multi-statement
+        // participants). KNOWN-SCOPE: a multi-statement-same-range txn whose leader fails over
+        // mid-way then retries a LATER statement would be short-circuited here; the bank
+        // workload (one statement per range per txn) never hits this, matching the slice scope.
+        let has_held = { self.held.lock().await.contains_key(&(g, range)) };
+        if !has_held {
+            let engine = self.engine(range).expect("engine present (checked above)");
+            match engine.staged_local_for(g).await {
+                Ok(Some(_)) => return TxnResp::Staged,
+                Ok(None) => {}
+                Err(e) => return map_exec_err(e),
+            }
         }
         let stmt = match pgparser::parse(sql) {
             Ok(mut v) if v.len() == 1 => v.pop().expect("one statement"),
@@ -712,6 +754,93 @@ mod tests {
         assert!(
             gs2.is_empty(),
             "after the write-once Aborted decision, g is no longer in-doubt"
+        );
+    }
+
+    /// Participant `Stage` is IDEMPOTENT across a leader failover: a retried `Stage(g)` that
+    /// lands on a new leader (no in-memory held session, but the durable `Prepared(-> g)`
+    /// marker from the first attempt persists) must NOT write a second row version. After
+    /// committing g, the row reads its single updated value (no double-apply, exactly one live
+    /// version — a second would trip the executor's at-most-one-live debug_assert on read).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_is_idempotent_across_a_participant_leader_failover() {
+        let (node, _sql) = crate::server_node::testonly_two_range_node().await;
+        let svc = TxnService::new(node.engines.clone());
+        let mut ddl = node.engines[&0].connect();
+        ddl.run(&parse_one("CREATE TABLE _placeholder (id int4)"))
+            .await
+            .expect("placeholder"); // id 1 -> range 0
+        ddl.run(&parse_one("CREATE TABLE b (id int4)"))
+            .await
+            .expect("b"); // id 2 -> range 1
+        let mut seed = node.engines[&1].connect();
+        seed.run(&parse_one("INSERT INTO b VALUES (20)"))
+            .await
+            .expect("seed");
+        let g = node.engines[&0].begin_global_durable().await.expect("g");
+
+        // First stage: durably writes Prepared(Li -> g) + the updated row version.
+        assert!(matches!(
+            svc.handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                }
+            )
+            .await,
+            TxnResp::Staged
+        ));
+        // The participant leader 'dies': drop the in-memory held session; the durable marker stays.
+        svc.release_all_for_range(1).await;
+        assert!(
+            !svc.holds(g, 1).await,
+            "held session dropped (leader 'died')"
+        );
+
+        // RETRY the SAME Stage(g) on the 'new leader': durable marker present, no held session
+        // -> idempotent no-op, NO second version.
+        assert!(matches!(
+            svc.handle(
+                1,
+                TxnRpc::Stage {
+                    g,
+                    range: 1,
+                    sql: "UPDATE b SET id = 21 WHERE id = 20".into()
+                }
+            )
+            .await,
+            TxnResp::Staged
+        ));
+
+        // Commit g globally; read b: exactly one application (21), exactly one live version.
+        node.engines[&0]
+            .commit_global_decision(g, mvcc::clog::XidStatus::Committed)
+            .await
+            .expect("commit");
+        let mut read = node.engines[&1].connect();
+        let result = read
+            .run(&parse_one("SELECT id FROM b"))
+            .await
+            .expect("read b");
+        // Extract column 0 of every row as i32 and assert exactly [21] (NOT doubled / not 2 rows).
+        let ids = match result {
+            pgwire::engine::QueryResult::Rows { rows, .. } => rows
+                .iter()
+                .map(|r| {
+                    std::str::from_utf8(&r[0].as_ref().expect("non-null").text)
+                        .expect("utf8")
+                        .parse::<i32>()
+                        .expect("i32")
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(
+            ids,
+            vec![21],
+            "b updated exactly once (no double-apply across the stage retry)"
         );
     }
 

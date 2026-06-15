@@ -261,16 +261,19 @@ impl ServerNode {
 
         let node_listener = bind_with_retry(&cfg.node_addr).await?;
         let txn = crate::twopc::TxnService::new(engines.clone());
-        // Spawn a per-range leadership-loss watcher: on the falling edge of this
-        // node's leadership for a range, release (presumed-abort) every held 2PC
-        // session for that range so locks are freed promptly. TxnService is Clone
-        // (shares its Arc held-map), so every watcher shares the same registry.
+        // Spawn a per-range leadership-loss watcher: on the falling edge of this node's
+        // leadership for a range, resolve-then-release every held 2PC session for that
+        // range (drive each `g` to its global decision, then release per the decision) so
+        // a lock is never freed while its `g` is in-doubt. TxnService is Clone (shares its
+        // Arc held-map), so every watcher shares the same registry.
+        let loss_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
         for (&range, raft) in &rafts {
             tokio::spawn(release_on_leadership_loss(
                 raft.clone(),
                 range,
                 cfg.id,
                 txn.clone(),
+                loss_client.clone(),
             ));
         }
         // Coordinator-silence recovery: a per-node heartbeat self-resolves held 2PC
@@ -505,14 +508,18 @@ impl ServerNode {
             engines.insert(range, engine);
         }
 
-        // Per-range leadership-loss release: free held 2PC locks promptly when this
-        // node loses a range's leadership. All watchers share the same Arc held-map.
+        // Per-range leadership-loss resolve-then-release: when this node loses a range's
+        // leadership, drive each held `g` to its global decision and release per that
+        // decision, so a lock is never freed while its `g` is in-doubt. All watchers share
+        // the same Arc held-map.
+        let loss_client = crate::twopc::TwoPcClient::new(rafts.clone(), partition.clone());
         for (&range, raft) in &rafts {
             tokio::spawn(release_on_leadership_loss(
                 raft.clone(),
                 range,
                 cfg.id,
                 txn.clone(),
+                loss_client.clone(),
             ));
         }
         // Coordinator-silence recovery: a per-node heartbeat self-resolves held 2PC
@@ -577,13 +584,19 @@ async fn release_on_leadership_loss(
     range: RangeId,
     id: NodeId,
     txn: crate::twopc::TxnService,
+    client: std::sync::Arc<crate::twopc::TwoPcClient>,
 ) {
     let mut rx = raft.metrics();
     let mut was_leader = false;
     loop {
         let is_leader = rx.borrow().current_leader == Some(id);
         if was_leader && !is_leader {
-            txn.release_all_for_range(range).await; // free held locks; global clog is the arbiter
+            // Resolve-then-release: drive each held `g` through its WRITE-ONCE global
+            // decision and release per that decision, so a lock is NEVER freed while its
+            // `g` is in-doubt (the `eval_plan_qual` invariant). A blind `abort_release`
+            // here freed the lock pre-decision, letting a concurrent writer create a
+            // second, non-superseding version of the row → two live versions on commit.
+            txn.resolve_and_release_for_range(&client, range).await;
         }
         was_leader = is_leader;
         if rx.changed().await.is_err() {
