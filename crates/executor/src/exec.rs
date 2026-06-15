@@ -347,6 +347,12 @@ pub(crate) fn global_status<'a>(
 /// Find the single version of `rowid` visible to `snap` (with own-xid
 /// read-your-writes) among already-decoded `versions`. Mirrors `scan_live`'s
 /// per-version `satisfies_mvcc` check, but over one rowid's versions.
+///
+/// Returns the greatest-xmin live version. The MVCC at-most-one-live invariant
+/// means at most one version of a rowid is live under any one snapshot, so the
+/// selection is unambiguous; choosing the max explicitly (rather than relying on
+/// ascending scan order) makes it order-independent and is debug-asserted to see
+/// at most one live version.
 fn find_visible_one(
     kv: &dyn Kv,
     global: &dyn Kv,
@@ -356,6 +362,7 @@ fn find_visible_one(
     versions: &[(u64, u64, Vec<pgtypes::Datum>)],
 ) -> Result<Option<(u64, Vec<pgtypes::Datum>)>, ExecError> {
     let mut visible: Option<(u64, Vec<pgtypes::Datum>)> = None;
+    let mut live_count: usize = 0;
     for (xmin, xmax, row) in versions {
         if mvcc::visibility::satisfies_mvcc(
             *xmin,
@@ -364,9 +371,24 @@ fn find_visible_one(
             own,
             global_status(kv, global, gsnap),
         )? {
-            visible = Some((*xmin, row.clone())); // MVCC invariant: at most one
+            live_count += 1;
+            // Keep the greatest-xmin live version EXPLICITLY. The MVCC at-most-one-live
+            // invariant means there is normally exactly one; selecting the max removes the
+            // hidden dependence on ascending scan order, so a future scan-order change can
+            // never silently return a stale shadow (e.g. an aborted re-attempt's
+            // `Prepared(Li_old -> g)` tuple that resolves invisible anyway).
+            // NB: `is_none_or`, NOT `map_or(true, …)` — the latter trips
+            // `clippy::unnecessary_map_or` under the workspace's `-D warnings` gate.
+            if visible.as_ref().is_none_or(|(cur, _)| *xmin > *cur) {
+                visible = Some((*xmin, row.clone()));
+            }
         }
     }
+    debug_assert!(
+        live_count <= 1,
+        "find_visible_one: {live_count} live versions for one rowid under one snapshot \
+         — MVCC at-most-one-live invariant violated"
+    );
     Ok(visible)
 }
 
@@ -479,6 +501,7 @@ pub(crate) fn scan_live(
         let prefix = mvcc::version::row_prefix_of(&scanned[i].0)?.to_vec();
         let rowid = kv::key::rowid_of(table.id, &prefix)?;
         let mut visible: Option<(u64, Vec<pgtypes::Datum>)> = None;
+        let mut live_count: usize = 0;
         while i < scanned.len() && mvcc::version::row_prefix_of(&scanned[i].0)? == prefix.as_slice()
         {
             let (xmin, xmax, row) = mvcc::version::decode_tuple(&scanned[i].1)?;
@@ -489,10 +512,19 @@ pub(crate) fn scan_live(
                 own,
                 global_status(kv, global, gsnap),
             )? {
-                visible = Some((xmin, row)); // the MVCC invariant: at most one
+                live_count += 1;
+                // `is_none_or`, NOT `map_or(true, …)` — see find_visible_one above.
+                if visible.as_ref().is_none_or(|(cur, _)| xmin > *cur) {
+                    visible = Some((xmin, row));
+                }
             }
             i += 1;
         }
+        debug_assert!(
+            live_count <= 1,
+            "scan_live: {live_count} live versions for rowid {rowid} under one snapshot \
+             — MVCC at-most-one-live invariant violated"
+        );
         if let Some((xmin, row)) = visible {
             out.push((rowid, xmin, row));
         }
@@ -1462,6 +1494,124 @@ mod tests {
             vec![Datum::Int4(70)],
             "eval_plan_qual must return value 70 (cross-range committed UPDATE result), \
              not value 100 (the stale pre-2PC-commit row) — lost-update bug"
+        );
+    }
+
+    /// SP21: after a fresh-`g'` re-attempt, a row has TWO physical versions — the
+    /// abandoned attempt's `Prepared(Li_old -> g)` with `g` Aborted, and the re-attempt's
+    /// `Prepared(Li_new -> g')` with `g'` Committed. `find_visible_one` must return the
+    /// committed-`g'` version (highest xmin) and never the aborted shadow; exactly one
+    /// version is live (the assert holds).
+    #[test]
+    fn find_visible_one_returns_committed_reattempt_over_aborted_shadow() {
+        use std::sync::Arc;
+
+        use super::{find_visible_one, global_status};
+        use kv::{Kv, MemKv};
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::visibility::Snapshot;
+        use mvcc::xid::{GLOBAL_XID_BASE, INVALID_XID};
+        use pgtypes::Datum;
+
+        let li_old: u64 = 5; // abandoned attempt's local xid
+        let li_new: u64 = 9; // re-attempt's local xid (reseed -> strictly greater)
+        let g: u64 = GLOBAL_XID_BASE + 1; // abandoned global xid (Aborted)
+        let g2: u64 = GLOBAL_XID_BASE + 2; // fresh global xid (Committed)
+
+        let kv = Arc::new(MemKv::new()); // holds the local clog
+        let global = MemKv::new(); // range-0 global clog
+
+        // `find_visible_one` reads ONLY the passed `versions` slice + the local/global clogs
+        // (it never touches the kv row-version store), so seed just the two clogs here.
+        // Local clog: both local xids are Prepared, deref to the global clog.
+        kv.write_batch(&[
+            put_op(li_old, XidStatus::Prepared(g)),
+            put_op(li_new, XidStatus::Prepared(g2)),
+        ])
+        .expect("local clog");
+        // Global clog: g Aborted (abandoned), g2 Committed (re-attempt).
+        global
+            .write_batch(&[
+                put_op(g, XidStatus::Aborted),
+                put_op(g2, XidStatus::Committed),
+            ])
+            .expect("global clog");
+
+        // A settled snapshot: every xid is settled, so global_status reads the global clog.
+        let settled = Snapshot {
+            xmin: 0,
+            xmax: u64::MAX,
+            xip: Vec::new(),
+        };
+        // The two physical versions, both live (xmax = INVALID): old value 100, new value 70.
+        let versions = vec![
+            (li_old, INVALID_XID, vec![Datum::Int4(100)]),
+            (li_new, INVALID_XID, vec![Datum::Int4(70)]),
+        ];
+        let got = find_visible_one(kv.as_ref(), &global, &settled, &settled, None, &versions)
+            .expect("find_visible_one ok")
+            .expect("a version is visible");
+        assert_eq!(
+            got.0, li_new,
+            "the committed re-attempt version (highest xmin) wins"
+        );
+        assert_eq!(
+            got.1,
+            vec![Datum::Int4(70)],
+            "value is the re-attempt's, not the aborted shadow's"
+        );
+        // Sanity: the aborted shadow really is invisible under this resolver.
+        let resolve = global_status(kv.as_ref(), &global, &settled);
+        assert!(matches!(resolve(li_old), Ok(XidStatus::Aborted)));
+    }
+
+    /// The explicit highest-xmin selection is order-independent, and the at-most-one-live
+    /// invariant is debug-asserted. Two committed, non-deleted versions of one row are an
+    /// artificial invariant violation: in DEBUG the assert fires (`should_panic`); in
+    /// RELEASE the assert is compiled out and the greater xmin is returned regardless of
+    /// the order the versions are presented.
+    ///
+    /// Debug-profile-dependent BY DESIGN: this repo's CI runs `cargo nextest` and
+    /// `cargo llvm-cov nextest` in the debug profile, so the `debug_assert!` fires and the
+    /// `should_panic` arm is exercised. Introducing a release/opt test profile would flip
+    /// the expectation and require revisiting this `cfg_attr`.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "at-most-one-live"))]
+    fn find_visible_one_orders_by_xmin_and_flags_multiple_live() {
+        use std::sync::Arc;
+
+        use super::find_visible_one;
+        use kv::{Kv, MemKv};
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::visibility::Snapshot;
+        use mvcc::xid::INVALID_XID;
+        use pgtypes::Datum;
+
+        let kv = Arc::new(MemKv::new());
+        let global = MemKv::new();
+        kv.write_batch(&[
+            put_op(5, XidStatus::Committed),
+            put_op(9, XidStatus::Committed),
+        ])
+        .expect("clog");
+        let settled = Snapshot {
+            xmin: 0,
+            xmax: u64::MAX,
+            xip: Vec::new(),
+        };
+
+        // Present them in DESCENDING order so last-wins would pick the LOWER xmin; the
+        // explicit max must still pick 9.
+        let versions = vec![
+            (9u64, INVALID_XID, vec![Datum::Int4(70)]),
+            (5u64, INVALID_XID, vec![Datum::Int4(100)]),
+        ];
+        let got = find_visible_one(kv.as_ref(), &global, &settled, &settled, None, &versions)
+            .expect("ok"); // only reached in release builds
+        assert_eq!(
+            got.expect("visible").0,
+            9,
+            "highest xmin regardless of presentation order"
         );
     }
 }
