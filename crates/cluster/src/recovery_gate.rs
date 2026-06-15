@@ -2,7 +2,8 @@
 //! range leader must not serve WRITES for that range until its leadership-rise in-doubt
 //! sweep has settled every inherited `Prepared(-> g)` marker. A write to range R is
 //! admitted only when this node leads R AND R's last-settled term equals R's CURRENT Raft
-//! term — derived atomically from the term, so there is no rise-edge race. `served_term`
+//! term — derived from the live term rather than a rise-edge flag, so there is no
+//! rise-edge flag race. `served_term`
 //! starts at the sentinel 0; a node that won an election is at term >= 1, so a range is
 //! gated-by-default on every fresh rise until its sweep calls `mark_served`.
 
@@ -52,20 +53,27 @@ impl RecoveryGate {
     }
 
     /// True iff this node currently leads `range` AND its rise sweep has settled the current
-    /// term. A range not registered here is "not this node's concern" → `true` (such a write
-    /// rejects via the normal not-local-leader path instead). Re-reads the LIVE term every
-    /// call so a leadership flap re-closes the gate until the new term is settled.
+    /// term. The leadership check is churn-safe: it requires BOTH `state == Leader` AND this
+    /// node naming *itself* `current_leader` (the crate's self-confirming `wait_for_leader`
+    /// predicate), because a just-resumed/just-deposed node can transiently still name itself
+    /// leader while `state` has already left `Leader`. A range not registered here is "not
+    /// this node's concern" → `true` (such a write rejects via the normal not-local-leader
+    /// path instead). Re-reads the LIVE term every call so a leadership flap re-closes the
+    /// gate until the new term is settled.
     pub fn is_serving(&self, range: RangeId) -> bool {
+        use openraft::ServerState;
         let ranges = self.ranges.load();
         let Some((raft, served)) = ranges.get(&range) else {
             return true;
         };
-        let (leader, term) = {
+        let (leader, state, term) = {
             let m = raft.metrics();
             let m = m.borrow();
-            (m.current_leader, m.current_term)
+            (m.current_leader, m.state, m.current_term)
         };
-        leader == Some(self.id) && served.load(Ordering::Acquire) == term
+        leader == Some(self.id)
+            && state == ServerState::Leader
+            && served.load(Ordering::Acquire) == term
     }
 
     /// Open the gate for `range` at `term` — called by the rise sweep AFTER it has settled
