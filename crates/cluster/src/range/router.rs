@@ -19,6 +19,15 @@ use pgwire::error::PgError;
 use crate::range::cluster::MultiRangeCluster;
 use crate::range::map::{RangeId, RangeMap};
 
+/// Maximum fresh-`g'` re-attempts for one cross-range statement before the coordinator
+/// gives up and surfaces the retryable abort to the client (graceful degradation to the
+/// pre-SP21 behavior). Bounds churn under a persistently flapping participant leader.
+const MAX_REATTEMPTS: usize = 5;
+
+/// Test-only synthetic stage-fault hook: `(range, g) -> Option<err>` (see `stage_fault`).
+#[cfg(test)]
+type StageFaultHook = Box<dyn FnMut(RangeId, u64) -> Option<ExecError> + Send>;
+
 /// The remote half of the gateway: forward one simple-query statement to the
 /// owning range's leader on another node and return its single result. The router
 /// itself is pure routing/`Pin` (Decision: retry-on-NotLeader lives in the wire
@@ -200,6 +209,13 @@ pub struct RangeRouter {
     /// — deterministically, with no sleep. `None` in production (the seam is inert).
     #[cfg(test)]
     before_global_decision: Option<Box<dyn FnMut() + Send>>,
+    /// Test-only synthetic stage fault: invoked at the top of `stage_on` with the target
+    /// range + global xid. Returning `Some(err)` makes the stage fail with that error
+    /// WITHOUT touching the engine — the in-process way to model a participant-leader
+    /// move (`Some(ExecError::NotLeader)`) deterministically (the harness's static engine
+    /// map cannot model a real cross-node move). `None` in production (inert).
+    #[cfg(test)]
+    stage_fault: Option<StageFaultHook>,
 }
 
 impl RangeRouter {
@@ -227,6 +243,8 @@ impl RangeRouter {
             restage_buf: Vec::new(),
             #[cfg(test)]
             before_global_decision: None,
+            #[cfg(test)]
+            stage_fault: None,
         }
     }
 
@@ -236,6 +254,12 @@ impl RangeRouter {
     #[cfg(test)]
     fn set_before_global_decision(&mut self, hook: Box<dyn FnMut() + Send>) {
         self.before_global_decision = Some(hook);
+    }
+
+    /// Install the test-only synthetic stage fault (see `stage_fault`).
+    #[cfg(test)]
+    fn set_stage_fault(&mut self, hook: StageFaultHook) {
+        self.stage_fault = Some(hook);
     }
 
     /// Test-only: the global xid this txn has escalated to, if it is currently a
@@ -385,7 +409,10 @@ impl RangeRouter {
                     ranges.insert(r);
                     self.pin = Pin::Global { ranges, g };
                     self.record_write(r, stmt);
-                    self.stage_on(r, g, stmt).await
+                    match self.stage_on(r, g, stmt).await {
+                        Err(ExecError::NotLeader) => self.reattempt_under_fresh_g(r).await,
+                        other => other,
+                    }
                 }
                 None => self.run_on(0, stmt).await, // DDL / FROM-less SELECT: range 0, stay unpinned.
             },
@@ -416,7 +443,10 @@ impl RangeRouter {
                     ranges.insert(r);
                     self.pin = Pin::Global { ranges, g };
                     self.record_write(r, stmt);
-                    return self.stage_on(r, g, stmt).await;
+                    return match self.stage_on(r, g, stmt).await {
+                        Err(ExecError::NotLeader) => self.reattempt_under_fresh_g(r).await,
+                        other => other,
+                    };
                 }
                 // Same range (or no-table statement): run on the pinned session.
                 if pinning == Some(p) && self.can_escalate() {
@@ -434,9 +464,10 @@ impl RangeRouter {
                     {
                         ranges.insert(r);
                     }
-                    return {
-                        self.record_write(r, stmt);
-                        self.stage_on(r, g, stmt).await
+                    self.record_write(r, stmt);
+                    return match self.stage_on(r, g, stmt).await {
+                        Err(ExecError::NotLeader) => self.reattempt_under_fresh_g(r).await,
+                        other => other,
                     };
                 }
                 // A no-table statement (DDL / FROM-less SELECT) runs on range 0.
@@ -531,6 +562,12 @@ impl RangeRouter {
         g: u64,
         stmt: &Statement,
     ) -> Result<QueryResult, ExecError> {
+        #[cfg(test)]
+        if let Some(hook) = self.stage_fault.as_mut()
+            && let Some(err) = hook(range, g)
+        {
+            return Err(err);
+        }
         if self.engines.contains_key(&range) && self.leads.leads(range) {
             self.ensure_began_on(range).await?;
             self.session_mut(range).join_global(g).await?;
@@ -545,6 +582,102 @@ impl RangeRouter {
         // gateway reports a generic command tag, like any held-write in a txn.
         coord.stage_remote(g, range, &self.cur_sql).await?;
         Ok(QueryResult::Command { tag: "OK".into() })
+    }
+
+    /// A participant's stage returned `NotLeader` (its leader moved). Transparently
+    /// re-attempt the whole cross-range txn under a fresh `g'`: abort the abandoned `g`
+    /// (durable Abort + release every staged participant), mint `g'`, and replay the
+    /// buffered write-set. Bounded by `MAX_REATTEMPTS`; on exhaustion returns
+    /// `Err(NotLeader)` (today's retryable abort) leaving the last `g` staged for the
+    /// client's ROLLBACK to release. `failing_r` is the range whose stage just failed —
+    /// it never staged under the current `g`, so it is excluded from the release loop.
+    async fn reattempt_under_fresh_g(
+        &mut self,
+        failing_r: RangeId,
+    ) -> Result<QueryResult, ExecError> {
+        use std::collections::BTreeSet;
+        let coord = self.coordinator.as_ref().expect("coordinator").clone();
+        let mut failing_r = failing_r;
+        for _ in 0..MAX_REATTEMPTS {
+            let (ranges, g) = match &self.pin {
+                Pin::Global { ranges, g } => (ranges.clone(), *g),
+                _ => {
+                    return Err(ExecError::Unsupported(
+                        "re-attempt outside a global txn".into(),
+                    ));
+                }
+            };
+            // 1. Durably abort the abandoned g (write-once). It is unreachable for this to
+            //    return the COMMITTED effective decision (nothing writes Committed(g)
+            //    before finish_txn); if it ever does, do NOT re-attempt (would double-
+            //    apply) — surface the retryable abort instead.
+            let effective = coord.commit_global(g, false).await?;
+            if effective {
+                debug_assert!(false, "abandoned g committed during re-attempt");
+                return Err(ExecError::NotLeader);
+            }
+            // 2. Release every participant that STAGED under g (all of `ranges` except the
+            //    range whose stage just failed — it never staged). Local: abort_release;
+            //    remote: release_remote is idempotent (a no-op for an unknown (g,range)).
+            //    SCOPE NOTE: excluding `failing_r` conflates "the failing range" with "a
+            //    never-staged range", valid only while each range is touched at most once
+            //    per cross-range txn (the bank workload + every test — the spec's bounded
+            //    scope). A future multi-statement-per-range caller that re-touches an
+            //    already-staged range then fails would leak that lock until a sweep reclaims
+            //    it; the debug_assert makes that unsupported case loud rather than silent.
+            debug_assert!(
+                self.restage_buf
+                    .iter()
+                    .filter(|(r, _, _)| *r == failing_r)
+                    .count()
+                    <= 1,
+                "SP21 re-attempt assumes single-stage-per-range; range {failing_r} was re-touched"
+            );
+            for r in ranges.iter().copied().filter(|&r| r != failing_r) {
+                if self.engines.contains_key(&r) && self.leads.leads(r) {
+                    self.session_mut(r).abort_release();
+                } else {
+                    let _ = coord.release_remote(g, r, false).await;
+                }
+            }
+            // 3. Mint a fresh g'. If range 0 (the coordinator) itself moved, begin_global
+            //    returns NotLeader — that is a coordinator move (out of SP21 scope);
+            //    propagate it (g is already aborted + released, nothing leaks).
+            let g2 = coord.begin_global().await?;
+            // 4. Replay the buffered write-set under g'. A range joins the new participant
+            //    set only AFTER it successfully stages, so `ranges` (and what finish_txn
+            //    later releases) tracks exactly the staged set.
+            self.pin = Pin::Global {
+                ranges: BTreeSet::new(),
+                g: g2,
+            };
+            let buf = self.restage_buf.clone();
+            let mut last = QueryResult::Command { tag: "OK".into() };
+            let mut moved: Option<RangeId> = None;
+            for (br, bstmt, bsql) in &buf {
+                self.cur_sql = bsql.clone();
+                match self.stage_on(*br, g2, bstmt).await {
+                    Ok(q) => {
+                        last = q;
+                        if let Pin::Global { ranges, .. } = &mut self.pin {
+                            ranges.insert(*br);
+                        }
+                    }
+                    Err(ExecError::NotLeader) => {
+                        moved = Some(*br);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            match moved {
+                None => return Ok(last), // clean replay: the current statement staged under g'
+                Some(m) => failing_r = m, // a participant moved during replay; loop under g''
+            }
+        }
+        // Budget exhausted: surface today's retryable abort. The last g is left staged in
+        // `self.pin`; the client's ROLLBACK runs finish_txn, which aborts it + releases.
+        Err(ExecError::NotLeader)
     }
 
     /// Run a statement on `range`: locally only when this node holds a local engine
@@ -1056,6 +1189,153 @@ mod tests {
         assert_eq!(
             fresh.scan_one_i32("SELECT id FROM b").await,
             Vec::<i32>::new()
+        );
+    }
+
+    /// SP21: a participant-leader move during STAGE (modeled by a one-shot synthetic
+    /// `NotLeader` injected on range 1's first stage) is absorbed by the coordinator: the
+    /// cross-range txn COMMITs transparently, both rows read back with the re-attempt
+    /// values (exactly one live version each), and the abandoned `g` is durably Aborted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn participant_move_during_stage_reattempts_and_commits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        admin
+            .simple("INSERT INTO a VALUES (10)")
+            .await
+            .expect("seed a");
+        admin
+            .simple("INSERT INTO b VALUES (20)")
+            .await
+            .expect("seed b");
+        drop(admin);
+
+        let mut router = RangeRouter::connect(&c).await;
+        // Inject ONE synthetic NotLeader on range 1's first stage; capture the abandoned g.
+        let fired = Arc::new(AtomicBool::new(false));
+        let abandoned_g = Arc::new(AtomicU64::new(0));
+        {
+            let fired = fired.clone();
+            let abandoned_g = abandoned_g.clone();
+            router.set_stage_fault(Box::new(move |range, g| {
+                if range == 1 && !fired.swap(true, Ordering::SeqCst) {
+                    abandoned_g.store(g, Ordering::SeqCst);
+                    Some(ExecError::NotLeader)
+                } else {
+                    None
+                }
+            }));
+        }
+
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("UPDATE a SET id = 11 WHERE id = 10")
+            .await
+            .expect("a pins range 0");
+        // This UPDATE escalates and stages range 1 -> the injected NotLeader fires -> the
+        // coordinator aborts g, mints g', and replays [a, b] under g'. The client sees Ok.
+        router
+            .simple("UPDATE b SET id = 21 WHERE id = 20")
+            .await
+            .expect("b re-attempts and stages");
+        router.simple("COMMIT").await.expect("commit");
+
+        // A fresh router reads the re-attempt values through the global clog: exactly one
+        // live version per row (the g' version; the aborted-g shadow is invisible).
+        let mut fresh = RangeRouter::connect(&c).await;
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM a").await, vec![11]);
+        assert_eq!(fresh.scan_one_i32("SELECT id FROM b").await, vec![21]);
+
+        // The abandoned g is durably Aborted: re-deciding it Committed still reads back
+        // Aborted (write-once), proving the coordinator finalized it as Aborted.
+        let g = abandoned_g.load(Ordering::SeqCst);
+        assert!(
+            g != 0,
+            "the synthetic fault fired and captured the abandoned g"
+        );
+        let range0 = c.leader_engine(0).await;
+        assert_eq!(
+            range0
+                .commit_global_decision(g, mvcc::clog::XidStatus::Committed)
+                .await
+                .expect("re-decide"),
+            mvcc::clog::XidStatus::Aborted,
+            "abandoned g was durably Aborted by the re-attempt"
+        );
+    }
+
+    /// SP21: under a participant whose stage ALWAYS returns NotLeader (a persistently
+    /// flapping leader), the coordinator gives up after the bounded budget and surfaces the
+    /// retryable abort — no infinite loop, no hang. (Range 0's stages succeed; only range 1
+    /// flaps, so each round cleanly aborts + re-begins.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_reattempt_gives_up_under_persistent_move() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a");
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b");
+        admin
+            .simple("INSERT INTO a VALUES (10)")
+            .await
+            .expect("seed a");
+        admin
+            .simple("INSERT INTO b VALUES (20)")
+            .await
+            .expect("seed b");
+        drop(admin);
+
+        let mut router = RangeRouter::connect(&c).await;
+        // Range 1 ALWAYS returns NotLeader.
+        router.set_stage_fault(Box::new(|range, _g| {
+            if range == 1 {
+                Some(ExecError::NotLeader)
+            } else {
+                None
+            }
+        }));
+
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("UPDATE a SET id = 11 WHERE id = 10")
+            .await
+            .expect("a pins range 0");
+        // The escalating UPDATE b re-attempts MAX_REATTEMPTS times, each failing, then
+        // surfaces the retryable abort (NotLeader -> 40001). Bounded; must return, not hang.
+        let err = router
+            .simple("UPDATE b SET id = 21 WHERE id = 20")
+            .await
+            .expect_err("exhausted re-attempt surfaces a retryable abort");
+        assert!(
+            format!("{err:?}").contains("40001")
+                || format!("{err:?}").to_lowercase().contains("not"),
+            "exhausted re-attempt surfaces the retryable abort, got {err:?}"
+        );
+        // The client rolls back; finish_txn releases the last staged g (no stranded lock).
+        router.simple("ROLLBACK").await.expect("rollback");
+
+        // A fresh txn proceeds — no stranded locks from the exhausted attempt.
+        let mut after = RangeRouter::connect(&c).await;
+        after.simple("BEGIN").await.expect("begin");
+        after
+            .simple("UPDATE a SET id = 12 WHERE id = 10")
+            .await
+            .expect("a");
+        after.simple("ROLLBACK").await.expect("rollback");
+        assert_eq!(
+            after.scan_one_i32("SELECT id FROM a").await,
+            vec![10],
+            "a unchanged"
         );
     }
 }
