@@ -171,8 +171,6 @@ pub struct RangeRouter {
     /// when `engines` holds the range AND this returns true; otherwise it forwards.
     leads: Arc<dyn LeadsRange>,
     /// Settle-before-serve gate (SP22): `None` for the in-process harness (always serving).
-    // `#[allow(dead_code)]` until Task 4 reads it in the `dispatch` write check; removed then.
-    #[allow(dead_code)]
     gate: Option<Arc<crate::recovery_gate::RecoveryGate>>,
     /// Range-0 catalog store (schema resolution). For a range-0 follower gateway
     /// Task 4 makes this a wire-read handle; here it is the local range-0 store.
@@ -324,6 +322,19 @@ impl RangeRouter {
     ///   ROLLBACK close the block and clear the pin.
     async fn dispatch(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let pinning = self.pinning_range(stmt)?;
+        // SP22 settle-before-serve: reject a locally-led WRITE (Insert/Update/Delete) on a
+        // range whose rise sweep has not settled the current term. Reads (Select) and
+        // DDL/txn-control pass ungated. Retryable NotLeader -> 40001 -> client retries.
+        if matches!(
+            stmt,
+            Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
+        ) && let Some(r) = pinning
+            && self.engines.contains_key(&r)
+            && self.leads.leads(r)
+            && self.gate.as_ref().is_some_and(|g_| !g_.is_serving(r))
+        {
+            return Err(ExecError::NotLeader);
+        }
         match stmt {
             Statement::Begin { .. } => {
                 // Idempotent like PG: a BEGIN inside a block leaves the pin as-is.
@@ -1125,5 +1136,84 @@ mod gateway_seam_tests {
             QueryResult::Rows { rows, .. } => rows.len(),
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    /// SP22 settle-before-serve at the router write path: a locally-led WRITE to a range whose
+    /// rise sweep has not settled the current term is rejected (`ExecError::NotLeader` →
+    /// retryable 40001), while a READ on the same range passes ungated. Once the gate is opened
+    /// for the term (the rise sweep's `mark_served`), the same WRITE succeeds.
+    ///
+    /// The router is built local-led for every range (the `connect` idiom: all-local `engines` +
+    /// `AlwaysLeads`) so a range-1 `UPDATE` genuinely hits the local-led chokepoint
+    /// (`engines.contains_key(1) && leads.leads(1)`), the only place the gate check fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_gates_a_local_led_write_until_the_range_is_settled() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        // Seed the schema + a row in range 1 through a normal (ungated) router first.
+        let mut admin = RangeRouter::connect(&c).await;
+        admin.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        admin.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        admin
+            .simple("INSERT INTO b VALUES (20)")
+            .await
+            .expect("seed b");
+        drop(admin);
+
+        // A gate over range 1: id = range-1's leader node so `is_serving`'s
+        // `current_leader == Some(id)` can hold; gated-by-default (sentinel term) until
+        // `mark_served`.
+        let leader1 = c.wait_for_leader(1).await;
+        let gate = crate::recovery_gate::RecoveryGate::new(leader1);
+        gate.register_range(1, c.leader_raft(1).await);
+
+        // Build a local-led-everything router (the `connect` idiom) but WITH the gate.
+        let mut engines = HashMap::new();
+        for r in c.range_map().range_ids() {
+            engines.insert(r, c.leader_engine(r).await);
+        }
+        let coordinator: Arc<dyn GlobalCoordinator> = Arc::new(LocalCoordinator {
+            range0: c.leader_engine(0).await,
+        });
+        let mut router = RangeRouter::new(
+            c.range_map().clone(),
+            engines,
+            Arc::new(AlwaysLeads),
+            c.catalog_kv().await,
+            Arc::new(RejectForward),
+            Some(coordinator),
+            Some(gate.clone()),
+        );
+
+        // Gate closed: a locally-led range-1 WRITE is rejected (retryable NotLeader)...
+        let err = router
+            .simple("UPDATE b SET id = 21 WHERE id = 20")
+            .await
+            .expect_err("gated write rejected");
+        assert_eq!(
+            err.code, "40001",
+            "a write to an unsettled range is retryable (NotLeader -> 40001), got {err:?}"
+        );
+        // ...but a READ on the same range passes ungated.
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM b").await,
+            vec![20],
+            "reads are not gated"
+        );
+
+        // Open the gate for the current term → the same write now succeeds.
+        let term = c.leader_raft(1).await.metrics().borrow().current_term;
+        gate.mark_served(1, term);
+        router
+            .simple("UPDATE b SET id = 21 WHERE id = 20")
+            .await
+            .expect("after the gate opens, the write proceeds");
+        assert_eq!(
+            router.scan_one_i32("SELECT id FROM b").await,
+            vec![21],
+            "the write applied once the range settled"
+        );
     }
 }

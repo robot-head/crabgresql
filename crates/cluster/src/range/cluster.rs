@@ -238,6 +238,15 @@ impl MultiRangeCluster {
         engine
     }
 
+    /// The leader node's `openraft::Raft` handle for `range` — for tests that need to drive a
+    /// `RecoveryGate` (which reads `current_leader`/`current_term`) over the in-process cluster.
+    pub async fn leader_raft(&self, range: RangeId) -> openraft::Raft<crate::types::TypeConfig> {
+        let leader = self.wait_for_leader(range).await;
+        self.groups[range as usize].nodes[leader as usize]
+            .raft
+            .clone()
+    }
+
     /// The applied `sm_kv` of `(range, node)` — for asserting where rows landed.
     pub fn sm_kv(&self, range: RangeId, node: NodeId) -> Arc<dyn Kv> {
         self.groups[range as usize].nodes[node as usize]
