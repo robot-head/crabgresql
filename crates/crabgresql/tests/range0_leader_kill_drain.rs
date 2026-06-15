@@ -1,7 +1,10 @@
-//! SP18 D3c-net-hard: cross-range 2PC conserves the bank total under a multi-process
-//! crash/partition nemesis that kills random nodes INCLUDING mid-transaction
-//! coordinators. Recovery (write-once decision + participant self-resolve) ensures
-//! no transfer is half-applied and no lock is stranded forever.
+//! SP23: cross-range 2PC conserves the bank total under a multi-process nemesis that
+//! kills the RANGE-0 leader (the GTM/coordinator home AND `acct_a`'s participant) each
+//! round, with a FULL-DRAIN stable window between kills so single-failover GTM-reseed
+//! recovery is exercised in isolation (the deferred cascading/overlapping-failover case
+//! is a spec non-goal). Validates the reseed-before-allocate fix: a freshly-risen range-0
+//! leader reseeds the GTM counter (apply-waited) before serving `BeginGlobal`, so no
+//! global xid is ever reused and no duplicate MVCC version is created.
 mod harness;
 use harness::Cluster;
 use std::time::Duration;
