@@ -223,6 +223,33 @@ impl Parser {
                 break;
             }
             self.bump();
+            // SP34: `op ANY|SOME|ALL ( SELECT … )` — a quantified comparison. Only
+            // the comparison operators take a quantifier (PostgreSQL).
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) && matches!(
+                self.peek(),
+                Token::Keyword(Keyword::Any | Keyword::Some | Keyword::All)
+            ) {
+                let all = matches!(self.peek(), Token::Keyword(Keyword::All));
+                self.bump(); // ANY / SOME / ALL
+                self.expect(&Token::LParen)?;
+                let sub = self.select_inner()?;
+                self.expect(&Token::RParen)?;
+                lhs = Expr::Quantified {
+                    expr: Box::new(lhs),
+                    op,
+                    all,
+                    subquery: Box::new(sub),
+                };
+                continue;
+            }
             let rhs = self.expr(r_bp)?;
             lhs = Expr::Binary {
                 op,
@@ -252,10 +279,26 @@ impl Parser {
                 })
             }
             Token::LParen => {
-                self.bump();
-                let e = self.expr(0)?;
+                // SP34: `( SELECT … )` is a scalar subquery; anything else is a
+                // parenthesised (grouping) expression.
+                if *self.peek2() == Token::Keyword(Keyword::Select) {
+                    self.bump(); // (
+                    let sub = self.select_inner()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::ScalarSubquery(Box::new(sub)))
+                } else {
+                    self.bump();
+                    let e = self.expr(0)?;
+                    self.expect(&Token::RParen)?;
+                    Ok(e)
+                }
+            }
+            Token::Keyword(Keyword::Exists) => {
+                self.bump(); // EXISTS
+                self.expect(&Token::LParen)?;
+                let sub = self.select_inner()?;
                 self.expect(&Token::RParen)?;
-                Ok(e)
+                Ok(Expr::Exists(Box::new(sub)))
             }
             Token::IntLit(s) => {
                 self.bump();
@@ -367,11 +410,22 @@ impl Parser {
         })
     }
 
-    /// `expr [NOT] IN (e1, e2, …)`, positioned at `IN`. The list has ≥1 element
-    /// (`IN ()` is a 42601, matching PostgreSQL). Subqueries are out of scope.
+    /// `expr [NOT] IN (e1, e2, …)` or `expr [NOT] IN (SELECT …)`, positioned at
+    /// `IN`. The value-list form has ≥1 element (`IN ()` is a 42601, matching
+    /// PostgreSQL); the `SELECT` form (SP34) is a single-column subquery.
     fn parse_in(&mut self, lhs: Expr, negated: bool) -> Result<Expr, ParseError> {
         self.expect(&Token::Keyword(Keyword::In))?;
         self.expect(&Token::LParen)?;
+        // SP34: `IN ( SELECT … )` is a subquery; otherwise a value list.
+        if *self.peek() == Token::Keyword(Keyword::Select) {
+            let sub = self.select_inner()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                subquery: Box::new(sub),
+                negated,
+            });
+        }
         let mut list = Vec::new();
         loop {
             list.push(self.expr(0)?);
@@ -2029,5 +2083,64 @@ mod tests {
     #[test]
     fn derived_table_requires_alias() {
         assert!(parse("SELECT * FROM (SELECT 1)").is_err());
+    }
+
+    // ---- SP34: subquery expressions ----
+
+    #[test]
+    fn parses_scalar_subquery_in_expression_position() {
+        match expr("(SELECT 1)") {
+            Expr::ScalarSubquery(s) => {
+                assert_eq!(s.projection.len(), 1);
+                assert!(s.from.is_empty());
+            }
+            other => panic!("expected ScalarSubquery, got {other:?}"),
+        }
+        // Nested in arithmetic; and a plain parenthesised expr is still grouping.
+        assert!(matches!(
+            expr("1 + (SELECT a FROM t)"),
+            Expr::Binary { right, .. } if matches!(*right, Expr::ScalarSubquery(_))
+        ));
+        assert!(matches!(expr("(1 + 2) * 3"), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn parses_exists_and_not_exists() {
+        assert!(matches!(expr("EXISTS (SELECT 1 FROM t)"), Expr::Exists(_)));
+        match expr("NOT EXISTS (SELECT 1 FROM t)") {
+            Expr::Unary { op: UnaryOp::Not, expr } => {
+                assert!(matches!(*expr, Expr::Exists(_)))
+            }
+            other => panic!("expected NOT(EXISTS …), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_subquery_and_keeps_in_list_working() {
+        assert!(matches!(expr("a IN (1, 2, 3)"), Expr::InList { .. }));
+        match expr("a IN (SELECT id FROM t)") {
+            Expr::InSubquery { negated, .. } => assert!(!negated),
+            other => panic!("expected InSubquery, got {other:?}"),
+        }
+        match expr("a NOT IN (SELECT id FROM t)") {
+            Expr::InSubquery { negated, .. } => assert!(negated),
+            other => panic!("expected negated InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_quantified_any_all_some() {
+        match expr("a = ANY (SELECT id FROM t)") {
+            Expr::Quantified { op: BinaryOp::Eq, all, .. } => assert!(!all),
+            other => panic!("expected ANY, got {other:?}"),
+        }
+        match expr("a > ALL (SELECT v FROM t)") {
+            Expr::Quantified { op: BinaryOp::Gt, all, .. } => assert!(all),
+            other => panic!("expected ALL, got {other:?}"),
+        }
+        match expr("a <> SOME (SELECT v FROM t)") {
+            Expr::Quantified { op: BinaryOp::Ne, all, .. } => assert!(!all),
+            other => panic!("expected SOME(=ANY), got {other:?}"),
+        }
     }
 }
