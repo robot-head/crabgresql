@@ -59,7 +59,11 @@ impl ColumnType {
 }
 
 /// A runtime value.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Eq`/`Hash` are sound here because no variant holds a float (no `NaN`), so
+/// `PartialEq` is a total equivalence. SP27 keys `GROUP BY` group maps and
+/// aggregate `DISTINCT` sets on `Datum`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Datum {
     Null,
     Bool(bool),

@@ -143,13 +143,59 @@ impl Parser {
             }
             Token::Ident(s) => {
                 self.bump();
-                Ok(Expr::Column(s))
+                // SP27: `ident (` is a function call; a bare ident is a column.
+                if *self.peek() == Token::LParen {
+                    self.func_call(s)
+                } else {
+                    Ok(Expr::Column(s))
+                }
             }
             other => Err(ParseError::new(
                 format!("unexpected token {other:?}"),
                 self.peek_pos(),
             )),
         }
+    }
+
+    /// Parse a function call after its name `ident`, positioned at `(`.
+    /// `f(*)` yields [`FuncArgs::Star`]; `DISTINCT`/`ALL` may lead the argument
+    /// list; otherwise a (possibly empty) comma-separated expression list.
+    fn func_call(&mut self, name: String) -> Result<Expr, ParseError> {
+        use crate::ast::{FuncArgs, FuncCall};
+        self.expect(&Token::LParen)?;
+        // `f(*)` — the star form (no DISTINCT, no other args).
+        if *self.peek() == Token::Star {
+            self.bump();
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Func(FuncCall {
+                name,
+                distinct: false,
+                args: FuncArgs::Star,
+            }));
+        }
+        let distinct = if self.eat_keyword(Keyword::Distinct) {
+            true
+        } else {
+            // ALL is the default modifier; accept and ignore it.
+            self.eat_keyword(Keyword::All);
+            false
+        };
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                args.push(self.expr(0)?);
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Func(FuncCall {
+            name,
+            distinct,
+            args: FuncArgs::Exprs(args),
+        }))
     }
 
     pub(crate) fn program(&mut self) -> Result<Vec<crate::ast::Statement>, ParseError> {
@@ -405,6 +451,23 @@ impl Parser {
         } else {
             None
         };
+        // SP27: GROUP BY <expr-list> then HAVING <expr>, between WHERE and ORDER BY.
+        let mut group_by = Vec::new();
+        if self.eat_keyword(Keyword::Group) {
+            self.expect(&Token::Keyword(Keyword::By))?;
+            loop {
+                group_by.push(self.expr(0)?);
+                if self.eat_comma() {
+                    continue;
+                }
+                break;
+            }
+        }
+        let having = if self.eat_keyword(Keyword::Having) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
         let mut order_by = Vec::new();
         if self.eat_keyword(Keyword::Order) {
             self.expect(&Token::Keyword(Keyword::By))?;
@@ -458,6 +521,8 @@ impl Parser {
             projection,
             from,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
             locking,
@@ -600,6 +665,78 @@ mod tests {
                 assert!(!s.order_by[0].asc); // DESC
                 assert!(s.order_by[1].asc); // default ASC
                 assert_eq!(s.limit, Some(10));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_aggregates_group_by_having() {
+        use crate::ast::{FuncArgs, FuncCall};
+        match one("SELECT k, count(*), sum(v) FROM t WHERE v > 0 \
+             GROUP BY k HAVING count(*) > 1 ORDER BY k LIMIT 5")
+        {
+            Statement::Select(s) => {
+                assert_eq!(s.projection.len(), 3);
+                // count(*)
+                assert!(matches!(
+                    s.projection[1],
+                    SelectItem::Expr {
+                        expr: Expr::Func(FuncCall { ref name, distinct: false, args: FuncArgs::Star }),
+                        ..
+                    } if name == "count"
+                ));
+                assert_eq!(s.group_by, vec![Expr::Column("k".into())]);
+                assert!(s.having.is_some());
+                assert_eq!(s.order_by.len(), 1);
+                assert_eq!(s.limit, Some(5));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_count_distinct_and_func_args() {
+        use crate::ast::{FuncArgs, FuncCall};
+        match one("SELECT count(DISTINCT a + 1) FROM t") {
+            Statement::Select(s) => match &s.projection[0] {
+                SelectItem::Expr {
+                    expr:
+                        Expr::Func(FuncCall {
+                            name,
+                            distinct,
+                            args,
+                        }),
+                    ..
+                } => {
+                    assert_eq!(name, "count");
+                    assert!(*distinct);
+                    match args {
+                        FuncArgs::Exprs(v) => assert_eq!(v.len(), 1),
+                        other => panic!("expected Exprs, got {other:?}"),
+                    }
+                }
+                other => panic!("expected a Func projection, got {other:?}"),
+            },
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_distinct_star_is_rejected() {
+        // PostgreSQL rejects `count(DISTINCT *)` as a syntax error; so do we.
+        assert!(parse("SELECT count(DISTINCT *) FROM t").is_err());
+    }
+
+    #[test]
+    fn parses_multi_key_group_by() {
+        match one("SELECT a, b, max(c) FROM t GROUP BY a, b") {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.group_by,
+                    vec![Expr::Column("a".into()), Expr::Column("b".into())]
+                );
+                assert!(s.having.is_none());
             }
             other => panic!("expected Select, got {other:?}"),
         }

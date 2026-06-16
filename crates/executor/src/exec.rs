@@ -579,7 +579,7 @@ pub(crate) fn execute_read(
         None => vec![vec![]],
     };
 
-    // Filter.
+    // Filter (WHERE runs before grouping).
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
         if row_matches(s.filter.as_ref(), table.as_ref(), row)? {
@@ -587,6 +587,11 @@ pub(crate) fn execute_read(
         }
     }
 
+    // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
+    // groups; everything else projects rows one-for-one.
+    if crate::agg::is_aggregate_query(s) {
+        return crate::agg::execute_aggregate(s, table.as_ref(), kept);
+    }
     project_order_limit(s, table.as_ref(), kept)
 }
 
@@ -607,6 +612,12 @@ pub(crate) async fn execute_read_locking(
     mode: crate::lockmgr::LockMode,
     s: &SelectStmt,
 ) -> Result<QueryResult, ExecError> {
+    // FOR UPDATE/SHARE is not allowed with aggregation (PostgreSQL 0A000).
+    if crate::agg::is_aggregate_query(s) {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not allowed with aggregate functions or GROUP BY".into(),
+        ));
+    }
     // FOR UPDATE/SHARE requires a FROM clause — there are no rows to lock
     // in a FROM-less SELECT.
     let table_name = s
@@ -710,7 +721,7 @@ fn project_order_limit(
 
 /// Expand the projection list into output FieldDescriptions and the expressions
 /// that produce each column.
-fn resolve_projection(
+pub(crate) fn resolve_projection(
     items: &[SelectItem],
     table: Option<&Table>,
 ) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
@@ -750,6 +761,8 @@ fn resolve_projection(
 fn derived_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(c) => c.clone(),
+        // PostgreSQL names an aggregate output column after the function.
+        Expr::Func(fc) => fc.name.clone(),
         _ => "?column?".to_string(),
     }
 }
@@ -766,7 +779,7 @@ fn field(name: &str, ty: ColumnType) -> FieldDescription {
     }
 }
 
-fn datum_to_cell(d: &Datum) -> Option<Cell> {
+pub(crate) fn datum_to_cell(d: &Datum) -> Option<Cell> {
     if d.is_null() {
         return None;
     }
@@ -778,7 +791,7 @@ fn datum_to_cell(d: &Datum) -> Option<Cell> {
 
 /// Compare two order-key vectors per the SELECT's ASC/DESC flags, with PG's
 /// default null placement (NULLS LAST for ASC, NULLS FIRST for DESC).
-fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
+pub(crate) fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for (i, item) in s.order_by.iter().enumerate() {
         let (x, y) = (&a[i], &b[i]);

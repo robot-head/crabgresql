@@ -32,31 +32,43 @@ pub(crate) fn eval(
         }
         Expr::Unary { op, expr } => {
             let v = eval(expr, table, values)?;
-            match op {
-                UnaryOp::Not => Ok(ops::not(&v)?),
-                UnaryOp::Neg => Ok(ops::sub(&Datum::Int4(0), &v)?),
-            }
+            apply_unary(*op, &v)
         }
         Expr::Binary { op, left, right } => {
             let l = eval(left, table, values)?;
             let r = eval(right, table, values)?;
-            match op {
-                BinaryOp::Add => Ok(ops::add(&l, &r)?),
-                BinaryOp::Sub => Ok(ops::sub(&l, &r)?),
-                BinaryOp::Mul => Ok(ops::mul(&l, &r)?),
-                BinaryOp::Div => Ok(ops::div(&l, &r)?),
-                BinaryOp::And => Ok(ops::and(&l, &r)?),
-                BinaryOp::Or => Ok(ops::or(&l, &r)?),
-                BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge => {
-                    let ord = ops::compare(&l, &r)?;
-                    Ok(cmp_result(*op, ord))
-                }
-            }
+            apply_binary(*op, &l, &r)
+        }
+        // A function call reached scalar `eval` means it is NOT in an aggregate
+        // position (the aggregate path resolves aggregates from accumulators and
+        // their arguments by recursing through here). An aggregate here is
+        // therefore misplaced/nested (42803); any other name is undefined (42883).
+        Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
+    }
+}
+
+/// Apply a unary operator to an already-evaluated operand. Shared by scalar
+/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`).
+pub(crate) fn apply_unary(op: UnaryOp, v: &Datum) -> Result<Datum, ExecError> {
+    match op {
+        UnaryOp::Not => Ok(ops::not(v)?),
+        UnaryOp::Neg => Ok(ops::sub(&Datum::Int4(0), v)?),
+    }
+}
+
+/// Apply a binary operator to two already-evaluated operands. Shared by scalar
+/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`).
+pub(crate) fn apply_binary(op: BinaryOp, l: &Datum, r: &Datum) -> Result<Datum, ExecError> {
+    match op {
+        BinaryOp::Add => Ok(ops::add(l, r)?),
+        BinaryOp::Sub => Ok(ops::sub(l, r)?),
+        BinaryOp::Mul => Ok(ops::mul(l, r)?),
+        BinaryOp::Div => Ok(ops::div(l, r)?),
+        BinaryOp::And => Ok(ops::and(l, r)?),
+        BinaryOp::Or => Ok(ops::or(l, r)?),
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            let ord = ops::compare(l, r)?;
+            Ok(cmp_result(op, ord))
         }
     }
 }
@@ -117,6 +129,9 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
             }
             _ => Ok(ColumnType::Bool),
         },
+        // Aggregate result type for RowDescription (count/sum -> int8, min/max ->
+        // the argument's type); unknown names / bad arity -> 42883.
+        Expr::Func(fc) => crate::agg::func_result_type(fc, table),
     }
 }
 
