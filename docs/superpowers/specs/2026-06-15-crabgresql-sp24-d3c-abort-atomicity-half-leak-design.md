@@ -104,3 +104,35 @@ abort.
    participant-leader-kill nemesis (Task 4 passes 3×+ non-flaky under `--profile ci`).
 3. A Stateright model with teeth catches the un-fenced re-stage variant.
 4. Full gauntlet green; all probe scaffolding reverted; UAC guard clean.
+
+## As-shipped (SP24, 2026-06-15) — CORRECTED approach + scoped outcome
+
+The probe-first investigation refined this design twice:
+
+1. **Root cause corrected (re-stage fence → LOST LOCKS).** The first fix attempt (a session-level
+   `effective_global_xid` fence that adopts an in-doubt `g_old`) turned the in-process reproduction
+   green but a faithful multi-process *pure-participant* nemesis still tore. A reassessment drill pinned
+   the real trigger with hard evidence: **row locks live only in the in-memory `RowLockManager`; a
+   participant-leader kill wipes the lock table while the in-doubt `Prepared(Li→g)` version stays
+   durable**, so the row has no live lock holder and concurrent writers mint competing versions each
+   under its own `g` (one torn row had seven independently-committed versions). The fence only collapses
+   one `g` per stage and cannot serialize N writers.
+
+2. **Fix shipped = re-acquire in-doubt row locks on leadership rise** (textbook 2PC participant
+   recovery): `executor::SqlEngine::reacquire_in_doubt_locks` + `RowLockManager::reacquire_exclusive`,
+   wired into `server_node::resolve_in_doubt_on_leadership` BEFORE `mark_served` (settle-before-serve for
+   locks), held until each `g` resolves. The `effective_global_xid` fence is kept as defense-in-depth.
+   Proven by the in-process reproduction + an executor unit test with teeth (a concurrent writer BLOCKS
+   on the re-acquired lock) + the Stateright model with teeth (`crossrange_2pc_abort_atomicity_model`).
+   Zero regressions; full gauntlet green (419 passed, 1 skipped).
+
+3. **Scope correction (success criterion #2 partially DEFERRED).** The multi-process
+   `participant_kill_bank` nemesis is committed **`#[ignore]`'d**: it still tears, but the evidence shows
+   a SEPARATE, pre-existing failure — a *committed* cross-range txn's killed-participant half is **LOST**
+   (single live version, no competing version), distinct from the abort-atomicity half-leak SP24 fixes.
+   This is the **SP22/SP23-deferred committed-half-survival / non-atomic-2PC-commit** gap, reproducible
+   independent of all SP24 work, and explicitly a non-goal of this slice. Closing it (durably reconstruct
+   + re-apply a committed `g`'s killed-participant half on the risen leader) is a dedicated future slice;
+   `participant_kill_bank` is the ready acceptance test (un-`#[ignore]` it when that slice lands). SP24
+   therefore ships criteria #1, #3, #4 fully and #2 scoped to abort-atomicity (the converging nemesis
+   for the residual is the next slice's deliverable).
