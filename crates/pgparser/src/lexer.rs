@@ -88,6 +88,13 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                 out.push((Token::Concat, i));
                 i += 2;
             }
+            // SP31: `::` is the cast operator. A lone `:` is not a token in this
+            // slice (no array slices / named-parameter `:=`), so it falls through
+            // to the "unexpected character" arm.
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                out.push((Token::TypeCast, i));
+                i += 2;
+            }
             b'(' => push1(&mut out, Token::LParen, &mut i),
             b')' => push1(&mut out, Token::RParen, &mut i),
             b',' => push1(&mut out, Token::Comma, &mut i),
@@ -276,6 +283,24 @@ mod tests {
         );
         // A single `|` is not a token in this slice (no bitwise-or).
         let e = lex("a | b").expect_err("lone pipe");
+        assert!(e.message.contains("unexpected character"));
+    }
+
+    #[test]
+    fn cast_operator_lexes_and_a_lone_colon_is_rejected() {
+        // `::` is one token; with no surrounding spaces a slip in the two-byte
+        // advance would mis-read the next byte.
+        assert_eq!(
+            toks("x::int4"),
+            vec![
+                Token::Ident("x".into()),
+                Token::TypeCast,
+                Token::Ident("int4".into()),
+                Token::Eof,
+            ]
+        );
+        // A single `:` is not a token in this slice.
+        let e = lex("a : b").expect_err("lone colon");
         assert!(e.message.contains("unexpected character"));
     }
 

@@ -139,6 +139,13 @@ pub enum Expr {
         whens: Vec<(Expr, Expr)>,
         else_result: Option<Box<Expr>>,
     },
+    /// SP31: an explicit cast — `CAST(expr AS ty)` or `expr::ty`. The target type
+    /// is resolved to a [`ColumnType`] by the parser (an unknown type name is a
+    /// parse error); the executor performs the value conversion.
+    Cast {
+        expr: Box<Expr>,
+        ty: ColumnType,
+    },
 }
 
 /// SP27: a parsed function call. `name` is lowercased by the lexer.

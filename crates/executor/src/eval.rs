@@ -93,6 +93,13 @@ pub(crate) fn eval(
         } => eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
             eval(e, table, values)
         }),
+        // SP31: explicit cast — evaluate the operand, then convert. A text-parse
+        // failure (22P02), numeric overflow (22003), or undefined cast (42846)
+        // surfaces here; NULL casts to NULL.
+        Expr::Cast { expr, ty } => {
+            let v = eval(expr, table, values)?;
+            Ok(pgtypes::cast::cast(&v, *ty)?)
+        }
     }
 }
 
@@ -389,6 +396,21 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
         Expr::Case {
             whens, else_result, ..
         } => infer_case_type(whens, else_result.as_deref(), table),
+        // SP31: a cast's static result type is the target type — but only if the
+        // cast is defined; an undefined `(from, to)` pair is 42846 at plan time
+        // (so it is rejected before any row is produced). A bare `NULL` infers as
+        // text, and text → anything is defined, so `NULL::<any>` is accepted.
+        Expr::Cast { expr, ty } => {
+            let from = infer_type(expr, table)?;
+            if pgtypes::cast::cast_allowed(from, *ty) {
+                Ok(*ty)
+            } else {
+                Err(ExecError::Type(TypeError::CannotCast {
+                    from: from.name(),
+                    to: ty.name(),
+                }))
+            }
+        }
     }
 }
 
@@ -693,6 +715,72 @@ mod tests {
     #[test]
     fn case_when_non_boolean_condition_is_42804() {
         assert_eq!(err_code("case when 1 then 'x' end", None, &[]), "42804");
+    }
+
+    // ---- SP31: explicit casts ----
+
+    #[test]
+    fn cast_evaluates_each_supported_conversion() {
+        // text → numeric/bool.
+        assert_eq!(ev("'42'::int4", None, &[]), Datum::Int4(42));
+        assert_eq!(
+            ev("'9000000000'::int8", None, &[]),
+            Datum::Int8(9_000_000_000)
+        );
+        assert_eq!(ev("'1.5'::float8", None, &[]), Datum::Float8(1.5));
+        assert_eq!(ev("'true'::bool", None, &[]), Datum::Bool(true));
+        // numeric → numeric (float8 → int rounds half-to-even).
+        assert_eq!(ev("1.5::int4", None, &[]), Datum::Int4(2));
+        assert_eq!(ev("(5::int8)::int4", None, &[]), Datum::Int4(5));
+        // bool ↔ int4, and → text (`true`/`false`, not `t`/`f`).
+        assert_eq!(ev("true::int4", None, &[]), Datum::Int4(1));
+        assert_eq!(ev("5::bool", None, &[]), Datum::Bool(true));
+        assert_eq!(ev("0::bool", None, &[]), Datum::Bool(false));
+        assert_eq!(ev("42::text", None, &[]), Datum::Text("42".into()));
+        assert_eq!(ev("true::text", None, &[]), Datum::Text("true".into()));
+        // NULL casts to NULL; the CAST() spelling is identical to `::`.
+        assert_eq!(ev("null::int4", None, &[]), Datum::Null);
+        assert_eq!(ev("CAST('7' AS int4)", None, &[]), Datum::Int4(7));
+    }
+
+    #[test]
+    fn cast_infers_target_type_and_rejects_undefined_at_plan_time() {
+        let t = table();
+        // The static result type is the target type; a column operand resolves too.
+        assert_eq!(
+            infer_type(&pexpr("'42'::int8").expect("parse"), None).expect("infer"),
+            ColumnType::Int8
+        );
+        assert_eq!(
+            infer_type(&pexpr("a::text").expect("parse"), Some(&t)).expect("infer"),
+            ColumnType::Text
+        );
+        // A bare NULL infers as text, and text → anything is defined.
+        assert_eq!(
+            infer_type(&pexpr("null::bool").expect("parse"), None).expect("infer"),
+            ColumnType::Bool
+        );
+        // An undefined cast is rejected at plan time (42846), before evaluation:
+        // a float8 column → bool has no defined cast.
+        let ft = Table {
+            id: 1,
+            name: "t".into(),
+            columns: vec![Column {
+                name: "a".into(),
+                ty: ColumnType::Float8,
+            }],
+        };
+        let err = infer_type(&pexpr("a::bool").expect("parse"), Some(&ft))
+            .expect_err("float8->bool is undefined");
+        assert_eq!(err.into_pg().code, "42846");
+    }
+
+    #[test]
+    fn cast_runtime_error_surface() {
+        // Undefined cast at eval (42846), bad text syntax (22P02), overflow (22003).
+        assert_eq!(err_code("1.5::bool", None, &[]), "42846");
+        assert_eq!(err_code("'abc'::int4", None, &[]), "22P02");
+        assert_eq!(err_code("'99999999999'::int4", None, &[]), "22003");
     }
 
     #[test]
