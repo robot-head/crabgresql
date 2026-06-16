@@ -20,6 +20,12 @@ pub enum ExecError {
     /// Wrong type in a context that demands a specific one (42804) — e.g. a
     /// non-boolean WHERE.
     TypeMismatch(String),
+    /// A grouping/aggregation rule was violated (42803) — e.g. a column that is
+    /// neither grouped nor inside an aggregate, or a nested aggregate.
+    Grouping(String),
+    /// A call to a function that does not exist (42883) — e.g. an unknown name
+    /// or an aggregate applied to an argument type/arity it does not accept.
+    UndefinedFunction(String),
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -54,6 +60,8 @@ impl ExecError {
             }
             ExecError::Unsupported(m) => PgError::error("0A000", m),
             ExecError::TypeMismatch(m) => PgError::error("42804", m),
+            ExecError::Grouping(m) => PgError::error("42803", m),
+            ExecError::UndefinedFunction(m) => PgError::error("42883", m),
             ExecError::InFailedTransaction => PgError::error(
                 "25P02",
                 "current transaction is aborted, commands ignored until end of transaction block",

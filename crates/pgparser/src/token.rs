@@ -66,6 +66,11 @@ pub enum Keyword {
     // SP6: row-level locking
     For,
     Share,
+    // SP27: aggregates + grouping
+    Group,
+    Having,
+    Distinct,
+    All,
 }
 
 impl Keyword {
@@ -111,6 +116,11 @@ impl Keyword {
             // SP6: row-level locking
             "for" => Keyword::For,
             "share" => Keyword::Share,
+            // SP27: aggregates + grouping
+            "group" => Keyword::Group,
+            "having" => Keyword::Having,
+            "distinct" => Keyword::Distinct,
+            "all" => Keyword::All,
             _ => return None,
         })
     }

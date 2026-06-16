@@ -1,0 +1,856 @@
+//! SP27: aggregate functions + `GROUP BY` / `HAVING`.
+//!
+//! A whole table lives on a single range (`RangeMap::range_for_table`), so an
+//! aggregate query executes entirely inside one `execute_read` on one engine.
+//! This module is therefore a pure, deterministic fold over the already-correct
+//! MVCC-visible row set — no cross-range scatter/gather, no new lock, no new
+//! visibility rule, no new interleaving (see the SP27 design doc for why this
+//! single-range/pure-data feature warrants no Stateright model).
+//!
+//! Supported: `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `MIN(x)`, `MAX(x)`, their
+//! `DISTINCT` forms, multi-key `GROUP BY`, and `HAVING`. `AVG` is deferred until
+//! a `numeric`/float type exists.
+
+use std::collections::{HashMap, HashSet};
+
+use catalog::Table;
+use pgparser::ast::{Expr, FuncArgs, FuncCall, SelectItem, SelectStmt};
+use pgtypes::{ColumnType, Datum, TypeError, ops};
+use pgwire::engine::{Cell, QueryResult};
+
+use crate::error::ExecError;
+
+/// The aggregate functions SP27 supports. `AVG` is deferred (needs `numeric`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+/// Classify a (lowercased — the lexer lowercases unquoted idents) function name.
+/// `None` means "not a known aggregate" (treated as an undefined function, since
+/// no scalar functions exist yet).
+fn aggregate_func(name: &str) -> Option<AggFunc> {
+    match name {
+        "count" => Some(AggFunc::Count),
+        "sum" => Some(AggFunc::Sum),
+        "min" => Some(AggFunc::Min),
+        "max" => Some(AggFunc::Max),
+        _ => None,
+    }
+}
+
+/// Does `e` (or any subexpression) call a known aggregate function?
+pub(crate) fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Func(fc) => {
+            aggregate_func(&fc.name).is_some()
+                || match &fc.args {
+                    FuncArgs::Star => false,
+                    FuncArgs::Exprs(args) => args.iter().any(contains_aggregate),
+                }
+        }
+        Expr::Unary { expr, .. } => contains_aggregate(expr),
+        Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        _ => false,
+    }
+}
+
+/// A `SELECT` is an *aggregate query* iff it groups, has `HAVING`, or any
+/// aggregate call appears in the projection or `ORDER BY`.
+pub(crate) fn is_aggregate_query(s: &SelectStmt) -> bool {
+    !s.group_by.is_empty()
+        || s.having.is_some()
+        || s.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+            SelectItem::Wildcard => false,
+        })
+        || s.order_by.iter().any(|o| contains_aggregate(&o.expr))
+}
+
+/// Error for a function call reached by scalar `eval` (i.e. NOT a resolved
+/// aggregate position): a known aggregate there is misplaced/nested (42803);
+/// anything else is an undefined function (42883).
+pub(crate) fn func_in_scalar_context_error(fc: &FuncCall) -> ExecError {
+    if aggregate_func(&fc.name).is_some() {
+        ExecError::Grouping(format!(
+            "aggregate function \"{}\" is not allowed here \
+             (aggregates cannot be nested)",
+            fc.name
+        ))
+    } else {
+        undefined_function(&fc.name)
+    }
+}
+
+/// The result column type of an aggregate call, for RowDescription — also
+/// validating name, arity, and argument type (all mapped to 42883).
+pub(crate) fn func_result_type(
+    fc: &FuncCall,
+    table: Option<&Table>,
+) -> Result<ColumnType, ExecError> {
+    let Some(func) = aggregate_func(&fc.name) else {
+        return Err(undefined_function(&fc.name));
+    };
+    match func {
+        AggFunc::Count => {
+            count_arity(fc)?;
+            Ok(ColumnType::Int8) // count(*) / count(x) -> bigint
+        }
+        AggFunc::Sum => {
+            let arg = single_value_arg(fc)?;
+            match crate::eval::infer_type(arg, table)? {
+                // sum(int4) -> bigint; sum(int8) -> bigint here (PG: numeric — a
+                // documented deviation until a numeric type exists).
+                ColumnType::Int4 | ColumnType::Int8 => Ok(ColumnType::Int8),
+                other => Err(undefined_for_arg("sum", other)),
+            }
+        }
+        // min/max preserve the argument's type.
+        AggFunc::Min | AggFunc::Max => {
+            let arg = single_value_arg(fc)?;
+            crate::eval::infer_type(arg, table)
+        }
+    }
+}
+
+fn undefined_function(name: &str) -> ExecError {
+    ExecError::UndefinedFunction(format!("function {name}(...) does not exist"))
+}
+
+fn undefined_for_arg(name: &str, t: ColumnType) -> ExecError {
+    ExecError::UndefinedFunction(format!("function {}({}) does not exist", name, t.name()))
+}
+
+/// `count` accepts `*` or exactly one argument.
+fn count_arity(fc: &FuncCall) -> Result<(), ExecError> {
+    match &fc.args {
+        FuncArgs::Star => Ok(()),
+        FuncArgs::Exprs(args) if args.len() == 1 => Ok(()),
+        _ => Err(undefined_function("count")),
+    }
+}
+
+/// The single value argument of `sum`/`min`/`max` (and `count(x)`); errors
+/// (42883) for the wrong arity or the `*` form.
+fn single_value_arg(fc: &FuncCall) -> Result<&Expr, ExecError> {
+    match &fc.args {
+        FuncArgs::Exprs(args) if args.len() == 1 => Ok(&args[0]),
+        _ => Err(undefined_function(&fc.name)),
+    }
+}
+
+/// A resolved aggregate to compute: the function, its argument (`None` only for
+/// `count(*)`), and whether `DISTINCT`. `PartialEq` lets identical aggregates
+/// share a single accumulator (deduped at collection time).
+#[derive(Debug, Clone, PartialEq)]
+struct AggSpec {
+    func: AggFunc,
+    arg: Option<Expr>,
+    distinct: bool,
+}
+
+/// Build the spec for one aggregate call, validating arity, argument type, and
+/// the no-nested-aggregate rule.
+fn spec_of(fc: &FuncCall, table: Option<&Table>) -> Result<AggSpec, ExecError> {
+    let func = aggregate_func(&fc.name).ok_or_else(|| undefined_function(&fc.name))?;
+    match func {
+        AggFunc::Count => match &fc.args {
+            FuncArgs::Star => Ok(AggSpec {
+                func,
+                arg: None,
+                distinct: fc.distinct,
+            }),
+            FuncArgs::Exprs(args) if args.len() == 1 => {
+                reject_nested_aggregate(&args[0])?;
+                Ok(AggSpec {
+                    func,
+                    arg: Some(args[0].clone()),
+                    distinct: fc.distinct,
+                })
+            }
+            _ => Err(undefined_function("count")),
+        },
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+            let arg = single_value_arg(fc)?;
+            reject_nested_aggregate(arg)?;
+            // Type-check the argument now so RowDescription and folding agree.
+            match func {
+                AggFunc::Sum => match crate::eval::infer_type(arg, table)? {
+                    ColumnType::Int4 | ColumnType::Int8 => {}
+                    other => return Err(undefined_for_arg("sum", other)),
+                },
+                _ => {
+                    crate::eval::infer_type(arg, table)?;
+                }
+            }
+            Ok(AggSpec {
+                func,
+                arg: Some(arg.clone()),
+                distinct: fc.distinct,
+            })
+        }
+    }
+}
+
+fn reject_nested_aggregate(arg: &Expr) -> Result<(), ExecError> {
+    if contains_aggregate(arg) {
+        return Err(ExecError::Grouping(
+            "aggregate function calls cannot be nested".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Collect (deduped) every aggregate spec in `e`. A non-aggregate function call
+/// is an undefined function (42883).
+fn collect_specs(
+    e: &Expr,
+    table: Option<&Table>,
+    specs: &mut Vec<AggSpec>,
+) -> Result<(), ExecError> {
+    match e {
+        Expr::Func(fc) if aggregate_func(&fc.name).is_some() => {
+            let spec = spec_of(fc, table)?;
+            if !specs.contains(&spec) {
+                specs.push(spec);
+            }
+        }
+        Expr::Func(fc) => return Err(undefined_function(&fc.name)),
+        Expr::Unary { expr, .. } => collect_specs(expr, table, specs)?,
+        Expr::Binary { left, right, .. } => {
+            collect_specs(left, table, specs)?;
+            collect_specs(right, table, specs)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Data-independent validation: every projection / `HAVING` / `ORDER BY`
+/// expression must be built from aggregate calls, `GROUP BY` expressions, and
+/// constants. A bare ungrouped column → 42803 (even on an empty table).
+fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
+    if let Expr::Func(fc) = e
+        && aggregate_func(&fc.name).is_some()
+    {
+        return Ok(()); // an aggregate may reference any column in its argument
+    }
+    if group_by.iter().any(|g| g == e) {
+        return Ok(()); // matches a grouping expression structurally
+    }
+    match e {
+        Expr::Column(name) => Err(ungrouped_column(name)),
+        Expr::Unary { expr, .. } => validate_grouped(expr, group_by),
+        Expr::Binary { left, right, .. } => {
+            validate_grouped(left, group_by)?;
+            validate_grouped(right, group_by)
+        }
+        Expr::Func(fc) => Err(undefined_function(&fc.name)),
+        _ => Ok(()), // literals / params are constants
+    }
+}
+
+fn ungrouped_column(name: &str) -> ExecError {
+    ExecError::Grouping(format!(
+        "column \"{name}\" must appear in the GROUP BY clause or be used in an aggregate function"
+    ))
+}
+
+/// Evaluate an expression in a group's context: aggregate calls resolve to their
+/// finalized per-group result; subexpressions matching a `GROUP BY` expression
+/// resolve to the group key; everything else recurses. (Validation already
+/// guarantees no ungrouped column reaches the `Column` arm.)
+fn eval_grouped(
+    e: &Expr,
+    table: Option<&Table>,
+    group_by: &[Expr],
+    key: &[Datum],
+    specs: &[AggSpec],
+    results: &[Datum],
+) -> Result<Datum, ExecError> {
+    if let Expr::Func(fc) = e
+        && aggregate_func(&fc.name).is_some()
+    {
+        let spec = spec_of(fc, table)?;
+        let i = specs
+            .iter()
+            .position(|s| *s == spec)
+            .ok_or_else(|| ExecError::Grouping("aggregate not resolved".into()))?;
+        return Ok(results[i].clone());
+    }
+    if let Some(i) = group_by.iter().position(|g| g == e) {
+        return Ok(key[i].clone());
+    }
+    match e {
+        Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
+        Expr::StringLiteral(s) => Ok(Datum::Text(s.clone())),
+        Expr::BoolLiteral(b) => Ok(Datum::Bool(*b)),
+        Expr::NullLiteral => Ok(Datum::Null),
+        Expr::Param(_) => Err(ExecError::Unsupported(
+            "query parameters ($n) are not supported".into(),
+        )),
+        Expr::Column(name) => Err(ungrouped_column(name)),
+        Expr::Unary { op, expr } => {
+            let v = eval_grouped(expr, table, group_by, key, specs, results)?;
+            crate::eval::apply_unary(*op, &v)
+        }
+        Expr::Binary { op, left, right } => {
+            let l = eval_grouped(left, table, group_by, key, specs, results)?;
+            let r = eval_grouped(right, table, group_by, key, specs, results)?;
+            crate::eval::apply_binary(*op, &l, &r)
+        }
+        Expr::Func(fc) => Err(undefined_function(&fc.name)),
+    }
+}
+
+/// One group's running accumulator for one aggregate. The optional `seen` set is
+/// present iff the spec is `DISTINCT`.
+enum Acc {
+    Count {
+        n: i64,
+        seen: Option<HashSet<Datum>>,
+    },
+    Sum {
+        acc: Option<i64>,
+        seen: Option<HashSet<Datum>>,
+    },
+    MinMax {
+        best: Option<Datum>,
+        seen: Option<HashSet<Datum>>,
+    },
+}
+
+impl Acc {
+    fn new(spec: &AggSpec) -> Acc {
+        let seen = spec.distinct.then(HashSet::new);
+        match spec.func {
+            AggFunc::Count => Acc::Count { n: 0, seen },
+            AggFunc::Sum => Acc::Sum { acc: None, seen },
+            AggFunc::Min | AggFunc::Max => Acc::MinMax { best: None, seen },
+        }
+    }
+
+    fn seen_mut(&mut self) -> Option<&mut HashSet<Datum>> {
+        match self {
+            Acc::Count { seen, .. } | Acc::Sum { seen, .. } | Acc::MinMax { seen, .. } => {
+                seen.as_mut()
+            }
+        }
+    }
+
+    /// Fold one source row into this accumulator.
+    fn fold_row(
+        &mut self,
+        spec: &AggSpec,
+        table: Option<&Table>,
+        row: &[Datum],
+    ) -> Result<(), ExecError> {
+        // count(*) counts every row, ignoring NULL/DISTINCT.
+        if let (AggFunc::Count, None) = (spec.func, &spec.arg) {
+            if let Acc::Count { n, .. } = self {
+                *n += 1;
+            }
+            return Ok(());
+        }
+        let arg = spec
+            .arg
+            .as_ref()
+            .expect("non-star aggregate has an argument");
+        let v = crate::eval::eval(arg, table, row)?;
+        // count(x)/sum/min/max ignore NULL arguments.
+        if v.is_null() {
+            return Ok(());
+        }
+        // DISTINCT: fold only the first occurrence of each value.
+        if spec.distinct
+            && let Some(seen) = self.seen_mut()
+            && !seen.insert(v.clone())
+        {
+            return Ok(());
+        }
+        match self {
+            Acc::Count { n, .. } => *n += 1,
+            Acc::Sum { acc, .. } => {
+                let add = as_i64(&v).ok_or_else(|| {
+                    undefined_for_arg("sum", v.column_type().unwrap_or(ColumnType::Text))
+                })?;
+                let next = match acc {
+                    Some(cur) => cur
+                        .checked_add(add)
+                        .ok_or(ExecError::Type(TypeError::Overflow))?,
+                    None => add,
+                };
+                *acc = Some(next);
+            }
+            Acc::MinMax { best, .. } => {
+                let take = match best {
+                    None => true,
+                    Some(cur) => {
+                        let ord = ops::compare(&v, cur)?; // both non-null
+                        matches!(
+                            (spec.func, ord),
+                            (AggFunc::Min, Some(std::cmp::Ordering::Less))
+                                | (AggFunc::Max, Some(std::cmp::Ordering::Greater))
+                        )
+                    }
+                };
+                if take {
+                    *best = Some(v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Datum {
+        match self {
+            Acc::Count { n, .. } => Datum::Int8(*n),
+            Acc::Sum { acc, .. } => acc.map(Datum::Int8).unwrap_or(Datum::Null),
+            Acc::MinMax { best, .. } => best.clone().unwrap_or(Datum::Null),
+        }
+    }
+}
+
+fn as_i64(d: &Datum) -> Option<i64> {
+    match d {
+        Datum::Int4(n) => Some(i64::from(*n)),
+        Datum::Int8(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Execute an aggregate query over the already-`WHERE`-filtered `rows`.
+pub(crate) fn execute_aggregate(
+    s: &SelectStmt,
+    table: Option<&Table>,
+    rows: Vec<Vec<Datum>>,
+) -> Result<QueryResult, ExecError> {
+    // Output columns: field names + types via the shared projection resolver
+    // (infer_type now understands aggregate result types).
+    let (fields, out_exprs) = crate::exec::resolve_projection(&s.projection, table)?;
+
+    // GROUP BY expressions may not themselves be aggregates.
+    for g in &s.group_by {
+        if contains_aggregate(g) {
+            return Err(ExecError::Grouping(
+                "aggregate functions are not allowed in GROUP BY".into(),
+            ));
+        }
+    }
+
+    // Collect (deduped) the aggregates to compute, then validate every output /
+    // HAVING / ORDER BY expression is grouped-valid (data-independent).
+    let mut specs: Vec<AggSpec> = Vec::new();
+    for e in out_exprs
+        .iter()
+        .chain(s.having.iter())
+        .chain(s.order_by.iter().map(|o| &o.expr))
+    {
+        collect_specs(e, table, &mut specs)?;
+        validate_grouped(e, &s.group_by)?;
+    }
+
+    // Fold rows into groups, preserving first-appearance order.
+    let has_group_by = !s.group_by.is_empty();
+    let mut keys: Vec<Vec<Datum>> = Vec::new();
+    let mut accs: Vec<Vec<Acc>> = Vec::new();
+    let mut index: HashMap<Vec<Datum>, usize> = HashMap::new();
+    for row in &rows {
+        let mut key = Vec::with_capacity(s.group_by.len());
+        for g in &s.group_by {
+            key.push(crate::eval::eval(g, table, row)?);
+        }
+        let gi = match index.get(&key) {
+            Some(&i) => i,
+            None => {
+                let i = keys.len();
+                index.insert(key.clone(), i);
+                keys.push(key);
+                accs.push(specs.iter().map(Acc::new).collect());
+                i
+            }
+        };
+        for (spec, acc) in specs.iter().zip(accs[gi].iter_mut()) {
+            acc.fold_row(spec, table, row)?;
+        }
+    }
+    // A bare aggregate (no GROUP BY) over zero rows still yields ONE group.
+    if !has_group_by && keys.is_empty() {
+        keys.push(Vec::new());
+        accs.push(specs.iter().map(Acc::new).collect());
+    }
+
+    // Finalize each group: HAVING filter, ORDER BY keys, projection.
+    let mut out: Vec<(Vec<Datum>, Vec<Option<Cell>>)> = Vec::with_capacity(keys.len());
+    for (key, group_accs) in keys.iter().zip(accs.iter()) {
+        let results: Vec<Datum> = group_accs.iter().map(Acc::finish).collect();
+        if let Some(h) = &s.having {
+            match eval_grouped(h, table, &s.group_by, key, &specs, &results)? {
+                Datum::Bool(true) => {}
+                Datum::Bool(false) | Datum::Null => continue,
+                _ => {
+                    return Err(ExecError::TypeMismatch(
+                        "argument of HAVING must be type boolean".into(),
+                    ));
+                }
+            }
+        }
+        let mut order_keys = Vec::with_capacity(s.order_by.len());
+        for o in &s.order_by {
+            order_keys.push(eval_grouped(
+                &o.expr,
+                table,
+                &s.group_by,
+                key,
+                &specs,
+                &results,
+            )?);
+        }
+        let mut cells = Vec::with_capacity(out_exprs.len());
+        for e in &out_exprs {
+            let d = eval_grouped(e, table, &s.group_by, key, &specs, &results)?;
+            cells.push(crate::exec::datum_to_cell(&d));
+        }
+        out.push((order_keys, cells));
+    }
+
+    if !s.order_by.is_empty() {
+        out.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, s));
+    }
+    if let Some(limit) = s.limit {
+        let n = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+        out.truncate(n);
+    }
+
+    let rows_out: Vec<Vec<Option<Cell>>> = out.into_iter().map(|(_, cells)| cells).collect();
+    let tag = format!("SELECT {}", rows_out.len());
+    Ok(QueryResult::Rows {
+        fields,
+        rows: rows_out,
+        tag,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use catalog::{Column, Table};
+    use pgparser::ast::{SelectStmt, Statement};
+
+    fn table() -> Table {
+        Table {
+            id: 1,
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "k".into(),
+                    ty: ColumnType::Int4,
+                },
+                Column {
+                    name: "v".into(),
+                    ty: ColumnType::Int4,
+                },
+            ],
+        }
+    }
+
+    /// Parse one SELECT and run it over the given (already-WHERE-filtered) rows.
+    fn agg(
+        sql: &str,
+        t: Option<&Table>,
+        rows: Vec<Vec<Datum>>,
+    ) -> Result<Vec<Vec<Datum>>, ExecError> {
+        let stmt = pgparser::parse(sql).expect("parse").pop().expect("one");
+        let Statement::Select(s) = stmt else {
+            panic!("not a select");
+        };
+        assert!(
+            is_aggregate_query(&s),
+            "test sql must be an aggregate query"
+        );
+        match execute_aggregate(&s, t, rows)? {
+            QueryResult::Rows { rows, .. } => Ok(rows
+                .into_iter()
+                .map(|r| r.into_iter().map(cell_to_datum).collect())
+                .collect()),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// Decode a result cell back to a (typed-enough) Datum for assertions: we
+    /// compare text-format payloads, so map back to Text/Null and ints by parse.
+    fn cell_to_datum(c: Option<Cell>) -> Datum {
+        match c {
+            None => Datum::Null,
+            Some(cell) => {
+                let s = String::from_utf8(cell.text.to_vec()).expect("utf8");
+                match s.parse::<i64>() {
+                    Ok(n) => Datum::Int8(n),
+                    Err(_) => Datum::Text(s),
+                }
+            }
+        }
+    }
+
+    fn r(vals: &[Datum]) -> Vec<Datum> {
+        vals.to_vec()
+    }
+
+    fn int(n: i64) -> Datum {
+        Datum::Int8(n)
+    }
+
+    #[test]
+    fn count_star_counts_all_rows_including_nulls() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(1), Datum::Null]),
+            r(&[Datum::Int4(2), Datum::Int4(30)]),
+        ];
+        assert_eq!(
+            agg("SELECT count(*) FROM t", Some(&t), rows).expect("agg"),
+            vec![vec![int(3)]]
+        );
+    }
+
+    #[test]
+    fn count_and_sum_ignore_nulls() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(1), Datum::Null]),
+            r(&[Datum::Int4(1), Datum::Int4(5)]),
+        ];
+        // count(v) = 2 (nulls skipped); sum(v) = 15.
+        assert_eq!(
+            agg("SELECT count(v), sum(v) FROM t", Some(&t), rows).expect("agg"),
+            vec![vec![int(2), int(15)]]
+        );
+    }
+
+    #[test]
+    fn min_max_over_text_and_int() {
+        let mut t = table();
+        t.columns[1].ty = ColumnType::Text;
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Text("b".into())]),
+            r(&[Datum::Int4(1), Datum::Text("a".into())]),
+            r(&[Datum::Int4(1), Datum::Text("c".into())]),
+        ];
+        assert_eq!(
+            agg("SELECT min(v), max(v) FROM t", Some(&t), rows).expect("agg"),
+            vec![vec![Datum::Text("a".into()), Datum::Text("c".into())]]
+        );
+    }
+
+    #[test]
+    fn count_distinct_dedups_non_null() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(7)]),
+            r(&[Datum::Int4(1), Datum::Int4(7)]),
+            r(&[Datum::Int4(1), Datum::Int4(8)]),
+            r(&[Datum::Int4(1), Datum::Null]),
+        ];
+        assert_eq!(
+            agg(
+                "SELECT count(DISTINCT v), sum(DISTINCT v) FROM t",
+                Some(&t),
+                rows
+            )
+            .expect("agg"),
+            vec![vec![int(2), int(15)]]
+        );
+    }
+
+    #[test]
+    fn group_by_groups_with_null_as_its_own_group() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(20)]),
+            r(&[Datum::Int4(1), Datum::Int4(5)]),
+            r(&[Datum::Null, Datum::Int4(99)]),
+        ];
+        // ORDER BY k makes output deterministic; NULLS LAST for ASC.
+        let got = agg(
+            "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k",
+            Some(&t),
+            rows,
+        )
+        .expect("agg");
+        assert_eq!(
+            got,
+            vec![
+                vec![int(1), int(2), int(15)],
+                vec![int(2), int(1), int(20)],
+                vec![Datum::Null, int(1), int(99)], // the NULL group, last
+            ]
+        );
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(20)]),
+        ];
+        // only k=1 has count(*) > 1.
+        assert_eq!(
+            agg(
+                "SELECT k FROM t GROUP BY k HAVING count(*) > 1 ORDER BY k",
+                Some(&t),
+                rows
+            )
+            .expect("agg"),
+            vec![vec![int(1)]]
+        );
+    }
+
+    #[test]
+    fn grouping_expression_in_projection() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(1), Datum::Int4(20)]),
+        ];
+        // k+1 is built from the grouping column k -> valid.
+        assert_eq!(
+            agg("SELECT k + 1, sum(v) FROM t GROUP BY k", Some(&t), rows).expect("agg"),
+            vec![vec![int(2), int(30)]]
+        );
+    }
+
+    #[test]
+    fn bare_aggregate_over_empty_table_yields_one_row() {
+        let t = table();
+        // count = 0, sum/min/max = NULL.
+        assert_eq!(
+            agg("SELECT count(*), sum(v), min(v) FROM t", Some(&t), vec![]).expect("agg"),
+            vec![vec![int(0), Datum::Null, Datum::Null]]
+        );
+    }
+
+    #[test]
+    fn grouped_over_empty_table_yields_zero_rows() {
+        let t = table();
+        assert!(
+            agg("SELECT k, count(*) FROM t GROUP BY k", Some(&t), vec![])
+                .expect("agg")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ungrouped_column_is_42803() {
+        let t = table();
+        let err =
+            agg("SELECT v, count(*) FROM t GROUP BY k", Some(&t), vec![]).expect_err("ungrouped v");
+        assert_eq!(err.into_pg().code, "42803");
+    }
+
+    #[test]
+    fn unknown_function_is_42883() {
+        let t = table();
+        // Not an aggregate query unless an aggregate is present, so pair with count(*).
+        let stmt = pgparser::parse("SELECT frobnicate(v), count(*) FROM t GROUP BY v")
+            .expect("parse")
+            .pop()
+            .expect("one");
+        let Statement::Select(s) = stmt else { panic!() };
+        let err = execute_aggregate(&s, Some(&t), vec![]).expect_err("unknown fn");
+        assert_eq!(err.into_pg().code, "42883");
+    }
+
+    #[test]
+    fn sum_of_text_is_42883() {
+        let mut t = table();
+        t.columns[1].ty = ColumnType::Text;
+        let stmt = pgparser::parse("SELECT sum(v) FROM t")
+            .expect("parse")
+            .pop()
+            .expect("one");
+        let Statement::Select(s) = stmt else { panic!() };
+        let err = execute_aggregate(&s, Some(&t), vec![]).expect_err("sum(text)");
+        assert_eq!(err.into_pg().code, "42883");
+    }
+
+    #[test]
+    fn nested_aggregate_is_42803() {
+        let t = table();
+        let stmt = pgparser::parse("SELECT sum(count(v)) FROM t")
+            .expect("parse")
+            .pop()
+            .expect("one");
+        let Statement::Select(s) = stmt else { panic!() };
+        let err = execute_aggregate(&s, Some(&t), vec![]).expect_err("nested");
+        assert_eq!(err.into_pg().code, "42803");
+    }
+
+    #[test]
+    fn sum_overflow_is_22003() {
+        let mut t = table();
+        t.columns[1].ty = ColumnType::Int8;
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int8(i64::MAX)]),
+            r(&[Datum::Int4(1), Datum::Int8(1)]),
+        ];
+        let err = agg("SELECT sum(v) FROM t", Some(&t), rows).expect_err("overflow");
+        assert_eq!(err.into_pg().code, "22003");
+    }
+
+    #[test]
+    fn count_star_no_from_is_one() {
+        // SELECT count(*) with no FROM -> one (empty) row folded -> 1, like PG.
+        assert_eq!(
+            agg("SELECT count(*)", None, vec![vec![]]).expect("agg"),
+            vec![vec![int(1)]]
+        );
+    }
+
+    #[test]
+    fn aggregate_result_types_are_inferred_for_row_description() {
+        let mut t = table();
+        t.columns[1].ty = ColumnType::Text;
+        let stmt = pgparser::parse("SELECT count(*), sum(k), min(v), max(k) FROM t GROUP BY k")
+            .expect("parse")
+            .pop()
+            .expect("one");
+        let Statement::Select(s) = stmt else { panic!() };
+        let (fields, _) = crate::exec::resolve_projection(&s.projection, Some(&t)).expect("fields");
+        // count -> int8, sum(int4) -> int8, min(text) -> text, max(int4) -> int4
+        assert_eq!(fields[0].type_oid, ColumnType::Int8.oid());
+        assert_eq!(fields[1].type_oid, ColumnType::Int8.oid());
+        assert_eq!(fields[2].type_oid, ColumnType::Text.oid());
+        assert_eq!(fields[3].type_oid, ColumnType::Int4.oid());
+        assert_eq!(fields[0].name, "count");
+    }
+
+    #[test]
+    fn is_aggregate_query_detection() {
+        fn sel(sql: &str) -> SelectStmt {
+            match pgparser::parse(sql).expect("parse").pop().expect("one") {
+                Statement::Select(s) => s,
+                _ => panic!(),
+            }
+        }
+        assert!(is_aggregate_query(&sel("SELECT count(*) FROM t")));
+        assert!(is_aggregate_query(&sel("SELECT k FROM t GROUP BY k")));
+        assert!(is_aggregate_query(&sel(
+            "SELECT 1 FROM t HAVING count(*) > 0"
+        )));
+        assert!(is_aggregate_query(&sel(
+            "SELECT k FROM t ORDER BY count(*)"
+        )));
+        assert!(!is_aggregate_query(&sel("SELECT k, v FROM t")));
+        assert!(!is_aggregate_query(&sel(
+            "SELECT k FROM t WHERE v > 1 ORDER BY k"
+        )));
+    }
+}

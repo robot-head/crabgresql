@@ -57,6 +57,10 @@ pub struct SelectStmt {
     pub projection: Vec<SelectItem>,
     pub from: Option<String>,
     pub filter: Option<Expr>,
+    /// SP27: `GROUP BY <expr-list>` (empty when absent).
+    pub group_by: Vec<Expr>,
+    /// SP27: `HAVING <predicate>` (evaluated per group).
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<i64>,
     pub locking: Option<RowLockStrength>,
@@ -91,6 +95,27 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// SP27: a function call, e.g. `count(*)`, `sum(a + 1)`, `count(DISTINCT x)`.
+    /// Whether a name is an aggregate (vs. an unknown/undefined function) is
+    /// decided by the executor, not the parser.
+    Func(FuncCall),
+}
+
+/// SP27: a parsed function call. `name` is lowercased by the lexer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncCall {
+    pub name: String,
+    /// `true` for `f(DISTINCT …)`. `ALL` (the default) parses to `false`.
+    pub distinct: bool,
+    pub args: FuncArgs,
+}
+
+/// SP27: a function call's argument list. `Star` is the `f(*)` form (only
+/// `count(*)` is meaningful); `Exprs` is a (possibly empty) positional list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuncArgs {
+    Star,
+    Exprs(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
