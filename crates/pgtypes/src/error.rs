@@ -17,6 +17,13 @@ pub enum TypeError {
     /// SP28: a `LIKE`/`ILIKE` pattern ending in a lone escape `\` (22025).
     #[error("LIKE pattern must not end with escape character")]
     InvalidEscape,
+    /// SP31: an explicit `CAST`/`::` between two types with no defined cast
+    /// (42846) — e.g. `double precision` → `boolean`.
+    #[error("cannot cast type {from} to {to}")]
+    CannotCast {
+        from: &'static str,
+        to: &'static str,
+    },
 }
 
 impl TypeError {
@@ -28,6 +35,7 @@ impl TypeError {
             TypeError::InvalidText { .. } => "22P02",
             TypeError::TypeMismatch { .. } => "42804",
             TypeError::InvalidEscape => "22025",
+            TypeError::CannotCast { .. } => "42846",
         }
     }
 }
@@ -54,6 +62,15 @@ mod tests {
             }
             .sqlstate(),
             "42804"
+        );
+        assert_eq!(TypeError::InvalidEscape.sqlstate(), "22025");
+        assert_eq!(
+            TypeError::CannotCast {
+                from: "double precision",
+                to: "boolean",
+            }
+            .sqlstate(),
+            "42846"
         );
     }
 }

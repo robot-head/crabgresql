@@ -77,6 +77,8 @@ pub(crate) fn contains_aggregate(e: &Expr) -> bool {
                     .any(|(c, r)| contains_aggregate(c) || contains_aggregate(r))
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
+        // SP31: a cast over an aggregate is an aggregate (`sum(x)::int8`).
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
         _ => false,
     }
 }
@@ -310,6 +312,8 @@ fn collect_specs(
                 collect_specs(e, table, specs)?;
             }
         }
+        // SP31: gather aggregates from a cast's operand (`avg(x)::int8`).
+        Expr::Cast { expr, .. } => collect_specs(expr, table, specs)?,
         _ => {}
     }
     Ok(())
@@ -381,6 +385,9 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
             }
             Ok(())
         }
+        // SP31: a cast is grouped-valid iff its operand is (and an entire cast
+        // expression matching a GROUP BY key was already accepted above).
+        Expr::Cast { expr, .. } => validate_grouped(expr, group_by),
         _ => Ok(()), // literals / params are constants
     }
 }
@@ -485,6 +492,11 @@ fn eval_grouped(
             eval_grouped(e, table, group_by, key, specs, results)
         }),
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
+        // SP31: cast in a grouped context — convert the grouped-evaluated operand.
+        Expr::Cast { expr, ty } => {
+            let v = eval_grouped(expr, table, group_by, key, specs, results)?;
+            Ok(pgtypes::cast::cast(&v, *ty)?)
+        }
     }
 }
 

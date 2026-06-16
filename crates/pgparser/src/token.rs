@@ -19,6 +19,8 @@ pub enum Token {
     Slash,
     /// SP29: the `||` string-concatenation operator.
     Concat,
+    /// SP31: the `::` cast operator (`expr::type`).
+    TypeCast,
     Eq,
     Ne,
     Lt,
@@ -87,6 +89,8 @@ pub enum Keyword {
     Then,
     Else,
     Offset,
+    // SP31: explicit casts
+    Cast,
 }
 
 impl Keyword {
@@ -148,6 +152,8 @@ impl Keyword {
             "then" => Keyword::Then,
             "else" => Keyword::Else,
             "offset" => Keyword::Offset,
+            // SP31: explicit casts
+            "cast" => Keyword::Cast,
             _ => return None,
         })
     }
@@ -204,6 +210,7 @@ mod tests {
             ("having", Keyword::Having),
             ("distinct", Keyword::Distinct),
             ("all", Keyword::All),
+            ("cast", Keyword::Cast),
         ];
         for (word, kw) in pairs {
             assert_eq!(Keyword::from_word(word), Some(*kw), "from_word({word:?})");

@@ -70,10 +70,43 @@ impl Parser {
         }
     }
 
+    /// Parse a SQL type name into a [`ColumnType`] — shared by `CREATE TABLE`
+    /// column definitions and the SP31 cast target (`CAST(_ AS ty)` / `_::ty`).
+    /// Folds the two-word `double precision` (SP30) into one normalized name; an
+    /// unknown type name is a 42601 parse error (PostgreSQL: 42704 — a documented
+    /// deviation, consistent with the column-type path).
+    fn parse_type_name(&mut self) -> Result<pgtypes::ColumnType, ParseError> {
+        let type_pos = self.peek_pos();
+        let mut type_word = self.expect_ident()?;
+        if type_word.eq_ignore_ascii_case("double")
+            && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("precision"))
+        {
+            self.bump();
+            type_word = "double precision".to_string();
+        }
+        pgtypes::ColumnType::from_sql_name(&type_word)
+            .ok_or_else(|| ParseError::new(format!("unknown type \"{type_word}\""), type_pos))
+    }
+
     /// Pratt expression parser. `min_bp` is the minimum left binding power.
     pub(crate) fn expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.prefix()?;
         loop {
+            // SP31: `::` is the tightest-binding operator (tighter than unary
+            // minus and every arithmetic/comparison operator), so it is consumed
+            // unconditionally here — no `min_bp` gate — and left-associatively
+            // (`a::int::text` == `(a::int)::text`). `-2::int` still parses as
+            // `-(2::int)` because the unary-minus prefix recurses into `expr`,
+            // whose innermost frame grabs the `::` before the minus is applied.
+            if *self.peek() == Token::TypeCast {
+                self.bump();
+                let ty = self.parse_type_name()?;
+                lhs = Expr::Cast {
+                    expr: Box::new(lhs),
+                    ty,
+                };
+                continue;
+            }
             // SP28: postfix predicates (IS [NOT] NULL, [NOT] IN, [NOT] BETWEEN,
             // [NOT] LIKE/ILIKE) bind at the comparison level (l_bp = 5). They are
             // handled before the binary-operator match so `a = 1 AND b IN (1,2)`
@@ -208,6 +241,7 @@ impl Parser {
                 Ok(Expr::NullLiteral)
             }
             Token::Keyword(Keyword::Case) => self.case_expr(),
+            Token::Keyword(Keyword::Cast) => self.cast_expr(),
             Token::Param(n) => {
                 self.bump();
                 Ok(Expr::Param(n))
@@ -374,6 +408,22 @@ impl Parser {
         })
     }
 
+    /// `CAST(expr AS type)` — positioned at `CAST`. The functional spelling of
+    /// the `::` operator; the inner expression is parsed at the lowest precedence
+    /// (it is delimited by the surrounding parens).
+    fn cast_expr(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::Keyword(Keyword::Cast))?;
+        self.expect(&Token::LParen)?;
+        let expr = self.expr(0)?;
+        self.expect(&Token::Keyword(Keyword::As))?;
+        let ty = self.parse_type_name()?;
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Cast {
+            expr: Box::new(expr),
+            ty,
+        })
+    }
+
     pub(crate) fn program(&mut self) -> Result<Vec<crate::ast::Statement>, ParseError> {
         Ok(self
             .program_spanned()?
@@ -523,19 +573,7 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let col_name = self.expect_ident()?;
-            let type_pos = self.peek_pos();
-            let mut type_word = self.expect_ident()?;
-            // SP30: `double precision` is a two-word type name — fold the optional
-            // trailing `precision` into one normalized name for `from_sql_name`.
-            if type_word.eq_ignore_ascii_case("double")
-                && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("precision"))
-            {
-                self.bump();
-                type_word = "double precision".to_string();
-            }
-            let ty = pgtypes::ColumnType::from_sql_name(&type_word).ok_or_else(|| {
-                ParseError::new(format!("unknown type \"{type_word}\""), type_pos)
-            })?;
+            let ty = self.parse_type_name()?;
             columns.push(ColumnDef { name: col_name, ty });
             if self.eat_comma() {
                 continue;
@@ -1494,6 +1532,107 @@ mod tests {
             Statement::Select(s) => assert!(!s.distinct),
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    // ---- SP31: explicit casts ----
+
+    #[test]
+    fn parses_cast_both_forms_to_the_same_node() {
+        use pgtypes::ColumnType;
+        // `expr::type` and `CAST(expr AS type)` produce the identical Cast node.
+        let want = Expr::Cast {
+            expr: Box::new(Expr::IntLiteral("1".into())),
+            ty: ColumnType::Int8,
+        };
+        assert_eq!(expr("1::int8"), want);
+        assert_eq!(expr("CAST(1 AS int8)"), want);
+        // `double precision` (two-word) and the other spellings resolve.
+        assert!(matches!(
+            expr("x::double precision"),
+            Expr::Cast {
+                ty: ColumnType::Float8,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("CAST(x AS integer)"),
+            Expr::Cast {
+                ty: ColumnType::Int4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("x::text"),
+            Expr::Cast {
+                ty: ColumnType::Text,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cast_binds_tighter_than_unary_minus_and_arithmetic() {
+        // `-2::int8` == `-(2::int8)` — the cast binds to `2`, not to `-2`.
+        match expr("-2::int8") {
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => {
+                assert!(matches!(*expr, Expr::Cast { .. }), "got {expr:?}");
+            }
+            other => panic!("expected Neg(Cast), got {other:?}"),
+        }
+        // `1 + 2::int8` == `1 + (2::int8)`.
+        match expr("1 + 2::int8") {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                right,
+                ..
+            } => {
+                assert!(matches!(*right, Expr::Cast { .. }), "got {right:?}");
+            }
+            other => panic!("expected Add(1, Cast), got {other:?}"),
+        }
+        // `a::int4 + b` == `(a::int4) + b`.
+        match expr("a::int4 + b") {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                left,
+                ..
+            } => {
+                assert!(matches!(*left, Expr::Cast { .. }), "got {left:?}");
+            }
+            other => panic!("expected Add(Cast, b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_is_left_associative_when_chained() {
+        // `a::int4::text` == `(a::int4)::text`.
+        match expr("a::int4::text") {
+            Expr::Cast { expr: inner, ty } => {
+                assert_eq!(ty, pgtypes::ColumnType::Text);
+                assert!(
+                    matches!(
+                        *inner,
+                        Expr::Cast {
+                            ty: pgtypes::ColumnType::Int4,
+                            ..
+                        }
+                    ),
+                    "got {inner:?}"
+                );
+            }
+            other => panic!("expected outer text Cast over int4 Cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_to_unknown_type_is_a_parse_error() {
+        assert!(parse("SELECT 1::widget").is_err());
+        assert!(parse("SELECT CAST(1 AS widget)").is_err());
+        // `cast` is a reserved keyword now, so `CAST(... )` requires `AS`.
+        assert!(parse("SELECT CAST(1 int4)").is_err());
     }
 
     #[test]
