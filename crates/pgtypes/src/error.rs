@@ -14,6 +14,9 @@ pub enum TypeError {
     },
     #[error("{message}")]
     TypeMismatch { message: String },
+    /// SP28: a `LIKE`/`ILIKE` pattern ending in a lone escape `\` (22025).
+    #[error("LIKE pattern must not end with escape character")]
+    InvalidEscape,
 }
 
 impl TypeError {
@@ -24,6 +27,7 @@ impl TypeError {
             TypeError::DivisionByZero => "22012",
             TypeError::InvalidText { .. } => "22P02",
             TypeError::TypeMismatch { .. } => "42804",
+            TypeError::InvalidEscape => "22025",
         }
     }
 }

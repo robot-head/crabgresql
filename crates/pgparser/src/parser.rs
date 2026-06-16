@@ -19,6 +19,14 @@ impl Parser {
         &self.toks[self.pos].0
     }
 
+    /// The token *after* the current one (saturates at EOF). Used for the SP28
+    /// two-token lookahead that disambiguates infix `NOT IN`/`NOT BETWEEN`/
+    /// `NOT LIKE` from the prefix `NOT` operator.
+    fn peek2(&self) -> &Token {
+        let i = (self.pos + 1).min(self.toks.len() - 1);
+        &self.toks[i].0
+    }
+
     fn peek_pos(&self) -> usize {
         self.toks[self.pos].1
     }
@@ -66,6 +74,56 @@ impl Parser {
     pub(crate) fn expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.prefix()?;
         loop {
+            // SP28: postfix predicates (IS [NOT] NULL, [NOT] IN, [NOT] BETWEEN,
+            // [NOT] LIKE/ILIKE) bind at the comparison level (l_bp = 5). They are
+            // handled before the binary-operator match so `a = 1 AND b IN (1,2)`
+            // groups as `(a=1) AND (b IN (1,2))`.
+            if 5 >= min_bp {
+                match self.peek() {
+                    Token::Keyword(Keyword::Is) => {
+                        lhs = self.parse_is_null(lhs)?;
+                        continue;
+                    }
+                    Token::Keyword(Keyword::In) => {
+                        lhs = self.parse_in(lhs, false)?;
+                        continue;
+                    }
+                    Token::Keyword(Keyword::Between) => {
+                        lhs = self.parse_between(lhs, false)?;
+                        continue;
+                    }
+                    Token::Keyword(Keyword::Like) => {
+                        lhs = self.parse_like(lhs, false, false)?;
+                        continue;
+                    }
+                    Token::Keyword(Keyword::Ilike) => {
+                        lhs = self.parse_like(lhs, false, true)?;
+                        continue;
+                    }
+                    // Infix `NOT` only when it leads a negated predicate
+                    // (`x NOT IN/BETWEEN/LIKE/ILIKE …`); otherwise `NOT` is the
+                    // prefix operator handled in `prefix`. Two-token lookahead.
+                    Token::Keyword(Keyword::Not)
+                        if matches!(
+                            self.peek2(),
+                            Token::Keyword(
+                                Keyword::In | Keyword::Between | Keyword::Like | Keyword::Ilike
+                            )
+                        ) =>
+                    {
+                        self.bump(); // NOT
+                        lhs = match self.peek() {
+                            Token::Keyword(Keyword::In) => self.parse_in(lhs, true)?,
+                            Token::Keyword(Keyword::Between) => self.parse_between(lhs, true)?,
+                            Token::Keyword(Keyword::Like) => self.parse_like(lhs, true, false)?,
+                            Token::Keyword(Keyword::Ilike) => self.parse_like(lhs, true, true)?,
+                            _ => unreachable!("lookahead guaranteed a negated predicate"),
+                        };
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let (op, l_bp, r_bp) = match self.peek() {
                 Token::Keyword(Keyword::Or) => (BinaryOp::Or, 1, 2),
                 Token::Keyword(Keyword::And) => (BinaryOp::And, 3, 4),
@@ -137,6 +195,7 @@ impl Parser {
                 self.bump();
                 Ok(Expr::NullLiteral)
             }
+            Token::Keyword(Keyword::Case) => self.case_expr(),
             Token::Param(n) => {
                 self.bump();
                 Ok(Expr::Param(n))
@@ -196,6 +255,111 @@ impl Parser {
             distinct,
             args: FuncArgs::Exprs(args),
         }))
+    }
+
+    /// `expr IS [NOT] NULL`, positioned at `IS`. (`IS TRUE`/`IS DISTINCT FROM`
+    /// are out of scope — anything but `NULL` after `IS`/`IS NOT` is a 42601.)
+    fn parse_is_null(&mut self, lhs: Expr) -> Result<Expr, ParseError> {
+        self.expect(&Token::Keyword(Keyword::Is))?;
+        let negated = self.eat_keyword(Keyword::Not);
+        self.expect(&Token::Keyword(Keyword::Null))?;
+        Ok(Expr::IsNull {
+            expr: Box::new(lhs),
+            negated,
+        })
+    }
+
+    /// `expr [NOT] IN (e1, e2, …)`, positioned at `IN`. The list has ≥1 element
+    /// (`IN ()` is a 42601, matching PostgreSQL). Subqueries are out of scope.
+    fn parse_in(&mut self, lhs: Expr, negated: bool) -> Result<Expr, ParseError> {
+        self.expect(&Token::Keyword(Keyword::In))?;
+        self.expect(&Token::LParen)?;
+        let mut list = Vec::new();
+        loop {
+            list.push(self.expr(0)?);
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::InList {
+            expr: Box::new(lhs),
+            list,
+            negated,
+        })
+    }
+
+    /// `expr [NOT] BETWEEN low AND high`, positioned at `BETWEEN`. The bounds are
+    /// parsed at `min_bp = 4` so the separating `AND` (left bp 3) is NOT consumed
+    /// as a boolean `AND`; thus `a BETWEEN 1 AND 2 AND b` → `(a BETWEEN 1 AND 2) AND b`.
+    fn parse_between(&mut self, lhs: Expr, negated: bool) -> Result<Expr, ParseError> {
+        self.expect(&Token::Keyword(Keyword::Between))?;
+        let low = self.expr(4)?;
+        self.expect(&Token::Keyword(Keyword::And))?;
+        let high = self.expr(4)?;
+        Ok(Expr::Between {
+            expr: Box::new(lhs),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        })
+    }
+
+    /// `expr [NOT] LIKE pat` / `[NOT] ILIKE pat`, positioned at `LIKE`/`ILIKE`.
+    /// The pattern is parsed at `min_bp = 6` (the right bp of the comparison
+    /// level) so it stays a single comparand and does not swallow a trailing
+    /// `AND`/`OR`.
+    fn parse_like(
+        &mut self,
+        lhs: Expr,
+        negated: bool,
+        case_insensitive: bool,
+    ) -> Result<Expr, ParseError> {
+        self.bump(); // LIKE or ILIKE
+        let pattern = self.expr(6)?;
+        Ok(Expr::Like {
+            expr: Box::new(lhs),
+            pattern: Box::new(pattern),
+            negated,
+            case_insensitive,
+        })
+    }
+
+    /// A `CASE` expression. Simple form (`CASE x WHEN v THEN r …`) carries an
+    /// operand; searched form (`CASE WHEN cond THEN r …`) does not. At least one
+    /// `WHEN` is required; `ELSE` is optional.
+    fn case_expr(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::Keyword(Keyword::Case))?;
+        let operand = if *self.peek() == Token::Keyword(Keyword::When) {
+            None
+        } else {
+            Some(Box::new(self.expr(0)?))
+        };
+        let mut whens = Vec::new();
+        while self.eat_keyword(Keyword::When) {
+            let cond = self.expr(0)?;
+            self.expect(&Token::Keyword(Keyword::Then))?;
+            let result = self.expr(0)?;
+            whens.push((cond, result));
+        }
+        if whens.is_empty() {
+            return Err(ParseError::new(
+                "CASE requires at least one WHEN clause",
+                self.peek_pos(),
+            ));
+        }
+        let else_result = if self.eat_keyword(Keyword::Else) {
+            Some(Box::new(self.expr(0)?))
+        } else {
+            None
+        };
+        self.expect(&Token::Keyword(Keyword::End))?;
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_result,
+        })
     }
 
     pub(crate) fn program(&mut self) -> Result<Vec<crate::ast::Statement>, ParseError> {
@@ -420,6 +584,11 @@ impl Parser {
     fn select(&mut self) -> Result<crate::ast::Statement, ParseError> {
         use crate::ast::{OrderItem, SelectItem, SelectStmt, Statement};
         self.expect(&Token::Keyword(Keyword::Select))?;
+        // SP28: SELECT DISTINCT (ALL is the default modifier — accept and ignore).
+        let distinct = self.eat_keyword(Keyword::Distinct);
+        if !distinct {
+            self.eat_keyword(Keyword::All);
+        }
         let mut projection = Vec::new();
         if *self.peek() == Token::Star {
             self.bump();
@@ -486,23 +655,18 @@ impl Parser {
                 break;
             }
         }
-        let limit = if self.eat_keyword(Keyword::Limit) {
-            let pos = self.peek_pos();
-            match self.bump() {
-                Token::IntLit(s) => Some(
-                    s.parse::<i64>()
-                        .map_err(|_| ParseError::new("LIMIT value out of range", pos))?,
-                ),
-                other => {
-                    return Err(ParseError::new(
-                        format!("expected LIMIT count, found {other:?}"),
-                        pos,
-                    ));
-                }
+        // SP28: LIMIT and OFFSET in either order (PostgreSQL accepts both).
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if limit.is_none() && self.eat_keyword(Keyword::Limit) {
+                limit = Some(self.expect_int_count("LIMIT")?);
+            } else if offset.is_none() && self.eat_keyword(Keyword::Offset) {
+                offset = Some(self.expect_int_count("OFFSET")?);
+            } else {
+                break;
             }
-        } else {
-            None
-        };
+        }
         let locking = if self.eat_keyword(Keyword::For) {
             if self.eat_keyword(Keyword::Update) {
                 Some(crate::ast::RowLockStrength::ForUpdate)
@@ -521,12 +685,29 @@ impl Parser {
             projection,
             from,
             filter,
+            distinct,
             group_by,
             having,
             order_by,
             limit,
+            offset,
             locking,
         }))
+    }
+
+    /// Parse the integer count after a `LIMIT`/`OFFSET` keyword (`what` names it
+    /// in error messages).
+    fn expect_int_count(&mut self, what: &str) -> Result<i64, ParseError> {
+        let pos = self.peek_pos();
+        match self.bump() {
+            Token::IntLit(s) => s
+                .parse::<i64>()
+                .map_err(|_| ParseError::new(format!("{what} value out of range"), pos)),
+            other => Err(ParseError::new(
+                format!("expected {what} count, found {other:?}"),
+                pos,
+            )),
+        }
     }
 
     fn eat_comma(&mut self) -> bool {
@@ -982,6 +1163,174 @@ mod tests {
                 );
             }
             _ => panic!("expected NOT at root, got {e:?}"),
+        }
+    }
+
+    // ---- SP28: predicate + conditional expression breadth ----
+
+    #[test]
+    fn parses_is_null_and_is_not_null() {
+        assert!(matches!(
+            expr("a IS NULL"),
+            Expr::IsNull { negated: false, .. }
+        ));
+        assert!(matches!(
+            expr("a IS NOT NULL"),
+            Expr::IsNull { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_in_and_not_in() {
+        match expr("a IN (1, 2, 3)") {
+            Expr::InList { list, negated, .. } => {
+                assert_eq!(list.len(), 3);
+                assert!(!negated);
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+        assert!(matches!(
+            expr("a NOT IN (1, 2)"),
+            Expr::InList { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn empty_in_list_is_rejected() {
+        assert!(parse("SELECT a FROM t WHERE a IN ()").is_err());
+    }
+
+    #[test]
+    fn not_in_is_infix_but_prefix_not_wraps_in() {
+        // `x NOT IN (..)` is the infix negated predicate.
+        assert!(matches!(
+            expr("x NOT IN (1)"),
+            Expr::InList { negated: true, .. }
+        ));
+        // `NOT x IN (..)` is prefix NOT over (x IN ..).
+        match expr("NOT x IN (1)") {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => assert!(matches!(*expr, Expr::InList { negated: false, .. })),
+            other => panic!("expected NOT over InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn between_and_does_not_eat_boolean_and() {
+        // `a BETWEEN 1 AND 2 AND b` == `(a BETWEEN 1 AND 2) AND b`.
+        match expr("a BETWEEN 1 AND 2 AND b") {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                assert!(matches!(*left, Expr::Between { negated: false, .. }));
+                assert_eq!(*right, Expr::Column("b".into()));
+            }
+            other => panic!("expected AND(Between, b), got {other:?}"),
+        }
+        assert!(matches!(
+            expr("a NOT BETWEEN 1 AND 10"),
+            Expr::Between { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_like_ilike_all_combinations() {
+        assert!(matches!(
+            expr("a LIKE 'x%'"),
+            Expr::Like {
+                negated: false,
+                case_insensitive: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a NOT LIKE 'x%'"),
+            Expr::Like {
+                negated: true,
+                case_insensitive: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a ILIKE 'x%'"),
+            Expr::Like {
+                negated: false,
+                case_insensitive: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a NOT ILIKE 'x%'"),
+            Expr::Like {
+                negated: true,
+                case_insensitive: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_searched_and_simple_case() {
+        match expr("CASE WHEN a > 0 THEN 'pos' ELSE 'neg' END") {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                assert!(operand.is_none());
+                assert_eq!(whens.len(), 1);
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected searched CASE, got {other:?}"),
+        }
+        match expr("CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' END") {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                assert!(operand.is_some());
+                assert_eq!(whens.len(), 2);
+                assert!(else_result.is_none());
+            }
+            other => panic!("expected simple CASE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_without_when_is_rejected() {
+        assert!(parse("SELECT CASE END FROM t").is_err());
+    }
+
+    #[test]
+    fn parses_select_distinct() {
+        match one("SELECT DISTINCT a FROM t") {
+            Statement::Select(s) => assert!(s.distinct),
+            other => panic!("expected Select, got {other:?}"),
+        }
+        match one("SELECT a FROM t") {
+            Statement::Select(s) => assert!(!s.distinct),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_limit_and_offset_either_order() {
+        for sql in [
+            "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
+            "SELECT a FROM t ORDER BY a OFFSET 10 LIMIT 5",
+        ] {
+            match one(sql) {
+                Statement::Select(s) => {
+                    assert_eq!(s.limit, Some(5));
+                    assert_eq!(s.offset, Some(10));
+                }
+                other => panic!("expected Select, got {other:?}"),
+            }
         }
     }
 }

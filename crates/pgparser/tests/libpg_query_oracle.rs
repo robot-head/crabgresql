@@ -32,6 +32,24 @@ const ACCEPTED: &[&str] = &[
     // SP6: row-level locking
     "SELECT id FROM t FOR UPDATE",
     "SELECT id FROM t WHERE id > 1 FOR SHARE",
+    // SP28: predicate + conditional expression breadth
+    "SELECT a FROM t WHERE a IS NULL",
+    "SELECT a FROM t WHERE a IS NOT NULL",
+    "SELECT a FROM t WHERE a IN (1, 2, 3)",
+    "SELECT a FROM t WHERE a NOT IN (1, 2)",
+    "SELECT a FROM t WHERE a BETWEEN 1 AND 10",
+    "SELECT a FROM t WHERE a NOT BETWEEN 1 AND 10",
+    "SELECT a FROM t WHERE name LIKE 'a%'",
+    "SELECT a FROM t WHERE name NOT LIKE 'a_c'",
+    "SELECT a FROM t WHERE name ILIKE 'A%'",
+    "SELECT a FROM t WHERE name NOT ILIKE 'A%'",
+    "SELECT NOT a IN (1, 2) FROM t",
+    "SELECT a FROM t WHERE a BETWEEN 1 AND 2 AND b",
+    "SELECT CASE WHEN a > 0 THEN 'pos' ELSE 'neg' END FROM t",
+    "SELECT CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t",
+    "SELECT DISTINCT a FROM t",
+    "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
+    "SELECT a FROM t LIMIT 5 OFFSET 2",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.
@@ -44,6 +62,10 @@ const REJECTED: &[&str] = &[
     "SELECT 1 ORDER BY",
     "(",
     "SELECT 'unterminated",
+    // SP28: malformed predicate / CASE grammar
+    "SELECT a FROM t WHERE a IN ()",
+    "SELECT a FROM t WHERE a BETWEEN 1",
+    "SELECT CASE END FROM t",
 ];
 
 fn pg_accepts(sql: &str) -> bool {

@@ -618,6 +618,12 @@ pub(crate) async fn execute_read_locking(
             "FOR UPDATE/SHARE is not allowed with aggregate functions or GROUP BY".into(),
         ));
     }
+    // SP28: nor with SELECT DISTINCT (PostgreSQL 0A000).
+    if s.distinct {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not allowed with DISTINCT clause".into(),
+        ));
+    }
     // FOR UPDATE/SHARE requires a FROM clause — there are no rows to lock
     // in a FROM-less SELECT.
     let table_name = s
@@ -679,6 +685,28 @@ fn project_order_limit(
     // Resolve the projection into (field, expr) pairs.
     let (fields, out_exprs) = resolve_projection(&s.projection, table)?;
 
+    // SP28: SELECT DISTINCT projects FIRST so dedup is over output rows, then
+    // ORDER BY sorts the deduped output (its keys must be select-list columns).
+    if s.distinct {
+        let mut projected = project_rows(&out_exprs, table, &kept)?;
+        let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
+        projected.retain(|r| seen.insert(r.clone()));
+        if !s.order_by.is_empty() {
+            let idxs = distinct_order_indices(s, &out_exprs)?;
+            let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = projected
+                .into_iter()
+                .map(|r| {
+                    let keys = idxs.iter().map(|&i| r[i].clone()).collect();
+                    (keys, r)
+                })
+                .collect();
+            keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+            projected = keyed.into_iter().map(|(_, r)| r).collect();
+        }
+        apply_offset_limit(&mut projected, s.offset, s.limit);
+        return Ok(rows_result(fields, &projected));
+    }
+
     // ORDER BY: sort by evaluated order keys (over the source row).
     if !s.order_by.is_empty() {
         // Precompute keys to keep comparisons total and error-free during sort.
@@ -694,29 +722,73 @@ fn project_order_limit(
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
 
-    // LIMIT.
-    if let Some(limit) = s.limit {
-        let n = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-        kept.truncate(n);
-    }
+    // SP28: OFFSET (skip) then LIMIT (take), before projection.
+    apply_offset_limit(&mut kept, s.offset, s.limit);
 
-    // Project + encode to cells.
-    let mut out_rows: Vec<Vec<Option<Cell>>> = Vec::with_capacity(kept.len());
-    for row in &kept {
+    let projected = project_rows(&out_exprs, table, &kept)?;
+    Ok(rows_result(fields, &projected))
+}
+
+/// Evaluate the projection expressions for each source row, yielding output
+/// Datum rows (one `Datum` per output column).
+fn project_rows(
+    out_exprs: &[Expr],
+    table: Option<&Table>,
+    rows: &[Vec<Datum>],
+) -> Result<Vec<Vec<Datum>>, ExecError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
         let mut cells = Vec::with_capacity(out_exprs.len());
-        for e in &out_exprs {
-            let d = crate::eval::eval(e, table, row)?;
-            cells.push(datum_to_cell(&d));
+        for e in out_exprs {
+            cells.push(crate::eval::eval(e, table, row)?);
         }
-        out_rows.push(cells);
+        out.push(cells);
     }
+    Ok(out)
+}
 
-    let tag = format!("SELECT {}", out_rows.len());
-    Ok(QueryResult::Rows {
-        fields,
-        rows: out_rows,
-        tag,
-    })
+/// Encode projected Datum rows into a `QueryResult::Rows` (text + binary cells).
+fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
+    let rows: Vec<Vec<Option<Cell>>> = projected
+        .iter()
+        .map(|r| r.iter().map(datum_to_cell).collect())
+        .collect();
+    let tag = format!("SELECT {}", rows.len());
+    QueryResult::Rows { fields, rows, tag }
+}
+
+/// SP28: map each `ORDER BY` expression to the output column it references. Under
+/// `SELECT DISTINCT` the sort keys must be select-list columns (PostgreSQL's
+/// rule); a non-matching expression is rejected (0A000).
+fn distinct_order_indices(s: &SelectStmt, out_exprs: &[Expr]) -> Result<Vec<usize>, ExecError> {
+    let mut idxs = Vec::with_capacity(s.order_by.len());
+    for item in &s.order_by {
+        match out_exprs.iter().position(|e| e == &item.expr) {
+            Some(i) => idxs.push(i),
+            None => {
+                return Err(ExecError::Unsupported(
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in the select list"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(idxs)
+}
+
+/// SP28: drop the first `offset` rows then keep at most `limit` (negative values
+/// clamp to 0). Shared by the row and aggregate output paths.
+pub(crate) fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<i64>, limit: Option<i64>) {
+    if let Some(off) = offset {
+        let n = usize::try_from(off.max(0))
+            .unwrap_or(usize::MAX)
+            .min(rows.len());
+        rows.drain(0..n);
+    }
+    if let Some(limit) = limit {
+        let n = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+        rows.truncate(n);
+    }
 }
 
 /// Expand the projection list into output FieldDescriptions and the expressions
