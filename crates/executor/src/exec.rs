@@ -1378,7 +1378,24 @@ mod tests {
             "SELECT e.id, m.id FROM t e JOIN t m ON e.mgr = m.id",
         )
         .await[0];
-        assert_eq!(rows_of(r).len(), 1); // only (2 -> 1) matches
+        // Only (employee 2 -> manager 1) matches: e.id=2, m.id=1.
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+        assert_eq!(text(&rows_of(r)[0][1]), Some("1".into()));
+    }
+
+    #[tokio::test]
+    async fn unaliased_self_join_is_duplicate_alias_42712() {
+        // The same qualifier on both sides of a join is rejected (PG 42712).
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let err = engine
+            .connect()
+            .simple_query("SELECT * FROM t JOIN t ON t.id = t.id")
+            .await
+            .expect_err("duplicate table name");
+        assert_eq!(err.code, "42712");
     }
 
     #[tokio::test]

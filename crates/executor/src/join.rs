@@ -10,6 +10,9 @@ use pgtypes::Datum;
 use crate::error::ExecError;
 use crate::scope::Scope;
 
+/// A materialized relation: an ordered `Scope` (the schema) plus its rows, each
+/// row positionally aligned to `scope.columns`. Base tables, joins, and (later)
+/// derived subqueries all produce one.
 #[derive(Debug, Clone)]
 pub(crate) struct Relation {
     pub scope: Scope,
