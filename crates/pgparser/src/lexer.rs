@@ -111,12 +111,45 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                     .map_err(|_| ParseError::new("parameter number out of range", start))?;
                 out.push((Token::Param(n), start));
             }
-            c if c.is_ascii_digit() => {
+            // SP30: a numeric literal — an integer, or a `float8` literal if it has a
+            // fractional part (`.`) or an exponent (`e`/`E`). A leading `.` only starts
+            // a number when a digit follows (so a bare `.` stays an error).
+            c if c.is_ascii_digit()
+                || (c == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) =>
+            {
                 let start = i;
+                let mut is_float = false;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                out.push((Token::IntLit(sql[start..i].to_string()), start));
+                if i < bytes.len() && bytes[i] == b'.' {
+                    is_float = true;
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                    // Consume the exponent only if a (signed) digit run actually
+                    // follows; otherwise leave `e` for the identifier lexer.
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+') | Some(b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                        is_float = true;
+                        i = j;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                let text = sql[start..i].to_string();
+                if is_float {
+                    out.push((Token::FloatLit(text), start));
+                } else {
+                    out.push((Token::IntLit(text), start));
+                }
             }
             c if c == b'_' || c.is_ascii_alphabetic() => {
                 let start = i;
@@ -244,6 +277,49 @@ mod tests {
         // A single `|` is not a token in this slice (no bitwise-or).
         let e = lex("a | b").expect_err("lone pipe");
         assert!(e.message.contains("unexpected character"));
+    }
+
+    #[test]
+    fn float_literals_lex_distinctly_from_ints() {
+        // Fractional, leading-dot, trailing-dot, and exponent forms are FloatLit;
+        // a bare integer stays IntLit.
+        assert_eq!(toks("42"), vec![Token::IntLit("42".into()), Token::Eof]);
+        assert_eq!(toks("1.5"), vec![Token::FloatLit("1.5".into()), Token::Eof]);
+        assert_eq!(toks(".5"), vec![Token::FloatLit(".5".into()), Token::Eof]);
+        assert_eq!(toks("2."), vec![Token::FloatLit("2.".into()), Token::Eof]);
+        assert_eq!(
+            toks("1e10"),
+            vec![Token::FloatLit("1e10".into()), Token::Eof]
+        );
+        assert_eq!(
+            toks("1.5E-3"),
+            vec![Token::FloatLit("1.5E-3".into()), Token::Eof]
+        );
+        assert_eq!(
+            toks("6e+2"),
+            vec![Token::FloatLit("6e+2".into()), Token::Eof]
+        );
+        // `1 + 2.5` keeps the operator separate from the float.
+        assert_eq!(
+            toks("1 + 2.5"),
+            vec![
+                Token::IntLit("1".into()),
+                Token::Plus,
+                Token::FloatLit("2.5".into()),
+                Token::Eof,
+            ]
+        );
+        // A bare `.` with no following digit is still an unexpected character.
+        assert!(lex(".").is_err());
+        // An `e` not followed by a (signed) digit is left for the identifier lexer.
+        assert_eq!(
+            toks("3 e"),
+            vec![
+                Token::IntLit("3".into()),
+                Token::Ident("e".into()),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]

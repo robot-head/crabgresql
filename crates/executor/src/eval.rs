@@ -17,6 +17,7 @@ pub(crate) fn eval(
 ) -> Result<Datum, ExecError> {
     match expr {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
+        Expr::FloatLiteral(s) => Ok(ops::float_literal(s)?),
         Expr::StringLiteral(s) => Ok(Datum::Text(s.clone())),
         Expr::BoolLiteral(b) => Ok(Datum::Bool(*b)),
         Expr::NullLiteral => Ok(Datum::Null),
@@ -329,6 +330,11 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
             Datum::Int8(_) => Ok(ColumnType::Int8),
             _ => unreachable!(),
         },
+        // SP30: a decimal/exponent literal types as float8 (validated so `1e400`
+        // overflow surfaces at plan time, like the int-literal arm above).
+        Expr::FloatLiteral(s) => ops::float_literal(s)
+            .map(|_| ColumnType::Float8)
+            .map_err(Into::into),
         Expr::StringLiteral(_) => Ok(ColumnType::Text),
         Expr::BoolLiteral(_) => Ok(ColumnType::Bool),
         // PostgreSQL types a bare NULL as "unknown"; the slice uses text as a
@@ -351,11 +357,7 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
         Expr::Binary { op, left, right } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 let (lt, rt) = (infer_type(left, table)?, infer_type(right, table)?);
-                Ok(if lt == ColumnType::Int4 && rt == ColumnType::Int4 {
-                    ColumnType::Int4
-                } else {
-                    ColumnType::Int8
-                })
+                Ok(numeric_result_type(lt, rt))
             }
             // SP29: `||` yields text. PostgreSQL resolves the operator at plan
             // time and requires at least one operand to be text (`text || anynonarray`
@@ -427,11 +429,13 @@ pub(crate) fn unify_branch(
 }
 
 pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, ExecError> {
-    use ColumnType::{Int4, Int8};
+    use ColumnType::{Float8, Int4, Int8};
     Ok(match (a, b) {
         (x, y) if x == y => x,
         // Mirror the arithmetic int4->int8 promotion rule.
         (Int4, Int8) | (Int8, Int4) => Int8,
+        // SP30: an integer and a float unify to float8 (same promotion as arithmetic).
+        (Float8, Int4 | Int8) | (Int4 | Int8, Float8) => Float8,
         _ => {
             return Err(ExecError::TypeMismatch(format!(
                 "types {} and {} cannot be matched",
@@ -440,6 +444,21 @@ pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, Ex
             )));
         }
     })
+}
+
+/// The result type of `+ - * /` on two operand types: any float makes the result
+/// float8; else int4 only if both are int4; else int8 (the existing int promotion).
+/// Like the existing arithmetic inference this is permissive about non-numeric
+/// operands (a real type error surfaces at evaluation).
+fn numeric_result_type(lt: ColumnType, rt: ColumnType) -> ColumnType {
+    use ColumnType::{Float8, Int4};
+    if lt == Float8 || rt == Float8 {
+        Float8
+    } else if lt == Int4 && rt == Int4 {
+        Int4
+    } else {
+        ColumnType::Int8
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +516,33 @@ mod tests {
         assert_eq!(ev("1 + 1", None, &[]), Datum::Int4(2));
         assert_eq!(ev("'x'", None, &[]), Datum::Text("x".into()));
         assert_eq!(ev("not true", None, &[]), Datum::Bool(false));
+    }
+
+    #[test]
+    fn float_literals_arithmetic_and_inference() {
+        // float literal evaluates and types as float8.
+        assert_eq!(ev("1.5", None, &[]), Datum::Float8(1.5));
+        assert_eq!(
+            infer_type(&pexpr("1.5").expect("parse"), None).expect("infer"),
+            ColumnType::Float8
+        );
+        // int ⊕ float promotes to float8 at eval and inference.
+        assert_eq!(ev("1 + 0.5", None, &[]), Datum::Float8(1.5));
+        assert_eq!(ev("3 / 2.0", None, &[]), Datum::Float8(1.5));
+        assert_eq!(ev("- 2.5", None, &[]), Datum::Float8(-2.5));
+        assert_eq!(
+            infer_type(&pexpr("a + 1.0").expect("parse"), Some(&table())).expect("infer"),
+            ColumnType::Float8
+        );
+        // CASE/coalesce unify int and float to float8.
+        assert_eq!(
+            infer_type(
+                &pexpr("case when a > 0 then 1 else 2.5 end").expect("parse"),
+                Some(&table())
+            )
+            .expect("infer"),
+            ColumnType::Float8
+        );
     }
 
     #[test]

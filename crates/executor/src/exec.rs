@@ -473,6 +473,28 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
             .map(Datum::Int4)
             .map_err(|_| TypeError::Overflow)?,
         (Datum::Text(s), ColumnType::Text) => Datum::Text(s),
+        // SP30: float8 assignment casts. int → float8 is the standard widening;
+        // float8 → int rounds half-to-even (PG's float→int assignment cast) and
+        // range-checks (out of range / non-finite → 22003).
+        (Datum::Float8(f), ColumnType::Float8) => Datum::Float8(f),
+        (Datum::Int4(n), ColumnType::Float8) => Datum::Float8(f64::from(n)),
+        (Datum::Int8(n), ColumnType::Float8) => Datum::Float8(n as f64),
+        (Datum::Float8(f), ColumnType::Int4) => {
+            let r = f.round_ties_even();
+            if r.is_finite() && (i32::MIN as f64..=i32::MAX as f64).contains(&r) {
+                Datum::Int4(r as i32)
+            } else {
+                return Err(TypeError::Overflow.into());
+            }
+        }
+        (Datum::Float8(f), ColumnType::Int8) => {
+            let r = f.round_ties_even();
+            if r.is_finite() && (i64::MIN as f64..=i64::MAX as f64).contains(&r) {
+                Datum::Int8(r as i64)
+            } else {
+                return Err(TypeError::Overflow.into());
+            }
+        }
         (v, target) => {
             return Err(ExecError::TypeMismatch(format!(
                 "column is of type {} but expression is of type {}",

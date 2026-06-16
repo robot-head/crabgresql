@@ -15,6 +15,8 @@ mod tag {
     pub const INT4: u8 = 2;
     pub const INT8: u8 = 3;
     pub const TEXT: u8 = 4;
+    /// SP30: `float8` (IEEE-754 big-endian f64). Append-only — no version bump.
+    pub const FLOAT8: u8 = 5;
 }
 
 pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
@@ -39,6 +41,10 @@ pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
                 let len = u32::try_from(s.len()).expect("text column exceeds 4 GiB");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(s.as_bytes());
+            }
+            Datum::Float8(f) => {
+                out.push(tag::FLOAT8);
+                out.extend_from_slice(&f.to_be_bytes());
             }
         }
     }
@@ -75,6 +81,10 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Datum>, KvError> {
                     String::from_utf8(raw.to_vec())
                         .map_err(|_| KvError::CorruptRow("text is not valid UTF-8".into()))?,
                 )
+            }
+            tag::FLOAT8 => {
+                let raw = take_n(&mut cur, 8)?;
+                Datum::Float8(f64::from_be_bytes(raw.try_into().expect("8 bytes fit f64")))
             }
             other => return Err(KvError::CorruptRow(format!("unknown field tag {other}"))),
         };
@@ -114,6 +124,9 @@ mod tests {
             Datum::Int4(i32::MIN),
             Datum::Int8(i64::MIN),
             Datum::Text("héllo".into()),
+            Datum::Float8(-1.5),
+            Datum::Float8(f64::NAN),
+            Datum::Float8(-0.0),
         ];
         let bytes = encode_row(&row);
         assert_eq!(decode_row(&bytes).expect("decode"), row);
@@ -141,6 +154,7 @@ mod tests {
             any::<i32>().prop_map(Datum::Int4),
             any::<i64>().prop_map(Datum::Int8),
             ".*".prop_map(Datum::Text),
+            any::<f64>().prop_map(Datum::Float8),
         ]
     }
 

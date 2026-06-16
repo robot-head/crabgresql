@@ -15,6 +15,8 @@ mod type_tag {
     pub const INT4: u8 = 1;
     pub const INT8: u8 = 2;
     pub const TEXT: u8 = 3;
+    /// SP30: `float8` / `double precision`. Append-only — no version bump.
+    pub const FLOAT8: u8 = 4;
 }
 
 fn tag_of(ty: ColumnType) -> u8 {
@@ -23,6 +25,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int4 => type_tag::INT4,
         ColumnType::Int8 => type_tag::INT8,
         ColumnType::Text => type_tag::TEXT,
+        ColumnType::Float8 => type_tag::FLOAT8,
     }
 }
 
@@ -32,6 +35,7 @@ fn type_of(tag: u8) -> Result<ColumnType, KvError> {
         type_tag::INT4 => ColumnType::Int4,
         type_tag::INT8 => ColumnType::Int8,
         type_tag::TEXT => ColumnType::Text,
+        type_tag::FLOAT8 => ColumnType::Float8,
         other => {
             return Err(KvError::CorruptRow(format!(
                 "unknown column type tag {other}"
@@ -115,6 +119,10 @@ mod tests {
             Column {
                 name: "big".into(),
                 ty: ColumnType::Int8,
+            },
+            Column {
+                name: "score".into(),
+                ty: ColumnType::Float8,
             },
         ];
         let bytes = serialize_schema(table_id, &columns);

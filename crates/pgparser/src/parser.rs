@@ -187,6 +187,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::IntLiteral(s))
             }
+            Token::FloatLit(s) => {
+                self.bump();
+                Ok(Expr::FloatLiteral(s))
+            }
             Token::StringLit(s) => {
                 self.bump();
                 Ok(Expr::StringLiteral(s))
@@ -520,7 +524,15 @@ impl Parser {
         loop {
             let col_name = self.expect_ident()?;
             let type_pos = self.peek_pos();
-            let type_word = self.expect_ident()?;
+            let mut type_word = self.expect_ident()?;
+            // SP30: `double precision` is a two-word type name — fold the optional
+            // trailing `precision` into one normalized name for `from_sql_name`.
+            if type_word.eq_ignore_ascii_case("double")
+                && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("precision"))
+            {
+                self.bump();
+                type_word = "double precision".to_string();
+            }
             let ty = pgtypes::ColumnType::from_sql_name(&type_word).ok_or_else(|| {
                 ParseError::new(format!("unknown type \"{type_word}\""), type_pos)
             })?;
@@ -813,6 +825,48 @@ mod tests {
     fn unknown_column_type_is_error() {
         let e = parse("CREATE TABLE t (x widget)").expect_err("bad type");
         assert_eq!(e.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn parses_float8_column_types() {
+        // SP30: `float8`, `float`, and the two-word `double precision` all map to Float8.
+        for sql in [
+            "CREATE TABLE t (x float8)",
+            "CREATE TABLE t (x float)",
+            "CREATE TABLE t (x double precision)",
+        ] {
+            match one(sql) {
+                Statement::CreateTable { columns, .. } => {
+                    assert_eq!(columns[0].ty, ColumnType::Float8, "for `{sql}`");
+                }
+                other => panic!("expected CreateTable, got {other:?}"),
+            }
+        }
+        // Bare `double` (without `precision`) is not a type — PG rejects it too.
+        assert!(parse("CREATE TABLE t (x double)").is_err());
+    }
+
+    #[test]
+    fn parses_float_literals() {
+        assert_eq!(expr("1.5"), Expr::FloatLiteral("1.5".into()));
+        assert_eq!(expr(".25"), Expr::FloatLiteral(".25".into()));
+        assert_eq!(expr("1e3"), Expr::FloatLiteral("1e3".into()));
+        assert_eq!(expr("42"), Expr::IntLiteral("42".into()));
+        // float participates in arithmetic with the usual precedence.
+        match expr("1 + 2.5 * 2") {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                right,
+                ..
+            } => assert!(matches!(
+                *right,
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    ..
+                }
+            )),
+            other => panic!("expected Add(_, Mul), got {other:?}"),
+        }
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub struct OrderItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(String),
+    /// SP30: a decimal/exponent literal, typed `float8` by the executor.
+    FloatLiteral(String),
     StringLiteral(String),
     BoolLiteral(bool),
     NullLiteral,

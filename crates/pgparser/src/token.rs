@@ -5,6 +5,9 @@ pub enum Token {
     Ident(String),
     Keyword(Keyword),
     IntLit(String),
+    /// SP30: a decimal/exponent numeric literal (`1.5`, `.5`, `2.`, `1e10`), typed
+    /// `float8` by the executor (crabgresql has no `numeric`).
+    FloatLit(String),
     StringLit(String),
     LParen,
     RParen,
