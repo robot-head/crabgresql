@@ -108,11 +108,14 @@ no test catches. It is the dual of the Stateright discipline above — exhaustiv
   `KeyspaceKv::sync`, an fsync whose only observable effect is power-loss durability —
   is EXCLUDED via `exclude_re` *with a rationale*, so every remaining survivor stays
   actionable. Never exclude a mutant just to silence it.
-- **Baseline (this slice):** `kv`, `mvcc`, `pgtypes`, and `catalog` are at zero missed
-  mutants, as is the `pgparser` lexer — every survivor the first sweep surfaced was
-  killed with a targeted unit test (the lone `KeyspaceKv::sync` fsync is the one
-  documented exclusion). The full `pgparser` sweep runs in the nightly and is driven to
-  zero the same way as new gaps surface.
+- **Baseline (this slice):** `kv`, `mvcc`, `pgtypes`, `catalog`, and the FULL `pgparser`
+  crate (lexer, parser, and the keyword table) are at zero missed mutants — every
+  survivor the per-subsystem sweeps surfaced was killed with a targeted unit test. TWO
+  mutants are excluded with a rationale (never merely to silence): `KeyspaceKv::sync` (a
+  power-loss-only fsync, undetectable in-process) and `Parser::expr`'s `l_bp < min_bp`
+  Pratt check — a provably EQUIVALENT mutant, since the odd-left / even-right binding-
+  power scheme makes `l_bp == min_bp` unreachable, so `<` and `<=` decide identically on
+  every input. The nightly drives each subsystem to zero the same way as new gaps surface.
 
 ## Windows UAC-safe target names (os error 740)
 

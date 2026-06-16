@@ -863,6 +863,40 @@ mod tests {
     }
 
     #[test]
+    fn every_binary_operator_parses_to_its_op() {
+        // Each operator token must map to its own BinaryOp arm in `expr` — pin all
+        // ten so dropping any single arm (e.g. `<>`, `<=`, `-`, `/`) is caught.
+        use crate::ast::BinaryOp::*;
+        for (src, want) in [
+            ("a = b", Eq),
+            ("a <> b", Ne),
+            ("a < b", Lt),
+            ("a <= b", Le),
+            ("a > b", Gt),
+            ("a >= b", Ge),
+            ("a + b", Add),
+            ("a - b", Sub),
+            ("a * b", Mul),
+            ("a / b", Div),
+        ] {
+            match expr(src) {
+                Expr::Binary { op, .. } => assert_eq!(op, want, "operator in `{src}`"),
+                other => panic!("`{src}` should parse to a Binary expr, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bump_does_not_advance_past_eof() {
+        // `bump` clamps at the trailing Eof token: a statement that runs out of
+        // input (no table name) makes the parser bump AT Eof and then read the
+        // next position for its error message. If `bump` advanced past Eof that
+        // read would be out of bounds — instead we must get a clean parse error.
+        assert!(parse("DROP TABLE").is_err());
+        assert!(parse("CREATE TABLE").is_err());
+    }
+
+    #[test]
     fn precedence_mul_over_add() {
         // 1 + 2 * 3  ==  1 + (2 * 3)
         let e = expr("1 + 2 * 3");

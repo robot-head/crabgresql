@@ -302,6 +302,17 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_block_comment_ending_in_a_star_does_not_read_past_eof() {
+        // A trailing `*` makes the `bytes[i] == b'*'` half of the terminator
+        // check true, so the scan would read `bytes[i + 1]` — its `i + 1 < len`
+        // bound is what stops that from running off the end. ("/* c" can't catch
+        // this: 'c' is not `*`, so the `&&` short-circuits before bytes[i + 1].)
+        let e = lex("/* *").expect_err("unterminated block comment");
+        assert!(e.message.contains("unterminated block comment"));
+        assert_eq!(e.position, 0);
+    }
+
+    #[test]
     fn lone_dollar_is_an_unexpected_character_not_a_bad_param() {
         // `$` only begins a parameter when a digit follows; otherwise it is an
         // unexpected character (this lexer has no dollar-quoting).
