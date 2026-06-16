@@ -679,12 +679,7 @@ fn collect_expr_ranges(
     use pgparser::ast::{Expr, FuncArgs};
     match e {
         Expr::ScalarSubquery(s) | Expr::Exists(s) => collect_select_ranges(router, s, out)?,
-        Expr::InSubquery {
-            expr, subquery, ..
-        }
-        | Expr::Quantified {
-            expr, subquery, ..
-        } => {
+        Expr::InSubquery { expr, subquery, .. } | Expr::Quantified { expr, subquery, .. } => {
             collect_expr_ranges(router, expr, out)?;
             collect_select_ranges(router, subquery, out)?;
         }
@@ -907,8 +902,14 @@ mod tests {
         let mut router = RangeRouter::connect(&c).await;
         router.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
         router.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
-        router.simple("INSERT INTO a VALUES (1)").await.expect("seed a");
-        router.simple("INSERT INTO b VALUES (1)").await.expect("seed b");
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("seed a");
+        router
+            .simple("INSERT INTO b VALUES (1)")
+            .await
+            .expect("seed b");
 
         // a (range 0) referencing b (range 1) in a subquery -> rejected 0A000.
         let err = router

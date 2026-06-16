@@ -2108,7 +2108,10 @@ mod tests {
     fn parses_exists_and_not_exists() {
         assert!(matches!(expr("EXISTS (SELECT 1 FROM t)"), Expr::Exists(_)));
         match expr("NOT EXISTS (SELECT 1 FROM t)") {
-            Expr::Unary { op: UnaryOp::Not, expr } => {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => {
                 assert!(matches!(*expr, Expr::Exists(_)))
             }
             other => panic!("expected NOT(EXISTS …), got {other:?}"),
@@ -2131,15 +2134,27 @@ mod tests {
     #[test]
     fn parses_quantified_any_all_some() {
         match expr("a = ANY (SELECT id FROM t)") {
-            Expr::Quantified { op: BinaryOp::Eq, all, .. } => assert!(!all),
+            Expr::Quantified {
+                op: BinaryOp::Eq,
+                all,
+                ..
+            } => assert!(!all),
             other => panic!("expected ANY, got {other:?}"),
         }
         match expr("a > ALL (SELECT v FROM t)") {
-            Expr::Quantified { op: BinaryOp::Gt, all, .. } => assert!(all),
+            Expr::Quantified {
+                op: BinaryOp::Gt,
+                all,
+                ..
+            } => assert!(all),
             other => panic!("expected ALL, got {other:?}"),
         }
         match expr("a <> SOME (SELECT v FROM t)") {
-            Expr::Quantified { op: BinaryOp::Ne, all, .. } => assert!(!all),
+            Expr::Quantified {
+                op: BinaryOp::Ne,
+                all,
+                ..
+            } => assert!(!all),
             other => panic!("expected SOME(=ANY), got {other:?}"),
         }
     }

@@ -424,9 +424,7 @@ pub(crate) fn infer_type(expr: &Expr, scope: &Scope) -> Result<ColumnType, ExecE
         Expr::Const { ty, .. } => Ok(*ty),
         // SP34: EXISTS / IN-subquery / quantified comparison are always boolean
         // (typeable without executing — used by `describe`).
-        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Quantified { .. } => {
-            Ok(ColumnType::Bool)
-        }
+        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Quantified { .. } => Ok(ColumnType::Bool),
         // A scalar subquery's type needs the catalog; both the exec and describe
         // paths substitute it to `Const` before `infer_type` runs, so this is
         // unreachable in practice (defensive).

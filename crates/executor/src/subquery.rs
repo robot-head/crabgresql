@@ -390,7 +390,11 @@ mod tests {
             cell0(&run(&e, "SELECT (SELECT max(v) FROM t)").await),
             Some("30".into())
         );
-        let r = run(&e, "SELECT id FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY id").await;
+        let r = run(
+            &e,
+            "SELECT id FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY id",
+        )
+        .await;
         assert_eq!(rowcount(&r), 1); // only id=3 (v=30 > avg 20)
         assert_eq!(cell0(&r), Some("3".into()));
     }
@@ -450,10 +454,18 @@ mod tests {
         let e = seed().await;
         run(&e, "CREATE TABLE u (k int4)").await;
         run(&e, "INSERT INTO u VALUES (1), (3)").await;
-        let r = run(&e, "SELECT id FROM t WHERE id IN (SELECT k FROM u) ORDER BY id").await;
+        let r = run(
+            &e,
+            "SELECT id FROM t WHERE id IN (SELECT k FROM u) ORDER BY id",
+        )
+        .await;
         assert_eq!(rowcount(&r), 2);
         assert_eq!(cell0(&r), Some("1".into()));
-        let r = run(&e, "SELECT id FROM t WHERE id NOT IN (SELECT k FROM u) ORDER BY id").await;
+        let r = run(
+            &e,
+            "SELECT id FROM t WHERE id NOT IN (SELECT k FROM u) ORDER BY id",
+        )
+        .await;
         assert_eq!(rowcount(&r), 1);
         assert_eq!(cell0(&r), Some("2".into()));
     }
@@ -472,10 +484,18 @@ mod tests {
         let e = seed().await;
         run(&e, "CREATE TABLE u (k int4)").await;
         run(&e, "INSERT INTO u VALUES (15), (25)").await;
-        let r = run(&e, "SELECT id FROM t WHERE v > ALL (SELECT k FROM u) ORDER BY id").await;
+        let r = run(
+            &e,
+            "SELECT id FROM t WHERE v > ALL (SELECT k FROM u) ORDER BY id",
+        )
+        .await;
         assert_eq!(rowcount(&r), 1);
         assert_eq!(cell0(&r), Some("3".into()));
-        let r = run(&e, "SELECT id FROM t WHERE v > ANY (SELECT k FROM u) ORDER BY id").await;
+        let r = run(
+            &e,
+            "SELECT id FROM t WHERE v > ANY (SELECT k FROM u) ORDER BY id",
+        )
+        .await;
         assert_eq!(rowcount(&r), 2);
         run(&e, "CREATE TABLE empt (k int4)").await;
         let r_any = run(&e, "SELECT id FROM t WHERE v > ANY (SELECT k FROM empt)").await;
@@ -500,8 +520,8 @@ mod tests {
         let e = seed().await; // t (id int4, v int4)
         // A scalar subquery in the projection types as its single column's type (int4),
         // without executing — the catalog-only describe type pass.
-        let fields =
-            crate::describe_fields(&*e.kv, "SELECT (SELECT max(v) FROM t) FROM t").expect("describe");
+        let fields = crate::describe_fields(&*e.kv, "SELECT (SELECT max(v) FROM t) FROM t")
+            .expect("describe");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].type_oid, pgtypes::oids::INT4); // max(int4) → int4
     }

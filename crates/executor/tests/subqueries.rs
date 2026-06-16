@@ -105,7 +105,11 @@ async fn in_not_in_exists_quantified() {
     let client = connect(spawn().await).await;
     seed(&client).await;
     assert_eq!(
-        col0(&client, "SELECT id FROM t WHERE id IN (SELECT k FROM u) ORDER BY id").await,
+        col0(
+            &client,
+            "SELECT id FROM t WHERE id IN (SELECT k FROM u) ORDER BY id"
+        )
+        .await,
         vec![Some("1".into()), Some("3".into())]
     );
     assert_eq!(
@@ -160,7 +164,11 @@ async fn error_surface() {
     );
     // IN-subquery > 1 column → 42601.
     assert_eq!(
-        err_code(&client, "SELECT id FROM t WHERE id IN (SELECT id, v FROM t)").await,
+        err_code(
+            &client,
+            "SELECT id FROM t WHERE id IN (SELECT id, v FROM t)"
+        )
+        .await,
         "42601"
     );
 }
