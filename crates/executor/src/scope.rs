@@ -12,15 +12,15 @@ use crate::error::ExecError;
 /// `None` for a USING/NATURAL-coalesced column), its name, and its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnBinding {
-    pub qualifier: Option<String>,
-    pub name: String,
-    pub ty: ColumnType,
+    pub(crate) qualifier: Option<String>,
+    pub(crate) name: String,
+    pub(crate) ty: ColumnType,
 }
 
 /// The ordered schema of a relation. Flat indices line up with the combined row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Scope {
-    pub columns: Vec<ColumnBinding>,
+    pub(crate) columns: Vec<ColumnBinding>,
 }
 
 impl Scope {
@@ -54,6 +54,7 @@ impl Scope {
         self.columns.len()
     }
 
+    /// The type of the column at `idx` (caller ensures `idx < width()`).
     pub fn ty_at(&self, idx: usize) -> ColumnType {
         self.columns[idx].ty
     }
