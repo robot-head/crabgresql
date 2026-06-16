@@ -746,7 +746,7 @@ async fn resolve_in_doubt_on_leadership(
                 engine.reseed_gtm().map_err(|_| ())?;
                 engine.reseed_counters().map_err(|_| ())?;
                 let scan_lo = engine.clog_scan_lo().unwrap_or(0);
-                let (gs, new_lo) = engine
+                let (gs, _) = engine
                     .in_doubt_globals_from(scan_lo)
                     .await
                     .map_err(|_| ())?;
@@ -757,6 +757,25 @@ async fn resolve_in_doubt_on_leadership(
                     {
                         tracing::warn!(g, ?e, "recovery abort-race failed; g stays in-doubt");
                     }
+                }
+                // SETTLE-COMPLETE-BEFORE-SERVE: re-scan AFTER the abort-races and open the gate
+                // only when EVERY inherited marker has been driven to a durable terminal decision
+                // (the re-scan is empty). The abort-race above is best-effort — under an OVERLAPPING
+                // (cascading) failover a `CommitGlobal` abort-race can fail to land (this leader
+                // loses leadership again before it commits), leaving a marker in-doubt. Opening the
+                // gate with a marker still in-doubt lets a new gated write supersede AROUND it (the
+                // in-doubt version is invisible), and when that marker is later committed BOTH
+                // versions go live: the MVCC at-most-one-live violation that tears the cross-range
+                // bank total. If any marker remains in-doubt, FAIL the settle so the gate stays
+                // CLOSED and the sweep retries once a stable leader can finalize them — genuine
+                // settle-BEFORE-serve, converging instead of racing the window. Proven by the
+                // Stateright model `crossrange_2pc_overlap_settle_model`.
+                let (still_in_doubt, new_lo) = engine
+                    .in_doubt_globals_from(scan_lo)
+                    .await
+                    .map_err(|_| ())?;
+                if !still_in_doubt.is_empty() {
+                    return Err(());
                 }
                 if let Err(e) = engine.advance_clog_scan_lo(new_lo).await {
                     tracing::debug!(new_lo, ?e, "watermark advance not durable; safe to re-scan");
