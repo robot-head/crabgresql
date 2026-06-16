@@ -39,10 +39,14 @@ pub(crate) fn eval(
             let r = eval(right, table, values)?;
             apply_binary(*op, &l, &r)
         }
-        // A function call reached scalar `eval` means it is NOT in an aggregate
-        // position (the aggregate path resolves aggregates from accumulators and
-        // their arguments by recursing through here). An aggregate here is
-        // therefore misplaced/nested (42803); any other name is undefined (42883).
+        // A function call reached scalar `eval`: a SP29 scalar function evaluates
+        // here (its arguments recurse through this same `eval`). Otherwise it is
+        // NOT in a valid aggregate position (the aggregate path resolves
+        // aggregates from accumulators) — a known aggregate here is misplaced /
+        // nested (42803); any other name is undefined (42883).
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+            crate::func::eval_scalar(fc, |e| eval(e, table, values))
+        }
         Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
         // SP28: predicate + conditional expressions. The pure-Datum combinators
         // (`eval_in_list`/`eval_between`/`eval_like`/`eval_case`) are shared with
@@ -291,6 +295,7 @@ pub(crate) fn apply_binary(op: BinaryOp, l: &Datum, r: &Datum) -> Result<Datum, 
         BinaryOp::Div => Ok(ops::div(l, r)?),
         BinaryOp::And => Ok(ops::and(l, r)?),
         BinaryOp::Or => Ok(ops::or(l, r)?),
+        BinaryOp::Concat => Ok(ops::concat(l, r)?),
         BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             let ord = ops::compare(l, r)?;
             Ok(cmp_result(op, ord))
@@ -352,10 +357,28 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
                     ColumnType::Int8
                 })
             }
+            // SP29: `||` yields text. PostgreSQL resolves the operator at plan
+            // time and requires at least one operand to be text (`text || anynonarray`
+            // / `anynonarray || text`); neither-text (e.g. `int || int`) is 42883.
+            BinaryOp::Concat => {
+                let (lt, rt) = (infer_type(left, table)?, infer_type(right, table)?);
+                if lt != ColumnType::Text && rt != ColumnType::Text {
+                    return Err(ExecError::UndefinedFunction(format!(
+                        "operator does not exist: {} || {}",
+                        lt.name(),
+                        rt.name()
+                    )));
+                }
+                Ok(ColumnType::Text)
+            }
             _ => Ok(ColumnType::Bool),
         },
-        // Aggregate result type for RowDescription (count/sum -> int8, min/max ->
-        // the argument's type); unknown names / bad arity -> 42883.
+        // SP29: a scalar function's result type; otherwise an aggregate result
+        // type for RowDescription (count/sum -> int8, min/max -> the argument's
+        // type); unknown names / bad arity / bad argument type -> 42883.
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+            crate::func::scalar_result_type(fc, table)
+        }
         Expr::Func(fc) => crate::agg::func_result_type(fc, table),
         // SP28: predicates are boolean; CASE unifies its branch result types.
         Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => {
@@ -385,7 +408,10 @@ fn infer_case_type(
     Ok(acc.unwrap_or(ColumnType::Text))
 }
 
-fn unify_branch(
+/// Fold one branch/argument into a running unified type. A bare `NULL` is
+/// type-neutral (imposes no constraint). Shared by `CASE` type inference and
+/// SP29's `coalesce`/`greatest`/`least`.
+pub(crate) fn unify_branch(
     acc: Option<ColumnType>,
     expr: &Expr,
     table: Option<&Table>,
@@ -400,7 +426,7 @@ fn unify_branch(
     }
 }
 
-fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, ExecError> {
+pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, ExecError> {
     use ColumnType::{Int4, Int8};
     Ok(match (a, b) {
         (x, y) if x == y => x,
@@ -408,7 +434,7 @@ fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, ExecError> {
         (Int4, Int8) | (Int8, Int4) => Int8,
         _ => {
             return Err(ExecError::TypeMismatch(format!(
-                "CASE types {} and {} cannot be matched",
+                "types {} and {} cannot be matched",
                 a.name(),
                 b.name()
             )));

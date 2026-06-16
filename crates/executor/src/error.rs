@@ -26,6 +26,9 @@ pub enum ExecError {
     /// A call to a function that does not exist (42883) — e.g. an unknown name
     /// or an aggregate applied to an argument type/arity it does not accept.
     UndefinedFunction(String),
+    /// An object was used in a way its kind does not allow (42809) — e.g.
+    /// `DISTINCT`/`ALL` applied to a scalar (non-aggregate) function.
+    WrongObjectType(String),
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -62,6 +65,7 @@ impl ExecError {
             ExecError::TypeMismatch(m) => PgError::error("42804", m),
             ExecError::Grouping(m) => PgError::error("42803", m),
             ExecError::UndefinedFunction(m) => PgError::error("42883", m),
+            ExecError::WrongObjectType(m) => PgError::error("42809", m),
             ExecError::InFailedTransaction => PgError::error(
                 "25P02",
                 "current transaction is aborted, commands ignored until end of transaction block",

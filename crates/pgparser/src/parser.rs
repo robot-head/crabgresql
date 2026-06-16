@@ -124,6 +124,11 @@ impl Parser {
                     _ => {}
                 }
             }
+            // SP29 inserts `||` (BinaryOp::Concat) between the comparison level
+            // (5/6) and the additive level: like PostgreSQL, `||` binds TIGHTER
+            // than `< > = <= >= <>`, `BETWEEN/IN/LIKE`, `AND`/`OR` but LOOSER than
+            // `+ - * /`. So `+ - * /` and the unary-minus operand power shift up by
+            // two to make room (odd l_bp / even r_bp preserved).
             let (op, l_bp, r_bp) = match self.peek() {
                 Token::Keyword(Keyword::Or) => (BinaryOp::Or, 1, 2),
                 Token::Keyword(Keyword::And) => (BinaryOp::And, 3, 4),
@@ -133,10 +138,11 @@ impl Parser {
                 Token::Le => (BinaryOp::Le, 5, 6),
                 Token::Gt => (BinaryOp::Gt, 5, 6),
                 Token::Ge => (BinaryOp::Ge, 5, 6),
-                Token::Plus => (BinaryOp::Add, 7, 8),
-                Token::Minus => (BinaryOp::Sub, 7, 8),
-                Token::Star => (BinaryOp::Mul, 9, 10),
-                Token::Slash => (BinaryOp::Div, 9, 10),
+                Token::Concat => (BinaryOp::Concat, 7, 8),
+                Token::Plus => (BinaryOp::Add, 9, 10),
+                Token::Minus => (BinaryOp::Sub, 9, 10),
+                Token::Star => (BinaryOp::Mul, 11, 12),
+                Token::Slash => (BinaryOp::Div, 11, 12),
                 _ => break,
             };
             if l_bp < min_bp {
@@ -164,9 +170,11 @@ impl Parser {
             }
             Token::Minus => {
                 self.bump();
+                // Unary minus binds tighter than `* /` (now 11/12), so its operand
+                // is parsed above that level (13) — `-a * b` stays `(-a) * b`.
                 Ok(Expr::Unary {
                     op: UnaryOp::Neg,
-                    expr: Box::new(self.expr(11)?),
+                    expr: Box::new(self.expr(13)?),
                 })
             }
             Token::LParen => {
@@ -1059,6 +1067,7 @@ mod tests {
             ("a - b", Sub),
             ("a * b", Mul),
             ("a / b", Div),
+            ("a || b", Concat),
         ] {
             match expr(src) {
                 Expr::Binary { op, .. } => assert_eq!(op, want, "operator in `{src}`"),
@@ -1093,6 +1102,87 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn concat_precedence_and_associativity() {
+        // `||` binds looser than `+` (PG): `a || b + c` == `a || (b + c)`.
+        match expr("a || b + c") {
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => assert!(matches!(
+                *right,
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            )),
+            other => panic!("expected Concat(.., Add) , got {other:?}"),
+        }
+        // `||` binds tighter than `=` (PG): `a || b = c` == `(a || b) = c`.
+        match expr("a || b = c") {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                ..
+            } => assert!(matches!(
+                *left,
+                Expr::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                }
+            )),
+            other => panic!("expected Eq(Concat, ..), got {other:?}"),
+        }
+        // Left-associative: `a || b || c` == `(a || b) || c`.
+        match expr("a || b || c") {
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                left,
+                ..
+            } => assert!(matches!(
+                *left,
+                Expr::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                }
+            )),
+            other => panic!("expected left-nested Concat, got {other:?}"),
+        }
+        // `||` binds tighter than LIKE: `a || b LIKE p` == `(a || b) LIKE p`.
+        match expr("a || b LIKE 'p'") {
+            Expr::Like { expr, .. } => {
+                assert!(matches!(
+                    *expr,
+                    Expr::Binary {
+                        op: BinaryOp::Concat,
+                        ..
+                    }
+                ))
+            }
+            other => panic!("expected Like over Concat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_minus_still_binds_tighter_than_star() {
+        // After the SP29 renumber, `-a * b` must still be `(-a) * b`.
+        match expr("-a * b") {
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                left,
+                ..
+            } => assert!(matches!(
+                *left,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    ..
+                }
+            )),
+            other => panic!("expected Mul((-a), b), got {other:?}"),
+        }
     }
 
     #[test]

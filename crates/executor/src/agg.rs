@@ -238,6 +238,15 @@ fn collect_specs(
                 specs.push(spec);
             }
         }
+        // SP29: a scalar function may wrap aggregates / grouped columns — gather
+        // aggregates from its arguments (the call itself is not an aggregate).
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+            if let FuncArgs::Exprs(args) = &fc.args {
+                for a in args {
+                    collect_specs(a, table, specs)?;
+                }
+            }
+        }
         Expr::Func(fc) => return Err(undefined_function(&fc.name)),
         Expr::Unary { expr, .. } => collect_specs(expr, table, specs)?,
         Expr::Binary { left, right, .. } => {
@@ -302,6 +311,15 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
         Expr::Binary { left, right, .. } => {
             validate_grouped(left, group_by)?;
             validate_grouped(right, group_by)
+        }
+        // SP29: every argument of a scalar function must itself be grouped-valid.
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+            if let FuncArgs::Exprs(args) = &fc.args {
+                for a in args {
+                    validate_grouped(a, group_by)?;
+                }
+            }
+            Ok(())
         }
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
         // SP28: every child of a predicate / CASE must itself be grouped-valid.
@@ -436,6 +454,11 @@ fn eval_grouped(
             whens,
             else_result,
         } => crate::eval::eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
+            eval_grouped(e, table, group_by, key, specs, results)
+        }),
+        // SP29: a scalar function over grouped/aggregate arguments — evaluate it
+        // with the grouped evaluator as its child-eval closure.
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => crate::func::eval_scalar(fc, |e| {
             eval_grouped(e, table, group_by, key, specs, results)
         }),
         Expr::Func(fc) => Err(undefined_function(&fc.name)),

@@ -84,6 +84,10 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                 out.push((Token::Ne, i));
                 i += 2;
             }
+            b'|' if bytes.get(i + 1) == Some(&b'|') => {
+                out.push((Token::Concat, i));
+                i += 2;
+            }
             b'(' => push1(&mut out, Token::LParen, &mut i),
             b')' => push1(&mut out, Token::RParen, &mut i),
             b',' => push1(&mut out, Token::Comma, &mut i),
@@ -222,6 +226,24 @@ mod tests {
                 Token::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn concat_operator_lexes_and_a_lone_pipe_is_rejected() {
+        // `||` is one token; with no surrounding spaces a slip in the two-byte
+        // advance would mis-read the next byte.
+        assert_eq!(
+            toks("a||b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Concat,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+        // A single `|` is not a token in this slice (no bitwise-or).
+        let e = lex("a | b").expect_err("lone pipe");
+        assert!(e.message.contains("unexpected character"));
     }
 
     #[test]

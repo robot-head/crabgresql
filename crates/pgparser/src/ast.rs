@@ -168,6 +168,8 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    /// SP29: `||` string concatenation.
+    Concat,
     Eq,
     Ne,
     Lt,

@@ -14,6 +14,8 @@ pub enum Token {
     Plus,
     Minus,
     Slash,
+    /// SP29: the `||` string-concatenation operator.
+    Concat,
     Eq,
     Ne,
     Lt,
