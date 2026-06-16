@@ -331,7 +331,7 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
         return Ok(()); // matches a grouping expression structurally
     }
     match e {
-        Expr::Column(name) => Err(ungrouped_column(name)),
+        Expr::Column { name, .. } => Err(ungrouped_column(name)),
         Expr::Unary { expr, .. } => validate_grouped(expr, group_by),
         Expr::Binary { left, right, .. } => {
             validate_grouped(left, group_by)?;
@@ -440,7 +440,7 @@ fn eval_grouped(
         Expr::Param(_) => Err(ExecError::Unsupported(
             "query parameters ($n) are not supported".into(),
         )),
-        Expr::Column(name) => Err(ungrouped_column(name)),
+        Expr::Column { name, .. } => Err(ungrouped_column(name)),
         Expr::Unary { op, expr } => {
             let v = eval_grouped(expr, scope, group_by, key, specs, results)?;
             crate::eval::apply_unary(*op, &v)

@@ -284,10 +284,21 @@ impl Parser {
             Token::Ident(s) => {
                 self.bump();
                 // SP27: `ident (` is a function call; a bare ident is a column.
+                // SP33: `ident . ident` is a table-qualified column reference.
                 if *self.peek() == Token::LParen {
                     self.func_call(s)
+                } else if *self.peek() == Token::Dot {
+                    self.bump();
+                    let name = self.expect_ident()?;
+                    Ok(Expr::Column {
+                        table: Some(s),
+                        name,
+                    })
                 } else {
-                    Ok(Expr::Column(s))
+                    Ok(Expr::Column {
+                        table: None,
+                        name: s,
+                    })
                 }
             }
             other => Err(ParseError::new(
@@ -1041,7 +1052,13 @@ mod tests {
                         ..
                     } if name == "count"
                 ));
-                assert_eq!(s.group_by, vec![Expr::Column("k".into())]);
+                assert_eq!(
+                    s.group_by,
+                    vec![Expr::Column {
+                        table: None,
+                        name: "k".into()
+                    }]
+                );
                 assert!(s.having.is_some());
                 assert_eq!(s.order_by.len(), 1);
                 assert_eq!(s.limit, Some(5));
@@ -1089,7 +1106,16 @@ mod tests {
             Statement::Select(s) => {
                 assert_eq!(
                     s.group_by,
-                    vec![Expr::Column("a".into()), Expr::Column("b".into())]
+                    vec![
+                        Expr::Column {
+                            table: None,
+                            name: "a".into()
+                        },
+                        Expr::Column {
+                            table: None,
+                            name: "b".into()
+                        }
+                    ]
                 );
                 assert!(s.having.is_none());
             }
@@ -1403,7 +1429,13 @@ mod tests {
         assert_eq!(expr("'hi'"), Expr::StringLiteral("hi".into()));
         assert_eq!(expr("true"), Expr::BoolLiteral(true));
         assert_eq!(expr("null"), Expr::NullLiteral);
-        assert_eq!(expr("col"), Expr::Column("col".into()));
+        assert_eq!(
+            expr("col"),
+            Expr::Column {
+                table: None,
+                name: "col".into()
+            }
+        );
         assert_eq!(expr("$2"), Expr::Param(2));
     }
 
@@ -1517,7 +1549,13 @@ mod tests {
                 right,
             } => {
                 assert!(matches!(*left, Expr::Between { negated: false, .. }));
-                assert_eq!(*right, Expr::Column("b".into()));
+                assert_eq!(
+                    *right,
+                    Expr::Column {
+                        table: None,
+                        name: "b".into()
+                    }
+                );
             }
             other => panic!("expected AND(Between, b), got {other:?}"),
         }
@@ -1707,6 +1745,25 @@ mod tests {
         assert!(parse("SELECT CAST(1 AS widget)").is_err());
         // `cast` is a reserved keyword now, so `CAST(... )` requires `AS`.
         assert!(parse("SELECT CAST(1 int4)").is_err());
+    }
+
+    #[test]
+    fn parses_qualified_column() {
+        use crate::ast::Expr;
+        assert_eq!(
+            expr("a.col"),
+            Expr::Column {
+                table: Some("a".into()),
+                name: "col".into()
+            }
+        );
+        assert_eq!(
+            expr("col"),
+            Expr::Column {
+                table: None,
+                name: "col".into()
+            }
+        );
     }
 
     #[test]

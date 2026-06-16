@@ -857,7 +857,10 @@ pub(crate) fn resolve_projection(
         let exprs = scope
             .columns
             .iter()
-            .map(|c| Expr::Column(c.name.clone()))
+            .map(|c| Expr::Column {
+                table: None,
+                name: c.name.clone(),
+            })
             .collect();
         return Ok((fields, exprs));
     }
@@ -883,7 +886,7 @@ pub(crate) fn resolve_projection(
 
 fn derived_name(expr: &Expr) -> String {
     match expr {
-        Expr::Column(c) => c.clone(),
+        Expr::Column { name, .. } => name.clone(),
         // PostgreSQL names an aggregate output column after the function.
         Expr::Func(fc) => fc.name.clone(),
         _ => "?column?".to_string(),

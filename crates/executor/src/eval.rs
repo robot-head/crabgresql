@@ -31,8 +31,8 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
         Expr::Param(_) => Err(ExecError::Unsupported(
             "query parameters ($n) are not supported".into(),
         )),
-        Expr::Column(name) => {
-            let idx = scope.resolve(None, name)?;
+        Expr::Column { table, name } => {
+            let idx = scope.resolve(table.as_deref(), name)?;
             Ok(values[idx].clone())
         }
         Expr::Unary { op, expr } => {
@@ -351,8 +351,8 @@ pub(crate) fn infer_type(expr: &Expr, scope: &Scope) -> Result<ColumnType, ExecE
         Expr::Param(_) => Err(ExecError::Unsupported(
             "query parameters ($n) are not supported".into(),
         )),
-        Expr::Column(name) => {
-            let idx = scope.resolve(None, name)?;
+        Expr::Column { table, name } => {
+            let idx = scope.resolve(table.as_deref(), name)?;
             Ok(scope.ty_at(idx))
         }
         Expr::Unary { op, expr } => match op {

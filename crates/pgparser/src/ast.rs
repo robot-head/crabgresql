@@ -92,7 +92,12 @@ pub enum Expr {
     StringLiteral(String),
     BoolLiteral(bool),
     NullLiteral,
-    Column(String),
+    /// SP33: a column reference, optionally table-qualified (`a.col`). `table` is
+    /// `None` for a bare `col`.
+    Column {
+        table: Option<String>,
+        name: String,
+    },
     Param(u32),
     Unary {
         op: UnaryOp,
