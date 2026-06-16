@@ -608,12 +608,19 @@ pub(crate) fn execute_read(
     let Statement::Select(s) = stmt else {
         return Err(ExecError::Unsupported("not a SELECT".into()));
     };
-    let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
-        None => None,
+    // SP33: a single base table is the only FROM shape the executor handles for
+    // now — the nested-loop join builder lands in the next task. Anything else is
+    // rejected 0A000 here so the parser + router can land independently.
+    let (table, alias): (Option<Table>, Option<&str>) = match s.from.as_slice() {
+        [] => (None, None),
+        [pgparser::ast::TableExpr::Table { name, alias }] => (
+            Some(catalog::get_table(catalog_kv, name)?),
+            alias.as_deref(),
+        ),
+        _ => return Err(ExecError::Unsupported("joins land in the next task".into())),
     };
     let scope = match &table {
-        Some(t) => Scope::single(t, &t.name),
+        Some(t) => Scope::single(t, alias.unwrap_or(&t.name)),
         None => Scope::empty(),
     };
 
@@ -672,13 +679,21 @@ pub(crate) async fn execute_read_locking(
             "FOR UPDATE/SHARE is not allowed with DISTINCT clause".into(),
         ));
     }
-    // FOR UPDATE/SHARE requires a FROM clause — there are no rows to lock
-    // in a FROM-less SELECT.
-    let table_name = s
-        .from
-        .as_ref()
-        .ok_or_else(|| ExecError::Unsupported("FOR UPDATE/SHARE requires a FROM clause".into()))?;
-    let t = catalog::get_table(catalog_kv, table_name)?;
+    // FOR UPDATE/SHARE requires exactly one base table — there are no rows to lock
+    // in a FROM-less SELECT, and a join is not supported (0A000).
+    let t = match s.from.as_slice() {
+        [pgparser::ast::TableExpr::Table { name, .. }] => catalog::get_table(catalog_kv, name)?,
+        [] => {
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE requires a FROM clause".into(),
+            ));
+        }
+        _ => {
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE with a join is not supported".into(),
+            ));
+        }
+    };
     let scope = Scope::single(&t, &t.name);
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
@@ -873,6 +888,14 @@ pub(crate) fn resolve_projection(
                     "* mixed with other items is not supported".into(),
                 ));
             }
+            // SP33: `a.*` qualified-wildcard expansion lands with the join builder
+            // (the next task); the single-base-table read path of this slice does
+            // not expand it yet.
+            SelectItem::QualifiedWildcard(_) => {
+                return Err(ExecError::Unsupported(
+                    "qualified wildcard (a.*) lands in the next task".into(),
+                ));
+            }
             SelectItem::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| derived_name(expr));
                 let ty = crate::eval::infer_type(expr, scope)?;
@@ -972,12 +995,16 @@ pub(crate) fn describe(
     let Some(Statement::Select(s)) = statements.first() else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
-    let table = match &s.from {
-        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
-        None => None,
+    let (table, alias): (Option<Table>, Option<&str>) = match s.from.as_slice() {
+        [] => (None, None),
+        [pgparser::ast::TableExpr::Table { name, alias }] => (
+            Some(catalog::get_table(catalog_kv, name)?),
+            alias.as_deref(),
+        ),
+        _ => return Err(ExecError::Unsupported("joins land in the next task".into())),
     };
     let scope = match &table {
-        Some(t) => Scope::single(t, &t.name),
+        Some(t) => Scope::single(t, alias.unwrap_or(&t.name)),
         None => Scope::empty(),
     };
     let (fields, _exprs) = resolve_projection(&s.projection, &scope)?;

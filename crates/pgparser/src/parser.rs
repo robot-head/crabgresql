@@ -27,6 +27,12 @@ impl Parser {
         &self.toks[i].0
     }
 
+    /// The token `n` positions ahead of the current one (saturates at EOF).
+    fn peek_n(&self, n: usize) -> &Token {
+        let i = (self.pos + n).min(self.toks.len() - 1);
+        &self.toks[i].0
+    }
+
     fn peek_pos(&self) -> usize {
         self.toks[self.pos].1
     }
@@ -686,7 +692,13 @@ impl Parser {
     }
 
     fn select(&mut self) -> Result<crate::ast::Statement, ParseError> {
-        use crate::ast::{OrderItem, SelectItem, SelectStmt, Statement};
+        Ok(crate::ast::Statement::Select(self.select_inner()?))
+    }
+
+    /// Parse a SELECT body into a [`SelectStmt`]. Factored out of `select` so the
+    /// FROM-clause derived-table path (`( SELECT … ) alias`) can recurse into it.
+    fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
+        use crate::ast::{OrderItem, SelectItem, SelectStmt};
         self.expect(&Token::Keyword(Keyword::Select))?;
         // SP28: SELECT DISTINCT (ALL is the default modifier — accept and ignore).
         let distinct = self.eat_keyword(Keyword::Distinct);
@@ -699,6 +711,22 @@ impl Parser {
             projection.push(SelectItem::Wildcard);
         } else {
             loop {
+                // SP33: `a.*` qualified wildcard — only when the THREE tokens
+                // `Ident Dot Star` line up (so bare `SELECT *` and `SELECT a.col`
+                // are unaffected).
+                if let Token::Ident(_) = self.peek()
+                    && *self.peek_n(1) == Token::Dot
+                    && *self.peek_n(2) == Token::Star
+                {
+                    let q = self.expect_ident()?;
+                    self.bump(); // Dot
+                    self.bump(); // Star
+                    projection.push(SelectItem::QualifiedWildcard(q));
+                    if self.eat_comma() {
+                        continue;
+                    }
+                    break;
+                }
                 let expr = self.expr(0)?;
                 let alias = if self.eat_keyword(Keyword::As) {
                     Some(self.expect_ident()?)
@@ -715,9 +743,9 @@ impl Parser {
             }
         }
         let from = if self.eat_keyword(Keyword::From) {
-            Some(self.expect_ident()?)
+            self.parse_from()?
         } else {
-            None
+            Vec::new()
         };
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.expr(0)?)
@@ -785,7 +813,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Statement::Select(SelectStmt {
+        Ok(SelectStmt {
             projection,
             from,
             filter,
@@ -796,7 +824,134 @@ impl Parser {
             limit,
             offset,
             locking,
-        }))
+        })
+    }
+
+    /// Parse the FROM clause: a comma-separated list of join trees.
+    fn parse_from(&mut self) -> Result<Vec<crate::ast::TableExpr>, ParseError> {
+        let mut items = vec![self.join_tree()?];
+        while self.eat_comma() {
+            items.push(self.join_tree()?);
+        }
+        Ok(items)
+    }
+
+    /// A left-associative chain of joins over table factors. `JOIN` binds tighter
+    /// than the top-level comma (handled by `parse_from`).
+    fn join_tree(&mut self) -> Result<crate::ast::TableExpr, ParseError> {
+        use crate::ast::{JoinConstraint, JoinKind, TableExpr};
+        let mut left = self.table_factor()?;
+        loop {
+            let (kind, natural) = if self.eat_keyword(Keyword::Natural) {
+                (self.join_kind()?, true)
+            } else if self.peek_is_join_start() {
+                (self.join_kind()?, false)
+            } else {
+                break;
+            };
+            let right = self.table_factor()?;
+            let constraint = if natural || kind == JoinKind::Cross {
+                if natural {
+                    JoinConstraint::Natural
+                } else {
+                    JoinConstraint::None
+                }
+            } else if self.eat_keyword(Keyword::On) {
+                JoinConstraint::On(self.expr(0)?)
+            } else if self.eat_keyword(Keyword::Using) {
+                self.expect(&Token::LParen)?;
+                let mut cols = vec![self.expect_ident()?];
+                while self.eat_comma() {
+                    cols.push(self.expect_ident()?);
+                }
+                self.expect(&Token::RParen)?;
+                JoinConstraint::Using(cols)
+            } else {
+                return Err(ParseError::new(
+                    "expected ON or USING after JOIN",
+                    self.peek_pos(),
+                ));
+            };
+            left = TableExpr::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind,
+                constraint,
+            };
+        }
+        Ok(left)
+    }
+
+    /// True if the next token begins a join clause (after an optional NATURAL).
+    fn peek_is_join_start(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Join)
+                | Token::Keyword(Keyword::Inner)
+                | Token::Keyword(Keyword::Left)
+                | Token::Keyword(Keyword::Right)
+                | Token::Keyword(Keyword::Full)
+                | Token::Keyword(Keyword::Cross)
+        )
+    }
+
+    /// Consume a join-kind prefix and the `JOIN` keyword. `INNER`/`LEFT`/`RIGHT`/
+    /// `FULL` may be followed by `OUTER`; a bare `JOIN` is INNER.
+    fn join_kind(&mut self) -> Result<crate::ast::JoinKind, ParseError> {
+        use crate::ast::JoinKind;
+        let kind = if self.eat_keyword(Keyword::Inner) {
+            JoinKind::Inner
+        } else if self.eat_keyword(Keyword::Left) {
+            self.eat_keyword(Keyword::Outer);
+            JoinKind::Left
+        } else if self.eat_keyword(Keyword::Right) {
+            self.eat_keyword(Keyword::Outer);
+            JoinKind::Right
+        } else if self.eat_keyword(Keyword::Full) {
+            self.eat_keyword(Keyword::Outer);
+            JoinKind::Full
+        } else if self.eat_keyword(Keyword::Cross) {
+            JoinKind::Cross
+        } else {
+            JoinKind::Inner // a bare JOIN
+        };
+        self.expect(&Token::Keyword(Keyword::Join))?;
+        Ok(kind)
+    }
+
+    /// A table factor: a base table (`t` / `t alias` / `t AS alias`), a derived
+    /// table (`( SELECT … ) alias`), or a parenthesized join (`( … )`).
+    fn table_factor(&mut self) -> Result<crate::ast::TableExpr, ParseError> {
+        use crate::ast::TableExpr;
+        if *self.peek() == Token::LParen {
+            self.bump();
+            if *self.peek() == Token::Keyword(Keyword::Select) {
+                let subquery = Box::new(self.select_inner()?);
+                self.expect(&Token::RParen)?;
+                let alias = self.opt_alias()?.ok_or_else(|| {
+                    ParseError::new("subquery in FROM must have an alias", self.peek_pos())
+                })?;
+                return Ok(TableExpr::Derived { subquery, alias });
+            }
+            let inner = self.join_tree()?;
+            self.expect(&Token::RParen)?;
+            return Ok(inner);
+        }
+        let name = self.expect_ident()?;
+        let alias = self.opt_alias()?;
+        Ok(TableExpr::Table { name, alias })
+    }
+
+    /// An optional table alias: `AS ident`, or a bare `ident` that is not a
+    /// keyword (so `FROM t JOIN …` does not read `JOIN` as an alias).
+    fn opt_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if self.eat_keyword(Keyword::As) {
+            return Ok(Some(self.expect_ident()?));
+        }
+        if let Token::Ident(_) = self.peek() {
+            return Ok(Some(self.expect_ident()?));
+        }
+        Ok(None)
     }
 
     /// Parse the integer count after a `LIMIT`/`OFFSET` keyword (`what` names it
@@ -1025,7 +1180,10 @@ mod tests {
                 assert!(
                     matches!(s.projection[1], SelectItem::Expr { alias: Some(ref n), .. } if n == "bee")
                 );
-                assert_eq!(s.from.as_deref(), Some("t"));
+                assert!(matches!(
+                    s.from.as_slice(),
+                    [crate::ast::TableExpr::Table { name, alias: None }] if name == "t"
+                ));
                 assert!(s.filter.is_some());
                 assert_eq!(s.order_by.len(), 2);
                 assert!(!s.order_by[0].asc); // DESC
@@ -1128,7 +1286,7 @@ mod tests {
         match one("SELECT *") {
             Statement::Select(s) => {
                 assert_eq!(s.projection, vec![SelectItem::Wildcard]);
-                assert!(s.from.is_none());
+                assert!(s.from.is_empty());
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -1780,5 +1938,96 @@ mod tests {
                 other => panic!("expected Select, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn parses_inner_join_on() {
+        use crate::ast::{JoinConstraint, JoinKind, TableExpr};
+        match one("SELECT a.x FROM a JOIN b ON a.id = b.id") {
+            Statement::Select(s) => {
+                assert_eq!(s.from.len(), 1);
+                match &s.from[0] {
+                    TableExpr::Join {
+                        kind, constraint, ..
+                    } => {
+                        assert_eq!(*kind, JoinKind::Inner);
+                        assert!(matches!(constraint, JoinConstraint::On(_)));
+                    }
+                    other => panic!("expected Join, got {other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_left_join_using_and_aliases_and_comma() {
+        use crate::ast::{JoinConstraint, JoinKind, TableExpr};
+        match one("SELECT * FROM a x LEFT OUTER JOIN b AS y USING (id), c") {
+            Statement::Select(s) => {
+                assert_eq!(s.from.len(), 2); // comma -> two top-level items
+                match &s.from[0] {
+                    TableExpr::Join {
+                        kind,
+                        constraint,
+                        left,
+                        right,
+                    } => {
+                        assert_eq!(*kind, JoinKind::Left);
+                        assert_eq!(*constraint, JoinConstraint::Using(vec!["id".into()]));
+                        assert!(
+                            matches!(**left, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("x"))
+                        );
+                        assert!(
+                            matches!(**right, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("y"))
+                        );
+                    }
+                    other => panic!("expected Join, got {other:?}"),
+                }
+                assert!(
+                    matches!(&s.from[1], TableExpr::Table { name, alias: None } if name == "c")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_natural_and_cross_and_derived_and_multiway() {
+        use crate::ast::TableExpr;
+        assert!(matches!(
+            one("SELECT * FROM a NATURAL JOIN b"),
+            Statement::Select(_)
+        ));
+        assert!(matches!(
+            one("SELECT * FROM a CROSS JOIN b"),
+            Statement::Select(_)
+        ));
+        assert!(matches!(
+            one("SELECT * FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id"),
+            Statement::Select(_)
+        ));
+        match one("SELECT d.n FROM (SELECT n FROM t) AS d") {
+            Statement::Select(s) => {
+                assert!(matches!(&s.from[0], TableExpr::Derived { alias, .. } if alias == "d"))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_qualified_wildcard() {
+        use crate::ast::SelectItem;
+        match one("SELECT a.* FROM a JOIN b ON a.id=b.id") {
+            Statement::Select(s) => {
+                assert_eq!(s.projection[0], SelectItem::QualifiedWildcard("a".into()))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn derived_table_requires_alias() {
+        assert!(parse("SELECT * FROM (SELECT 1)").is_err());
     }
 }

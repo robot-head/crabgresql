@@ -90,7 +90,7 @@ pub(crate) fn is_aggregate_query(s: &SelectStmt) -> bool {
         || s.having.is_some()
         || s.projection.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => contains_aggregate(expr),
-            SelectItem::Wildcard => false,
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
         })
         || s.order_by.iter().any(|o| contains_aggregate(&o.expr))
 }

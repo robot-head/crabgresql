@@ -3,8 +3,9 @@
 //! range 0's catalog), and pins a transaction to one range. A transaction that
 //! touches a second range ESCALATES to a cross-range global txn (`Pin::Global`)
 //! committed all-or-nothing by a single decision in range 0 (D3c 2PC), instead of
-//! being rejected. Single statements are never cross-range — the grammar has no
-//! joins and every DML carries one table.
+//! being rejected. A single DML statement still carries one table; a `SELECT` may
+//! now reference several tables (SP33 joins), but a single statement spanning more
+//! than one range is rejected `0A000` (cross-range joins are not supported).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -281,18 +282,29 @@ impl RangeRouter {
     }
 
     /// The concrete data range a *table-bearing* statement targets — the only kind
-    /// that pins a transaction. `Insert`/`Update`/`Delete` and a `SELECT ... FROM t`
-    /// carry exactly one table; everything else (DDL, txn-control, `SELECT` with no
-    /// FROM) carries no table and returns `None`, so it never pins.
+    /// that pins a transaction. `Insert`/`Update`/`Delete` carry exactly one table.
+    /// A `SELECT` may reference several base tables (SP33 joins): it pins iff all of
+    /// them live on one range; a SELECT spanning ranges is rejected `0A000`, and a
+    /// FROM-less SELECT carries no table and returns `None`, so it never pins.
+    /// Everything else (DDL, txn-control) carries no table and returns `None`.
     fn pinning_range(&self, stmt: &Statement) -> Result<Option<RangeId>, ExecError> {
         match stmt {
             Statement::Insert { table, .. }
             | Statement::Update { table, .. }
             | Statement::Delete { table, .. } => self.range_of(table).map(Some),
-            Statement::Select(s) => match &s.from {
-                Some(name) => self.range_of(name).map(Some),
-                None => Ok(None),
-            },
+            Statement::Select(s) => {
+                let mut ranges = std::collections::BTreeSet::new();
+                collect_select_ranges(self, &s.from, &mut ranges)?;
+                match ranges.len() {
+                    0 => Ok(None), // FROM-less -> range 0, unpinned
+                    1 => Ok(Some(
+                        *ranges.iter().next().expect("len()==1 has one element"),
+                    )),
+                    _ => Err(ExecError::Unsupported(
+                        "cross-range joins are not supported".into(),
+                    )),
+                }
+            }
             // DDL and transaction control resolve to range 0 but do not pin: a txn
             // can still be pinned to a data range by a later DML.
             Statement::CreateTable { .. }
@@ -600,6 +612,41 @@ impl RangeRouter {
     }
 }
 
+/// Collect every base-table range a SELECT's FROM clause references into `out`.
+/// Free function (not a method) so it borrows the router immutably while walking a
+/// borrowed `&[TableExpr]` from the same statement — no borrow friction.
+fn collect_select_ranges(
+    router: &RangeRouter,
+    from: &[pgparser::ast::TableExpr],
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    for te in from {
+        collect_table_expr_ranges(router, te, out)?;
+    }
+    Ok(())
+}
+
+fn collect_table_expr_ranges(
+    router: &RangeRouter,
+    te: &pgparser::ast::TableExpr,
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    use pgparser::ast::TableExpr;
+    match te {
+        TableExpr::Table { name, .. } => {
+            out.insert(router.range_of(name)?);
+        }
+        TableExpr::Derived { subquery, .. } => {
+            collect_select_ranges(router, &subquery.from, out)?;
+        }
+        TableExpr::Join { left, right, .. } => {
+            collect_table_expr_ranges(router, left, out)?;
+            collect_table_expr_ranges(router, right, out)?;
+        }
+    }
+    Ok(())
+}
+
 impl pgwire::engine::Session for RangeRouter {
     /// One simple-protocol `Query` frame → one result per statement. Each statement
     /// is range-demuxed (local engine or forward seam); a routing/exec error becomes
@@ -694,6 +741,56 @@ mod tests {
             .expect("insert b");
 
         assert_eq!(router.scan_one_i32("SELECT id FROM a").await, vec![10]);
+        assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![20]);
+    }
+
+    /// SP33: a single `SELECT` join that SPANS ranges is rejected `0A000` by the
+    /// router with its cross-range message (`pinning_range` walks the join's base
+    /// tables, dedups their ranges, and rejects when more than one is touched),
+    /// while an ordinary single-table SELECT on a data range still routes and reads
+    /// back fine — so the multi-table walk did not break single-table routing. (The
+    /// executor's nested-loop join builder is the next task; this asserts only the
+    /// routing decision.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_range_join_is_rejected_while_single_table_select_routes() {
+        // boundary at table 2: a (id 1) -> range 0, b (id 2) -> range 1.
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        router
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO b VALUES (20)")
+            .await
+            .expect("seed b");
+
+        // A join spanning range 0 (a) and range 1 (b) -> rejected 0A000 BY THE ROUTER.
+        // The router rejects (`cross-range joins are not supported`) before the
+        // statement ever reaches an engine, so this is the router's decision, not the
+        // executor's not-yet-implemented join builder.
+        let err = router
+            .simple("SELECT * FROM a JOIN b ON a.id = b.id")
+            .await
+            .expect_err("cross-range join rejected");
+        assert_eq!(
+            err.code, "0A000",
+            "a join spanning ranges surfaces 0A000, got {err:?}"
+        );
+        assert!(
+            err.message.contains("cross-range"),
+            "the router (not the executor) rejected it; got {err:?}"
+        );
+
+        // A single-table SELECT on its data range still routes and reads back — the
+        // multi-table FROM walk did not regress ordinary single-table routing.
         assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![20]);
     }
 
