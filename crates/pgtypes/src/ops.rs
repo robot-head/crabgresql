@@ -181,6 +181,9 @@ mod tests {
     #[test]
     fn null_propagates_through_arithmetic() {
         assert_eq!(add(&Datum::Null, &Datum::Int4(1)).expect("ok"), Datum::Null);
+        // NULL propagates BEFORE division-by-zero is evaluated: NULL / 0 is NULL,
+        // not a 22012 error (the null check must short-circuit on EITHER operand).
+        assert_eq!(div(&Datum::Null, &Datum::Int4(0)).expect("ok"), Datum::Null);
     }
 
     #[test]
@@ -198,10 +201,28 @@ mod tests {
             compare(&Datum::Text("a".into()), &Datum::Text("b".into())).expect("ok"),
             Some(Ordering::Less)
         );
+        // bool compares false < true (its own arm, not the integer fallback).
+        assert_eq!(
+            compare(&Datum::Bool(false), &Datum::Bool(true)).expect("ok"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare(&Datum::Bool(true), &Datum::Bool(true)).expect("ok"),
+            Some(Ordering::Equal)
+        );
     }
 
     #[test]
     fn three_valued_boolean_logic() {
+        // Fully-defined operands: true AND true = true, false OR false = false.
+        assert_eq!(
+            and(&Datum::Bool(true), &Datum::Bool(true)).expect("ok"),
+            Datum::Bool(true)
+        );
+        assert_eq!(
+            or(&Datum::Bool(false), &Datum::Bool(false)).expect("ok"),
+            Datum::Bool(false)
+        );
         assert_eq!(
             and(&Datum::Null, &Datum::Bool(false)).expect("ok"),
             Datum::Bool(false)

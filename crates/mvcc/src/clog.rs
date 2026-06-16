@@ -127,4 +127,21 @@ mod tests {
         .expect("put");
         assert!(get(&kv, 9).is_err());
     }
+
+    #[test]
+    fn is_terminal_only_for_committed_and_aborted() {
+        // Derive each status's on-disk bytes from put_op so this tracks the real
+        // encoding rather than hardcoding the status bytes.
+        let bytes = |s| match put_op(1, s) {
+            kv::WriteOp::Put { value, .. } => value,
+            kv::WriteOp::Delete { .. } => unreachable!("put_op only emits Put"),
+        };
+        assert!(is_terminal(&bytes(XidStatus::Committed)));
+        assert!(is_terminal(&bytes(XidStatus::Aborted)));
+        assert!(!is_terminal(&bytes(XidStatus::InProgress)));
+        assert!(!is_terminal(&bytes(XidStatus::Prepared(
+            crate::xid::GLOBAL_XID_BASE + 1
+        ))));
+        assert!(!is_terminal(&[])); // an absent clog entry is non-terminal
+    }
 }

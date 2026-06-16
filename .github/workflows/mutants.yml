@@ -1,0 +1,88 @@
+name: mutants
+
+# Mutation testing (cargo-mutants). Coverage proves a line RAN; a mutant proves
+# a line MATTERS — cargo-mutants makes a small behavioral change to the source
+# and reruns the tests, and a mutant the tests still pass on is a real gap.
+#
+# It is expensive (the suite reruns once per mutant), so — exactly like
+# fuzz-nightly — it runs on a SCHEDULE plus manual dispatch, never on the PR
+# critical path. Each subsystem is its own matrix shard, so they run in parallel
+# and report independently. Config lives in .cargo/mutants.toml.
+#
+# To shift this left onto PRs later, a non-blocking job running
+# `cargo mutants --in-diff <pr.diff>` over the same crate set scopes mutation
+# testing to just the changed lines; left out here to keep PRs fast.
+on:
+  schedule:
+    - cron: "41 3 * * *" # daily, 03:41 UTC (offset from fuzz-nightly's 04:17)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: Mutants (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Start with the pure, fast, deterministic subsystems (the encoding /
+        # storage / type / catalog / parser layers — a superset of the `property`
+        # job's crate set). The slow, timing-sensitive distributed suites
+        # (cluster, crabgresql) are deliberately excluded: mutation testing reruns
+        # the whole suite per mutant, and their Raft elections make them a slow,
+        # flaky fit. executor and pgwire are the next subsystems to fold in once
+        # their unit suites are hardened against the survivors this surfaces.
+        crate: [kv, mvcc, pgtypes, catalog, pgparser]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-mutants, nextest" }
+      - name: cargo mutants — ${{ matrix.crate }}
+        run: |
+          set +e
+          # --in-place reuses the rust-cache-warmed target/ (no tree copy); the CI
+          # runner is ephemeral, so mutating the checkout in place is harmless.
+          cargo mutants --no-shuffle --in-place --package "${{ matrix.crate }}"
+          code=$?
+          echo "cargo-mutants exit code: $code"
+          # Exit codes: 0=all caught, 1=error, 2=some missed, 3=some timed out,
+          # 4=baseline tests failed. MISSED (2) / TIMEOUT (3) are tracked in the
+          # report + job summary but don't fail this informational nightly; a
+          # broken build (1) or a failing baseline (4) always does — the suite
+          # itself is broken then, which is always actionable.
+          case $code in
+            0 | 2 | 3) exit 0 ;;
+            *) exit $code ;;
+          esac
+      - name: Summarize survivors
+        if: always()
+        run: |
+          out=mutants.out
+          {
+            echo "## Mutants: ${{ matrix.crate }}"
+            if [ -f "$out/missed.txt" ] && [ -s "$out/missed.txt" ]; then
+              echo "### Missed (survived) — gaps in the ${{ matrix.crate }} test suite"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            else
+              echo "No missed mutants 🎉"
+            fi
+            if [ -f "$out/timeout.txt" ] && [ -s "$out/timeout.txt" ]; then
+              echo "### Timed out"
+              echo '```'
+              cat "$out/timeout.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-${{ matrix.crate }}
+          path: mutants.out/
+          if-no-files-found: ignore

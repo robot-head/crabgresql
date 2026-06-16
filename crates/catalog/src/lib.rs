@@ -177,7 +177,9 @@ mod tests {
         let t = get_table(kv, "t").expect("lookup");
         assert_eq!(t.id, id);
         assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.column_index("id"), Some(0));
         assert_eq!(t.column_index("name"), Some(1));
+        assert_eq!(t.column_index("nope"), None);
         // Duplicate → 42P07.
         assert_eq!(
             create_table(kv, "t", cols()).expect_err("dup").sqlstate(),

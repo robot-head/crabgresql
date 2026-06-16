@@ -79,6 +79,41 @@ concurrency/fault dimension may not warrant one — but anything touching 2PC,
 replication, recovery, leadership, locking, MVCC visibility, or cross-range consistency
 does, and gets a model with teeth as part of the slice.
 
+## Mutation testing: cargo-mutants on subsystems (CI nightly)
+
+Coverage proves a line *ran*; a mutant proves a line *matters*. **cargo-mutants**
+makes a small behavioral change to the source — `a + b` -> `a - b`, `<` -> `<=`, or
+replacing a function body with a default return — and reruns that crate's tests. A
+mutant the tests still pass on ("missed" / survived) is a real gap: a behavior change
+no test catches. It is the dual of the Stateright discipline above — exhaustive over
+*source edits* rather than over *interleavings*.
+
+- **Where it runs.** `.github/workflows/mutants.yml` runs on a SCHEDULE plus manual
+  dispatch (mirroring `fuzz-nightly`; it is far too slow for the PR gate, since the
+  suite reruns once per mutant). Each subsystem is its own matrix shard. The matrix
+  starts with the pure, fast, deterministic crates — `kv`, `mvcc`, `pgtypes`,
+  `catalog`, `pgparser` — and deliberately EXCLUDES the slow, timing-sensitive
+  distributed suites (`cluster`, `crabgresql`): rerunning their Raft elections per
+  mutant is slow and flaky. `executor`/`pgwire` are the next to fold in.
+- **Config** lives in `.cargo/mutants.toml`: `test_tool = "nextest"` (matches the rest
+  of CI), `test_workspace = false` (a mutant runs ONLY the mutated crate's own tests,
+  so a subsystem run measures *that* subsystem's adequacy and stays fast), and a
+  generous `minimum_test_timeout` so an infinite-loop mutant is bounded by the timeout
+  on a starved runner rather than left to hang.
+- **The discipline:** treat a surviving mutant like a surviving Stateright
+  counterexample — investigate it and add the test that kills it. The nightly is
+  informational (it REPORTS survivors via the job summary + an uploaded `mutants.out`
+  artifact; it does not fail the PR), so the practice is to drive each subsystem to
+  zero survivors over time. A mutant genuinely undetectable by a unit test — e.g.
+  `KeyspaceKv::sync`, an fsync whose only observable effect is power-loss durability —
+  is EXCLUDED via `exclude_re` *with a rationale*, so every remaining survivor stays
+  actionable. Never exclude a mutant just to silence it.
+- **Baseline (this slice):** `kv`, `mvcc`, `pgtypes`, and `catalog` are at zero missed
+  mutants, as is the `pgparser` lexer — every survivor the first sweep surfaced was
+  killed with a targeted unit test (the lone `KeyspaceKv::sync` fsync is the one
+  documented exclusion). The full `pgparser` sweep runs in the nightly and is driven to
+  zero the same way as new gaps surface.
+
 ## Windows UAC-safe target names (os error 740)
 
 Windows UAC **installer-detection** refuses to launch (un-elevated) any executable

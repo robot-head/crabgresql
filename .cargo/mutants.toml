@@ -1,0 +1,45 @@
+# cargo-mutants configuration. See <https://mutants.rs/>.
+#
+# Mutation testing checks our *tests*, not just our code. Coverage proves a line
+# RAN; a mutant proves a line MATTERS: cargo-mutants makes a small behavioral
+# change to the source (e.g. `a + b` -> `a - b`, `<` -> `<=`, or replaces a
+# function body with a default return) and reruns the tests. A mutant the tests
+# still pass on ("missed" / survived) is a real gap — a behavior change no test
+# would catch. CI runs this per-subsystem on a schedule, not on the PR critical
+# path (it reruns the suite once per mutant); see .github/workflows/mutants.yml.
+
+# Run tests under nextest, matching the rest of CI (and picking up the
+# .config/nextest.toml concurrency caps). nextest's default fail-fast=true is
+# exactly what we want here: the first failing test kills the mutant, so a caught
+# mutant stops early instead of running the whole suite.
+test_tool = "nextest"
+
+# A mutant only needs the tests of the package it was generated in. Running the
+# whole workspace per mutant would drag the slow, timing-sensitive distributed
+# suites (cluster / crabgresql) into every single mutant; scoping to the mutated
+# package keeps a subsystem run fast, focused, and a true measure of THAT
+# subsystem's own test adequacy. The per-crate CI matrix relies on this.
+test_workspace = false
+
+# Turn off rustc lints inside mutants so a lint-as-error (e.g. an unused binding
+# a mutation happens to create) can't make an otherwise-meaningful mutant report
+# as "unviable" and disappear from the signal.
+cap_lints = true
+
+# The 2-core CI runner is slow, and a mutant can wedge an algorithm into a
+# near-infinite loop. cargo-mutants auto-derives the per-mutant timeout from the
+# baseline test time; floor it so a fast baseline can't produce a knife-edge
+# timeout that flakes, and give the multiplier headroom for a starved runner.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60
+
+# Skip mutants that are genuinely undetectable by a unit test, so that every
+# remaining survivor is actionable (a real test gap) rather than noise.
+exclude_re = [
+    # KeyspaceKv::sync is the fsync (PersistMode::SyncAll) tail of every durable
+    # write — it guarantees power-loss durability, not clean-exit persistence.
+    # Replacing it with Ok(()) is invisible to any in-process test: fjall's
+    # buffers still flush on a clean drop, so a reopen sees the data either way.
+    # Only a real power-cut (which no unit test can stage) tells them apart.
+    "KeyspaceKv::sync",
+]
