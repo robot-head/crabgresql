@@ -50,6 +50,24 @@ const ACCEPTED: &[&str] = &[
     "SELECT DISTINCT a FROM t",
     "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
     "SELECT a FROM t LIMIT 5 OFFSET 2",
+    // SP33: joins — every join type, comma form, USING/NATURAL, aliases,
+    // qualified refs, qualified wildcard, multi-way, and derived tables.
+    "SELECT t.a FROM t JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t INNER JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t LEFT JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t LEFT OUTER JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t RIGHT JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t FULL OUTER JOIN u ON t.id = u.id",
+    "SELECT t.a FROM t CROSS JOIN u",
+    "SELECT a FROM t NATURAL JOIN u",
+    "SELECT a FROM t JOIN u USING (id)",
+    "SELECT a FROM t, u WHERE t.id = u.id",
+    "SELECT t.a, u.b FROM t JOIN u ON t.id = u.id JOIN v ON u.id = v.id",
+    "SELECT x.a FROM t AS x",
+    "SELECT x.a FROM t x JOIN u y ON x.id = y.id",
+    "SELECT t.* FROM t JOIN u ON t.id = u.id",
+    "SELECT d.n FROM (SELECT a AS n FROM t) AS d",
+    "SELECT d.n FROM (SELECT a AS n FROM t) d",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.
@@ -66,6 +84,10 @@ const REJECTED: &[&str] = &[
     "SELECT a FROM t WHERE a IN ()",
     "SELECT a FROM t WHERE a BETWEEN 1",
     "SELECT CASE END FROM t",
+    // SP33: a non-CROSS/NATURAL JOIN requires an ON/USING qualification, and ON
+    // requires a predicate — gram.y rejects both (raw-parse agreement).
+    "SELECT a FROM t JOIN u",
+    "SELECT a FROM t JOIN u ON",
 ];
 
 fn pg_accepts(sql: &str) -> bool {

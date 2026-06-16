@@ -748,9 +748,9 @@ mod tests {
     /// router with its cross-range message (`pinning_range` walks the join's base
     /// tables, dedups their ranges, and rejects when more than one is touched),
     /// while an ordinary single-table SELECT on a data range still routes and reads
-    /// back fine — so the multi-table walk did not break single-table routing. (The
-    /// executor's nested-loop join builder is the next task; this asserts only the
-    /// routing decision.)
+    /// back fine — so the multi-table walk did not break single-table routing. (This
+    /// asserts only the routing decision; the executor's nested-loop join execution
+    /// for same-range joins is covered by the `executor` crate's tests.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cross_range_join_is_rejected_while_single_table_select_routes() {
         // boundary at table 2: a (id 1) -> range 0, b (id 2) -> range 1.

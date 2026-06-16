@@ -186,6 +186,9 @@ fn coalesce_join_columns(
     let right_join: Vec<usize> = pairs.iter().map(|(_, ri)| *ri).collect();
 
     // New schema: merged join cols (unqualified), then non-join left, then non-join right.
+    // The merged column takes the LEFT side's type. USING/NATURAL keys are the same
+    // type on both sides in this slice's tested surface; PG unifies left/right types
+    // for a mixed-width key (e.g. `int4` USING `int8`) — that unification is deferred.
     let mut columns: Vec<ColumnBinding> = Vec::new();
     for ((li, _ri), name) in pairs.iter().zip(join_names) {
         columns.push(ColumnBinding {
