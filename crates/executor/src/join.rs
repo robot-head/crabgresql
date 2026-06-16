@@ -8,7 +8,7 @@ use pgparser::ast::{Expr, JoinConstraint, JoinKind};
 use pgtypes::Datum;
 
 use crate::error::ExecError;
-use crate::scope::Scope;
+use crate::scope::{ColumnBinding, Scope};
 
 /// A materialized relation: an ordered `Scope` (the schema) plus its rows, each
 /// row positionally aligned to `scope.columns`. Base tables, joins, and (later)
@@ -20,13 +20,15 @@ pub(crate) struct Relation {
 }
 
 /// Join two relations under `kind` + `constraint`, returning the combined
-/// relation. INNER/CROSS only in this step; outer kinds land in the next task.
+/// relation.
 pub(crate) fn join_relations(
     left: Relation,
     right: Relation,
     kind: JoinKind,
     constraint: &JoinConstraint,
 ) -> Result<Relation, ExecError> {
+    use std::cmp::Ordering;
+
     // Self-join / duplicate alias: a qualifier may not appear on both sides.
     for c in &right.scope.columns {
         if let Some(q) = &c.qualifier
@@ -40,26 +42,45 @@ pub(crate) fn join_relations(
         }
     }
 
-    // Combined schema for predicate evaluation (left ++ right).
+    // Combined schema (left ++ right): the ON-predicate evaluation scope and the
+    // pre-reshape output schema.
     let mut combined_scope = left.scope.clone();
     combined_scope
         .columns
         .extend(right.scope.columns.iter().cloned());
 
-    // The effective ON predicate. USING/NATURAL synthesis lands in a later task;
-    // here On(expr) or always-true (Cross / None).
-    let pred: Option<&Expr> = match constraint {
+    // USING/NATURAL -> the join columns and their (left_idx, right_idx) pairs; a
+    // column must exist on BOTH sides (else 42703/42702 via `resolve`). NATURAL
+    // with no common column has empty pairs and degenerates to a cross join.
+    let join_cols: Vec<String> = match constraint {
+        JoinConstraint::Using(cols) => cols.clone(),
+        JoinConstraint::Natural => natural_common_columns(&left.scope, &right.scope),
+        JoinConstraint::On(_) | JoinConstraint::None => Vec::new(),
+    };
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(join_cols.len());
+    for jc in &join_cols {
+        let li = left.scope.resolve(None, jc)?;
+        let ri = right.scope.resolve(None, jc)?;
+        pairs.push((li, ri));
+    }
+    let on_pred: Option<&Expr> = match constraint {
         JoinConstraint::On(e) => Some(e),
-        JoinConstraint::None => None,
-        JoinConstraint::Using(_) | JoinConstraint::Natural => {
-            return Err(ExecError::Unsupported(
-                "USING/NATURAL land in a later task".into(),
-            ));
-        }
+        _ => None,
     };
 
+    let lw = left.scope.width();
     let matches = |lrow: &[Datum], rrow: &[Datum]| -> Result<bool, ExecError> {
-        let Some(e) = pred else { return Ok(true) };
+        // USING/NATURAL: every join-column pair must compare Equal (NULL never matches).
+        if !pairs.is_empty() {
+            for (li, ri) in &pairs {
+                if pgtypes::ops::compare(&lrow[*li], &rrow[*ri])? != Some(Ordering::Equal) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // ON(expr) over the combined row; CROSS/comma (no predicate) always matches.
+        let Some(e) = on_pred else { return Ok(true) };
         let mut combined = lrow.to_vec();
         combined.extend_from_slice(rrow);
         match crate::eval::eval(e, &combined_scope, &combined)? {
@@ -85,7 +106,6 @@ pub(crate) fn join_relations(
             }
         }
         JoinKind::Left | JoinKind::Right | JoinKind::Full => {
-            let lw = left.scope.width();
             let rw = right.scope.width();
             let want_left = matches!(kind, JoinKind::Left | JoinKind::Full);
             let want_right = matches!(kind, JoinKind::Right | JoinKind::Full);
@@ -118,10 +138,106 @@ pub(crate) fn join_relations(
             }
         }
     }
-    Ok(Relation {
-        scope: combined_scope,
-        rows,
-    })
+
+    // USING/NATURAL: coalesce + reorder the join columns. Otherwise the combined
+    // left ++ right schema is the result.
+    if pairs.is_empty() {
+        Ok(Relation {
+            scope: combined_scope,
+            rows,
+        })
+    } else {
+        Ok(coalesce_join_columns(
+            &left.scope,
+            &right.scope,
+            &pairs,
+            &join_cols,
+            rows,
+        ))
+    }
+}
+
+/// The column names common to both scopes (matched by name), in left order,
+/// deduplicated. Drives `NATURAL JOIN`'s join-column set (empty => degenerates to
+/// a cross join, per PostgreSQL).
+fn natural_common_columns(left: &Scope, right: &Scope) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in &left.columns {
+        if right.columns.iter().any(|rc| rc.name == c.name) && !out.contains(&c.name) {
+            out.push(c.name.clone());
+        }
+    }
+    out
+}
+
+/// Reshape a `left ++ right` combined relation into PostgreSQL's USING/NATURAL
+/// output: each join column appears ONCE (coalesced — the present side wins, which
+/// matters for outer joins), unqualified, positioned FIRST in `join` order; then
+/// the remaining left columns, then the remaining right columns.
+fn coalesce_join_columns(
+    left_scope: &Scope,
+    right_scope: &Scope,
+    pairs: &[(usize, usize)], // (left_idx, right_idx) per join column, in join order
+    join_names: &[String],
+    rows: Vec<Vec<Datum>>, // combined left ++ right rows
+) -> Relation {
+    let lw = left_scope.width();
+    let left_join: Vec<usize> = pairs.iter().map(|(li, _)| *li).collect();
+    let right_join: Vec<usize> = pairs.iter().map(|(_, ri)| *ri).collect();
+
+    // New schema: merged join cols (unqualified), then non-join left, then non-join right.
+    let mut columns: Vec<ColumnBinding> = Vec::new();
+    for ((li, _ri), name) in pairs.iter().zip(join_names) {
+        columns.push(ColumnBinding {
+            qualifier: None,
+            name: name.clone(),
+            ty: left_scope.ty_at(*li),
+        });
+    }
+    for (i, c) in left_scope.columns.iter().enumerate() {
+        if !left_join.contains(&i) {
+            columns.push(c.clone());
+        }
+    }
+    for (i, c) in right_scope.columns.iter().enumerate() {
+        if !right_join.contains(&i) {
+            columns.push(c.clone());
+        }
+    }
+    let scope = Scope { columns };
+
+    let new_rows = rows
+        .into_iter()
+        .map(|row| {
+            let mut out: Vec<Datum> = Vec::with_capacity(scope.width());
+            // Coalesced join columns (left value unless NULL, else right value).
+            for (li, ri) in pairs {
+                let lv = &row[*li];
+                out.push(if lv.is_null() {
+                    row[lw + *ri].clone()
+                } else {
+                    lv.clone()
+                });
+            }
+            // Remaining left columns.
+            for (i, val) in row[..lw].iter().enumerate() {
+                if !left_join.contains(&i) {
+                    out.push(val.clone());
+                }
+            }
+            // Remaining right columns.
+            for (i, val) in row[lw..].iter().enumerate() {
+                if !right_join.contains(&i) {
+                    out.push(val.clone());
+                }
+            }
+            out
+        })
+        .collect();
+    Relation {
+        scope,
+        rows: new_rows,
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +333,67 @@ mod tests {
         assert!(j.rows.contains(&vec![Datum::Null, Datum::Int4(3)])); // unmatched right
         assert!(j.rows.contains(&vec![Datum::Int4(2), Datum::Int4(2)])); // matched
         assert_eq!(j.rows.len(), 3);
+    }
+
+    #[test]
+    fn using_join_coalesces_the_column_first_and_unqualified() {
+        let a = rel("a", &["id", "av"], vec![vec![1, 10], vec![2, 20]]);
+        let b = rel("b", &["id", "bv"], vec![vec![2, 200], vec![3, 300]]);
+        let j = join_relations(
+            a,
+            b,
+            JoinKind::Inner,
+            &JoinConstraint::Using(vec!["id".into()]),
+        )
+        .expect("using");
+        // Output schema: merged unqualified `id` first, then a.av, then b.bv.
+        assert_eq!(j.scope.columns[0].qualifier, None);
+        assert_eq!(j.scope.columns[0].name, "id");
+        assert_eq!(
+            j.scope
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "av", "bv"]
+        );
+        assert_eq!(
+            j.rows,
+            vec![vec![Datum::Int4(2), Datum::Int4(20), Datum::Int4(200)]]
+        );
+    }
+
+    #[test]
+    fn natural_join_uses_all_common_columns() {
+        let a = rel("a", &["id"], vec![vec![1], vec![2]]);
+        let b = rel("b", &["id"], vec![vec![2], vec![3]]);
+        let j = join_relations(a, b, JoinKind::Inner, &JoinConstraint::Natural).expect("natural");
+        assert_eq!(j.scope.columns.len(), 1); // single merged `id`
+        assert_eq!(j.rows, vec![vec![Datum::Int4(2)]]);
+    }
+
+    #[test]
+    fn left_join_using_coalesces_unmatched_to_left_value() {
+        // LEFT JOIN USING: an unmatched left row keeps its own join-key value (the
+        // right side is NULL, so COALESCE picks the left).
+        let a = rel("a", &["id", "av"], vec![vec![1, 10], vec![2, 20]]);
+        let b = rel("b", &["id", "bv"], vec![vec![2, 200]]);
+        let j = join_relations(
+            a,
+            b,
+            JoinKind::Left,
+            &JoinConstraint::Using(vec!["id".into()]),
+        )
+        .expect("left using");
+        // rows: id=1 unmatched -> (1, 10, NULL); id=2 matched -> (2, 20, 200).
+        assert!(
+            j.rows
+                .contains(&vec![Datum::Int4(1), Datum::Int4(10), Datum::Null])
+        );
+        assert!(
+            j.rows
+                .contains(&vec![Datum::Int4(2), Datum::Int4(20), Datum::Int4(200)])
+        );
+        assert_eq!(j.rows.len(), 2);
     }
 }

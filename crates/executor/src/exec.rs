@@ -1437,6 +1437,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn using_join_merges_the_key_column() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4, av text)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1,'a1'),(2,'a2')").await;
+        run(&engine, "INSERT INTO b VALUES (2,'b2'),(3,'b3')").await;
+        // SELECT * -> merged id first, then av, then bv.
+        let r = &run(&engine, "SELECT * FROM a JOIN b USING (id)").await[0];
+        assert_eq!(
+            fields_of(r)
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "av", "bv"]
+        );
+        assert_eq!(rows_of(r).len(), 1);
+        // Bare `id` is unambiguous after USING/NATURAL.
+        let r2 = &run(&engine, "SELECT id FROM a NATURAL JOIN b").await[0];
+        assert_eq!(rows_of(r2).len(), 1);
+        assert_eq!(text(&rows_of(r2)[0][0]), Some("2".into()));
+    }
+
+    #[tokio::test]
     async fn select_command_tag_counts_rows() {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (id int4)").await;
