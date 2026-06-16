@@ -12,9 +12,11 @@ mod eval;
 mod exec;
 mod func;
 mod gtm;
+mod join;
 mod lockmgr;
 mod procarray;
 mod read_gate;
+mod scope;
 mod seq;
 mod session;
 

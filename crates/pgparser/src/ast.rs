@@ -55,7 +55,10 @@ pub enum RowLockStrength {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub projection: Vec<SelectItem>,
-    pub from: Option<String>,
+    /// SP33: the FROM clause — a list of join trees. Empty for a FROM-less SELECT;
+    /// the comma form (`FROM a, b`) is a `Vec<TableExpr>` with len > 1 (implicit
+    /// cross join).
+    pub from: Vec<TableExpr>,
     pub filter: Option<Expr>,
     /// SP28: `SELECT DISTINCT` — dedup the projected output rows.
     pub distinct: bool,
@@ -73,7 +76,50 @@ pub struct SelectStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
-    Expr { expr: Expr, alias: Option<String> },
+    /// SP33: `a.*` — every column of one table in scope.
+    QualifiedWildcard(String),
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
+}
+
+/// SP33: one entry in the FROM clause — a base table, a derived table
+/// (subquery), or a join of two table-exprs. The comma form (`FROM a, b`) is a
+/// `Vec<TableExpr>` with len > 1 (implicit cross join).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableExpr {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    Derived {
+        subquery: Box<SelectStmt>,
+        alias: String, // PG requires a derived table to be aliased
+    },
+    Join {
+        left: Box<TableExpr>,
+        right: Box<TableExpr>,
+        kind: JoinKind,
+        constraint: JoinConstraint,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinConstraint {
+    On(Expr),
+    Using(Vec<String>),
+    Natural,
+    None, // CROSS JOIN / comma
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,7 +138,12 @@ pub enum Expr {
     StringLiteral(String),
     BoolLiteral(bool),
     NullLiteral,
-    Column(String),
+    /// SP33: a column reference, optionally table-qualified (`a.col`). `table` is
+    /// `None` for a bare `col`.
+    Column {
+        table: Option<String>,
+        name: String,
+    },
     Param(u32),
     Unary {
         op: UnaryOp,

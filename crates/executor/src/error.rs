@@ -15,6 +15,12 @@ pub enum ExecError {
     Kv(KvError),
     /// Column referenced that the row/table doesn't have (42703).
     UndefinedColumn(String),
+    /// A column reference matched more than one table in scope (42702).
+    AmbiguousColumn(String),
+    /// A qualified reference named a table not in the FROM clause (42P01).
+    MissingFromEntry(String),
+    /// The same table name/alias appears twice in one FROM clause (42712).
+    DuplicateAlias(String),
     /// In-grammar but unimplemented (0A000) — e.g. $1 parameters.
     Unsupported(String),
     /// Wrong type in a context that demands a specific one (42804) — e.g. a
@@ -61,6 +67,17 @@ impl ExecError {
             ExecError::UndefinedColumn(c) => {
                 PgError::error("42703", format!("column \"{c}\" does not exist"))
             }
+            ExecError::AmbiguousColumn(c) => {
+                PgError::error("42702", format!("column reference \"{c}\" is ambiguous"))
+            }
+            ExecError::MissingFromEntry(t) => PgError::error(
+                "42P01",
+                format!("missing FROM-clause entry for table \"{t}\""),
+            ),
+            ExecError::DuplicateAlias(t) => PgError::error(
+                "42712",
+                format!("table name \"{t}\" specified more than once"),
+            ),
             ExecError::Unsupported(m) => PgError::error("0A000", m),
             ExecError::TypeMismatch(m) => PgError::error("42804", m),
             ExecError::Grouping(m) => PgError::error("42803", m),

@@ -10,6 +10,8 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
+use crate::join::{Relation, join_relations};
+use crate::scope::{ColumnBinding, Scope};
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
 /// the sequence read.
@@ -139,7 +141,7 @@ pub(crate) async fn execute_write(
                 let mut full = vec![pgtypes::Datum::Null; t.columns.len()];
                 for (slot, expr) in target_idx.iter().zip(row_exprs.iter()) {
                     // VALUES expressions are literal (no FROM/columns in scope).
-                    let v = crate::eval::eval(expr, None, &[])?;
+                    let v = crate::eval::eval(expr, &Scope::empty(), &[])?;
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
                 ops.push(kv::WriteOp::Put {
@@ -160,6 +162,7 @@ pub(crate) async fn execute_write(
             filter,
         } => {
             let t = catalog::get_table(catalog_kv, table)?;
+            let scope = Scope::single(&t, &t.name);
             // Resolve each assignment's target column index up front (42703 on miss).
             let targets: Vec<(usize, &Expr)> = assignments
                 .iter()
@@ -176,7 +179,7 @@ pub(crate) async fn execute_write(
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause (avoids over-locking and
                 //    restores row-level write concurrency for different rows).
-                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -204,12 +207,12 @@ pub(crate) async fn execute_write(
                 };
                 // 4. Re-check the filter on the (possibly re-found) current row —
                 //    under READ COMMITTED the row may have changed since the scan.
-                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
                 let mut next = cur_row.clone();
                 for (idx, expr) in &targets {
-                    let v = crate::eval::eval(expr, Some(&t), &cur_row)?;
+                    let v = crate::eval::eval(expr, &scope, &cur_row)?;
                     next[*idx] = coerce(v, t.columns[*idx].ty)?;
                 }
                 if cur_xmin == xid {
@@ -243,13 +246,14 @@ pub(crate) async fn execute_write(
         }
         Statement::Delete { table, filter } => {
             let t = catalog::get_table(catalog_kv, table)?;
+            let scope = Scope::single(&t, &t.name);
             let mut n: u64 = 0;
             for (rowid, _xmin, scanned_row) in
                 scan_live(kv, global, gsnap, snapshot, Some(xid), &t)?
             {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause.
-                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -275,7 +279,7 @@ pub(crate) async fn execute_write(
                     continue; // already deleted by a concurrent committed txn
                 };
                 // 4. Re-check filter on the (possibly re-found) current row.
-                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
                 if cur_xmin == xid {
@@ -577,18 +581,221 @@ pub(crate) fn scan_live(
 /// Evaluate an optional WHERE predicate against a row (NULL => false, like SELECT).
 fn row_matches(
     filter: Option<&Expr>,
-    table: Option<&catalog::Table>,
+    scope: &Scope,
     row: &[pgtypes::Datum],
 ) -> Result<bool, ExecError> {
     match filter {
         None => Ok(true),
-        Some(f) => match crate::eval::eval(f, table, row)? {
+        Some(f) => match crate::eval::eval(f, scope, row)? {
             pgtypes::Datum::Bool(b) => Ok(b),
             pgtypes::Datum::Null => Ok(false),
             _ => Err(ExecError::TypeMismatch(
                 "argument of WHERE must be type boolean".into(),
             )),
         },
+    }
+}
+
+/// Build the relation for one FROM list (comma items folded as cross joins).
+#[allow(clippy::too_many_arguments)]
+fn build_from(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    from: &[pgparser::ast::TableExpr],
+) -> Result<Relation, ExecError> {
+    let mut iter = from.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
+    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first)?;
+    for te in iter {
+        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te)?;
+        acc = join_relations(
+            acc,
+            next,
+            pgparser::ast::JoinKind::Cross,
+            &pgparser::ast::JoinConstraint::None,
+        )?;
+    }
+    Ok(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_table_expr(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    te: &pgparser::ast::TableExpr,
+) -> Result<Relation, ExecError> {
+    use pgparser::ast::TableExpr;
+    match te {
+        TableExpr::Table { name, alias } => {
+            let t = catalog::get_table(catalog_kv, name)?;
+            let qualifier = alias.as_deref().unwrap_or(&t.name);
+            let scope = Scope::single(&t, qualifier);
+            let rows = scan_live(kv, global, gsnap, snapshot, own, &t)?
+                .into_iter()
+                .map(|(_, _, row)| row)
+                .collect();
+            Ok(Relation { scope, rows })
+        }
+        TableExpr::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } => {
+            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left)?;
+            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right)?;
+            join_relations(l, r, *kind, constraint)
+        }
+        TableExpr::Derived { subquery, alias } => {
+            let inner = select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, subquery)?;
+            // Re-qualify every output column under the derived alias.
+            let columns = inner
+                .scope
+                .columns
+                .into_iter()
+                .map(|c| ColumnBinding {
+                    qualifier: Some(alias.clone()),
+                    ..c
+                })
+                .collect();
+            Ok(Relation {
+                scope: Scope { columns },
+                rows: inner.rows,
+            })
+        }
+    }
+}
+
+/// Run a SELECT to a `Relation` (output columns + rows). The top-level
+/// `execute_read` renders this to a `QueryResult`; a derived table re-qualifies
+/// its columns under the derived alias. Non-correlated only (the subquery's scope
+/// is built solely from its own FROM clause).
+#[allow(clippy::too_many_arguments)]
+fn select_to_relation(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    s: &SelectStmt,
+) -> Result<Relation, ExecError> {
+    let relation = if s.from.is_empty() {
+        Relation {
+            scope: Scope::empty(),
+            rows: vec![vec![]],
+        }
+    } else {
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
+    };
+    let mut kept = Vec::new();
+    for row in &relation.rows {
+        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
+            kept.push(row.clone());
+        }
+    }
+    let (fields, out_exprs, tys) = resolve_projection(&s.projection, &relation.scope)?;
+    let out_scope = Scope {
+        columns: fields
+            .iter()
+            .zip(&tys)
+            .map(|(f, ty)| ColumnBinding {
+                qualifier: None, // a projected result has no base-table qualifier
+                name: f.name.clone(),
+                ty: *ty,
+            })
+            .collect(),
+    };
+    let rows = if crate::agg::is_aggregate_query(s) {
+        crate::agg::aggregate_rows(s, &relation.scope, kept)?
+    } else {
+        project_rows_ordered(s, &relation.scope, &out_exprs, kept)?
+    };
+    Ok(Relation {
+        scope: out_scope,
+        rows,
+    })
+}
+
+/// Schema-only relation builder for `describe` — parallels `build_from` but base
+/// tables produce no rows (no `scan_live`). Joining empty relations yields the
+/// correct combined scope with no rows, so it reuses `join_relations`.
+fn build_from_schema(
+    catalog_kv: &dyn Kv,
+    from: &[pgparser::ast::TableExpr],
+) -> Result<Relation, ExecError> {
+    let mut iter = from.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| ExecError::Unsupported("build_from_schema on empty FROM".into()))?;
+    let mut acc = build_table_expr_schema(catalog_kv, first)?;
+    for te in iter {
+        let next = build_table_expr_schema(catalog_kv, te)?;
+        acc = join_relations(
+            acc,
+            next,
+            pgparser::ast::JoinKind::Cross,
+            &pgparser::ast::JoinConstraint::None,
+        )?;
+    }
+    Ok(acc)
+}
+
+fn build_table_expr_schema(
+    catalog_kv: &dyn Kv,
+    te: &pgparser::ast::TableExpr,
+) -> Result<Relation, ExecError> {
+    use pgparser::ast::TableExpr;
+    match te {
+        TableExpr::Table { name, alias } => {
+            let t = catalog::get_table(catalog_kv, name)?;
+            let qualifier = alias.as_deref().unwrap_or(&t.name);
+            Ok(Relation {
+                scope: Scope::single(&t, qualifier),
+                rows: Vec::new(),
+            })
+        }
+        TableExpr::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } => {
+            let l = build_table_expr_schema(catalog_kv, left)?;
+            let r = build_table_expr_schema(catalog_kv, right)?;
+            join_relations(l, r, *kind, constraint)
+        }
+        TableExpr::Derived { subquery, alias } => {
+            let inner_scope = if subquery.from.is_empty() {
+                Scope::empty()
+            } else {
+                build_from_schema(catalog_kv, &subquery.from)?.scope
+            };
+            let (fields, _exprs, tys) = resolve_projection(&subquery.projection, &inner_scope)?;
+            let columns = fields
+                .iter()
+                .zip(&tys)
+                .map(|(f, ty)| ColumnBinding {
+                    qualifier: Some(alias.clone()),
+                    name: f.name.clone(),
+                    ty: *ty,
+                })
+                .collect();
+            Ok(Relation {
+                scope: Scope { columns },
+                rows: Vec::new(),
+            })
+        }
     }
 }
 
@@ -605,25 +812,23 @@ pub(crate) fn execute_read(
     let Statement::Select(s) = stmt else {
         return Err(ExecError::Unsupported("not a SELECT".into()));
     };
-    let table: Option<Table> = match &s.from {
-        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
-        None => None,
-    };
 
-    // Source rows: scan the table (dropping the rowid/xmin for projection), or a
-    // single empty row for FROM-less SELECT.
-    let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => scan_live(kv, global, gsnap, snapshot, own, t)?
-            .into_iter()
-            .map(|(_, _, row)| row)
-            .collect(),
-        None => vec![vec![]],
+    // SP33: build the (possibly joined) relation. A FROM-less SELECT is one empty
+    // row over the empty scope; otherwise `build_from` folds the comma list as
+    // cross joins and recurses into each explicit join tree.
+    let relation = if s.from.is_empty() {
+        Relation {
+            scope: Scope::empty(),
+            rows: vec![vec![]],
+        }
+    } else {
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
     };
 
     // Filter (WHERE runs before grouping).
     let mut kept: Vec<Vec<Datum>> = Vec::new();
-    for row in &source {
-        if row_matches(s.filter.as_ref(), table.as_ref(), row)? {
+    for row in &relation.rows {
+        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
             kept.push(row.clone());
         }
     }
@@ -631,9 +836,9 @@ pub(crate) fn execute_read(
     // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
     // groups; everything else projects rows one-for-one.
     if crate::agg::is_aggregate_query(s) {
-        return crate::agg::execute_aggregate(s, table.as_ref(), kept);
+        return crate::agg::execute_aggregate(s, &relation.scope, kept);
     }
-    project_order_limit(s, table.as_ref(), kept)
+    project_order_limit(s, &relation.scope, kept)
 }
 
 /// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
@@ -665,13 +870,22 @@ pub(crate) async fn execute_read_locking(
             "FOR UPDATE/SHARE is not allowed with DISTINCT clause".into(),
         ));
     }
-    // FOR UPDATE/SHARE requires a FROM clause — there are no rows to lock
-    // in a FROM-less SELECT.
-    let table_name = s
-        .from
-        .as_ref()
-        .ok_or_else(|| ExecError::Unsupported("FOR UPDATE/SHARE requires a FROM clause".into()))?;
-    let t = catalog::get_table(catalog_kv, table_name)?;
+    // FOR UPDATE/SHARE requires exactly one base table — there are no rows to lock
+    // in a FROM-less SELECT, and a join is not supported (0A000).
+    let t = match s.from.as_slice() {
+        [pgparser::ast::TableExpr::Table { name, .. }] => catalog::get_table(catalog_kv, name)?,
+        [] => {
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE requires a FROM clause".into(),
+            ));
+        }
+        _ => {
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE with a join is not supported".into(),
+            ));
+        }
+    };
+    let scope = Scope::single(&t, &t.name);
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
@@ -679,7 +893,7 @@ pub(crate) async fn execute_read_locking(
         // 1. Filter on the snapshot-visible row FIRST — only lock rows that
         //    match the WHERE clause (a FOR UPDATE/SHARE with no WHERE still
         //    locks all rows because row_matches(None, ..) returns true).
-        if !row_matches(s.filter.as_ref(), Some(&t), &scanned_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &scanned_row)? {
             continue;
         }
 
@@ -706,34 +920,32 @@ pub(crate) async fn execute_read_locking(
         };
 
         // 4. Re-apply the WHERE filter against the (possibly newer) row.
-        if !row_matches(s.filter.as_ref(), Some(&t), &cur_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &cur_row)? {
             continue; // no longer matches
         }
         kept.push(cur_row);
     }
 
-    project_order_limit(s, Some(&t), kept)
+    project_order_limit(s, &scope, kept)
 }
 
-/// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
-/// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
-/// and `execute_read_locking` to avoid duplication.
-fn project_order_limit(
+/// Apply DISTINCT / ORDER BY / OFFSET / LIMIT and projection, returning the
+/// projected output Datum rows. Shared by the top-level row path and derived
+/// tables.
+fn project_rows_ordered(
     s: &SelectStmt,
-    table: Option<&Table>,
+    scope: &Scope,
+    out_exprs: &[Expr],
     mut kept: Vec<Vec<Datum>>,
-) -> Result<QueryResult, ExecError> {
-    // Resolve the projection into (field, expr) pairs.
-    let (fields, out_exprs) = resolve_projection(&s.projection, table)?;
-
-    // SP28: SELECT DISTINCT projects FIRST so dedup is over output rows, then
-    // ORDER BY sorts the deduped output (its keys must be select-list columns).
+) -> Result<Vec<Vec<Datum>>, ExecError> {
+    // SP28: SELECT DISTINCT projects FIRST, dedups output rows, then ORDER BY
+    // sorts the deduped output (keys must be select-list columns).
     if s.distinct {
-        let mut projected = project_rows(&out_exprs, table, &kept)?;
+        let mut projected = project_rows(out_exprs, scope, &kept)?;
         let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
         projected.retain(|r| seen.insert(r.clone()));
         if !s.order_by.is_empty() {
-            let idxs = distinct_order_indices(s, &out_exprs)?;
+            let idxs = distinct_order_indices(s, out_exprs)?;
             let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = projected
                 .into_iter()
                 .map(|r| {
@@ -745,43 +957,50 @@ fn project_order_limit(
             projected = keyed.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_limit(&mut projected, s.offset, s.limit);
-        return Ok(rows_result(fields, &projected));
+        return Ok(projected);
     }
-
-    // ORDER BY: sort by evaluated order keys (over the source row).
+    // ORDER BY over the source row, then OFFSET/LIMIT, then project.
     if !s.order_by.is_empty() {
-        // Precompute keys to keep comparisons total and error-free during sort.
         let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(kept.len());
         for row in kept {
             let mut keys = Vec::with_capacity(s.order_by.len());
             for item in &s.order_by {
-                keys.push(crate::eval::eval(&item.expr, table, &row)?);
+                keys.push(crate::eval::eval(&item.expr, scope, &row)?);
             }
             keyed.push((keys, row));
         }
         keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
-
-    // SP28: OFFSET (skip) then LIMIT (take), before projection.
     apply_offset_limit(&mut kept, s.offset, s.limit);
+    project_rows(out_exprs, scope, &kept)
+}
 
-    let projected = project_rows(&out_exprs, table, &kept)?;
-    Ok(rows_result(fields, &projected))
+/// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
+/// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
+/// and `execute_read_locking` to avoid duplication.
+fn project_order_limit(
+    s: &SelectStmt,
+    scope: &Scope,
+    kept: Vec<Vec<Datum>>,
+) -> Result<QueryResult, ExecError> {
+    let (fields, out_exprs, _tys) = resolve_projection(&s.projection, scope)?;
+    let rows = project_rows_ordered(s, scope, &out_exprs, kept)?;
+    Ok(rows_result(fields, &rows))
 }
 
 /// Evaluate the projection expressions for each source row, yielding output
 /// Datum rows (one `Datum` per output column).
 fn project_rows(
     out_exprs: &[Expr],
-    table: Option<&Table>,
+    scope: &Scope,
     rows: &[Vec<Datum>],
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = Vec::with_capacity(out_exprs.len());
         for e in out_exprs {
-            cells.push(crate::eval::eval(e, table, row)?);
+            cells.push(crate::eval::eval(e, scope, row)?);
         }
         out.push(cells);
     }
@@ -789,7 +1008,7 @@ fn project_rows(
 }
 
 /// Encode projected Datum rows into a `QueryResult::Rows` (text + binary cells).
-fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
+pub(crate) fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
     let rows: Vec<Vec<Option<Cell>>> = projected
         .iter()
         .map(|r| r.iter().map(datum_to_cell).collect())
@@ -832,48 +1051,71 @@ pub(crate) fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<i64>, limi
     }
 }
 
-/// Expand the projection list into output FieldDescriptions and the expressions
-/// that produce each column.
+/// Expand the projection list into output FieldDescriptions, the expressions
+/// that produce each column, and each column's `ColumnType` (the third element
+/// lets `select_to_relation` build a derived table's output scope without
+/// re-inferring types).
+#[allow(clippy::type_complexity)]
 pub(crate) fn resolve_projection(
     items: &[SelectItem],
-    table: Option<&Table>,
-) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
-    // SELECT * requires a FROM.
-    if items == [SelectItem::Wildcard] {
-        let t = table.ok_or_else(|| {
-            ExecError::Unsupported("SELECT * with no FROM clause is not supported".into())
-        })?;
-        let fields = t.columns.iter().map(|c| field(&c.name, c.ty)).collect();
-        let exprs = t
-            .columns
-            .iter()
-            .map(|c| Expr::Column(c.name.clone()))
-            .collect();
-        return Ok((fields, exprs));
-    }
-    let mut fields = Vec::with_capacity(items.len());
-    let mut exprs = Vec::with_capacity(items.len());
+    scope: &Scope,
+) -> Result<(Vec<FieldDescription>, Vec<Expr>, Vec<ColumnType>), ExecError> {
+    // SP33: expand each item in turn so `*` spans every FROM table and `a.*`
+    // expands one qualifier. Each `*`-expanded column carries its qualifier so a
+    // multi-table `*` re-resolves unambiguously via `scope.resolve`.
+    let mut fields = Vec::new();
+    let mut exprs = Vec::new();
+    let mut tys = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                return Err(ExecError::Unsupported(
-                    "* mixed with other items is not supported".into(),
-                ));
+                if scope.columns.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "SELECT * with no FROM clause is not supported".into(),
+                    ));
+                }
+                for c in &scope.columns {
+                    fields.push(field(&c.name, c.ty));
+                    exprs.push(Expr::Column {
+                        table: c.qualifier.clone(),
+                        name: c.name.clone(),
+                    });
+                    tys.push(c.ty);
+                }
+            }
+            SelectItem::QualifiedWildcard(q) => {
+                let cols: Vec<_> = scope
+                    .columns
+                    .iter()
+                    .filter(|c| c.qualifier.as_deref() == Some(q))
+                    .collect();
+                if cols.is_empty() {
+                    return Err(ExecError::MissingFromEntry(q.clone()));
+                }
+                for c in cols {
+                    fields.push(field(&c.name, c.ty));
+                    exprs.push(Expr::Column {
+                        table: c.qualifier.clone(),
+                        name: c.name.clone(),
+                    });
+                    tys.push(c.ty);
+                }
             }
             SelectItem::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| derived_name(expr));
-                let ty = crate::eval::infer_type(expr, table)?;
+                let ty = crate::eval::infer_type(expr, scope)?;
                 fields.push(field(&name, ty));
                 exprs.push(expr.clone());
+                tys.push(ty);
             }
         }
     }
-    Ok((fields, exprs))
+    Ok((fields, exprs, tys))
 }
 
 fn derived_name(expr: &Expr) -> String {
     match expr {
-        Expr::Column(c) => c.clone(),
+        Expr::Column { name, .. } => name.clone(),
         // PostgreSQL names an aggregate output column after the function.
         Expr::Func(fc) => fc.name.clone(),
         _ => "?column?".to_string(),
@@ -959,11 +1201,12 @@ pub(crate) fn describe(
     let Some(Statement::Select(s)) = statements.first() else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
-    let table = match &s.from {
-        Some(name) => Some(catalog::get_table(catalog_kv, name)?),
-        None => None,
+    let scope = if s.from.is_empty() {
+        Scope::empty()
+    } else {
+        build_from_schema(catalog_kv, &s.from)?.scope
     };
-    let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
+    let (fields, _exprs, _tys) = resolve_projection(&s.projection, &scope)?;
     Ok(fields)
 }
 
@@ -1181,6 +1424,162 @@ mod tests {
         );
         assert_eq!(text(&rows_of(r)[0][0]), Some("7".into()));
         assert_eq!(text(&rows_of(r)[0][1]), Some("x".into()));
+    }
+
+    #[tokio::test]
+    async fn derived_table_in_from() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, v int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,10),(2,20),(3,30)").await;
+        let r = &run(
+            &engine,
+            "SELECT d.s FROM (SELECT v + 1 AS s FROM t WHERE id > 1) d ORDER BY d.s",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(got, vec![Some("21".into()), Some("31".into())]);
+    }
+
+    #[tokio::test]
+    async fn join_against_a_derived_table() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, v int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,10),(2,20)").await;
+        let r = &run(
+            &engine,
+            "SELECT t.id, d.mx FROM t JOIN (SELECT max(v) AS mx FROM t) d ON t.v = d.mx",
+        )
+        .await[0];
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+    }
+
+    #[tokio::test]
+    async fn inner_join_on_equi_key() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4, av text)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(3,'a3')").await;
+        run(&engine, "INSERT INTO b VALUES (2,'b2'),(3,'b3'),(4,'b4')").await;
+        let r = &run(
+            &engine,
+            "SELECT a.av, b.bv FROM a JOIN b ON a.id = b.id ORDER BY a.id",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r)
+            .iter()
+            .map(|row| (text(&row[0]), text(&row[1])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("a2".into()), Some("b2".into())),
+                (Some("a3".into()), Some("b3".into()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn comma_form_is_a_cross_join_filtered_by_where() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4)").await;
+        run(&engine, "INSERT INTO a VALUES (1),(2)").await;
+        run(&engine, "INSERT INTO b VALUES (2),(3)").await;
+        let r = &run(&engine, "SELECT a.id FROM a, b WHERE a.id = b.id").await[0];
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+    }
+
+    #[tokio::test]
+    async fn self_join_requires_distinct_aliases() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, mgr int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1, NULL),(2, 1)").await;
+        let r = &run(
+            &engine,
+            "SELECT e.id, m.id FROM t e JOIN t m ON e.mgr = m.id",
+        )
+        .await[0];
+        // Only (employee 2 -> manager 1) matches: e.id=2, m.id=1.
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+        assert_eq!(text(&rows_of(r)[0][1]), Some("1".into()));
+    }
+
+    #[tokio::test]
+    async fn unaliased_self_join_is_duplicate_alias_42712() {
+        // The same qualifier on both sides of a join is rejected (PG 42712).
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1)").await;
+        let err = engine
+            .connect()
+            .simple_query("SELECT * FROM t JOIN t ON t.id = t.id")
+            .await
+            .expect_err("duplicate table name");
+        assert_eq!(err.code, "42712");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_bare_column_is_42702() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4)").await;
+        let err = engine
+            .connect()
+            .simple_query("SELECT id FROM a JOIN b ON a.id = b.id")
+            .await
+            .expect_err("ambiguous");
+        assert_eq!(err.code, "42702");
+    }
+
+    #[tokio::test]
+    async fn left_join_emits_nulls_for_unmatched() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1),(2)").await;
+        run(&engine, "INSERT INTO b VALUES (2,'two')").await;
+        let r = &run(
+            &engine,
+            "SELECT a.id, b.bv FROM a LEFT JOIN b ON a.id = b.id ORDER BY a.id",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r)
+            .iter()
+            .map(|row| (text(&row[0]), text(&row[1])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("1".into()), None),
+                (Some("2".into()), Some("two".into())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn using_join_merges_the_key_column() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4, av text)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1,'a1'),(2,'a2')").await;
+        run(&engine, "INSERT INTO b VALUES (2,'b2'),(3,'b3')").await;
+        // SELECT * -> merged id first, then av, then bv.
+        let r = &run(&engine, "SELECT * FROM a JOIN b USING (id)").await[0];
+        assert_eq!(
+            fields_of(r)
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "av", "bv"]
+        );
+        assert_eq!(rows_of(r).len(), 1);
+        // Bare `id` is unambiguous after USING/NATURAL.
+        let r2 = &run(&engine, "SELECT id FROM a NATURAL JOIN b").await[0];
+        assert_eq!(rows_of(r2).len(), 1);
+        assert_eq!(text(&rows_of(r2)[0][0]), Some("2".into()));
     }
 
     #[tokio::test]
