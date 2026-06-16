@@ -463,6 +463,18 @@ fn eval_plan_qual(
 /// Coerce an evaluated value into a target column type (assignment context).
 fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes::Datum, ExecError> {
     use pgtypes::{ColumnType, Datum, TypeError};
+    // SP32: assignment to a `numeric` column — any numeric-family value (int4/
+    // int8/float8/numeric) converts, applying the column's `(p,s)` modifier (round
+    // + overflow). A `text` value still needs an explicit cast (handled by the
+    // catch-all below); NULL falls through to the `(Null, _)` arm.
+    if target.is_numeric()
+        && matches!(
+            value,
+            Datum::Int4(_) | Datum::Int8(_) | Datum::Float8(_) | Datum::Numeric(_)
+        )
+    {
+        return Ok(pgtypes::cast::cast(&value, target)?);
+    }
     Ok(match (value, target) {
         (Datum::Null, _) => Datum::Null,
         (Datum::Bool(b), ColumnType::Bool) => Datum::Bool(b),
@@ -495,6 +507,13 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
                 return Err(TypeError::Overflow.into());
             }
         }
+        // SP32: assignment of a numeric value into a non-numeric numeric-family
+        // column (→ numeric column is handled by the pre-check above). numeric→int
+        // rounds half-away-from-zero with a range check (22003); numeric→float8 may
+        // become ±Infinity for an out-of-range magnitude.
+        (Datum::Numeric(d), ColumnType::Float8) => Datum::Float8(pgtypes::numeric::to_f64(&d)),
+        (Datum::Numeric(d), ColumnType::Int4) => pgtypes::numeric::to_i32(&d).map(Datum::Int4)?,
+        (Datum::Numeric(d), ColumnType::Int8) => pgtypes::numeric::to_i64(&d).map(Datum::Int8)?,
         (v, target) => {
             return Err(ExecError::TypeMismatch(format!(
                 "column is of type {} but expression is of type {}",

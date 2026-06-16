@@ -17,6 +17,9 @@ mod tag {
     pub const TEXT: u8 = 4;
     /// SP30: `float8` (IEEE-754 big-endian f64). Append-only — no version bump.
     pub const FLOAT8: u8 = 5;
+    /// SP32: `numeric` — stored as its canonical decimal text (length-prefixed),
+    /// which round-trips the value AND its display scale. Append-only.
+    pub const NUMERIC: u8 = 6;
 }
 
 pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
@@ -45,6 +48,13 @@ pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
             Datum::Float8(f) => {
                 out.push(tag::FLOAT8);
                 out.extend_from_slice(&f.to_be_bytes());
+            }
+            Datum::Numeric(d) => {
+                out.push(tag::NUMERIC);
+                let s = pgtypes::numeric::to_text(d);
+                let len = u32::try_from(s.len()).expect("numeric text exceeds 4 GiB");
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(s.as_bytes());
             }
         }
     }
@@ -85,6 +95,17 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Datum>, KvError> {
             tag::FLOAT8 => {
                 let raw = take_n(&mut cur, 8)?;
                 Datum::Float8(f64::from_be_bytes(raw.try_into().expect("8 bytes fit f64")))
+            }
+            tag::NUMERIC => {
+                let len_raw = take_n(&mut cur, 4)?;
+                let len = u32::from_be_bytes(len_raw.try_into().expect("4 bytes fit u32")) as usize;
+                let raw = take_n(&mut cur, len)?;
+                let s = std::str::from_utf8(raw)
+                    .map_err(|_| KvError::CorruptRow("numeric text is not valid UTF-8".into()))?;
+                Datum::Numeric(
+                    pgtypes::numeric::parse(s)
+                        .ok_or_else(|| KvError::CorruptRow(format!("invalid numeric {s:?}")))?,
+                )
             }
             other => return Err(KvError::CorruptRow(format!("unknown field tag {other}"))),
         };
@@ -127,6 +148,9 @@ mod tests {
             Datum::Float8(-1.5),
             Datum::Float8(f64::NAN),
             Datum::Float8(-0.0),
+            // SP32: numeric round-trips value AND scale (1.50 stays scale 2).
+            Datum::Numeric(pgtypes::numeric::parse("1.50").expect("n")),
+            Datum::Numeric(pgtypes::numeric::parse("-9999999999999999999.0001").expect("n")),
         ];
         let bytes = encode_row(&row);
         assert_eq!(decode_row(&bytes).expect("decode"), row);
@@ -155,6 +179,10 @@ mod tests {
             any::<i64>().prop_map(Datum::Int8),
             ".*".prop_map(Datum::Text),
             any::<f64>().prop_map(Datum::Float8),
+            // SP32: arbitrary numerics (a signed mantissa at a small scale).
+            (any::<i64>(), 0u32..6).prop_map(|(m, s)| {
+                Datum::Numeric(pgtypes::numeric::parse(&format!("{m}e-{s}")).expect("numeric"))
+            }),
         ]
     }
 

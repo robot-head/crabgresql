@@ -4,6 +4,8 @@
 
 use std::cmp::Ordering;
 
+use bigdecimal::BigDecimal;
+
 use crate::{Datum, TypeError};
 
 /// Type an integer literal: narrowest of int4, then int8; overflow -> 22003.
@@ -40,18 +42,36 @@ fn as_i64(d: &Datum) -> Option<i64> {
     }
 }
 
-/// Promote a numeric Datum (int or float) to f64 for mixed-type arithmetic.
+/// Promote a numeric Datum (int, numeric, or float) to f64 for mixed-type
+/// arithmetic. (SP32: a `numeric` operand mixed with a `float8` promotes to
+/// `float8`, since `float8` is the preferred type — `numeric ⊕ float8 → float8`.)
 fn as_f64(d: &Datum) -> Option<f64> {
     match d {
         Datum::Int4(n) => Some(f64::from(*n)),
         Datum::Int8(n) => Some(*n as f64),
         Datum::Float8(f) => Some(*f),
+        Datum::Numeric(d) => Some(crate::numeric::to_f64(d)),
+        _ => None,
+    }
+}
+
+/// SP32: promote an int/`numeric` Datum to `BigDecimal` (used when an operand is
+/// `numeric` but neither is `float8`).
+fn as_numeric(d: &Datum) -> Option<BigDecimal> {
+    match d {
+        Datum::Int4(n) => Some(BigDecimal::from(*n)),
+        Datum::Int8(n) => Some(BigDecimal::from(*n)),
+        Datum::Numeric(d) => Some(d.clone()),
         _ => None,
     }
 }
 
 fn is_float(d: &Datum) -> bool {
     matches!(d, Datum::Float8(_))
+}
+
+fn is_numeric(d: &Datum) -> bool {
+    matches!(d, Datum::Numeric(_))
 }
 
 /// Apply a float op with PostgreSQL's finite-overflow rule: a `finite ⊕ finite`
@@ -71,14 +91,25 @@ fn arith(
     op_i4: fn(i32, i32) -> Option<i32>,
     op_i8: fn(i64, i64) -> Option<i64>,
     op_f8: fn(f64, f64) -> f64,
+    op_num: fn(&BigDecimal, &BigDecimal) -> BigDecimal,
 ) -> Result<Datum, TypeError> {
     if a.is_null() || b.is_null() {
         return Ok(Datum::Null);
     }
-    // SP30: if either operand is float, promote both to f64 and compute in float.
+    // SP30: if either operand is float, promote both to f64 (float8 is the
+    // preferred numeric type, so it wins over numeric and int).
     if is_float(a) || is_float(b) {
         return match (as_f64(a), as_f64(b)) {
             (Some(x), Some(y)) => float_arith(x, y, op_f8),
+            _ => Err(TypeError::TypeMismatch {
+                message: "operator requires numeric operands".into(),
+            }),
+        };
+    }
+    // SP32: else if either operand is numeric, promote both to numeric.
+    if is_numeric(a) || is_numeric(b) {
+        return match (as_numeric(a), as_numeric(b)) {
+            (Some(x), Some(y)) => Ok(Datum::Numeric(op_num(&x, &y))),
             _ => Err(TypeError::TypeMismatch {
                 message: "operator requires numeric operands".into(),
             }),
@@ -98,13 +129,34 @@ fn arith(
 }
 
 pub fn add(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_add, i64::checked_add, |x, y| x + y)
+    arith(
+        a,
+        b,
+        i32::checked_add,
+        i64::checked_add,
+        |x, y| x + y,
+        crate::numeric::add,
+    )
 }
 pub fn sub(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_sub, i64::checked_sub, |x, y| x - y)
+    arith(
+        a,
+        b,
+        i32::checked_sub,
+        i64::checked_sub,
+        |x, y| x - y,
+        crate::numeric::sub,
+    )
 }
 pub fn mul(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_mul, i64::checked_mul, |x, y| x * y)
+    arith(
+        a,
+        b,
+        i32::checked_mul,
+        i64::checked_mul,
+        |x, y| x * y,
+        crate::numeric::mul,
+    )
 }
 pub fn div(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
     if a.is_null() || b.is_null() {
@@ -122,10 +174,29 @@ pub fn div(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
         }
         return float_arith(x, y, |x, y| x / y);
     }
+    // SP32: numeric division uses PostgreSQL's display-scale rule (a zero divisor
+    // is 22012, handled inside `numeric::div`).
+    if is_numeric(a) || is_numeric(b) {
+        let (Some(x), Some(y)) = (as_numeric(a), as_numeric(b)) else {
+            return Err(TypeError::TypeMismatch {
+                message: "operator requires numeric operands".into(),
+            });
+        };
+        return crate::numeric::div(&x, &y).map(Datum::Numeric);
+    }
     if matches!(b, Datum::Int4(0) | Datum::Int8(0)) {
         return Err(TypeError::DivisionByZero);
     }
-    arith(a, b, i32::checked_div, i64::checked_div, |x, y| x / y)
+    // Only integer operands reach here (float/numeric returned above), so the
+    // float/numeric `op` arguments to `arith` are never exercised on this path.
+    arith(
+        a,
+        b,
+        i32::checked_div,
+        i64::checked_div,
+        |x, y| x / y,
+        |_, _| unreachable!("numeric division is handled before arith"),
+    )
 }
 
 /// SQL `mod(a, b)` / the `%` remainder (SP29, exposed as the `mod` function).
@@ -136,6 +207,15 @@ pub fn div(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
 pub fn rem(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
     if a.is_null() || b.is_null() {
         return Ok(Datum::Null);
+    }
+    // SP32: numeric `mod` (a zero divisor is 22012, handled in `numeric::rem`).
+    if is_numeric(a) || is_numeric(b) {
+        let (Some(x), Some(y)) = (as_numeric(a), as_numeric(b)) else {
+            return Err(TypeError::TypeMismatch {
+                message: "mod requires numeric operands".into(),
+            });
+        };
+        return crate::numeric::rem(&x, &y).map(Datum::Numeric);
     }
     if matches!(b, Datum::Int4(0) | Datum::Int8(0)) {
         return Err(TypeError::DivisionByZero);
@@ -187,6 +267,11 @@ pub fn compare(a: &Datum, b: &Datum) -> Result<Option<Ordering>, TypeError> {
         // the largest value and equals itself; `-0.0 == +0.0` — PG's float ordering).
         _ if is_float(a) || is_float(b) => match (as_f64(a), as_f64(b)) {
             (Some(x), Some(y)) => float_cmp(x, y),
+            _ => return Err(cannot_compare(a, b)),
+        },
+        // SP32: a numeric pair (no float) compares exactly, by value (ignoring scale).
+        _ if is_numeric(a) || is_numeric(b) => match (as_numeric(a), as_numeric(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
             _ => return Err(cannot_compare(a, b)),
         },
         _ => match (as_i64(a), as_i64(b)) {

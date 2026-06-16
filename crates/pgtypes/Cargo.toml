@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+bigdecimal.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

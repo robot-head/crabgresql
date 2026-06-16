@@ -163,9 +163,15 @@ pub(crate) fn scalar_result_type(
         }
         ScalarFunc::Mod => {
             require_arity(fc, n == 2)?;
-            let lt = require_int(&args[0], table)?;
-            let rt = require_int(&args[1], table)?;
-            Ok(promote(lt, rt))
+            // SP32: mod takes int OR numeric operands (PostgreSQL has no float8 mod);
+            // a numeric operand makes the result numeric, else the int promotion.
+            let lt = require_int_or_numeric(&args[0], table)?;
+            let rt = require_int_or_numeric(&args[1], table)?;
+            if lt.is_numeric() || rt.is_numeric() {
+                Ok(ColumnType::Numeric(None))
+            } else {
+                Ok(promote(lt, rt))
+            }
         }
         ScalarFunc::Coalesce | ScalarFunc::Greatest | ScalarFunc::Least => {
             require_arity(fc, n >= 1)?;
@@ -337,6 +343,8 @@ fn eval_eager(f: ScalarFunc, fc: &FuncCall, vals: &[Datum]) -> Result<Datum, Exe
                     .ok_or(ExecError::Type(pgtypes::TypeError::Overflow)),
                 // SP30: abs over float8 (always representable, no overflow trap).
                 Datum::Float8(f) => Ok(Datum::Float8(f.abs())),
+                // SP32: abs over numeric.
+                Datum::Numeric(d) => Ok(Datum::Numeric(pgtypes::numeric::abs(d))),
                 other => Err(type_error("abs", other)),
             }
         }
@@ -374,12 +382,25 @@ fn require_int(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecErro
     }
 }
 
-/// SP30: require a numeric argument (int4/int8/float8); returns that type so the
-/// caller (`abs`) can preserve it.
+/// SP32: require an int OR numeric argument (the `mod` operand types — PostgreSQL
+/// has no `float8` modulo).
+fn require_int_or_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
+    let t = crate::eval::infer_type(arg, table)?;
+    if matches!(t, ColumnType::Int4 | ColumnType::Int8) || t.is_numeric() {
+        Ok(t)
+    } else {
+        Err(no_matching_function())
+    }
+}
+
+/// SP30/SP32: require a numeric argument (int4/int8/float8/numeric); returns that
+/// type so the caller (`abs`) can preserve it.
 fn require_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
-    match crate::eval::infer_type(arg, table)? {
-        t @ (ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8) => Ok(t),
-        _ => Err(no_matching_function()),
+    let t = crate::eval::infer_type(arg, table)?;
+    if matches!(t, ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8) || t.is_numeric() {
+        Ok(t)
+    } else {
+        Err(no_matching_function())
     }
 }
 
@@ -580,13 +601,18 @@ mod tests {
 
     #[test]
     fn abs_and_mod() {
+        let num = |s: &str| Datum::Numeric(pgtypes::numeric::parse(s).expect("n"));
         assert_eq!(ev("abs(-5)"), Datum::Int4(5));
         assert_eq!(ev("abs(7)"), Datum::Int4(7));
-        // SP30: abs over float8 preserves the float type.
-        assert_eq!(ev("abs(-2.5)"), Datum::Float8(2.5));
-        assert_eq!(ev("abs(2.5)"), Datum::Float8(2.5));
+        // SP32: a bare decimal is numeric, so abs over it is numeric (float8 abs
+        // is reached via an explicit cast).
+        assert_eq!(ev("abs(-2.5)"), num("2.5"));
+        assert_eq!(ev("abs(2.5)"), num("2.5"));
+        assert_eq!(ev("abs(-2.5::float8)"), Datum::Float8(2.5));
         assert_eq!(ev("mod(11, 3)"), Datum::Int4(2));
         assert_eq!(ev("mod(-11, 3)"), Datum::Int4(-2));
+        // SP32: numeric mod (the remainder takes the dividend's sign).
+        assert_eq!(ev("mod(7.5, 2)"), num("1.5"));
         assert_eq!(ev("abs(null)"), Datum::Null);
         // abs overflow at i32::MIN is 22003. A bare `-2147483648` literal is a
         // negated int8, so the overflow only arises on an actual int4 column

@@ -126,21 +126,26 @@ pub(crate) fn func_result_type(
         }
         AggFunc::Sum => {
             let arg = single_value_arg(fc)?;
-            match crate::eval::infer_type(arg, table)? {
-                // sum(int4) -> bigint; sum(int8) -> bigint here (PG: numeric — a
-                // documented deviation until a numeric type exists). sum(float8)
-                // -> float8 (exact PG parity).
+            let t = crate::eval::infer_type(arg, table)?;
+            match t {
+                // sum(int4)/sum(int8) -> bigint (PG: int8 sums to numeric — a
+                // remaining documented deviation). sum(float8) -> float8;
+                // SP32: sum(numeric) -> numeric.
                 ColumnType::Int4 | ColumnType::Int8 => Ok(ColumnType::Int8),
                 ColumnType::Float8 => Ok(ColumnType::Float8),
+                _ if t.is_numeric() => Ok(ColumnType::Numeric(None)),
                 other => Err(undefined_for_arg("sum", other)),
             }
         }
-        // SP30: avg always yields float8 (PG: numeric for integer input — a
-        // documented deviation; exact parity for float8 input).
+        // SP32: avg(int)/avg(numeric) -> numeric (exact PG parity now that numeric
+        // exists — retiring SP30's float8 deviation); avg(float8) -> float8.
         AggFunc::Avg => {
             let arg = single_value_arg(fc)?;
-            match crate::eval::infer_type(arg, table)? {
-                ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8 => Ok(ColumnType::Float8),
+            let t = crate::eval::infer_type(arg, table)?;
+            match t {
+                ColumnType::Float8 => Ok(ColumnType::Float8),
+                ColumnType::Int4 | ColumnType::Int8 => Ok(ColumnType::Numeric(None)),
+                _ if t.is_numeric() => Ok(ColumnType::Numeric(None)),
                 other => Err(undefined_for_arg("avg", other)),
             }
         }
@@ -220,12 +225,13 @@ fn spec_of(fc: &FuncCall, table: Option<&Table>) -> Result<AggSpec, ExecError> {
             reject_nested_aggregate(arg)?;
             // Type-check the argument now so RowDescription and folding agree.
             let arg_type = crate::eval::infer_type(arg, table)?;
-            // sum/avg accept only numeric arguments (int4/int8/float8).
+            // sum/avg accept only numeric arguments (int4/int8/float8/numeric).
             if matches!(func, AggFunc::Sum | AggFunc::Avg)
                 && !matches!(
                     arg_type,
                     ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8
                 )
+                && !arg_type.is_numeric()
             {
                 return Err(undefined_for_arg(&fc.name, arg_type));
             }
@@ -425,7 +431,16 @@ fn eval_grouped(
     }
     match e {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
-        Expr::FloatLiteral(s) => Ok(ops::float_literal(s)?),
+        Expr::NumericLiteral(s) => {
+            pgtypes::numeric::parse(s)
+                .map(Datum::Numeric)
+                .ok_or_else(|| {
+                    ExecError::Type(TypeError::InvalidText {
+                        type_name: "numeric",
+                        value: s.clone(),
+                    })
+                })
+        }
         Expr::StringLiteral(s) => Ok(Datum::Text(s.clone())),
         Expr::BoolLiteral(b) => Ok(Datum::Bool(*b)),
         Expr::NullLiteral => Ok(Datum::Null),
@@ -518,12 +533,24 @@ enum Acc {
         any: bool,
         seen: Option<HashSet<Datum>>,
     },
+    /// SP32: numeric sum (exact, no overflow) — accumulated as a numeric `Datum`.
+    SumN {
+        acc: Option<Datum>,
+        seen: Option<HashSet<Datum>>,
+    },
     MinMax {
         best: Option<Datum>,
         seen: Option<HashSet<Datum>>,
     },
     Avg {
         sum: f64,
+        n: i64,
+        seen: Option<HashSet<Datum>>,
+    },
+    /// SP32: numeric mean — a numeric running sum and a count, divided at finish
+    /// with PostgreSQL's `select_div_scale` (so `avg(int)`/`avg(numeric)` are exact).
+    AvgN {
+        sum: Option<Datum>,
         n: i64,
         seen: Option<HashSet<Datum>>,
     },
@@ -534,22 +561,31 @@ impl Acc {
         let seen = spec.distinct.then(HashSet::new);
         match spec.func {
             AggFunc::Count => Acc::Count { n: 0, seen },
-            AggFunc::Sum => {
+            AggFunc::Sum => match spec.arg_type {
+                Some(ColumnType::Float8) => Acc::SumF {
+                    acc: 0.0,
+                    any: false,
+                    seen,
+                },
+                Some(t) if t.is_numeric() => Acc::SumN { acc: None, seen },
+                _ => Acc::SumI { acc: None, seen },
+            },
+            // float8 avg stays in f64; int/numeric avg accumulates exactly.
+            AggFunc::Avg => {
                 if spec.arg_type == Some(ColumnType::Float8) {
-                    Acc::SumF {
-                        acc: 0.0,
-                        any: false,
+                    Acc::Avg {
+                        sum: 0.0,
+                        n: 0,
                         seen,
                     }
                 } else {
-                    Acc::SumI { acc: None, seen }
+                    Acc::AvgN {
+                        sum: None,
+                        n: 0,
+                        seen,
+                    }
                 }
             }
-            AggFunc::Avg => Acc::Avg {
-                sum: 0.0,
-                n: 0,
-                seen,
-            },
             AggFunc::Min | AggFunc::Max => Acc::MinMax { best: None, seen },
         }
     }
@@ -559,8 +595,10 @@ impl Acc {
             Acc::Count { seen, .. }
             | Acc::SumI { seen, .. }
             | Acc::SumF { seen, .. }
+            | Acc::SumN { seen, .. }
             | Acc::MinMax { seen, .. }
-            | Acc::Avg { seen, .. } => seen.as_mut(),
+            | Acc::Avg { seen, .. }
+            | Acc::AvgN { seen, .. } => seen.as_mut(),
         }
     }
 
@@ -614,6 +652,22 @@ impl Acc {
                 })?;
                 *any = true;
             }
+            // SP32: numeric sum/avg accumulate exactly via the numeric ops (sum's
+            // scale is the max input scale; avg defers the division to `finish`).
+            Acc::SumN { acc, .. } => {
+                *acc = Some(match acc.take() {
+                    None => v,
+                    Some(cur) => ops::add(&cur, &v)?,
+                });
+            }
+            Acc::AvgN { sum, n, .. } => {
+                let vn = pgtypes::cast::cast(&v, ColumnType::Numeric(None))?;
+                *sum = Some(match sum.take() {
+                    None => vn,
+                    Some(cur) => ops::add(&cur, &vn)?,
+                });
+                *n += 1;
+            }
             Acc::Avg { sum, n, .. } => {
                 *sum += as_f64(&v).ok_or_else(|| {
                     undefined_for_arg("avg", v.column_type().unwrap_or(ColumnType::Text))
@@ -640,8 +694,8 @@ impl Acc {
         Ok(())
     }
 
-    fn finish(&self) -> Datum {
-        match self {
+    fn finish(&self) -> Result<Datum, ExecError> {
+        Ok(match self {
             Acc::Count { n, .. } => Datum::Int8(*n),
             Acc::SumI { acc, .. } => acc.map(Datum::Int8).unwrap_or(Datum::Null),
             // An empty / all-null float sum is NULL (matches the integer sum).
@@ -652,6 +706,8 @@ impl Acc {
                     Datum::Null
                 }
             }
+            // SP32: an empty/all-null numeric sum is NULL; else the exact numeric.
+            Acc::SumN { acc, .. } => acc.clone().unwrap_or(Datum::Null),
             Acc::MinMax { best, .. } => best.clone().unwrap_or(Datum::Null),
             // avg over zero non-null rows is NULL; otherwise the float8 mean.
             Acc::Avg { sum, n, .. } => {
@@ -661,7 +717,12 @@ impl Acc {
                     Datum::Float8(*sum / *n as f64)
                 }
             }
-        }
+            // SP32: numeric mean = sum / count, with PostgreSQL's division scale.
+            Acc::AvgN { sum, n, .. } => match sum {
+                Some(s) if *n > 0 => ops::div(s, &Datum::Int8(*n))?,
+                _ => Datum::Null,
+            },
+        })
     }
 }
 
@@ -746,7 +807,10 @@ pub(crate) fn execute_aggregate(
     // Finalize each group: HAVING filter, ORDER BY keys, projected output Datums.
     let mut out: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(keys.len());
     for (key, group_accs) in keys.iter().zip(accs.iter()) {
-        let results: Vec<Datum> = group_accs.iter().map(Acc::finish).collect();
+        let results: Vec<Datum> = group_accs
+            .iter()
+            .map(Acc::finish)
+            .collect::<Result<_, ExecError>>()?;
         if let Some(h) = &s.having {
             match eval_grouped(h, table, &s.group_by, key, &specs, &results)? {
                 Datum::Bool(true) => {}
@@ -1224,8 +1288,9 @@ mod tests {
     }
 
     #[test]
-    fn avg_over_integers_returns_float8_value() {
-        // SP30 deviation: avg(int) is float8 (PG: numeric). The VALUE is exact.
+    fn avg_over_integers_returns_numeric() {
+        // SP32: avg(int) is now numeric (exact PG parity — retires SP30's float8
+        // deviation), with PostgreSQL's division display scale (16 places for 3/2).
         let t = table(); // v is int4
         let rows = vec![
             r(&[Datum::Int4(1), Datum::Int4(1)]),
@@ -1233,7 +1298,7 @@ mod tests {
         ];
         assert_eq!(
             agg_text("SELECT avg(v) FROM t", Some(&t), rows).expect("agg"),
-            vec![vec![Some("1.5".to_string())]]
+            vec![vec![Some("1.5000000000000000".to_string())]]
         );
         // avg over zero rows is NULL.
         assert_eq!(
@@ -1269,10 +1334,10 @@ mod tests {
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
         let (fields, _) = crate::exec::resolve_projection(&s.projection, Some(&t)).expect("fields");
-        assert_eq!(fields[0].type_oid, ColumnType::Float8.oid()); // avg
+        assert_eq!(fields[0].type_oid, ColumnType::Float8.oid()); // avg(float8)
         assert_eq!(fields[1].type_oid, ColumnType::Float8.oid()); // sum(float8)
         assert_eq!(fields[2].type_oid, ColumnType::Float8.oid()); // min(float8)
-        // avg(int) also types as float8 for RowDescription.
+        // SP32: avg(int) now types as numeric (1700) for RowDescription.
         let it = table();
         let stmt = pgparser::parse("SELECT avg(v) FROM t")
             .expect("parse")
@@ -1281,7 +1346,7 @@ mod tests {
         let Statement::Select(s) = stmt else { panic!() };
         let (fields, _) =
             crate::exec::resolve_projection(&s.projection, Some(&it)).expect("fields");
-        assert_eq!(fields[0].type_oid, ColumnType::Float8.oid());
+        assert_eq!(fields[0].type_oid, ColumnType::Numeric(None).oid());
         assert_eq!(fields[0].name, "avg");
     }
 

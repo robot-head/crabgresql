@@ -17,7 +17,18 @@ pub(crate) fn eval(
 ) -> Result<Datum, ExecError> {
     match expr {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
-        Expr::FloatLiteral(s) => Ok(ops::float_literal(s)?),
+        // SP32: a bare decimal/exponent literal is `numeric` (arbitrary precision —
+        // no overflow; the lexer already guaranteed a well-formed decimal lexeme).
+        Expr::NumericLiteral(s) => {
+            pgtypes::numeric::parse(s)
+                .map(Datum::Numeric)
+                .ok_or_else(|| {
+                    ExecError::Type(TypeError::InvalidText {
+                        type_name: "numeric",
+                        value: s.clone(),
+                    })
+                })
+        }
         Expr::StringLiteral(s) => Ok(Datum::Text(s.clone())),
         Expr::BoolLiteral(b) => Ok(Datum::Bool(*b)),
         Expr::NullLiteral => Ok(Datum::Null),
@@ -337,11 +348,8 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
             Datum::Int8(_) => Ok(ColumnType::Int8),
             _ => unreachable!(),
         },
-        // SP30: a decimal/exponent literal types as float8 (validated so `1e400`
-        // overflow surfaces at plan time, like the int-literal arm above).
-        Expr::FloatLiteral(s) => ops::float_literal(s)
-            .map(|_| ColumnType::Float8)
-            .map_err(Into::into),
+        // SP32: a decimal/exponent literal types as unconstrained `numeric`.
+        Expr::NumericLiteral(_) => Ok(ColumnType::Numeric(None)),
         Expr::StringLiteral(_) => Ok(ColumnType::Text),
         Expr::BoolLiteral(_) => Ok(ColumnType::Bool),
         // PostgreSQL types a bare NULL as "unknown"; the slice uses text as a
@@ -451,13 +459,16 @@ pub(crate) fn unify_branch(
 }
 
 pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, ExecError> {
-    use ColumnType::{Float8, Int4, Int8};
+    use ColumnType::{Float8, Int4, Int8, Numeric};
+    // The numeric tower: int4/int8 < numeric < float8.
+    let num_family = |t: ColumnType| matches!(t, Int4 | Int8 | Float8) || t.is_numeric();
     Ok(match (a, b) {
         (x, y) if x == y => x,
         // Mirror the arithmetic int4->int8 promotion rule.
         (Int4, Int8) | (Int8, Int4) => Int8,
-        // SP30: an integer and a float unify to float8 (same promotion as arithmetic).
-        (Float8, Int4 | Int8) | (Int4 | Int8, Float8) => Float8,
+        // SP30/SP32: any float8 wins; else (a numeric in the mix) → numeric.
+        _ if a == Float8 || b == Float8 => Float8,
+        _ if num_family(a) && num_family(b) => Numeric(None),
         _ => {
             return Err(ExecError::TypeMismatch(format!(
                 "types {} and {} cannot be matched",
@@ -468,14 +479,16 @@ pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, Ex
     })
 }
 
-/// The result type of `+ - * /` on two operand types: any float makes the result
-/// float8; else int4 only if both are int4; else int8 (the existing int promotion).
-/// Like the existing arithmetic inference this is permissive about non-numeric
-/// operands (a real type error surfaces at evaluation).
+/// The result type of `+ - * /` on two operand types. The numeric tower is
+/// int < numeric < float8: any float8 makes the result float8; else any numeric
+/// makes it numeric; else int4 only if both are int4, else int8. Permissive about
+/// non-numeric operands (a real type error surfaces at evaluation).
 fn numeric_result_type(lt: ColumnType, rt: ColumnType) -> ColumnType {
     use ColumnType::{Float8, Int4};
     if lt == Float8 || rt == Float8 {
         Float8
+    } else if lt.is_numeric() || rt.is_numeric() {
+        ColumnType::Numeric(None)
     } else if lt == Int4 && rt == Int4 {
         Int4
     } else {
@@ -541,30 +554,34 @@ mod tests {
     }
 
     #[test]
-    fn float_literals_arithmetic_and_inference() {
-        // float literal evaluates and types as float8.
-        assert_eq!(ev("1.5", None, &[]), Datum::Float8(1.5));
+    fn numeric_literals_arithmetic_and_inference() {
+        let num = |s: &str| Datum::Numeric(pgtypes::numeric::parse(s).expect("n"));
+        // SP32: a bare decimal literal evaluates and types as `numeric`.
+        assert_eq!(ev("1.5", None, &[]), num("1.5"));
         assert_eq!(
             infer_type(&pexpr("1.5").expect("parse"), None).expect("infer"),
-            ColumnType::Float8
+            ColumnType::Numeric(None)
         );
-        // int ⊕ float promotes to float8 at eval and inference.
-        assert_eq!(ev("1 + 0.5", None, &[]), Datum::Float8(1.5));
-        assert_eq!(ev("3 / 2.0", None, &[]), Datum::Float8(1.5));
-        assert_eq!(ev("- 2.5", None, &[]), Datum::Float8(-2.5));
+        // int ⊕ numeric promotes to numeric (exact). `3 / 2.0` uses PG's div scale.
+        assert_eq!(ev("1 + 0.5", None, &[]), num("1.5"));
+        assert_eq!(ev("3 / 2.0", None, &[]), num("1.5000000000000000"));
+        assert_eq!(ev("- 2.5", None, &[]), num("-2.5"));
         assert_eq!(
             infer_type(&pexpr("a + 1.0").expect("parse"), Some(&table())).expect("infer"),
-            ColumnType::Float8
+            ColumnType::Numeric(None)
         );
-        // CASE/coalesce unify int and float to float8.
+        // CASE/coalesce unify int and numeric to numeric.
         assert_eq!(
             infer_type(
                 &pexpr("case when a > 0 then 1 else 2.5 end").expect("parse"),
                 Some(&table())
             )
             .expect("infer"),
-            ColumnType::Float8
+            ColumnType::Numeric(None)
         );
+        // float8 is still reachable via an explicit cast (and wins over numeric).
+        assert_eq!(ev("1.5::float8", None, &[]), Datum::Float8(1.5));
+        assert_eq!(ev("3 / 2.0::float8", None, &[]), Datum::Float8(1.5));
     }
 
     #[test]

@@ -1,5 +1,9 @@
 //! The runtime value type and the SQL column types of the SP2 slice.
 
+use bigdecimal::BigDecimal;
+
+use crate::numeric::Typmod;
+
 /// PostgreSQL type OIDs (from pg_type.dat) for the slice's types.
 pub mod oids {
     pub const BOOL: u32 = 16;
@@ -8,9 +12,13 @@ pub mod oids {
     pub const TEXT: u32 = 25;
     /// SP30: `double precision` (IEEE-754 f64).
     pub const FLOAT8: u32 = 701;
+    /// SP32: arbitrary-precision `numeric`/`decimal`.
+    pub const NUMERIC: u32 = 1700;
 }
 
-/// A SQL column type. SP30 added `Float8` (`double precision`).
+/// A SQL column type. SP30 added `Float8`; SP32 added `Numeric` (which carries an
+/// optional `numeric(precision, scale)` modifier for column definitions / casts —
+/// `None` is unconstrained `numeric`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Bool,
@@ -19,9 +27,14 @@ pub enum ColumnType {
     Text,
     /// SP30: PostgreSQL `double precision` (an IEEE-754 `f64`).
     Float8,
+    /// SP32: PostgreSQL `numeric`/`decimal`. The `Typmod` (precision, scale) is
+    /// significant only when storing/casting; OID/name/typlen ignore it.
+    Numeric(Option<Typmod>),
 }
 
 impl ColumnType {
+    /// Resolve a bare SQL type name (no modifier). `numeric`/`decimal` resolve to
+    /// the unconstrained form; the parser layers the `(p, s)` modifier on top.
     pub fn from_sql_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "int4" | "integer" | "int" => Some(ColumnType::Int4),
@@ -32,6 +45,8 @@ impl ColumnType {
             // two-word `double precision` is normalized to this single string by the
             // parser before it reaches here. `real`/`float4` is a deferred non-goal.
             "float8" | "float" | "double precision" => Some(ColumnType::Float8),
+            // SP32: `numeric`/`decimal` (unconstrained here; typmod added by parser).
+            "numeric" | "decimal" => Some(ColumnType::Numeric(None)),
             _ => None,
         }
     }
@@ -43,6 +58,7 @@ impl ColumnType {
             ColumnType::Int4 => oids::INT4,
             ColumnType::Text => oids::TEXT,
             ColumnType::Float8 => oids::FLOAT8,
+            ColumnType::Numeric(_) => oids::NUMERIC,
         }
     }
 
@@ -54,10 +70,11 @@ impl ColumnType {
             ColumnType::Int4 => "integer",
             ColumnType::Text => "text",
             ColumnType::Float8 => "double precision",
+            ColumnType::Numeric(_) => "numeric",
         }
     }
 
-    /// pg_type.typlen: fixed sizes, -1 for variable-length text.
+    /// pg_type.typlen: fixed sizes, -1 for variable-length text/numeric.
     pub fn type_size(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
@@ -65,7 +82,14 @@ impl ColumnType {
             ColumnType::Int4 => 4,
             ColumnType::Text => -1,
             ColumnType::Float8 => 8,
+            ColumnType::Numeric(_) => -1,
         }
+    }
+
+    /// True for any `numeric` (ignoring its modifier) — the common "is this the
+    /// numeric type?" test used by the promotion/cast logic.
+    pub fn is_numeric(self) -> bool {
+        matches!(self, ColumnType::Numeric(_))
     }
 }
 
@@ -86,6 +110,8 @@ pub enum Datum {
     Text(String),
     /// SP30: PostgreSQL `double precision`.
     Float8(f64),
+    /// SP32: PostgreSQL `numeric` — arbitrary-precision exact decimal.
+    Numeric(BigDecimal),
 }
 
 impl PartialEq for Datum {
@@ -99,6 +125,9 @@ impl PartialEq for Datum {
             // Grouping equality: `NaN == NaN` (Rust's `==` says false, hence the
             // explicit NaN arm) and `-0.0 == +0.0` (Rust's `==` already says true).
             (Datum::Float8(a), Datum::Float8(b)) => a == b || (a.is_nan() && b.is_nan()),
+            // SP32: numeric grouping equality is by VALUE, ignoring scale, so
+            // `1.0` and `1.00` group together (`bigdecimal`'s `==` already does this).
+            (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
             _ => false,
         }
     }
@@ -130,6 +159,9 @@ impl std::hash::Hash for Datum {
                 };
                 bits.hash(state);
             }
+            // SP32: hash the scale-normalized form so values that compare equal
+            // (`1.0` and `1.00`) hash equally (the Hash/Eq contract).
+            Datum::Numeric(d) => d.normalized().to_string().hash(state),
         }
     }
 }
@@ -144,6 +176,8 @@ impl Datum {
             Datum::Int8(_) => Some(ColumnType::Int8),
             Datum::Text(_) => Some(ColumnType::Text),
             Datum::Float8(_) => Some(ColumnType::Float8),
+            // The runtime value carries no typmod — it is unconstrained `numeric`.
+            Datum::Numeric(_) => Some(ColumnType::Numeric(None)),
         }
     }
 
