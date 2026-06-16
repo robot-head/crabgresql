@@ -458,11 +458,9 @@ fn eval_grouped(
         }),
         // SP29: a scalar function over grouped/aggregate arguments — evaluate it
         // with the grouped evaluator as its child-eval closure.
-        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
-            crate::func::eval_scalar(fc, |e| {
-                eval_grouped(e, table, group_by, key, specs, results)
-            })
-        }
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => crate::func::eval_scalar(fc, |e| {
+            eval_grouped(e, table, group_by, key, specs, results)
+        }),
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
     }
 }

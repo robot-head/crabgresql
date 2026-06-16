@@ -1112,7 +1112,13 @@ mod tests {
                 op: BinaryOp::Concat,
                 right,
                 ..
-            } => assert!(matches!(*right, Expr::Binary { op: BinaryOp::Add, .. })),
+            } => assert!(matches!(
+                *right,
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            )),
             other => panic!("expected Concat(.., Add) , got {other:?}"),
         }
         // `||` binds tighter than `=` (PG): `a || b = c` == `(a || b) = c`.
@@ -1121,7 +1127,13 @@ mod tests {
                 op: BinaryOp::Eq,
                 left,
                 ..
-            } => assert!(matches!(*left, Expr::Binary { op: BinaryOp::Concat, .. })),
+            } => assert!(matches!(
+                *left,
+                Expr::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                }
+            )),
             other => panic!("expected Eq(Concat, ..), got {other:?}"),
         }
         // Left-associative: `a || b || c` == `(a || b) || c`.
@@ -1130,13 +1142,25 @@ mod tests {
                 op: BinaryOp::Concat,
                 left,
                 ..
-            } => assert!(matches!(*left, Expr::Binary { op: BinaryOp::Concat, .. })),
+            } => assert!(matches!(
+                *left,
+                Expr::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                }
+            )),
             other => panic!("expected left-nested Concat, got {other:?}"),
         }
         // `||` binds tighter than LIKE: `a || b LIKE p` == `(a || b) LIKE p`.
         match expr("a || b LIKE 'p'") {
             Expr::Like { expr, .. } => {
-                assert!(matches!(*expr, Expr::Binary { op: BinaryOp::Concat, .. }))
+                assert!(matches!(
+                    *expr,
+                    Expr::Binary {
+                        op: BinaryOp::Concat,
+                        ..
+                    }
+                ))
             }
             other => panic!("expected Like over Concat, got {other:?}"),
         }
@@ -1150,7 +1174,13 @@ mod tests {
                 op: BinaryOp::Mul,
                 left,
                 ..
-            } => assert!(matches!(*left, Expr::Unary { op: UnaryOp::Neg, .. })),
+            } => assert!(matches!(
+                *left,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    ..
+                }
+            )),
             other => panic!("expected Mul((-a), b), got {other:?}"),
         }
     }

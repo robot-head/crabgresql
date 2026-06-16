@@ -226,7 +226,10 @@ mod tests {
     #[test]
     fn modulo_sign_promotion_zero_and_min() {
         // Remainder takes the dividend's sign (truncated division, like PG).
-        assert_eq!(rem(&Datum::Int4(11), &Datum::Int4(3)).expect("ok"), Datum::Int4(2));
+        assert_eq!(
+            rem(&Datum::Int4(11), &Datum::Int4(3)).expect("ok"),
+            Datum::Int4(2)
+        );
         assert_eq!(
             rem(&Datum::Int4(-11), &Datum::Int4(3)).expect("ok"),
             Datum::Int4(-2)

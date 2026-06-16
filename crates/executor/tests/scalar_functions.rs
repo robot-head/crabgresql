@@ -62,27 +62,44 @@ async fn err_code(client: &tokio_postgres::Client, sql: &str) -> String {
 #[tokio::test]
 async fn string_functions() {
     let client = connect(spawn().await).await;
-    assert_eq!(scalar(&client, "SELECT length('hello')").await.as_deref(), Some("5"));
-    assert_eq!(scalar(&client, "SELECT upper('aBc')").await.as_deref(), Some("ABC"));
-    assert_eq!(scalar(&client, "SELECT lower('aBc')").await.as_deref(), Some("abc"));
+    assert_eq!(
+        scalar(&client, "SELECT length('hello')").await.as_deref(),
+        Some("5")
+    );
+    assert_eq!(
+        scalar(&client, "SELECT upper('aBc')").await.as_deref(),
+        Some("ABC")
+    );
+    assert_eq!(
+        scalar(&client, "SELECT lower('aBc')").await.as_deref(),
+        Some("abc")
+    );
     assert_eq!(
         scalar(&client, "SELECT btrim('  hi  ')").await.as_deref(),
         Some("hi")
     );
     assert_eq!(
-        scalar(&client, "SELECT ltrim('xxhi', 'x')").await.as_deref(),
+        scalar(&client, "SELECT ltrim('xxhi', 'x')")
+            .await
+            .as_deref(),
         Some("hi")
     );
     assert_eq!(
-        scalar(&client, "SELECT substr('abcdef', 2, 3)").await.as_deref(),
+        scalar(&client, "SELECT substr('abcdef', 2, 3)")
+            .await
+            .as_deref(),
         Some("bcd")
     );
     assert_eq!(
-        scalar(&client, "SELECT replace('a.b.c', '.', '-')").await.as_deref(),
+        scalar(&client, "SELECT replace('a.b.c', '.', '-')")
+            .await
+            .as_deref(),
         Some("a-b-c")
     );
     assert_eq!(
-        scalar(&client, "SELECT concat('x', NULL, 'y', 1)").await.as_deref(),
+        scalar(&client, "SELECT concat('x', NULL, 'y', 1)")
+            .await
+            .as_deref(),
         Some("xy1")
     );
 }
@@ -96,25 +113,40 @@ async fn concat_operator_and_math() {
     );
     // a NULL operand makes the whole `||` NULL.
     assert_eq!(scalar(&client, "SELECT 'x' || NULL").await, None);
-    assert_eq!(scalar(&client, "SELECT abs(-7)").await.as_deref(), Some("7"));
-    assert_eq!(scalar(&client, "SELECT mod(11, 3)").await.as_deref(), Some("2"));
+    assert_eq!(
+        scalar(&client, "SELECT abs(-7)").await.as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        scalar(&client, "SELECT mod(11, 3)").await.as_deref(),
+        Some("2")
+    );
 }
 
 #[tokio::test]
 async fn null_and_conditional_functions() {
     let client = connect(spawn().await).await;
     assert_eq!(
-        scalar(&client, "SELECT coalesce(NULL, NULL, 'third')").await.as_deref(),
+        scalar(&client, "SELECT coalesce(NULL, NULL, 'third')")
+            .await
+            .as_deref(),
         Some("third")
     );
     assert_eq!(scalar(&client, "SELECT nullif(5, 5)").await, None);
-    assert_eq!(scalar(&client, "SELECT nullif(5, 6)").await.as_deref(), Some("5"));
     assert_eq!(
-        scalar(&client, "SELECT greatest(3, 7, NULL, 2)").await.as_deref(),
+        scalar(&client, "SELECT nullif(5, 6)").await.as_deref(),
+        Some("5")
+    );
+    assert_eq!(
+        scalar(&client, "SELECT greatest(3, 7, NULL, 2)")
+            .await
+            .as_deref(),
         Some("7")
     );
     assert_eq!(
-        scalar(&client, "SELECT least('b', 'a', 'c')").await.as_deref(),
+        scalar(&client, "SELECT least('b', 'a', 'c')")
+            .await
+            .as_deref(),
         Some("a")
     );
 }
@@ -203,5 +235,8 @@ async fn error_sqlstates() {
     // incompatible coalesce types -> 42804.
     assert_eq!(err_code(&client, "SELECT coalesce(1, 'x')").await, "42804");
     // DISTINCT on a scalar function -> 42809.
-    assert_eq!(err_code(&client, "SELECT upper(DISTINCT s) FROM t").await, "42809");
+    assert_eq!(
+        err_code(&client, "SELECT upper(DISTINCT s) FROM t").await,
+        "42809"
+    );
 }

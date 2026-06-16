@@ -586,8 +586,7 @@ mod tests {
         .expect_err("overflow");
         assert_eq!(err.into_pg().code, "22003");
         // mod by zero is 22012.
-        let err =
-            crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), None, &[]).expect_err("div0");
+        let err = crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), None, &[]).expect_err("div0");
         assert_eq!(err.into_pg().code, "22012");
     }
 
@@ -614,7 +613,8 @@ mod tests {
     #[test]
     fn result_types_for_row_description() {
         let t = table();
-        let ty = |sql: &str| crate::eval::infer_type(&pexpr(sql).expect("p"), Some(&t)).expect("ty");
+        let ty =
+            |sql: &str| crate::eval::infer_type(&pexpr(sql).expect("p"), Some(&t)).expect("ty");
         assert_eq!(ty("length(s)"), ColumnType::Int4);
         assert_eq!(ty("upper(s)"), ColumnType::Text);
         assert_eq!(ty("substr(s, 1, 2)"), ColumnType::Text);
