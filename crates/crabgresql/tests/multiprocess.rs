@@ -539,19 +539,8 @@ async fn bank_conserves_with_random_node_clients() {
             .control(id, cluster::transport::protocol::ControlRequest::Heal)
             .await;
     }
-    let _final_leader = c.wait_for_leader().await;
-
-    // read_total via pg_try loop — some node accepts after heal.
-    let final_client = {
-        let mut idx = 0usize;
-        loop {
-            if let Some(cl) = c.pg_try(idx).await {
-                break cl;
-            }
-            idx = idx.wrapping_add(1) % n_nodes;
-        }
-    };
-    let final_total = read_total(&final_client, ACCOUNTS).await;
+    let final_leader = c.wait_for_leader().await;
+    let final_total = read_total(&c.pg(final_leader).await, ACCOUNTS).await;
 
     assert_eq!(
         final_total, seeded_total,
