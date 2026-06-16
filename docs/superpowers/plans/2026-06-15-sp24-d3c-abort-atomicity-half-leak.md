@@ -106,17 +106,21 @@ git commit -m "test(sp24): reproduce the abort-atomicity half-leak under partici
 
 ---
 
-## Task 2: Fence the re-stage to the global decision (GREEN)
+## Task 2: Re-acquire in-doubt row locks on leadership rise (GREEN)
 
-**Goal:** Enforce the invariant **`aborted(g) ⇒ 0 visible halves`** by closing the exact escape Task 1 named. The controller refines this task's concrete diff from Task 1's report before dispatch; the acceptance criterion is fixed (Task 1's test green + no regressions).
+**CORRECTION (after T1 + a first fix attempt + a faithful-nemesis reassessment drill):** T1's in-process reproduction (committed `91b8fae`) re-stages after the new leader *settles*, so a first fix — a session-level `effective_global_xid` fence that adopts the in-doubt `g_old` (committed `1c3b2a6`) — turned T1 green but the faithful MULTI-PROCESS pure-participant nemesis still TORE ~6/8. A reassessment drill pinned the REAL trigger with hard evidence: **lost row locks on failover.** Row locks live only in the in-memory `RowLockManager` (`crates/executor/src/lockmgr.rs`); when a participant-range leader is killed and recovers, its lock table is WIPED while the in-doubt `Prepared(Li → g_old)` row version it left is durable + replicated — so the row carries an unresolved marker with NO live lock holder, and concurrent transfers write competing versions each under its own `g` (one torn row had SEVEN independently-committed versions). The `effective_global_xid` fence only collapses one in-doubt `g` per stage and cannot serialize N concurrent writers, so it is structurally insufficient.
+
+**Goal:** Enforce **`aborted(g) ⇒ 0 visible halves`** (and at-most-one-live per cross-range row) by closing the window at its source: a freshly-risen participant leader must hold the row locks for its inherited in-doubt prepared rows until each `g` resolves, exactly as a non-failover participant does.
 
 **Files:**
-- Modify: the site named by Task 1 — most likely `crates/cluster/src/twopc.rs` (`stage` idempotency / `resolve_in_doubt`) and/or `crates/cluster/src/range/router.rs` (escalation must not mint a fresh `g'` for an already-staged participant) and/or `crates/executor/src/session.rs` (participant re-stage must reuse `g` and the same version identity).
-- Test: `crates/cluster/tests/crossrange_2pc.rs` (Task 1's test).
+- Modify: `crates/cluster/src/server_node.rs` (`resolve_in_doubt_on_leadership` ~:700 — the rise sweep that already scans this range's clog for in-doubt `Prepared(Li → g)` markers before `mark_served`).
+- Modify: `crates/executor/src/lib.rs` and/or `crates/executor/src/lockmgr.rs` (a new `SqlEngine` recovery API: for the in-doubt local xids, enumerate the `(table, rowid)` versions they wrote in the durable store and re-acquire the exclusive `RowLockManager` lock under each `Li`).
+- Decide on the committed `effective_global_xid` fence (`crates/executor/src/session.rs` + `table_rowid_of` in `crates/kv/src/key.rs`): if approach C alone makes T1 AND the nemesis green, **revert that fence** (commit `1c3b2a6`) to keep the codebase clean (the lock re-acquisition is the correct single fix); keep it ONLY if it provides genuine defense-in-depth at low complexity cost. State which you chose and why.
+- Test: `crates/cluster/tests/crossrange_2pc.rs` (T1) AND `crates/crabgresql/tests/participant_kill_bank.rs` (the faithful multi-process validator, currently untracked — see Task 4).
 
-**Invariant-driven fix (the controller supplies the exact diff from Task 1's report; the strongest a-priori candidate):** a participant re-stage for a cross-range txn MUST be strictly idempotent on `(g, range, rowid)` — it reuses the SAME `g` and supersedes (not duplicates) any prior staged version for that row, so a single global decision governs exactly one live version per row; and the router must NEVER re-escalate an already-staged participant under a fresh `g'`. Then a global abort of `g` makes the (single) staged version resolve `Aborted` → invisible, with no second version under a different decision to leak.
+**The fix (approach C — textbook 2PC participant recovery):** in `resolve_in_doubt_on_leadership`, before `mark_served` opens the gate, for every in-doubt `Prepared(Li → g)` marker the sweep finds, re-acquire the exclusive row lock for each `(table, rowid)` that `Li` wrote (discoverable by scanning the range's durable version store for versions whose `xmin == Li`, mirroring how the recovery scan already enumerates markers). Hold those locks (under the recovered participant identity) so a concurrent writer blocks until `g` resolves (the sweep's own abort-race, or a real commit). This must complete BEFORE the gate opens (settle-before-serve), so no un-locked in-doubt row is ever served.
 
-- [ ] **Step 1: Apply the minimal fix** to the file named by Task 1 (controller-provided concrete diff). Keep it minimal and local; do not touch the commit path (proven correct).
+- [ ] **Step 1: Apply the fix** (the lock re-acquisition on rise, per above). Keep it minimal; do not touch the commit path (proven correct). Settle-before-serve ordering: lock re-acquisition happens inside the rise sweep before `mark_served`.
 
 - [ ] **Step 2: Run Task 1's test; confirm it PASSES (5×, non-flaky).**
 

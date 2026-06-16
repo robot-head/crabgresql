@@ -314,6 +314,93 @@ impl SqlEngine {
         Ok(self.in_doubt_globals_from(0).await?.0)
     }
 
+    /// SP24 abort-atomicity ROOT FIX — re-acquire the in-memory row locks for every
+    /// inherited in-doubt participant version on this range, returning the in-doubt
+    /// local xids `Li` that now hold those locks. Call on the leadership-rising edge,
+    /// AFTER the apply-wait (so every inherited `Prepared(Li -> g)` marker is visible)
+    /// and BEFORE the recovery gate opens (`mark_served`) — the settle-before-serve-for-
+    /// LOCKS step.
+    ///
+    /// Why locks, not just the per-session `effective_global_xid` fence: row locks live
+    /// ONLY in the in-memory `RowLockManager`, which is WIPED when this range's leader is
+    /// killed and a new one rises — yet the in-doubt `Prepared(Li -> g)` row version it
+    /// left behind is DURABLE + replicated. So a cross-range row can carry an unresolved
+    /// in-doubt marker with NO live lock holder; a concurrent re-staging writer whose
+    /// apply-lagged read misses the inherited version then writes a COMPETING version
+    /// under a different global decision → two live versions on commit (money created).
+    /// A per-statement fence cannot serialize N concurrent writers across apply lag; a
+    /// re-acquired exclusive lock does — the next writer BLOCKS until the inherited row
+    /// resolves, giving exactly one live version.
+    ///
+    /// Scans the clog from the recovery watermark for in-doubt `Prepared(Li -> g)`
+    /// markers (mirrors `in_doubt_globals_from`'s decidedness rule), then scans this
+    /// range's primary-index version keyspace once and, for every version whose `xmin`
+    /// is an in-doubt `Li`, re-acquires `(table, rowid)` EXCLUSIVELY under `Li`. Returns
+    /// the `(Li, g)` pairs so the rise sweep can release each `Li`'s lock the moment its
+    /// `g` is driven terminal (the abort-race), so the lock is NEVER freed while its `g`
+    /// is still in-doubt. Idempotent (a re-scan re-acquires the same locks).
+    pub async fn reacquire_in_doubt_locks(&self) -> Result<Vec<(u64, u64)>, ExecError> {
+        use std::collections::BTreeMap;
+        // 1) In-doubt `(Li -> g)` markers on this range (those whose `g` is not terminal).
+        let scan_lo = self.clog_scan_lo()?;
+        let mut in_doubt: BTreeMap<u64, u64> = BTreeMap::new();
+        for (k, v) in self.kv.scan_range(
+            &kv::key::clog_key(scan_lo),
+            &kv::key::clog_key(mvcc::xid::GLOBAL_XID_BASE),
+        )? {
+            let Some(li) = kv::key::clog_xid_of(&k) else {
+                continue;
+            };
+            if let mvcc::clog::XidStatus::Prepared(g) = mvcc::clog::decode(&v)? {
+                let terminal = matches!(
+                    mvcc::clog::get(self.catalog_kv.as_ref(), g)?,
+                    mvcc::clog::XidStatus::Committed | mvcc::clog::XidStatus::Aborted
+                );
+                if !terminal {
+                    in_doubt.insert(li, g);
+                }
+            }
+        }
+        if in_doubt.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 2) Scan this range's primary-index version keyspace once; for every version
+        //    whose creating xid (xmin, encoded in the version key's 8-byte suffix) is an
+        //    in-doubt `Li`, re-acquire `(table, rowid)` exclusively under `Li`. User
+        //    tables start at id 1 (`SYSTEM_TABLE_ID == 0`), so scan from `table_prefix(1)`
+        //    onward; `table_rowid_of` filters non-primary/system keys.
+        let start = kv::key::table_prefix(kv::key::SYSTEM_TABLE_ID + 1);
+        // Upper bound above every primary-index version key. A version key is
+        // `put_u32(table) ++ put_u32(INDEX_PRIMARY=1) ++ put_u64(rowid) ++ put_u64(xid)`;
+        // its 5th byte is the high byte of `INDEX_PRIMARY`, i.e. `0x00`, so any key
+        // whose 5th byte is `0xFF` (e.g. five `0xFF` bytes) sorts strictly after every
+        // real version key regardless of table id.
+        let end = [0xFFu8; 5];
+        for (k, _v) in self.kv.scan_range(&start, &end)? {
+            let Some((table, rowid)) = kv::key::table_rowid_of(&k) else {
+                continue;
+            };
+            let Ok(li) = mvcc::version::xid_of_key(&k) else {
+                continue;
+            };
+            if in_doubt.contains_key(&li) {
+                self.lockmgr.reacquire_exclusive(table, rowid, li);
+            }
+        }
+        Ok(in_doubt.into_iter().collect())
+    }
+
+    /// Release the in-doubt row locks re-acquired under `li` (frees every `(table, rowid)`
+    /// lock that local xid holds). Called by the rise sweep the moment `li`'s global `g`
+    /// has been driven TERMINAL by the abort-race, so the lock is never freed while its
+    /// `g` is in-doubt. A re-staging writer that blocked on the lock wakes to a fully-
+    /// RESOLVED row: its `effective_global_xid` fence sees the terminal decision and
+    /// proceeds correctly (exactly one live version). A no-op for an `li` that holds no
+    /// lock.
+    pub fn release_in_doubt_lock(&self, li: u64) {
+        self.lockmgr.release_all(li);
+    }
+
     /// Scan THIS range's clog (from the recovery watermark) for an existing durable
     /// `Prepared(Li -> g)` marker for the given in-doubt global xid `g`; return the local
     /// xid `Li` of the first such marker, or `None`.
@@ -541,6 +628,135 @@ mod tests {
         assert_eq!(
             lo3, 20,
             "in-doubt at the highest Li holds the watermark there"
+        );
+    }
+
+    /// SP24 root fix: on a leadership rise, `reacquire_in_doubt_locks` re-takes the
+    /// exclusive row lock for an inherited in-doubt `Prepared(Li -> g)` version even
+    /// though the in-memory lock table was wiped — and a concurrent writer BLOCKS on
+    /// that lock until `release_in_doubt_lock(Li)` frees it once `g` is terminal. This
+    /// is the serialize-before-serve guarantee the per-session fence cannot give under
+    /// apply lag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reacquire_in_doubt_locks_blocks_a_concurrent_writer_until_released() {
+        use crate::lockmgr::LockMode;
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        use pgwire::engine::{Engine, Session};
+
+        // One in-memory store plays both this range's local clog/versions AND range 0's
+        // global clog (single-store engine: kv == catalog_kv).
+        let kv = Arc::new(MemKv::new());
+        let engine = SqlEngine::with_kv(Arc::clone(&kv) as Arc<dyn Kv>).expect("engine");
+        // Seed schema + a row, then stage an UPDATE under a held participant session so the
+        // store carries a real `Prepared(Li -> g)` version with the row-keyed xmin == Li.
+        {
+            let mut s = engine.connect();
+            s.simple_query("CREATE TABLE t (id int4)")
+                .await
+                .expect("create");
+            s.simple_query("INSERT INTO t VALUES (1)")
+                .await
+                .expect("insert");
+        }
+        let g = GLOBAL_XID_BASE + 1;
+        let li = {
+            let mut s = engine.connect();
+            s.ensure_began().await.expect("begin");
+            s.simple_query("UPDATE t SET id = 2 WHERE id = 1")
+                .await
+                .expect("stage");
+            let li = s.local_xid().expect("li");
+            s.join_global(g).await.expect("join g"); // Prepared(li -> g) durable
+            // Drop the held session WITHOUT resolving — mirrors the killed leader losing its
+            // in-memory session + lock table, while the durable Prepared(li -> g) version stays.
+            drop(s);
+            li
+        };
+        // The dropped session freed li's lock (presumed-abort), so the inherited in-doubt
+        // row now has NO live lock holder — exactly the wiped-lock-table condition.
+        let table = catalog::get_table(kv.as_ref(), "t").expect("t").id;
+        // g is still in-doubt (no global decision written): recovery re-acquires li's lock.
+        let pairs = engine.reacquire_in_doubt_locks().await.expect("reacquire");
+        assert_eq!(
+            pairs,
+            vec![(li, g)],
+            "the inherited (Li -> g) is re-acquired"
+        );
+
+        // A concurrent writer for the SAME row must BLOCK on the re-acquired lock.
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lockmgr = Arc::clone(&engine.lockmgr);
+        let blocked2 = Arc::clone(&blocked);
+        let other_xid = li + 1000;
+        let waiter = tokio::spawn(async move {
+            lockmgr
+                .acquire(table, /*rowid*/ 1, LockMode::Exclusive, other_xid)
+                .await
+                .expect("not a deadlock");
+            blocked2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // Give the waiter a chance to register; it must NOT have acquired (lock held by li).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "a concurrent writer must block on the re-acquired in-doubt lock"
+        );
+
+        // Resolve g terminally, then release li's lock — the waiter must now proceed.
+        kv.write_batch(&[put_op(g, XidStatus::Aborted)])
+            .expect("decide g");
+        engine.release_in_doubt_lock(li);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter did not hang")
+            .expect("waiter task");
+        assert!(
+            blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "the writer proceeds once the in-doubt lock is released"
+        );
+    }
+
+    /// `reacquire_in_doubt_locks` skips a marker whose `g` is already TERMINAL (no lock
+    /// taken — the row is settled), and returns only the genuinely in-doubt pairs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reacquire_in_doubt_locks_skips_terminal_g() {
+        use mvcc::clog::{XidStatus, put_op};
+        use mvcc::xid::GLOBAL_XID_BASE;
+        use pgwire::engine::{Engine, Session};
+        let kv = Arc::new(MemKv::new());
+        let engine = SqlEngine::with_kv(Arc::clone(&kv) as Arc<dyn Kv>).expect("engine");
+        {
+            let mut s = engine.connect();
+            s.simple_query("CREATE TABLE t (id int4)")
+                .await
+                .expect("create");
+            s.simple_query("INSERT INTO t VALUES (1)")
+                .await
+                .expect("insert");
+        }
+        let g = GLOBAL_XID_BASE + 1;
+        {
+            let mut s = engine.connect();
+            s.ensure_began().await.expect("begin");
+            s.simple_query("UPDATE t SET id = 2 WHERE id = 1")
+                .await
+                .expect("stage");
+            s.join_global(g).await.expect("join g");
+            drop(s);
+        }
+        // g is COMMITTED (terminal) → the row is settled → recovery takes no lock.
+        kv.write_batch(&[put_op(g, XidStatus::Committed)])
+            .expect("decide g");
+        assert!(
+            engine
+                .reacquire_in_doubt_locks()
+                .await
+                .expect("reacquire")
+                .is_empty(),
+            "a terminally-decided g is not re-locked"
         );
     }
 

@@ -745,17 +745,48 @@ async fn resolve_in_doubt_on_leadership(
                 // possibly-regressed counter.
                 engine.reseed_gtm().map_err(|_| ())?;
                 engine.reseed_counters().map_err(|_| ())?;
+                // SP24 abort-atomicity ROOT FIX — settle-before-serve for LOCKS. The row-lock
+                // table is purely in-memory and was WIPED by this failover, but the inherited
+                // `Prepared(Li -> g)` row versions are durable. Re-acquire the exclusive row
+                // lock for every inherited in-doubt `(Li -> g)` BEFORE the gate opens, so a
+                // concurrent re-staging writer (whose apply-lagged read might miss the inherited
+                // version) BLOCKS on the lock rather than minting a second, competing live
+                // version. Each `Li`'s lock is released below the instant its `g` is driven
+                // terminal by the abort-race — never while `g` is in-doubt.
+                let in_doubt = engine.reacquire_in_doubt_locks().await.map_err(|_| ())?;
                 let scan_lo = engine.clog_scan_lo().unwrap_or(0);
                 let (gs, _) = engine
                     .in_doubt_globals_from(scan_lo)
                     .await
                     .map_err(|_| ())?;
+                // Abort-race each in-doubt `g` to its terminal global decision (write-once:
+                // Committed if a coordinator already won, Aborted if we win). Record which `g`s
+                // resolved so their re-acquired row locks can be freed.
+                let mut resolved: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 for g in gs {
-                    if let Err(e) = client
+                    match client
                         .call(0, TxnRpc::CommitGlobal { g, commit: false })
                         .await
                     {
-                        tracing::warn!(g, ?e, "recovery abort-race failed; g stays in-doubt");
+                        Ok(_) => {
+                            resolved.insert(g);
+                        }
+                        Err(e) => {
+                            tracing::warn!(g, ?e, "recovery abort-race failed; g stays in-doubt")
+                        }
+                    }
+                }
+                // Release the re-acquired lock for every `Li` whose `g` is now terminal. An `Li`
+                // whose `g` the abort-race could NOT reach (range 0 unreachable) is left LOCKED —
+                // its row stays serialized against a concurrent re-staging writer — and a later
+                // sweep tick re-resolves + frees it. The lock is held across the abort-race AND
+                // (just below) `mark_served`, so the gate never opens onto an inherited row that
+                // is both unlocked and unresolved. A re-staging writer that blocks on a freed
+                // lock wakes to a terminal `g`, so its `effective_global_xid` fence yields exactly
+                // one live version.
+                for (li, g) in &in_doubt {
+                    if resolved.contains(g) {
+                        engine.release_in_doubt_lock(*li);
                     }
                 }
                 // SETTLE-COMPLETE-BEFORE-SERVE: re-scan AFTER the abort-races and open the gate

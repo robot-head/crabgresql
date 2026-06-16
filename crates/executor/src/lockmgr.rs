@@ -81,6 +81,33 @@ impl RowLockManager {
         try_acquire_locked(&mut g, table, rowid, mode, my_xid)
     }
 
+    /// Recovery re-acquisition (SP24 abort atomicity): grab `(table, rowid)`
+    /// EXCLUSIVELY for an inherited in-doubt local xid `Li` whose `Prepared(Li -> g)`
+    /// row version this leader inherited but whose in-memory lock was wiped by the
+    /// failover. Always installs the lock under `my_xid` — overwriting any holder of
+    /// the SAME row, because on the rising edge no live transaction holds this row
+    /// (the lock table started empty) and the inherited marker is the sole claimant.
+    /// Idempotent: re-acquiring an already-held lock is a no-op. The lock is freed by
+    /// the rise sweep's `release_all(Li)` once `g` is driven terminal — so a
+    /// concurrent re-staging writer BLOCKS here until the inherited row resolves,
+    /// giving exactly one live version (the serialize-before-serve invariant the
+    /// per-session `effective_global_xid` fence cannot enforce under apply lag).
+    pub(crate) fn reacquire_exclusive(&self, table: catalog::TableId, rowid: u64, my_xid: u64) {
+        let mut g = self.inner.lock().expect("lockmgr");
+        // Install an exclusive lock held solely by `my_xid`. We intentionally do NOT
+        // go through `try_acquire_locked` (which would return Conflict against a
+        // pre-existing holder): on a fresh leadership rise the lock table is empty,
+        // so this only ever installs a NEW lock or no-ops on a re-scan of the same
+        // `Li`. Keeping it unconditional makes recovery deterministic regardless of
+        // sweep re-entry.
+        let lock = g.locks.entry((table, rowid)).or_insert_with(|| RowLock {
+            mode: LockMode::Exclusive,
+            holders: HashSet::new(),
+        });
+        lock.mode = LockMode::Exclusive;
+        lock.holders.insert(my_xid);
+    }
+
     /// Acquire `(table, rowid)` in `mode` for `my_xid`, blocking until granted.
     /// Returns `Err(())` if blocking would close a wait-for cycle (caller maps
     /// to 40P01). Conflict-detect and waiter-register happen ATOMICALLY under
