@@ -68,6 +68,51 @@ pub fn div(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
     arith(a, b, i32::checked_div, i64::checked_div)
 }
 
+/// SQL `mod(a, b)` / the `%` remainder (SP29, exposed as the `mod` function).
+/// NULL propagates; a zero divisor is 22012; otherwise the remainder takes the
+/// sign of the dividend (truncated division, like PostgreSQL). `wrapping_rem`
+/// makes `i32::MIN % -1` the mathematically-correct `0` rather than an overflow
+/// trap, so a remainder never raises 22003.
+pub fn rem(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
+    if a.is_null() || b.is_null() {
+        return Ok(Datum::Null);
+    }
+    if matches!(b, Datum::Int4(0) | Datum::Int8(0)) {
+        return Err(TypeError::DivisionByZero);
+    }
+    match (a, b) {
+        (Datum::Int4(x), Datum::Int4(y)) => Ok(Datum::Int4(x.wrapping_rem(*y))),
+        _ => match (as_i64(a), as_i64(b)) {
+            (Some(x), Some(y)) => Ok(Datum::Int8(x.wrapping_rem(y))),
+            _ => Err(TypeError::TypeMismatch {
+                message: "mod requires integer operands".into(),
+            }),
+        },
+    }
+}
+
+/// SQL `||` string concatenation (SP29). A NULL operand yields NULL; otherwise
+/// each operand is rendered via its canonical text encoding (the same encoding
+/// the wire layer uses — `true`→`t`, `5`→`5`) and the two are joined into a
+/// `text`. The "at least one operand must be text" operator-resolution rule is a
+/// static (plan-time) concern enforced by the executor's `infer_type`; this
+/// value-level op is permissive so a `||` reached at runtime always has a result.
+pub fn concat(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
+    if a.is_null() || b.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut s = text_of(a);
+    s.push_str(&text_of(b));
+    Ok(Datum::Text(s))
+}
+
+/// The canonical text rendering of a non-NULL Datum, reusing the wire text
+/// encoder so `||` and the DataRow encoding never disagree.
+fn text_of(d: &Datum) -> String {
+    String::from_utf8(crate::encoding::encode_text(d))
+        .expect("a Datum's text encoding is always valid UTF-8")
+}
+
 /// SQL comparison. Returns Ok(None) if either operand is NULL (so the caller
 /// yields NULL / excludes the row). Cross-type integer comparison is allowed;
 /// text compares lexicographically; bool compares false < true.
@@ -176,6 +221,67 @@ mod tests {
             div(&Datum::Int4(1), &Datum::Int4(0)),
             Err(TypeError::DivisionByZero)
         ));
+    }
+
+    #[test]
+    fn modulo_sign_promotion_zero_and_min() {
+        // Remainder takes the dividend's sign (truncated division, like PG).
+        assert_eq!(rem(&Datum::Int4(11), &Datum::Int4(3)).expect("ok"), Datum::Int4(2));
+        assert_eq!(
+            rem(&Datum::Int4(-11), &Datum::Int4(3)).expect("ok"),
+            Datum::Int4(-2)
+        );
+        // Mixed width promotes to int8.
+        assert_eq!(
+            rem(&Datum::Int4(11), &Datum::Int8(3)).expect("ok"),
+            Datum::Int8(2)
+        );
+        // NULL propagates; a zero divisor is 22012 (and NULL short-circuits it).
+        assert_eq!(rem(&Datum::Null, &Datum::Int4(0)).expect("ok"), Datum::Null);
+        assert!(matches!(
+            rem(&Datum::Int4(1), &Datum::Int4(0)),
+            Err(TypeError::DivisionByZero)
+        ));
+        // i32::MIN % -1 is mathematically 0, never an overflow trap.
+        assert_eq!(
+            rem(&Datum::Int4(i32::MIN), &Datum::Int4(-1)).expect("ok"),
+            Datum::Int4(0)
+        );
+        // A non-integer operand is a type mismatch (42804).
+        assert!(matches!(
+            rem(&Datum::Text("x".into()), &Datum::Int4(1)),
+            Err(TypeError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn concat_renders_each_operand_and_propagates_null() {
+        assert_eq!(
+            concat(&Datum::Text("ab".into()), &Datum::Text("cd".into())).expect("ok"),
+            Datum::Text("abcd".into())
+        );
+        // Non-text operands render via their canonical text encoding.
+        assert_eq!(
+            concat(&Datum::Text("id=".into()), &Datum::Int4(5)).expect("ok"),
+            Datum::Text("id=5".into())
+        );
+        assert_eq!(
+            concat(&Datum::Int8(9_000_000_000), &Datum::Text("!".into())).expect("ok"),
+            Datum::Text("9000000000!".into())
+        );
+        assert_eq!(
+            concat(&Datum::Bool(true), &Datum::Text("x".into())).expect("ok"),
+            Datum::Text("tx".into())
+        );
+        // Either NULL operand yields NULL.
+        assert_eq!(
+            concat(&Datum::Null, &Datum::Text("x".into())).expect("ok"),
+            Datum::Null
+        );
+        assert_eq!(
+            concat(&Datum::Text("x".into()), &Datum::Null).expect("ok"),
+            Datum::Null
+        );
     }
 
     #[test]

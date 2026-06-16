@@ -10,6 +10,7 @@ mod commit;
 mod error;
 mod eval;
 mod exec;
+mod func;
 mod gtm;
 mod lockmgr;
 mod procarray;
