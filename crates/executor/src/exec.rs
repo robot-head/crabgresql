@@ -10,6 +10,7 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
+use crate::join::{Relation, join_relations};
 use crate::scope::Scope;
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
@@ -595,6 +596,126 @@ fn row_matches(
     }
 }
 
+/// Build the relation for one FROM list (comma items folded as cross joins).
+#[allow(clippy::too_many_arguments)]
+fn build_from(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    from: &[pgparser::ast::TableExpr],
+) -> Result<Relation, ExecError> {
+    let mut iter = from.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
+    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first)?;
+    for te in iter {
+        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te)?;
+        acc = join_relations(
+            acc,
+            next,
+            pgparser::ast::JoinKind::Cross,
+            &pgparser::ast::JoinConstraint::None,
+        )?;
+    }
+    Ok(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_table_expr(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    te: &pgparser::ast::TableExpr,
+) -> Result<Relation, ExecError> {
+    use pgparser::ast::TableExpr;
+    match te {
+        TableExpr::Table { name, alias } => {
+            let t = catalog::get_table(catalog_kv, name)?;
+            let qualifier = alias.as_deref().unwrap_or(&t.name);
+            let scope = Scope::single(&t, qualifier);
+            let rows = scan_live(kv, global, gsnap, snapshot, own, &t)?
+                .into_iter()
+                .map(|(_, _, row)| row)
+                .collect();
+            Ok(Relation { scope, rows })
+        }
+        TableExpr::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } => {
+            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left)?;
+            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right)?;
+            join_relations(l, r, *kind, constraint)
+        }
+        TableExpr::Derived { .. } => Err(ExecError::Unsupported(
+            "derived tables land in a later task".into(),
+        )),
+    }
+}
+
+/// Schema-only relation builder for `describe` — parallels `build_from` but base
+/// tables produce no rows (no `scan_live`). Joining empty relations yields the
+/// correct combined scope with no rows, so it reuses `join_relations`.
+fn build_from_schema(
+    catalog_kv: &dyn Kv,
+    from: &[pgparser::ast::TableExpr],
+) -> Result<Relation, ExecError> {
+    let mut iter = from.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| ExecError::Unsupported("build_from_schema on empty FROM".into()))?;
+    let mut acc = build_table_expr_schema(catalog_kv, first)?;
+    for te in iter {
+        let next = build_table_expr_schema(catalog_kv, te)?;
+        acc = join_relations(
+            acc,
+            next,
+            pgparser::ast::JoinKind::Cross,
+            &pgparser::ast::JoinConstraint::None,
+        )?;
+    }
+    Ok(acc)
+}
+
+fn build_table_expr_schema(
+    catalog_kv: &dyn Kv,
+    te: &pgparser::ast::TableExpr,
+) -> Result<Relation, ExecError> {
+    use pgparser::ast::TableExpr;
+    match te {
+        TableExpr::Table { name, alias } => {
+            let t = catalog::get_table(catalog_kv, name)?;
+            let qualifier = alias.as_deref().unwrap_or(&t.name);
+            Ok(Relation {
+                scope: Scope::single(&t, qualifier),
+                rows: Vec::new(),
+            })
+        }
+        TableExpr::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } => {
+            let l = build_table_expr_schema(catalog_kv, left)?;
+            let r = build_table_expr_schema(catalog_kv, right)?;
+            join_relations(l, r, *kind, constraint)
+        }
+        TableExpr::Derived { .. } => Err(ExecError::Unsupported(
+            "derived tables land in a later task".into(),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_read(
     catalog_kv: &dyn Kv,
@@ -608,36 +729,23 @@ pub(crate) fn execute_read(
     let Statement::Select(s) = stmt else {
         return Err(ExecError::Unsupported("not a SELECT".into()));
     };
-    // SP33: a single base table is the only FROM shape the executor handles for
-    // now — the nested-loop join builder lands in the next task. Anything else is
-    // rejected 0A000 here so the parser + router can land independently.
-    let (table, alias): (Option<Table>, Option<&str>) = match s.from.as_slice() {
-        [] => (None, None),
-        [pgparser::ast::TableExpr::Table { name, alias }] => (
-            Some(catalog::get_table(catalog_kv, name)?),
-            alias.as_deref(),
-        ),
-        _ => return Err(ExecError::Unsupported("joins land in the next task".into())),
-    };
-    let scope = match &table {
-        Some(t) => Scope::single(t, alias.unwrap_or(&t.name)),
-        None => Scope::empty(),
-    };
 
-    // Source rows: scan the table (dropping the rowid/xmin for projection), or a
-    // single empty row for FROM-less SELECT.
-    let source: Vec<Vec<Datum>> = match &table {
-        Some(t) => scan_live(kv, global, gsnap, snapshot, own, t)?
-            .into_iter()
-            .map(|(_, _, row)| row)
-            .collect(),
-        None => vec![vec![]],
+    // SP33: build the (possibly joined) relation. A FROM-less SELECT is one empty
+    // row over the empty scope; otherwise `build_from` folds the comma list as
+    // cross joins and recurses into each explicit join tree.
+    let relation = if s.from.is_empty() {
+        Relation {
+            scope: Scope::empty(),
+            rows: vec![vec![]],
+        }
+    } else {
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
     };
 
     // Filter (WHERE runs before grouping).
     let mut kept: Vec<Vec<Datum>> = Vec::new();
-    for row in &source {
-        if row_matches(s.filter.as_ref(), &scope, row)? {
+    for row in &relation.rows {
+        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
             kept.push(row.clone());
         }
     }
@@ -645,9 +753,9 @@ pub(crate) fn execute_read(
     // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
     // groups; everything else projects rows one-for-one.
     if crate::agg::is_aggregate_query(s) {
-        return crate::agg::execute_aggregate(s, &scope, kept);
+        return crate::agg::execute_aggregate(s, &relation.scope, kept);
     }
-    project_order_limit(s, &scope, kept)
+    project_order_limit(s, &relation.scope, kept)
 }
 
 /// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
@@ -861,40 +969,43 @@ pub(crate) fn resolve_projection(
     items: &[SelectItem],
     scope: &Scope,
 ) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
-    // SELECT * requires a FROM (the scope's columns drive the expansion).
-    if items == [SelectItem::Wildcard] {
-        if scope.columns.is_empty() {
-            return Err(ExecError::Unsupported(
-                "SELECT * with no FROM clause is not supported".into(),
-            ));
-        }
-        let fields = scope.columns.iter().map(|c| field(&c.name, c.ty)).collect();
-        let exprs = scope
-            .columns
-            .iter()
-            .map(|c| Expr::Column {
-                table: None,
-                name: c.name.clone(),
-            })
-            .collect();
-        return Ok((fields, exprs));
-    }
-    let mut fields = Vec::with_capacity(items.len());
-    let mut exprs = Vec::with_capacity(items.len());
+    // SP33: expand each item in turn so `*` spans every FROM table and `a.*`
+    // expands one qualifier. Each `*`-expanded column carries its qualifier so a
+    // multi-table `*` re-resolves unambiguously via `scope.resolve`.
+    let mut fields = Vec::new();
+    let mut exprs = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                return Err(ExecError::Unsupported(
-                    "* mixed with other items is not supported".into(),
-                ));
+                if scope.columns.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "SELECT * with no FROM clause is not supported".into(),
+                    ));
+                }
+                for c in &scope.columns {
+                    fields.push(field(&c.name, c.ty));
+                    exprs.push(Expr::Column {
+                        table: c.qualifier.clone(),
+                        name: c.name.clone(),
+                    });
+                }
             }
-            // SP33: `a.*` qualified-wildcard expansion lands with the join builder
-            // (the next task); the single-base-table read path of this slice does
-            // not expand it yet.
-            SelectItem::QualifiedWildcard(_) => {
-                return Err(ExecError::Unsupported(
-                    "qualified wildcard (a.*) lands in the next task".into(),
-                ));
+            SelectItem::QualifiedWildcard(q) => {
+                let cols: Vec<_> = scope
+                    .columns
+                    .iter()
+                    .filter(|c| c.qualifier.as_deref() == Some(q))
+                    .collect();
+                if cols.is_empty() {
+                    return Err(ExecError::MissingFromEntry(q.clone()));
+                }
+                for c in cols {
+                    fields.push(field(&c.name, c.ty));
+                    exprs.push(Expr::Column {
+                        table: c.qualifier.clone(),
+                        name: c.name.clone(),
+                    });
+                }
             }
             SelectItem::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| derived_name(expr));
@@ -995,17 +1106,10 @@ pub(crate) fn describe(
     let Some(Statement::Select(s)) = statements.first() else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
-    let (table, alias): (Option<Table>, Option<&str>) = match s.from.as_slice() {
-        [] => (None, None),
-        [pgparser::ast::TableExpr::Table { name, alias }] => (
-            Some(catalog::get_table(catalog_kv, name)?),
-            alias.as_deref(),
-        ),
-        _ => return Err(ExecError::Unsupported("joins land in the next task".into())),
-    };
-    let scope = match &table {
-        Some(t) => Scope::single(t, alias.unwrap_or(&t.name)),
-        None => Scope::empty(),
+    let scope = if s.from.is_empty() {
+        Scope::empty()
+    } else {
+        build_from_schema(catalog_kv, &s.from)?.scope
     };
     let (fields, _exprs) = resolve_projection(&s.projection, &scope)?;
     Ok(fields)
@@ -1225,6 +1329,69 @@ mod tests {
         );
         assert_eq!(text(&rows_of(r)[0][0]), Some("7".into()));
         assert_eq!(text(&rows_of(r)[0][1]), Some("x".into()));
+    }
+
+    #[tokio::test]
+    async fn inner_join_on_equi_key() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4, av text)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(3,'a3')").await;
+        run(&engine, "INSERT INTO b VALUES (2,'b2'),(3,'b3'),(4,'b4')").await;
+        let r = &run(
+            &engine,
+            "SELECT a.av, b.bv FROM a JOIN b ON a.id = b.id ORDER BY a.id",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r)
+            .iter()
+            .map(|row| (text(&row[0]), text(&row[1])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("a2".into()), Some("b2".into())),
+                (Some("a3".into()), Some("b3".into()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn comma_form_is_a_cross_join_filtered_by_where() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4)").await;
+        run(&engine, "INSERT INTO a VALUES (1),(2)").await;
+        run(&engine, "INSERT INTO b VALUES (2),(3)").await;
+        let r = &run(&engine, "SELECT a.id FROM a, b WHERE a.id = b.id").await[0];
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
+    }
+
+    #[tokio::test]
+    async fn self_join_requires_distinct_aliases() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, mgr int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1, NULL),(2, 1)").await;
+        let r = &run(
+            &engine,
+            "SELECT e.id, m.id FROM t e JOIN t m ON e.mgr = m.id",
+        )
+        .await[0];
+        assert_eq!(rows_of(r).len(), 1); // only (2 -> 1) matches
+    }
+
+    #[tokio::test]
+    async fn ambiguous_bare_column_is_42702() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4)").await;
+        let err = engine
+            .connect()
+            .simple_query("SELECT id FROM a JOIN b ON a.id = b.id")
+            .await
+            .expect_err("ambiguous");
+        assert_eq!(err.code, "42702");
     }
 
     #[tokio::test]
