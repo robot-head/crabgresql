@@ -20,11 +20,11 @@
 
 use std::cmp::Ordering;
 
-use catalog::Table;
 use pgparser::ast::{Expr, FuncArgs, FuncCall};
 use pgtypes::{ColumnType, Datum, ops};
 
 use crate::error::ExecError;
+use crate::scope::Scope;
 
 /// The scalar functions SP29 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,43 +114,40 @@ fn checked_args(fc: &FuncCall) -> Result<&[Expr], ExecError> {
 /// separate type-resolution pass (a pre-existing trait of the engine — the same
 /// is true of arithmetic), so an argument-type misuse THERE surfaces at runtime
 /// as 42804 rather than here as 42883. This per-clause difference is documented.
-pub(crate) fn scalar_result_type(
-    fc: &FuncCall,
-    table: Option<&Table>,
-) -> Result<ColumnType, ExecError> {
+pub(crate) fn scalar_result_type(fc: &FuncCall, scope: &Scope) -> Result<ColumnType, ExecError> {
     let f = scalar_func(&fc.name).ok_or_else(|| undefined_function(&fc.name))?;
     let args = checked_args(fc)?;
     let n = args.len();
     match f {
         ScalarFunc::Length => {
             require_arity(fc, n == 1)?;
-            require_text(&args[0], table)?;
+            require_text(&args[0], scope)?;
             Ok(ColumnType::Int4)
         }
         ScalarFunc::Upper | ScalarFunc::Lower => {
             require_arity(fc, n == 1)?;
-            require_text(&args[0], table)?;
+            require_text(&args[0], scope)?;
             Ok(ColumnType::Text)
         }
         ScalarFunc::Btrim | ScalarFunc::Ltrim | ScalarFunc::Rtrim => {
             require_arity(fc, n == 1 || n == 2)?;
             for a in args {
-                require_text(a, table)?;
+                require_text(a, scope)?;
             }
             Ok(ColumnType::Text)
         }
         ScalarFunc::Substr => {
             require_arity(fc, n == 2 || n == 3)?;
-            require_text(&args[0], table)?;
+            require_text(&args[0], scope)?;
             for a in &args[1..] {
-                require_int(a, table)?;
+                require_int(a, scope)?;
             }
             Ok(ColumnType::Text)
         }
         ScalarFunc::Replace => {
             require_arity(fc, n == 3)?;
             for a in args {
-                require_text(a, table)?;
+                require_text(a, scope)?;
             }
             Ok(ColumnType::Text)
         }
@@ -159,14 +156,14 @@ pub(crate) fn scalar_result_type(
         ScalarFunc::Abs => {
             require_arity(fc, n == 1)?;
             // abs preserves the numeric type (int width, or SP30's float8).
-            require_numeric(&args[0], table)
+            require_numeric(&args[0], scope)
         }
         ScalarFunc::Mod => {
             require_arity(fc, n == 2)?;
             // SP32: mod takes int OR numeric operands (PostgreSQL has no float8 mod);
             // a numeric operand makes the result numeric, else the int promotion.
-            let lt = require_int_or_numeric(&args[0], table)?;
-            let rt = require_int_or_numeric(&args[1], table)?;
+            let lt = require_int_or_numeric(&args[0], scope)?;
+            let rt = require_int_or_numeric(&args[1], scope)?;
             if lt.is_numeric() || rt.is_numeric() {
                 Ok(ColumnType::Numeric(None))
             } else {
@@ -175,7 +172,7 @@ pub(crate) fn scalar_result_type(
         }
         ScalarFunc::Coalesce | ScalarFunc::Greatest | ScalarFunc::Least => {
             require_arity(fc, n >= 1)?;
-            unify_args(args, table)
+            unify_args(args, scope)
         }
         ScalarFunc::NullIf => {
             require_arity(fc, n == 2)?;
@@ -183,7 +180,7 @@ pub(crate) fn scalar_result_type(
             if matches!(args[0], Expr::NullLiteral) {
                 Ok(ColumnType::Text)
             } else {
-                crate::eval::infer_type(&args[0], table)
+                crate::eval::infer_type(&args[0], scope)
             }
         }
     }
@@ -367,16 +364,16 @@ fn no_matching_function() -> ExecError {
 
 /// Require the argument to statically type as `text` (a bare `NULL` qualifies,
 /// since it types as text); otherwise the function does not exist for it (42883).
-fn require_text(arg: &Expr, table: Option<&Table>) -> Result<(), ExecError> {
-    match crate::eval::infer_type(arg, table)? {
+fn require_text(arg: &Expr, scope: &Scope) -> Result<(), ExecError> {
+    match crate::eval::infer_type(arg, scope)? {
         ColumnType::Text => Ok(()),
         _ => Err(no_matching_function()),
     }
 }
 
 /// Require the argument to statically type as an integer; returns that width.
-fn require_int(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
-    match crate::eval::infer_type(arg, table)? {
+fn require_int(arg: &Expr, scope: &Scope) -> Result<ColumnType, ExecError> {
+    match crate::eval::infer_type(arg, scope)? {
         t @ (ColumnType::Int4 | ColumnType::Int8) => Ok(t),
         _ => Err(no_matching_function()),
     }
@@ -384,8 +381,8 @@ fn require_int(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecErro
 
 /// SP32: require an int OR numeric argument (the `mod` operand types — PostgreSQL
 /// has no `float8` modulo).
-fn require_int_or_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
-    let t = crate::eval::infer_type(arg, table)?;
+fn require_int_or_numeric(arg: &Expr, scope: &Scope) -> Result<ColumnType, ExecError> {
+    let t = crate::eval::infer_type(arg, scope)?;
     if matches!(t, ColumnType::Int4 | ColumnType::Int8) || t.is_numeric() {
         Ok(t)
     } else {
@@ -395,8 +392,8 @@ fn require_int_or_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnTyp
 
 /// SP30/SP32: require a numeric argument (int4/int8/float8/numeric); returns that
 /// type so the caller (`abs`) can preserve it.
-fn require_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
-    let t = crate::eval::infer_type(arg, table)?;
+fn require_numeric(arg: &Expr, scope: &Scope) -> Result<ColumnType, ExecError> {
+    let t = crate::eval::infer_type(arg, scope)?;
     if matches!(t, ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8) || t.is_numeric() {
         Ok(t)
     } else {
@@ -406,10 +403,10 @@ fn require_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, Exec
 
 /// Unify every argument's type into one (for `coalesce`/`greatest`/`least`); an
 /// all-NULL argument list types as text. Incompatible types are 42804.
-fn unify_args(args: &[Expr], table: Option<&Table>) -> Result<ColumnType, ExecError> {
+fn unify_args(args: &[Expr], scope: &Scope) -> Result<ColumnType, ExecError> {
     let mut acc: Option<ColumnType> = None;
     for a in args {
-        acc = crate::eval::unify_branch(acc, a, table)?;
+        acc = crate::eval::unify_branch(acc, a, scope)?;
     }
     Ok(acc.unwrap_or(ColumnType::Text))
 }
@@ -532,18 +529,27 @@ mod tests {
         }
     }
 
+    /// The table's single-relation scope, or the empty (FROM-less) scope.
+    fn scope_of(t: Option<&Table>) -> Scope {
+        match t {
+            Some(t) => Scope::single(t, &t.name),
+            None => Scope::empty(),
+        }
+    }
+
     /// Evaluate a scalar-function expression with no row context.
     fn ev(sql: &str) -> Datum {
-        crate::eval::eval(&pexpr(sql).expect("parse"), None, &[]).expect("eval")
+        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[]).expect("eval")
     }
 
     fn err_code(sql: &str, t: Option<&Table>) -> String {
         // Drive both the static (projection) and runtime path: infer first (this
         // is what a projected expression hits), falling back to eval.
         let e = pexpr(sql).expect("parse");
-        crate::eval::infer_type(&e, t)
+        let scope = scope_of(t);
+        crate::eval::infer_type(&e, &scope)
             .err()
-            .or_else(|| crate::eval::eval(&e, t, &[Datum::Null, Datum::Null]).err())
+            .or_else(|| crate::eval::eval(&e, &scope, &[Datum::Null, Datum::Null]).err())
             .expect("expected error")
             .into_pg()
             .code
@@ -584,8 +590,12 @@ mod tests {
             Datum::Text("a-b-c".into())
         );
         // negative substring length is 22011-class (mapped to 42804 here).
-        let err = crate::eval::eval(&pexpr("substr('abc', 1, -1)").expect("p"), None, &[])
-            .expect_err("neg len");
+        let err = crate::eval::eval(
+            &pexpr("substr('abc', 1, -1)").expect("p"),
+            &Scope::empty(),
+            &[],
+        )
+        .expect_err("neg len");
         assert_eq!(err.into_pg().code, "42804");
     }
 
@@ -620,13 +630,14 @@ mod tests {
         let t = table();
         let err = crate::eval::eval(
             &pexpr("abs(n)").expect("p"),
-            Some(&t),
+            &scope_of(Some(&t)),
             &[Datum::Null, Datum::Int4(i32::MIN)],
         )
         .expect_err("overflow");
         assert_eq!(err.into_pg().code, "22003");
         // mod by zero is 22012.
-        let err = crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), None, &[]).expect_err("div0");
+        let err = crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), &Scope::empty(), &[])
+            .expect_err("div0");
         assert_eq!(err.into_pg().code, "22012");
     }
 
@@ -653,8 +664,8 @@ mod tests {
     #[test]
     fn result_types_for_row_description() {
         let t = table();
-        let ty =
-            |sql: &str| crate::eval::infer_type(&pexpr(sql).expect("p"), Some(&t)).expect("ty");
+        let scope = scope_of(Some(&t));
+        let ty = |sql: &str| crate::eval::infer_type(&pexpr(sql).expect("p"), &scope).expect("ty");
         assert_eq!(ty("length(s)"), ColumnType::Int4);
         assert_eq!(ty("upper(s)"), ColumnType::Text);
         assert_eq!(ty("substr(s, 1, 2)"), ColumnType::Text);

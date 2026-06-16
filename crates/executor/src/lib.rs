@@ -15,6 +15,7 @@ mod gtm;
 mod lockmgr;
 mod procarray;
 mod read_gate;
+mod scope;
 mod seq;
 mod session;
 

@@ -3,18 +3,14 @@
 
 use std::cmp::Ordering;
 
-use catalog::Table;
 use pgparser::ast::{BinaryOp, Expr, UnaryOp};
 use pgtypes::{ColumnType, Datum, TypeError, ops};
 
 use crate::error::ExecError;
+use crate::scope::Scope;
 
-/// Evaluate `expr` against a row (`values`, aligned to `table.columns`).
-pub(crate) fn eval(
-    expr: &Expr,
-    table: Option<&Table>,
-    values: &[Datum],
-) -> Result<Datum, ExecError> {
+/// Evaluate `expr` against a row (`values`, aligned to `scope.columns`).
+pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum, ExecError> {
     match expr {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
         // SP32: a bare decimal/exponent literal is `numeric` (arbitrary precision —
@@ -36,19 +32,16 @@ pub(crate) fn eval(
             "query parameters ($n) are not supported".into(),
         )),
         Expr::Column(name) => {
-            let t = table.ok_or_else(|| ExecError::UndefinedColumn(name.clone()))?;
-            let idx = t
-                .column_index(name)
-                .ok_or_else(|| ExecError::UndefinedColumn(name.clone()))?;
+            let idx = scope.resolve(None, name)?;
             Ok(values[idx].clone())
         }
         Expr::Unary { op, expr } => {
-            let v = eval(expr, table, values)?;
+            let v = eval(expr, scope, values)?;
             apply_unary(*op, &v)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval(left, table, values)?;
-            let r = eval(right, table, values)?;
+            let l = eval(left, scope, values)?;
+            let r = eval(right, scope, values)?;
             apply_binary(*op, &l, &r)
         }
         // A function call reached scalar `eval`: a SP29 scalar function evaluates
@@ -57,7 +50,7 @@ pub(crate) fn eval(
         // aggregates from accumulators) — a known aggregate here is misplaced /
         // nested (42803); any other name is undefined (42883).
         Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
-            crate::func::eval_scalar(fc, |e| eval(e, table, values))
+            crate::func::eval_scalar(fc, |e| eval(e, scope, values))
         }
         Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
         // SP28: predicate + conditional expressions. The pure-Datum combinators
@@ -65,7 +58,7 @@ pub(crate) fn eval(
         // the grouped evaluator (`agg::eval_grouped`); only the child-evaluation
         // closure differs.
         Expr::IsNull { expr, negated } => {
-            let v = eval(expr, table, values)?;
+            let v = eval(expr, scope, values)?;
             Ok(Datum::Bool(v.is_null() ^ *negated))
         }
         Expr::InList {
@@ -73,8 +66,8 @@ pub(crate) fn eval(
             list,
             negated,
         } => {
-            let x = eval(expr, table, values)?;
-            eval_in_list(&x, list, *negated, |e| eval(e, table, values))
+            let x = eval(expr, scope, values)?;
+            eval_in_list(&x, list, *negated, |e| eval(e, scope, values))
         }
         Expr::Between {
             expr,
@@ -82,9 +75,9 @@ pub(crate) fn eval(
             high,
             negated,
         } => {
-            let x = eval(expr, table, values)?;
-            let lo = eval(low, table, values)?;
-            let hi = eval(high, table, values)?;
+            let x = eval(expr, scope, values)?;
+            let lo = eval(low, scope, values)?;
+            let hi = eval(high, scope, values)?;
             eval_between(&x, &lo, &hi, *negated)
         }
         Expr::Like {
@@ -93,8 +86,8 @@ pub(crate) fn eval(
             negated,
             case_insensitive,
         } => {
-            let s = eval(expr, table, values)?;
-            let p = eval(pattern, table, values)?;
+            let s = eval(expr, scope, values)?;
+            let p = eval(pattern, scope, values)?;
             eval_like(&s, &p, *negated, *case_insensitive)
         }
         Expr::Case {
@@ -102,13 +95,13 @@ pub(crate) fn eval(
             whens,
             else_result,
         } => eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
-            eval(e, table, values)
+            eval(e, scope, values)
         }),
         // SP31: explicit cast — evaluate the operand, then convert. A text-parse
         // failure (22P02), numeric overflow (22003), or undefined cast (42846)
         // surfaces here; NULL casts to NULL.
         Expr::Cast { expr, ty } => {
-            let v = eval(expr, table, values)?;
+            let v = eval(expr, scope, values)?;
             Ok(pgtypes::cast::cast(&v, *ty)?)
         }
     }
@@ -341,7 +334,7 @@ fn cmp_result(op: BinaryOp, ord: Option<Ordering>) -> Datum {
 }
 
 /// Statically infer the result column type of an expression, for RowDescription.
-pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
+pub(crate) fn infer_type(expr: &Expr, scope: &Scope) -> Result<ColumnType, ExecError> {
     match expr {
         Expr::IntLiteral(s) => match ops::int_literal(s)? {
             Datum::Int4(_) => Ok(ColumnType::Int4),
@@ -359,26 +352,23 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
             "query parameters ($n) are not supported".into(),
         )),
         Expr::Column(name) => {
-            let t = table.ok_or_else(|| ExecError::UndefinedColumn(name.clone()))?;
-            let idx = t
-                .column_index(name)
-                .ok_or_else(|| ExecError::UndefinedColumn(name.clone()))?;
-            Ok(t.columns[idx].ty)
+            let idx = scope.resolve(None, name)?;
+            Ok(scope.ty_at(idx))
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Not => Ok(ColumnType::Bool),
-            UnaryOp::Neg => infer_type(expr, table),
+            UnaryOp::Neg => infer_type(expr, scope),
         },
         Expr::Binary { op, left, right } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                let (lt, rt) = (infer_type(left, table)?, infer_type(right, table)?);
+                let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
                 Ok(numeric_result_type(lt, rt))
             }
             // SP29: `||` yields text. PostgreSQL resolves the operator at plan
             // time and requires at least one operand to be text (`text || anynonarray`
             // / `anynonarray || text`); neither-text (e.g. `int || int`) is 42883.
             BinaryOp::Concat => {
-                let (lt, rt) = (infer_type(left, table)?, infer_type(right, table)?);
+                let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
                 if lt != ColumnType::Text && rt != ColumnType::Text {
                     return Err(ExecError::UndefinedFunction(format!(
                         "operator does not exist: {} || {}",
@@ -394,22 +384,22 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
         // type for RowDescription (count/sum -> int8, min/max -> the argument's
         // type); unknown names / bad arity / bad argument type -> 42883.
         Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
-            crate::func::scalar_result_type(fc, table)
+            crate::func::scalar_result_type(fc, scope)
         }
-        Expr::Func(fc) => crate::agg::func_result_type(fc, table),
+        Expr::Func(fc) => crate::agg::func_result_type(fc, scope),
         // SP28: predicates are boolean; CASE unifies its branch result types.
         Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => {
             Ok(ColumnType::Bool)
         }
         Expr::Case {
             whens, else_result, ..
-        } => infer_case_type(whens, else_result.as_deref(), table),
+        } => infer_case_type(whens, else_result.as_deref(), scope),
         // SP31: a cast's static result type is the target type — but only if the
         // cast is defined; an undefined `(from, to)` pair is 42846 at plan time
         // (so it is rejected before any row is produced). A bare `NULL` infers as
         // text, and text → anything is defined, so `NULL::<any>` is accepted.
         Expr::Cast { expr, ty } => {
-            let from = infer_type(expr, table)?;
+            let from = infer_type(expr, scope)?;
             if pgtypes::cast::cast_allowed(from, *ty) {
                 Ok(*ty)
             } else {
@@ -428,14 +418,14 @@ pub(crate) fn infer_type(expr: &Expr, table: Option<&Table>) -> Result<ColumnTyp
 fn infer_case_type(
     whens: &[(Expr, Expr)],
     else_result: Option<&Expr>,
-    table: Option<&Table>,
+    scope: &Scope,
 ) -> Result<ColumnType, ExecError> {
     let mut acc: Option<ColumnType> = None;
     for (_, result) in whens {
-        acc = unify_branch(acc, result, table)?;
+        acc = unify_branch(acc, result, scope)?;
     }
     if let Some(e) = else_result {
-        acc = unify_branch(acc, e, table)?;
+        acc = unify_branch(acc, e, scope)?;
     }
     Ok(acc.unwrap_or(ColumnType::Text))
 }
@@ -446,12 +436,12 @@ fn infer_case_type(
 pub(crate) fn unify_branch(
     acc: Option<ColumnType>,
     expr: &Expr,
-    table: Option<&Table>,
+    scope: &Scope,
 ) -> Result<Option<ColumnType>, ExecError> {
     if matches!(expr, Expr::NullLiteral) {
         return Ok(acc); // a bare NULL branch is type-neutral
     }
-    let t = infer_type(expr, table)?;
+    let t = infer_type(expr, scope)?;
     match acc {
         None => Ok(Some(t)),
         Some(a) => Ok(Some(unify_types(a, t)?)),
@@ -520,8 +510,17 @@ mod tests {
         }
     }
 
+    /// Build the `Scope` the tests evaluate against: the table's single-relation
+    /// scope, or the empty scope (FROM-less expressions).
+    fn scope_of(t: Option<&Table>) -> Scope {
+        match t {
+            Some(t) => Scope::single(t, &t.name),
+            None => Scope::empty(),
+        }
+    }
+
     fn ev(sql: &str, t: Option<&Table>, vals: &[Datum]) -> Datum {
-        eval(&pexpr(sql).expect("parse"), t, vals).expect("eval")
+        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals).expect("eval")
     }
 
     #[test]
@@ -559,7 +558,7 @@ mod tests {
         // SP32: a bare decimal literal evaluates and types as `numeric`.
         assert_eq!(ev("1.5", None, &[]), num("1.5"));
         assert_eq!(
-            infer_type(&pexpr("1.5").expect("parse"), None).expect("infer"),
+            infer_type(&pexpr("1.5").expect("parse"), &scope_of(None)).expect("infer"),
             ColumnType::Numeric(None)
         );
         // int ⊕ numeric promotes to numeric (exact). `3 / 2.0` uses PG's div scale.
@@ -567,14 +566,15 @@ mod tests {
         assert_eq!(ev("3 / 2.0", None, &[]), num("1.5000000000000000"));
         assert_eq!(ev("- 2.5", None, &[]), num("-2.5"));
         assert_eq!(
-            infer_type(&pexpr("a + 1.0").expect("parse"), Some(&table())).expect("infer"),
+            infer_type(&pexpr("a + 1.0").expect("parse"), &scope_of(Some(&table())))
+                .expect("infer"),
             ColumnType::Numeric(None)
         );
         // CASE/coalesce unify int and numeric to numeric.
         assert_eq!(
             infer_type(
                 &pexpr("case when a > 0 then 1 else 2.5 end").expect("parse"),
-                Some(&table())
+                &scope_of(Some(&table()))
             )
             .expect("infer"),
             ColumnType::Numeric(None)
@@ -589,7 +589,7 @@ mod tests {
         let t = table();
         let err = eval(
             &pexpr("zzz").expect("parse"),
-            Some(&t),
+            &scope_of(Some(&t)),
             &[Datum::Int4(1), Datum::Int4(1)],
         )
         .expect_err("eval zzz should fail");
@@ -598,7 +598,8 @@ mod tests {
 
     #[test]
     fn parameter_is_0a000() {
-        let err = eval(&pexpr("$1").expect("parse"), None, &[]).expect_err("eval $1 should fail");
+        let err = eval(&pexpr("$1").expect("parse"), &scope_of(None), &[])
+            .expect_err("eval $1 should fail");
         assert_eq!(err.into_pg().code, "0A000");
     }
 
@@ -606,19 +607,19 @@ mod tests {
     fn type_inference_is_static() {
         let t = table();
         assert_eq!(
-            infer_type(&pexpr("a + b").expect("parse"), Some(&t)).expect("infer"),
+            infer_type(&pexpr("a + b").expect("parse"), &scope_of(Some(&t))).expect("infer"),
             ColumnType::Int4
         );
         assert_eq!(
-            infer_type(&pexpr("a > b").expect("parse"), Some(&t)).expect("infer"),
+            infer_type(&pexpr("a > b").expect("parse"), &scope_of(Some(&t))).expect("infer"),
             ColumnType::Bool
         );
         assert_eq!(
-            infer_type(&pexpr("'x'").expect("parse"), None).expect("infer"),
+            infer_type(&pexpr("'x'").expect("parse"), &scope_of(None)).expect("infer"),
             ColumnType::Text
         );
         assert_eq!(
-            infer_type(&pexpr("2147483648").expect("parse"), None).expect("infer"),
+            infer_type(&pexpr("2147483648").expect("parse"), &scope_of(None)).expect("infer"),
             ColumnType::Int8
         );
     }
@@ -626,7 +627,7 @@ mod tests {
     // ---- SP28: predicate + conditional expression breadth ----
 
     fn err_code(sql: &str, t: Option<&Table>, vals: &[Datum]) -> String {
-        eval(&pexpr(sql).expect("parse"), t, vals)
+        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals)
             .expect_err("expected error")
             .into_pg()
             .code
@@ -765,16 +766,16 @@ mod tests {
         let t = table();
         // The static result type is the target type; a column operand resolves too.
         assert_eq!(
-            infer_type(&pexpr("'42'::int8").expect("parse"), None).expect("infer"),
+            infer_type(&pexpr("'42'::int8").expect("parse"), &scope_of(None)).expect("infer"),
             ColumnType::Int8
         );
         assert_eq!(
-            infer_type(&pexpr("a::text").expect("parse"), Some(&t)).expect("infer"),
+            infer_type(&pexpr("a::text").expect("parse"), &scope_of(Some(&t))).expect("infer"),
             ColumnType::Text
         );
         // A bare NULL infers as text, and text → anything is defined.
         assert_eq!(
-            infer_type(&pexpr("null::bool").expect("parse"), None).expect("infer"),
+            infer_type(&pexpr("null::bool").expect("parse"), &scope_of(None)).expect("infer"),
             ColumnType::Bool
         );
         // An undefined cast is rejected at plan time (42846), before evaluation:
@@ -787,7 +788,7 @@ mod tests {
                 ty: ColumnType::Float8,
             }],
         };
-        let err = infer_type(&pexpr("a::bool").expect("parse"), Some(&ft))
+        let err = infer_type(&pexpr("a::bool").expect("parse"), &scope_of(Some(&ft)))
             .expect_err("float8->bool is undefined");
         assert_eq!(err.into_pg().code, "42846");
     }
@@ -803,16 +804,17 @@ mod tests {
     #[test]
     fn infer_predicate_and_case_result_types() {
         let t = table();
+        let scope = scope_of(Some(&t));
         for sql in ["a is null", "a in (1,2)", "a between 1 and 2", "a like 'x'"] {
             // `a` is int4; `a like 'x'` infers Bool statically regardless.
-            let got = infer_type(&pexpr(sql).expect("parse"), Some(&t)).expect("infer");
+            let got = infer_type(&pexpr(sql).expect("parse"), &scope).expect("infer");
             assert_eq!(got, ColumnType::Bool, "for {sql}");
         }
         // CASE unifies int4 + int8 -> int8.
         assert_eq!(
             infer_type(
                 &pexpr("case when a > 0 then 1 else 2147483648 end").expect("parse"),
-                Some(&t)
+                &scope
             )
             .expect("infer"),
             ColumnType::Int8
@@ -821,7 +823,7 @@ mod tests {
         assert_eq!(
             infer_type(
                 &pexpr("case when a > 0 then 1 else null end").expect("parse"),
-                Some(&t)
+                &scope
             )
             .expect("infer"),
             ColumnType::Int4
@@ -829,7 +831,7 @@ mod tests {
         // incompatible branch types -> 42804.
         let err = infer_type(
             &pexpr("case when a > 0 then 1 else 'x' end").expect("parse"),
-            Some(&t),
+            &scope,
         )
         .expect_err("incompatible");
         assert_eq!(err.into_pg().code, "42804");

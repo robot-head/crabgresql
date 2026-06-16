@@ -10,6 +10,7 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
+use crate::scope::Scope;
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
 /// the sequence read.
@@ -139,7 +140,7 @@ pub(crate) async fn execute_write(
                 let mut full = vec![pgtypes::Datum::Null; t.columns.len()];
                 for (slot, expr) in target_idx.iter().zip(row_exprs.iter()) {
                     // VALUES expressions are literal (no FROM/columns in scope).
-                    let v = crate::eval::eval(expr, None, &[])?;
+                    let v = crate::eval::eval(expr, &Scope::empty(), &[])?;
                     full[*slot] = coerce(v, t.columns[*slot].ty)?;
                 }
                 ops.push(kv::WriteOp::Put {
@@ -160,6 +161,7 @@ pub(crate) async fn execute_write(
             filter,
         } => {
             let t = catalog::get_table(catalog_kv, table)?;
+            let scope = Scope::single(&t, &t.name);
             // Resolve each assignment's target column index up front (42703 on miss).
             let targets: Vec<(usize, &Expr)> = assignments
                 .iter()
@@ -176,7 +178,7 @@ pub(crate) async fn execute_write(
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause (avoids over-locking and
                 //    restores row-level write concurrency for different rows).
-                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -204,12 +206,12 @@ pub(crate) async fn execute_write(
                 };
                 // 4. Re-check the filter on the (possibly re-found) current row —
                 //    under READ COMMITTED the row may have changed since the scan.
-                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
                 let mut next = cur_row.clone();
                 for (idx, expr) in &targets {
-                    let v = crate::eval::eval(expr, Some(&t), &cur_row)?;
+                    let v = crate::eval::eval(expr, &scope, &cur_row)?;
                     next[*idx] = coerce(v, t.columns[*idx].ty)?;
                 }
                 if cur_xmin == xid {
@@ -243,13 +245,14 @@ pub(crate) async fn execute_write(
         }
         Statement::Delete { table, filter } => {
             let t = catalog::get_table(catalog_kv, table)?;
+            let scope = Scope::single(&t, &t.name);
             let mut n: u64 = 0;
             for (rowid, _xmin, scanned_row) in
                 scan_live(kv, global, gsnap, snapshot, Some(xid), &t)?
             {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause.
-                if !row_matches(filter.as_ref(), Some(&t), &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -275,7 +278,7 @@ pub(crate) async fn execute_write(
                     continue; // already deleted by a concurrent committed txn
                 };
                 // 4. Re-check filter on the (possibly re-found) current row.
-                if !row_matches(filter.as_ref(), Some(&t), &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
                     continue; // no longer matches the WHERE clause
                 }
                 if cur_xmin == xid {
@@ -577,12 +580,12 @@ pub(crate) fn scan_live(
 /// Evaluate an optional WHERE predicate against a row (NULL => false, like SELECT).
 fn row_matches(
     filter: Option<&Expr>,
-    table: Option<&catalog::Table>,
+    scope: &Scope,
     row: &[pgtypes::Datum],
 ) -> Result<bool, ExecError> {
     match filter {
         None => Ok(true),
-        Some(f) => match crate::eval::eval(f, table, row)? {
+        Some(f) => match crate::eval::eval(f, scope, row)? {
             pgtypes::Datum::Bool(b) => Ok(b),
             pgtypes::Datum::Null => Ok(false),
             _ => Err(ExecError::TypeMismatch(
@@ -609,6 +612,10 @@ pub(crate) fn execute_read(
         Some(name) => Some(catalog::get_table(catalog_kv, name)?),
         None => None,
     };
+    let scope = match &table {
+        Some(t) => Scope::single(t, &t.name),
+        None => Scope::empty(),
+    };
 
     // Source rows: scan the table (dropping the rowid/xmin for projection), or a
     // single empty row for FROM-less SELECT.
@@ -623,7 +630,7 @@ pub(crate) fn execute_read(
     // Filter (WHERE runs before grouping).
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &source {
-        if row_matches(s.filter.as_ref(), table.as_ref(), row)? {
+        if row_matches(s.filter.as_ref(), &scope, row)? {
             kept.push(row.clone());
         }
     }
@@ -631,9 +638,9 @@ pub(crate) fn execute_read(
     // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
     // groups; everything else projects rows one-for-one.
     if crate::agg::is_aggregate_query(s) {
-        return crate::agg::execute_aggregate(s, table.as_ref(), kept);
+        return crate::agg::execute_aggregate(s, &scope, kept);
     }
-    project_order_limit(s, table.as_ref(), kept)
+    project_order_limit(s, &scope, kept)
 }
 
 /// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
@@ -672,6 +679,7 @@ pub(crate) async fn execute_read_locking(
         .as_ref()
         .ok_or_else(|| ExecError::Unsupported("FOR UPDATE/SHARE requires a FROM clause".into()))?;
     let t = catalog::get_table(catalog_kv, table_name)?;
+    let scope = Scope::single(&t, &t.name);
 
     // Scan visible rows, then lock and EvalPlanQual-recheck each one.
     let mut kept: Vec<Vec<Datum>> = Vec::new();
@@ -679,7 +687,7 @@ pub(crate) async fn execute_read_locking(
         // 1. Filter on the snapshot-visible row FIRST — only lock rows that
         //    match the WHERE clause (a FOR UPDATE/SHARE with no WHERE still
         //    locks all rows because row_matches(None, ..) returns true).
-        if !row_matches(s.filter.as_ref(), Some(&t), &scanned_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &scanned_row)? {
             continue;
         }
 
@@ -706,13 +714,13 @@ pub(crate) async fn execute_read_locking(
         };
 
         // 4. Re-apply the WHERE filter against the (possibly newer) row.
-        if !row_matches(s.filter.as_ref(), Some(&t), &cur_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &cur_row)? {
             continue; // no longer matches
         }
         kept.push(cur_row);
     }
 
-    project_order_limit(s, Some(&t), kept)
+    project_order_limit(s, &scope, kept)
 }
 
 /// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
@@ -720,16 +728,16 @@ pub(crate) async fn execute_read_locking(
 /// and `execute_read_locking` to avoid duplication.
 fn project_order_limit(
     s: &SelectStmt,
-    table: Option<&Table>,
+    scope: &Scope,
     mut kept: Vec<Vec<Datum>>,
 ) -> Result<QueryResult, ExecError> {
     // Resolve the projection into (field, expr) pairs.
-    let (fields, out_exprs) = resolve_projection(&s.projection, table)?;
+    let (fields, out_exprs) = resolve_projection(&s.projection, scope)?;
 
     // SP28: SELECT DISTINCT projects FIRST so dedup is over output rows, then
     // ORDER BY sorts the deduped output (its keys must be select-list columns).
     if s.distinct {
-        let mut projected = project_rows(&out_exprs, table, &kept)?;
+        let mut projected = project_rows(&out_exprs, scope, &kept)?;
         let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
         projected.retain(|r| seen.insert(r.clone()));
         if !s.order_by.is_empty() {
@@ -755,7 +763,7 @@ fn project_order_limit(
         for row in kept {
             let mut keys = Vec::with_capacity(s.order_by.len());
             for item in &s.order_by {
-                keys.push(crate::eval::eval(&item.expr, table, &row)?);
+                keys.push(crate::eval::eval(&item.expr, scope, &row)?);
             }
             keyed.push((keys, row));
         }
@@ -766,7 +774,7 @@ fn project_order_limit(
     // SP28: OFFSET (skip) then LIMIT (take), before projection.
     apply_offset_limit(&mut kept, s.offset, s.limit);
 
-    let projected = project_rows(&out_exprs, table, &kept)?;
+    let projected = project_rows(&out_exprs, scope, &kept)?;
     Ok(rows_result(fields, &projected))
 }
 
@@ -774,14 +782,14 @@ fn project_order_limit(
 /// Datum rows (one `Datum` per output column).
 fn project_rows(
     out_exprs: &[Expr],
-    table: Option<&Table>,
+    scope: &Scope,
     rows: &[Vec<Datum>],
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = Vec::with_capacity(out_exprs.len());
         for e in out_exprs {
-            cells.push(crate::eval::eval(e, table, row)?);
+            cells.push(crate::eval::eval(e, scope, row)?);
         }
         out.push(cells);
     }
@@ -836,15 +844,17 @@ pub(crate) fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<i64>, limi
 /// that produce each column.
 pub(crate) fn resolve_projection(
     items: &[SelectItem],
-    table: Option<&Table>,
+    scope: &Scope,
 ) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
-    // SELECT * requires a FROM.
+    // SELECT * requires a FROM (the scope's columns drive the expansion).
     if items == [SelectItem::Wildcard] {
-        let t = table.ok_or_else(|| {
-            ExecError::Unsupported("SELECT * with no FROM clause is not supported".into())
-        })?;
-        let fields = t.columns.iter().map(|c| field(&c.name, c.ty)).collect();
-        let exprs = t
+        if scope.columns.is_empty() {
+            return Err(ExecError::Unsupported(
+                "SELECT * with no FROM clause is not supported".into(),
+            ));
+        }
+        let fields = scope.columns.iter().map(|c| field(&c.name, c.ty)).collect();
+        let exprs = scope
             .columns
             .iter()
             .map(|c| Expr::Column(c.name.clone()))
@@ -862,7 +872,7 @@ pub(crate) fn resolve_projection(
             }
             SelectItem::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| derived_name(expr));
-                let ty = crate::eval::infer_type(expr, table)?;
+                let ty = crate::eval::infer_type(expr, scope)?;
                 fields.push(field(&name, ty));
                 exprs.push(expr.clone());
             }
@@ -963,7 +973,11 @@ pub(crate) fn describe(
         Some(name) => Some(catalog::get_table(catalog_kv, name)?),
         None => None,
     };
-    let (fields, _exprs) = resolve_projection(&s.projection, table.as_ref())?;
+    let scope = match &table {
+        Some(t) => Scope::single(t, &t.name),
+        None => Scope::empty(),
+    };
+    let (fields, _exprs) = resolve_projection(&s.projection, &scope)?;
     Ok(fields)
 }
 
