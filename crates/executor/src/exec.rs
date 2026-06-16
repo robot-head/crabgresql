@@ -11,7 +11,7 @@ use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
 use crate::join::{Relation, join_relations};
-use crate::scope::Scope;
+use crate::scope::{ColumnBinding, Scope};
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
 /// the sequence read.
@@ -656,10 +656,75 @@ fn build_table_expr(
             let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right)?;
             join_relations(l, r, *kind, constraint)
         }
-        TableExpr::Derived { .. } => Err(ExecError::Unsupported(
-            "derived tables land in a later task".into(),
-        )),
+        TableExpr::Derived { subquery, alias } => {
+            let inner = select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, subquery)?;
+            // Re-qualify every output column under the derived alias.
+            let columns = inner
+                .scope
+                .columns
+                .into_iter()
+                .map(|c| ColumnBinding {
+                    qualifier: Some(alias.clone()),
+                    ..c
+                })
+                .collect();
+            Ok(Relation {
+                scope: Scope { columns },
+                rows: inner.rows,
+            })
+        }
     }
+}
+
+/// Run a SELECT to a `Relation` (output columns + rows). The top-level
+/// `execute_read` renders this to a `QueryResult`; a derived table re-qualifies
+/// its columns under the derived alias. Non-correlated only (the subquery's scope
+/// is built solely from its own FROM clause).
+#[allow(clippy::too_many_arguments)]
+fn select_to_relation(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    s: &SelectStmt,
+) -> Result<Relation, ExecError> {
+    let relation = if s.from.is_empty() {
+        Relation {
+            scope: Scope::empty(),
+            rows: vec![vec![]],
+        }
+    } else {
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
+    };
+    let mut kept = Vec::new();
+    for row in &relation.rows {
+        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
+            kept.push(row.clone());
+        }
+    }
+    let (fields, out_exprs, tys) = resolve_projection(&s.projection, &relation.scope)?;
+    let out_scope = Scope {
+        columns: fields
+            .iter()
+            .zip(&tys)
+            .map(|(f, ty)| ColumnBinding {
+                qualifier: None, // a projected result has no base-table qualifier
+                name: f.name.clone(),
+                ty: *ty,
+            })
+            .collect(),
+    };
+    let rows = if crate::agg::is_aggregate_query(s) {
+        crate::agg::aggregate_rows(s, &relation.scope, kept)?
+    } else {
+        project_rows_ordered(s, &relation.scope, &out_exprs, kept)?
+    };
+    Ok(Relation {
+        scope: out_scope,
+        rows,
+    })
 }
 
 /// Schema-only relation builder for `describe` — parallels `build_from` but base
@@ -710,9 +775,27 @@ fn build_table_expr_schema(
             let r = build_table_expr_schema(catalog_kv, right)?;
             join_relations(l, r, *kind, constraint)
         }
-        TableExpr::Derived { .. } => Err(ExecError::Unsupported(
-            "derived tables land in a later task".into(),
-        )),
+        TableExpr::Derived { subquery, alias } => {
+            let inner_scope = if subquery.from.is_empty() {
+                Scope::empty()
+            } else {
+                build_from_schema(catalog_kv, &subquery.from)?.scope
+            };
+            let (fields, _exprs, tys) = resolve_projection(&subquery.projection, &inner_scope)?;
+            let columns = fields
+                .iter()
+                .zip(&tys)
+                .map(|(f, ty)| ColumnBinding {
+                    qualifier: Some(alias.clone()),
+                    name: f.name.clone(),
+                    ty: *ty,
+                })
+                .collect();
+            Ok(Relation {
+                scope: Scope { columns },
+                rows: Vec::new(),
+            })
+        }
     }
 }
 
@@ -846,25 +929,23 @@ pub(crate) async fn execute_read_locking(
     project_order_limit(s, &scope, kept)
 }
 
-/// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
-/// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
-/// and `execute_read_locking` to avoid duplication.
-fn project_order_limit(
+/// Apply DISTINCT / ORDER BY / OFFSET / LIMIT and projection, returning the
+/// projected output Datum rows. Shared by the top-level row path and derived
+/// tables.
+fn project_rows_ordered(
     s: &SelectStmt,
     scope: &Scope,
+    out_exprs: &[Expr],
     mut kept: Vec<Vec<Datum>>,
-) -> Result<QueryResult, ExecError> {
-    // Resolve the projection into (field, expr) pairs.
-    let (fields, out_exprs) = resolve_projection(&s.projection, scope)?;
-
-    // SP28: SELECT DISTINCT projects FIRST so dedup is over output rows, then
-    // ORDER BY sorts the deduped output (its keys must be select-list columns).
+) -> Result<Vec<Vec<Datum>>, ExecError> {
+    // SP28: SELECT DISTINCT projects FIRST, dedups output rows, then ORDER BY
+    // sorts the deduped output (keys must be select-list columns).
     if s.distinct {
-        let mut projected = project_rows(&out_exprs, scope, &kept)?;
+        let mut projected = project_rows(out_exprs, scope, &kept)?;
         let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
         projected.retain(|r| seen.insert(r.clone()));
         if !s.order_by.is_empty() {
-            let idxs = distinct_order_indices(s, &out_exprs)?;
+            let idxs = distinct_order_indices(s, out_exprs)?;
             let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = projected
                 .into_iter()
                 .map(|r| {
@@ -876,12 +957,10 @@ fn project_order_limit(
             projected = keyed.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_limit(&mut projected, s.offset, s.limit);
-        return Ok(rows_result(fields, &projected));
+        return Ok(projected);
     }
-
-    // ORDER BY: sort by evaluated order keys (over the source row).
+    // ORDER BY over the source row, then OFFSET/LIMIT, then project.
     if !s.order_by.is_empty() {
-        // Precompute keys to keep comparisons total and error-free during sort.
         let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(kept.len());
         for row in kept {
             let mut keys = Vec::with_capacity(s.order_by.len());
@@ -893,12 +972,21 @@ fn project_order_limit(
         keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
-
-    // SP28: OFFSET (skip) then LIMIT (take), before projection.
     apply_offset_limit(&mut kept, s.offset, s.limit);
+    project_rows(out_exprs, scope, &kept)
+}
 
-    let projected = project_rows(&out_exprs, scope, &kept)?;
-    Ok(rows_result(fields, &projected))
+/// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
+/// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
+/// and `execute_read_locking` to avoid duplication.
+fn project_order_limit(
+    s: &SelectStmt,
+    scope: &Scope,
+    kept: Vec<Vec<Datum>>,
+) -> Result<QueryResult, ExecError> {
+    let (fields, out_exprs, _tys) = resolve_projection(&s.projection, scope)?;
+    let rows = project_rows_ordered(s, scope, &out_exprs, kept)?;
+    Ok(rows_result(fields, &rows))
 }
 
 /// Evaluate the projection expressions for each source row, yielding output
@@ -920,7 +1008,7 @@ fn project_rows(
 }
 
 /// Encode projected Datum rows into a `QueryResult::Rows` (text + binary cells).
-fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
+pub(crate) fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
     let rows: Vec<Vec<Option<Cell>>> = projected
         .iter()
         .map(|r| r.iter().map(datum_to_cell).collect())
@@ -963,17 +1051,21 @@ pub(crate) fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<i64>, limi
     }
 }
 
-/// Expand the projection list into output FieldDescriptions and the expressions
-/// that produce each column.
+/// Expand the projection list into output FieldDescriptions, the expressions
+/// that produce each column, and each column's `ColumnType` (the third element
+/// lets `select_to_relation` build a derived table's output scope without
+/// re-inferring types).
+#[allow(clippy::type_complexity)]
 pub(crate) fn resolve_projection(
     items: &[SelectItem],
     scope: &Scope,
-) -> Result<(Vec<FieldDescription>, Vec<Expr>), ExecError> {
+) -> Result<(Vec<FieldDescription>, Vec<Expr>, Vec<ColumnType>), ExecError> {
     // SP33: expand each item in turn so `*` spans every FROM table and `a.*`
     // expands one qualifier. Each `*`-expanded column carries its qualifier so a
     // multi-table `*` re-resolves unambiguously via `scope.resolve`.
     let mut fields = Vec::new();
     let mut exprs = Vec::new();
+    let mut tys = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard => {
@@ -988,6 +1080,7 @@ pub(crate) fn resolve_projection(
                         table: c.qualifier.clone(),
                         name: c.name.clone(),
                     });
+                    tys.push(c.ty);
                 }
             }
             SelectItem::QualifiedWildcard(q) => {
@@ -1005,6 +1098,7 @@ pub(crate) fn resolve_projection(
                         table: c.qualifier.clone(),
                         name: c.name.clone(),
                     });
+                    tys.push(c.ty);
                 }
             }
             SelectItem::Expr { expr, alias } => {
@@ -1012,10 +1106,11 @@ pub(crate) fn resolve_projection(
                 let ty = crate::eval::infer_type(expr, scope)?;
                 fields.push(field(&name, ty));
                 exprs.push(expr.clone());
+                tys.push(ty);
             }
         }
     }
-    Ok((fields, exprs))
+    Ok((fields, exprs, tys))
 }
 
 fn derived_name(expr: &Expr) -> String {
@@ -1111,7 +1206,7 @@ pub(crate) fn describe(
     } else {
         build_from_schema(catalog_kv, &s.from)?.scope
     };
-    let (fields, _exprs) = resolve_projection(&s.projection, &scope)?;
+    let (fields, _exprs, _tys) = resolve_projection(&s.projection, &scope)?;
     Ok(fields)
 }
 
@@ -1329,6 +1424,34 @@ mod tests {
         );
         assert_eq!(text(&rows_of(r)[0][0]), Some("7".into()));
         assert_eq!(text(&rows_of(r)[0][1]), Some("x".into()));
+    }
+
+    #[tokio::test]
+    async fn derived_table_in_from() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, v int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,10),(2,20),(3,30)").await;
+        let r = &run(
+            &engine,
+            "SELECT d.s FROM (SELECT v + 1 AS s FROM t WHERE id > 1) d ORDER BY d.s",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(got, vec![Some("21".into()), Some("31".into())]);
+    }
+
+    #[tokio::test]
+    async fn join_against_a_derived_table() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (id int4, v int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,10),(2,20)").await;
+        let r = &run(
+            &engine,
+            "SELECT t.id, d.mx FROM t JOIN (SELECT max(v) AS mx FROM t) d ON t.v = d.mx",
+        )
+        .await[0];
+        assert_eq!(rows_of(r).len(), 1);
+        assert_eq!(text(&rows_of(r)[0][0]), Some("2".into()));
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use pgparser::ast::{Expr, FuncArgs, FuncCall, SelectItem, SelectStmt};
 use pgtypes::{ColumnType, Datum, TypeError, ops};
-use pgwire::engine::{Cell, QueryResult};
+use pgwire::engine::QueryResult;
 
 use crate::error::ExecError;
 use crate::scope::Scope;
@@ -731,15 +731,31 @@ fn as_f64(d: &Datum) -> Option<f64> {
     }
 }
 
-/// Execute an aggregate query over the already-`WHERE`-filtered `rows`.
+/// Execute an aggregate query over the already-`WHERE`-filtered `rows`, returning
+/// the final `QueryResult::Rows`. Thin wrapper over `aggregate_rows` — the row-
+/// producing core shared with derived tables (`select_to_relation`).
 pub(crate) fn execute_aggregate(
     s: &SelectStmt,
     scope: &Scope,
     rows: Vec<Vec<Datum>>,
 ) -> Result<QueryResult, ExecError> {
-    // Output columns: field names + types via the shared projection resolver
-    // (infer_type now understands aggregate result types).
-    let (fields, out_exprs) = crate::exec::resolve_projection(&s.projection, scope)?;
+    let (fields, _exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
+    let out_rows = aggregate_rows(s, scope, rows)?;
+    Ok(crate::exec::rows_result(fields, &out_rows))
+}
+
+/// Fold an aggregate query over the already-`WHERE`-filtered `rows`, returning the
+/// projected output Datum rows (HAVING / DISTINCT / ORDER BY / OFFSET / LIMIT all
+/// applied). `execute_aggregate` renders these to a `QueryResult`; a derived table
+/// re-qualifies them under its alias.
+pub(crate) fn aggregate_rows(
+    s: &SelectStmt,
+    scope: &Scope,
+    rows: Vec<Vec<Datum>>,
+) -> Result<Vec<Vec<Datum>>, ExecError> {
+    // Output columns: the expressions that produce each column via the shared
+    // projection resolver (infer_type now understands aggregate result types).
+    let (_fields, out_exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
 
     // GROUP BY expressions may not themselves be aggregates.
     for g in &s.group_by {
@@ -839,16 +855,7 @@ pub(crate) fn execute_aggregate(
     // SP28: OFFSET then LIMIT.
     crate::exec::apply_offset_limit(&mut out, s.offset, s.limit);
 
-    let rows_out: Vec<Vec<Option<Cell>>> = out
-        .into_iter()
-        .map(|(_, proj)| proj.iter().map(crate::exec::datum_to_cell).collect())
-        .collect();
-    let tag = format!("SELECT {}", rows_out.len());
-    Ok(QueryResult::Rows {
-        fields,
-        rows: rows_out,
-        tag,
-    })
+    Ok(out.into_iter().map(|(_, proj)| proj).collect())
 }
 
 #[cfg(test)]
@@ -856,6 +863,7 @@ mod tests {
     use super::*;
     use catalog::{Column, Table};
     use pgparser::ast::{SelectStmt, Statement};
+    use pgwire::engine::Cell;
 
     fn table() -> Table {
         Table {
@@ -1178,7 +1186,7 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let (fields, _) =
+        let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&t))).expect("fields");
         // count -> int8, sum(int4) -> int8, min(text) -> text, max(int4) -> int4
         assert_eq!(fields[0].type_oid, ColumnType::Int8.oid());
@@ -1330,7 +1338,7 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let (fields, _) =
+        let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&t))).expect("fields");
         assert_eq!(fields[0].type_oid, ColumnType::Float8.oid()); // avg(float8)
         assert_eq!(fields[1].type_oid, ColumnType::Float8.oid()); // sum(float8)
@@ -1342,7 +1350,7 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let (fields, _) =
+        let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&it))).expect("fields");
         assert_eq!(fields[0].type_oid, ColumnType::Numeric(None).oid());
         assert_eq!(fields[0].name, "avg");
