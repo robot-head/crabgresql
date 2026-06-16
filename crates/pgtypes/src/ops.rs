@@ -17,6 +17,20 @@ pub fn int_literal(s: &str) -> Result<Datum, TypeError> {
     }
 }
 
+/// SP30: type a decimal/exponent literal as `float8` (crabgresql has no `numeric`,
+/// so a bare `1.5`/`1e3` is `double precision`, not `numeric`). A literal that
+/// overflows to infinity (e.g. `1e400`) is out of range (22003).
+pub fn float_literal(s: &str) -> Result<Datum, TypeError> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_infinite() => Err(TypeError::Overflow),
+        Ok(v) => Ok(Datum::Float8(v)),
+        Err(_) => Err(TypeError::InvalidText {
+            type_name: "double precision",
+            value: s.to_string(),
+        }),
+    }
+}
+
 /// Promote an integer Datum to i64 for mixed-width arithmetic.
 fn as_i64(d: &Datum) -> Option<i64> {
     match d {
@@ -26,14 +40,49 @@ fn as_i64(d: &Datum) -> Option<i64> {
     }
 }
 
+/// Promote a numeric Datum (int or float) to f64 for mixed-type arithmetic.
+fn as_f64(d: &Datum) -> Option<f64> {
+    match d {
+        Datum::Int4(n) => Some(f64::from(*n)),
+        Datum::Int8(n) => Some(*n as f64),
+        Datum::Float8(f) => Some(*f),
+        _ => None,
+    }
+}
+
+fn is_float(d: &Datum) -> bool {
+    matches!(d, Datum::Float8(_))
+}
+
+/// Apply a float op with PostgreSQL's finite-overflow rule: a `finite ⊕ finite`
+/// result that becomes infinite is out of range (22003); an infinite *operand*
+/// just propagates Infinity (no error). Underflow to 0 is silent, as in PG.
+fn float_arith(x: f64, y: f64, op: fn(f64, f64) -> f64) -> Result<Datum, TypeError> {
+    let r = op(x, y);
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        return Err(TypeError::Overflow);
+    }
+    Ok(Datum::Float8(r))
+}
+
 fn arith(
     a: &Datum,
     b: &Datum,
     op_i4: fn(i32, i32) -> Option<i32>,
     op_i8: fn(i64, i64) -> Option<i64>,
+    op_f8: fn(f64, f64) -> f64,
 ) -> Result<Datum, TypeError> {
     if a.is_null() || b.is_null() {
         return Ok(Datum::Null);
+    }
+    // SP30: if either operand is float, promote both to f64 and compute in float.
+    if is_float(a) || is_float(b) {
+        return match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => float_arith(x, y, op_f8),
+            _ => Err(TypeError::TypeMismatch {
+                message: "operator requires numeric operands".into(),
+            }),
+        };
     }
     match (a, b) {
         (Datum::Int4(x), Datum::Int4(y)) => {
@@ -49,23 +98,34 @@ fn arith(
 }
 
 pub fn add(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_add, i64::checked_add)
+    arith(a, b, i32::checked_add, i64::checked_add, |x, y| x + y)
 }
 pub fn sub(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_sub, i64::checked_sub)
+    arith(a, b, i32::checked_sub, i64::checked_sub, |x, y| x - y)
 }
 pub fn mul(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
-    arith(a, b, i32::checked_mul, i64::checked_mul)
+    arith(a, b, i32::checked_mul, i64::checked_mul, |x, y| x * y)
 }
 pub fn div(a: &Datum, b: &Datum) -> Result<Datum, TypeError> {
     if a.is_null() || b.is_null() {
         return Ok(Datum::Null);
     }
-    let zero = matches!(b, Datum::Int4(0) | Datum::Int8(0));
-    if zero {
+    // SP30: float division — a zero divisor (incl. `-0.0`) is 22012, like PG.
+    if is_float(a) || is_float(b) {
+        let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
+            return Err(TypeError::TypeMismatch {
+                message: "operator requires numeric operands".into(),
+            });
+        };
+        if y == 0.0 {
+            return Err(TypeError::DivisionByZero);
+        }
+        return float_arith(x, y, |x, y| x / y);
+    }
+    if matches!(b, Datum::Int4(0) | Datum::Int8(0)) {
         return Err(TypeError::DivisionByZero);
     }
-    arith(a, b, i32::checked_div, i64::checked_div)
+    arith(a, b, i32::checked_div, i64::checked_div, |x, y| x / y)
 }
 
 /// SQL `mod(a, b)` / the `%` remainder (SP29, exposed as the `mod` function).
@@ -123,20 +183,41 @@ pub fn compare(a: &Datum, b: &Datum) -> Result<Option<Ordering>, TypeError> {
     let ord = match (a, b) {
         (Datum::Text(x), Datum::Text(y)) => x.cmp(y),
         (Datum::Bool(x), Datum::Bool(y)) => x.cmp(y),
+        // SP30: any numeric pair with a float promotes to float comparison (NaN is
+        // the largest value and equals itself; `-0.0 == +0.0` — PG's float ordering).
+        _ if is_float(a) || is_float(b) => match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => float_cmp(x, y),
+            _ => return Err(cannot_compare(a, b)),
+        },
         _ => match (as_i64(a), as_i64(b)) {
             (Some(x), Some(y)) => x.cmp(&y),
-            _ => {
-                return Err(TypeError::TypeMismatch {
-                    message: format!(
-                        "cannot compare {} and {}",
-                        a.column_type().map(|t| t.name()).unwrap_or("unknown"),
-                        b.column_type().map(|t| t.name()).unwrap_or("unknown"),
-                    ),
-                });
-            }
+            _ => return Err(cannot_compare(a, b)),
         },
     };
     Ok(Some(ord))
+}
+
+/// PostgreSQL's `float8` total order: NaN sorts greater than every non-NaN and is
+/// equal to itself; `-0.0` and `+0.0` are equal.
+fn float_cmp(x: f64, y: f64) -> Ordering {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => x
+            .partial_cmp(&y)
+            .expect("non-NaN floats are totally ordered"),
+    }
+}
+
+fn cannot_compare(a: &Datum, b: &Datum) -> TypeError {
+    TypeError::TypeMismatch {
+        message: format!(
+            "cannot compare {} and {}",
+            a.column_type().map(|t| t.name()).unwrap_or("unknown"),
+            b.column_type().map(|t| t.name()).unwrap_or("unknown"),
+        ),
+    }
 }
 
 fn as_bool(d: &Datum) -> Result<Option<bool>, TypeError> {
@@ -284,6 +365,75 @@ mod tests {
         assert_eq!(
             concat(&Datum::Text("x".into()), &Datum::Null).expect("ok"),
             Datum::Null
+        );
+    }
+
+    #[test]
+    fn float_literal_and_overflow() {
+        assert_eq!(float_literal("1.5").expect("1.5"), Datum::Float8(1.5));
+        assert_eq!(float_literal(".5").expect(".5"), Datum::Float8(0.5));
+        assert_eq!(float_literal("2e3").expect("2e3"), Datum::Float8(2000.0));
+        // A literal overflowing to infinity is out of range.
+        assert!(matches!(float_literal("1e400"), Err(TypeError::Overflow)));
+    }
+
+    #[test]
+    fn float_arithmetic_promotion_and_division() {
+        // int ⊕ float promotes to float.
+        assert_eq!(
+            add(&Datum::Int4(3), &Datum::Float8(0.5)).expect("ok"),
+            Datum::Float8(3.5)
+        );
+        assert_eq!(
+            mul(&Datum::Float8(2.0), &Datum::Int8(3)).expect("ok"),
+            Datum::Float8(6.0)
+        );
+        // float division is real division (not integer truncation).
+        assert_eq!(
+            div(&Datum::Float8(5.0), &Datum::Float8(2.0)).expect("ok"),
+            Datum::Float8(2.5)
+        );
+        // a zero float divisor is 22012 (NULL still short-circuits first).
+        assert!(matches!(
+            div(&Datum::Float8(1.0), &Datum::Float8(0.0)),
+            Err(TypeError::DivisionByZero)
+        ));
+        assert_eq!(
+            div(&Datum::Null, &Datum::Float8(0.0)).expect("ok"),
+            Datum::Null
+        );
+        // finite × finite overflowing to infinity is 22003; an infinite operand
+        // propagates Infinity without error.
+        assert!(matches!(
+            mul(&Datum::Float8(1e308), &Datum::Float8(1e308)),
+            Err(TypeError::Overflow)
+        ));
+        assert_eq!(
+            mul(&Datum::Float8(f64::INFINITY), &Datum::Float8(2.0)).expect("ok"),
+            Datum::Float8(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn float_comparison_orders_nan_last_and_equal_zeros() {
+        // NaN equals itself and is greater than every non-NaN (PG float ordering).
+        assert_eq!(
+            compare(&Datum::Float8(f64::NAN), &Datum::Float8(f64::NAN)).expect("ok"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare(&Datum::Float8(f64::NAN), &Datum::Float8(1.0)).expect("ok"),
+            Some(Ordering::Greater)
+        );
+        // -0.0 and +0.0 compare equal.
+        assert_eq!(
+            compare(&Datum::Float8(-0.0), &Datum::Float8(0.0)).expect("ok"),
+            Some(Ordering::Equal)
+        );
+        // mixed int/float comparison promotes to float.
+        assert_eq!(
+            compare(&Datum::Int4(2), &Datum::Float8(2.5)).expect("ok"),
+            Some(Ordering::Less)
         );
     }
 

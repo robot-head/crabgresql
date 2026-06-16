@@ -158,8 +158,8 @@ pub(crate) fn scalar_result_type(
         ScalarFunc::Concat => Ok(ColumnType::Text),
         ScalarFunc::Abs => {
             require_arity(fc, n == 1)?;
-            // abs preserves the integer width.
-            require_int(&args[0], table)
+            // abs preserves the numeric type (int width, or SP30's float8).
+            require_numeric(&args[0], table)
         }
         ScalarFunc::Mod => {
             require_arity(fc, n == 2)?;
@@ -335,6 +335,8 @@ fn eval_eager(f: ScalarFunc, fc: &FuncCall, vals: &[Datum]) -> Result<Datum, Exe
                     .checked_abs()
                     .map(Datum::Int8)
                     .ok_or(ExecError::Type(pgtypes::TypeError::Overflow)),
+                // SP30: abs over float8 (always representable, no overflow trap).
+                Datum::Float8(f) => Ok(Datum::Float8(f.abs())),
                 other => Err(type_error("abs", other)),
             }
         }
@@ -368,6 +370,15 @@ fn require_text(arg: &Expr, table: Option<&Table>) -> Result<(), ExecError> {
 fn require_int(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
     match crate::eval::infer_type(arg, table)? {
         t @ (ColumnType::Int4 | ColumnType::Int8) => Ok(t),
+        _ => Err(no_matching_function()),
+    }
+}
+
+/// SP30: require a numeric argument (int4/int8/float8); returns that type so the
+/// caller (`abs`) can preserve it.
+fn require_numeric(arg: &Expr, table: Option<&Table>) -> Result<ColumnType, ExecError> {
+    match crate::eval::infer_type(arg, table)? {
+        t @ (ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8) => Ok(t),
         _ => Err(no_matching_function()),
     }
 }
@@ -571,6 +582,9 @@ mod tests {
     fn abs_and_mod() {
         assert_eq!(ev("abs(-5)"), Datum::Int4(5));
         assert_eq!(ev("abs(7)"), Datum::Int4(7));
+        // SP30: abs over float8 preserves the float type.
+        assert_eq!(ev("abs(-2.5)"), Datum::Float8(2.5));
+        assert_eq!(ev("abs(2.5)"), Datum::Float8(2.5));
         assert_eq!(ev("mod(11, 3)"), Datum::Int4(2));
         assert_eq!(ev("mod(-11, 3)"), Datum::Int4(-2));
         assert_eq!(ev("abs(null)"), Datum::Null);
