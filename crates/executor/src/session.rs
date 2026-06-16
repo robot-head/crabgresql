@@ -34,6 +34,16 @@ pub(crate) struct TxnCtx {
     /// on a non-GTM (single-range) engine — reads then use `NO_GLOBAL_SNAPSHOT()`
     /// and the `Prepared` branch is unreachable.
     pub(crate) global_snapshot: Option<Snapshot>,
+    /// The `(table_id, rowid)` set this transaction's local xid has written, in
+    /// write order (deduped is unnecessary — the abort-atomicity fence only scans
+    /// these rows' versions, and a repeated entry just re-scans). Used by the
+    /// cross-range re-stage fence (`effective_global_xid`): when a participant
+    /// re-stage lands on a row that already carries an in-doubt `Prepared(-> g_old)`
+    /// marker (a prior attempt staged it then its leader died), the `Prepared`
+    /// marker this write/`join_global` stamps must ADOPT `g_old` rather than mint a
+    /// SECOND version under a fresh `g'` that could commit independently — so each
+    /// cross-range row resolves under EXACTLY ONE global decision (abort atomicity).
+    pub(crate) written_rows: Vec<(u32, u64)>,
 }
 
 /// Per-connection transaction state. `Failed` carries the aborted block's
@@ -225,6 +235,7 @@ impl SqlSession {
             snapshot,
             repeatable_read: rr,
             global_snapshot,
+            written_rows: Vec::new(),
         });
         Ok(QueryResult::Command {
             tag: "BEGIN".into(),
@@ -545,6 +556,21 @@ impl SqlSession {
                     stmt,
                 )
                 .await?;
+                // Record the (table_id, rowid)s this write touched (from the version
+                // Puts it built) so the abort-atomicity fence (`effective_global_xid`)
+                // can scan them for an inherited in-doubt `Prepared(-> g_old)` marker.
+                // Read BEFORE the marker push below so the fence sees only pre-existing
+                // versions (the new `xmin` version is not committed to `self.kv` yet).
+                let touched: Vec<(u32, u64)> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        kv::WriteOp::Put { key, .. } => kv::key::table_rowid_of(key),
+                        _ => None,
+                    })
+                    .collect();
+                if let TxnState::InTransaction(c) = &mut self.state {
+                    c.written_rows.extend(touched);
+                }
                 // A participant in a cross-range global txn `g` stamps a
                 // Prepared(xid -> g) marker into the SAME durable batch so the row
                 // carries it from the start, and deregisters `xid` from the
@@ -554,9 +580,15 @@ impl SqlSession {
                 // the case where the escalation trigger IS this range's first
                 // write, so `join_global` had no local xid to backfill. Idempotent
                 // on later writes of the same txn (the marker key/value is stable
-                // and `finish` is a set-remove).
+                // and `finish` is a set-remove). The stamped global xid is FENCED to
+                // any in-doubt decision already governing a touched row
+                // (`effective_global_xid` — SP24 abort atomicity): a failover re-stage
+                // adopts the original `g_old` instead of this attempt's fresh `g`, so a
+                // row never carries two competing global decisions.
                 if let Some(g) = self.global_xid {
-                    ops.push(mvcc::clog::put_op(xid, XidStatus::Prepared(g)));
+                    let eff = self.effective_global_xid(g)?;
+                    self.global_xid = Some(eff);
+                    ops.push(mvcc::clog::put_op(xid, XidStatus::Prepared(eff)));
                 }
                 if self.persist_mode == crate::PersistMode::Replicated {
                     ops.push(self.procarray.next_xid_op());
@@ -663,6 +695,65 @@ impl SqlSession {
         Ok(())
     }
 
+    /// The global xid the `Prepared(Li -> ·)` marker for THIS participant write must
+    /// carry — the **abort-atomicity fence**. Normally `g` (the txn's own global xid),
+    /// but if any row this txn's local xid `Li` has written already carries a SIBLING
+    /// version under an in-doubt `Prepared(-> g_old)` marker for a DIFFERENT global
+    /// txn `g_old`, the marker ADOPTS `g_old` instead.
+    ///
+    /// Why: a participant whose leader is killed mid-cross-range-txn loses its in-memory
+    /// held session; the coordinator/worker retries the WHOLE transfer under a FRESH
+    /// global `g'`, re-staging the same row on the NEW leader. Without this fence the
+    /// re-stage mints a SECOND live version of the row stamped `Prepared(-> g')`, so the
+    /// row is governed by TWO independent global decisions (`g_old` and `g'`); if
+    /// `g_old` aborts but `g'` commits the `g'`-version stays visible — money created or
+    /// destroyed (the SP24 abort-atomicity half-leak). Adopting `g_old` keeps the row
+    /// under EXACTLY ONE global decision: when `g_old` is later aborted by the recovery
+    /// abort-race, every version of the row resolves invisible (the pre-txn value
+    /// re-surfaces); when `g_old` commits, exactly one version is live. The retry's `g'`
+    /// then governs no version of this row — which is correct, since the row was already
+    /// enlisted in `g_old`.
+    ///
+    /// Only an IN-DOUBT `g_old` is adopted (read range 0's global clog via `catalog_kv`,
+    /// which the caller has already barriered current): a `g_old` that is already
+    /// terminally decided imposes no surviving enlistment, so the write proceeds under
+    /// its own `g`. Bank txns touch one row per range, so at most one `g_old` is found;
+    /// if several rows disagree the smallest in-doubt `g_old` is adopted deterministically
+    /// (canonical, fingerprint-stable). A non-GTM (single-range) engine has no global
+    /// clog and no `Prepared` rows, so this returns `g` unchanged.
+    fn effective_global_xid(&self, g: u64) -> Result<u64, ExecError> {
+        let li = match self.local_xid() {
+            Some(li) => li,
+            None => return Ok(g), // no local write yet → nothing to fence
+        };
+        let written = match &self.state {
+            TxnState::InTransaction(c) | TxnState::Failed(c) => &c.written_rows,
+            TxnState::Idle => return Ok(g),
+        };
+        let mut adopted: Option<u64> = None;
+        for &(table_id, rowid) in written {
+            let prefix = kv::key::row_key(table_id, rowid);
+            for (_k, v) in self.kv.scan_prefix(&prefix)? {
+                let (xmin, _xmax, _row) = mvcc::version::decode_tuple(&v)?;
+                if xmin == li {
+                    continue; // this txn's OWN version — never fences itself
+                }
+                // A sibling version under an in-doubt `Prepared(-> g_old != g)` marker
+                // means `g_old` still governs this row; adopt it.
+                if let XidStatus::Prepared(g_old) = mvcc::clog::get(self.kv.as_ref(), xmin)?
+                    && g_old != g
+                    && !matches!(
+                        mvcc::clog::get(self.catalog_kv.as_ref(), g_old)?,
+                        XidStatus::Committed | XidStatus::Aborted
+                    )
+                {
+                    adopted = Some(adopted.map_or(g_old, |a| a.min(g_old)));
+                }
+            }
+        }
+        Ok(adopted.unwrap_or(g))
+    }
+
     /// Enlist this session as a participant of global txn `g`. If it has already
     /// done a write (local xid `Li` allocated), write the `Prepared(Li -> g)`
     /// marker durably AND deregister `Li` from the ProcArray running-set so the
@@ -671,12 +762,17 @@ impl SqlSession {
     /// the single `Committed(g)` instant (the deregister-at-PREPARE linchpin). If
     /// no write has happened yet there is nothing to backfill: the first write's
     /// commit batch (see `run_write`) carries the marker and deregisters then.
-    /// Idempotent.
+    /// Idempotent. The stamped marker is FENCED to any in-doubt global decision
+    /// already governing this txn's written rows (`effective_global_xid` — SP24
+    /// abort atomicity), so a failover re-stage never mints a second version under a
+    /// competing decision.
     pub async fn join_global(&mut self, g: u64) -> Result<(), ExecError> {
         self.global_xid = Some(g);
         if let Some(local) = self.local_xid() {
+            let eff = self.effective_global_xid(g)?;
+            self.global_xid = Some(eff);
             self.committer
-                .commit(vec![mvcc::clog::put_op(local, XidStatus::Prepared(g))])
+                .commit(vec![mvcc::clog::put_op(local, XidStatus::Prepared(eff))])
                 .await?;
             self.procarray.finish(local); // deregister-at-PREPARE (the atomicity linchpin)
         }

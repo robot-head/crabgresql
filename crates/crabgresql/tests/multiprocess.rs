@@ -414,8 +414,6 @@ async fn bank_conserves_with_random_node_clients() {
     // nodes (round-robin) — exercising the proxy under the same faults.
     let leader = c.wait_for_leader().await;
     let followers: Vec<u64> = (0..3u64).filter(|&i| i != leader).collect();
-    let n_nodes = c.len();
-
     // Seed the accounts. `wait_for_leader` guarantees a leader exists, but right
     // after bring-up (especially on a slow CI runner, e.g. directly after a long
     // nemesis test) the node we land on may not yet have a quorum view, so the
@@ -539,19 +537,8 @@ async fn bank_conserves_with_random_node_clients() {
             .control(id, cluster::transport::protocol::ControlRequest::Heal)
             .await;
     }
-    let _final_leader = c.wait_for_leader().await;
-
-    // read_total via pg_try loop — some node accepts after heal.
-    let final_client = {
-        let mut idx = 0usize;
-        loop {
-            if let Some(cl) = c.pg_try(idx).await {
-                break cl;
-            }
-            idx = idx.wrapping_add(1) % n_nodes;
-        }
-    };
-    let final_total = read_total(&final_client, ACCOUNTS).await;
+    let final_leader = c.wait_for_leader().await;
+    let final_total = read_total(&c.pg(final_leader).await, ACCOUNTS).await;
 
     assert_eq!(
         final_total, seeded_total,

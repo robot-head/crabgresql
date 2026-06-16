@@ -181,13 +181,22 @@ impl MultiRangeCluster {
     /// test assert on follower stores deterministically instead of racing apply.
     pub async fn wait_for_replication(&self, range: RangeId) {
         let leader = self.wait_for_leader(range).await;
-        let target = self.groups[range as usize].nodes[leader as usize]
-            .raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|l| l.index)
-            .unwrap_or(0);
+        let leader_node = &self.groups[range as usize].nodes[leader as usize];
+        let target = {
+            let mut rx = leader_node.raft.metrics();
+            // Mark the current value as seen so that `changed()` fires on the
+            // NEXT flush, not the stale one already in the channel. openraft's
+            // `runtime_loop` flushes metrics at the TOP of each iteration — AFTER
+            // `handle_apply_result` resolves the `client_write` future — so a bare
+            // `borrow()` right after an INSERT returns can read `last_applied = N-1`
+            // while the INSERT is at index N. Waiting for one more flush guarantees
+            // we capture the post-write index. 200 ms bound: if no flush arrives
+            // (nothing is running in the Raft loop), the current value is already
+            // fresh.
+            let _ = rx.borrow_and_update();
+            let _ = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+            rx.borrow().last_applied.map(|l| l.index).unwrap_or(0)
+        };
         for node in &self.groups[range as usize].nodes {
             // A paused node can't apply; don't wait on it (the caller resumes it
             // before relying on its store).

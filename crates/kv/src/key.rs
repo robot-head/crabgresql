@@ -122,6 +122,22 @@ pub fn clog_xid_of(key: &[u8]) -> Option<u64> {
     crate::keyenc::take_u64(&mut rest).ok()
 }
 
+/// Recover `(table_id, rowid)` from a primary-index row/version key
+/// (`put_u32(table) ++ put_u32(INDEX_PRIMARY) ++ put_u64(rowid) ++ ...`). Returns
+/// `None` for any key that is not a primary-index row key (a system key, a
+/// non-primary index, or a too-short key) — so a caller scanning a heterogeneous
+/// op batch can filter row versions without knowing each op's table up front.
+pub fn table_rowid_of(key: &[u8]) -> Option<(u32, u64)> {
+    let mut cur = key;
+    let t = take_u32(&mut cur).ok()?;
+    let idx = take_u32(&mut cur).ok()?;
+    if t == SYSTEM_TABLE_ID || idx != INDEX_PRIMARY {
+        return None;
+    }
+    let rowid = take_u64(&mut cur).ok()?;
+    Some((t, rowid))
+}
+
 /// Recover the rowid from a key known to belong to `table_id`.
 pub fn rowid_of(table_id: u32, key: &[u8]) -> Result<u64, KvError> {
     let mut cur = key;
