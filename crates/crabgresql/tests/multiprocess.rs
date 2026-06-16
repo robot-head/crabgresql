@@ -414,8 +414,6 @@ async fn bank_conserves_with_random_node_clients() {
     // nodes (round-robin) — exercising the proxy under the same faults.
     let leader = c.wait_for_leader().await;
     let followers: Vec<u64> = (0..3u64).filter(|&i| i != leader).collect();
-    let n_nodes = c.len();
-
     // Seed the accounts. `wait_for_leader` guarantees a leader exists, but right
     // after bring-up (especially on a slow CI runner, e.g. directly after a long
     // nemesis test) the node we land on may not yet have a quorum view, so the
