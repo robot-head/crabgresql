@@ -54,6 +54,26 @@ pub(crate) fn contains_aggregate(e: &Expr) -> bool {
         }
         Expr::Unary { expr, .. } => contains_aggregate(expr),
         Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        // SP28: recurse through predicate + conditional expressions.
+        Expr::IsNull { expr, .. } => contains_aggregate(expr),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || whens
+                    .iter()
+                    .any(|(c, r)| contains_aggregate(c) || contains_aggregate(r))
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
         _ => false,
     }
 }
@@ -224,6 +244,41 @@ fn collect_specs(
             collect_specs(left, table, specs)?;
             collect_specs(right, table, specs)?;
         }
+        // SP28: gather aggregates appearing inside predicate / CASE expressions.
+        Expr::IsNull { expr, .. } => collect_specs(expr, table, specs)?,
+        Expr::InList { expr, list, .. } => {
+            collect_specs(expr, table, specs)?;
+            for e in list {
+                collect_specs(e, table, specs)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_specs(expr, table, specs)?;
+            collect_specs(low, table, specs)?;
+            collect_specs(high, table, specs)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_specs(expr, table, specs)?;
+            collect_specs(pattern, table, specs)?;
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_specs(o, table, specs)?;
+            }
+            for (c, r) in whens {
+                collect_specs(c, table, specs)?;
+                collect_specs(r, table, specs)?;
+            }
+            if let Some(e) = else_result {
+                collect_specs(e, table, specs)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -249,6 +304,43 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
             validate_grouped(right, group_by)
         }
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
+        // SP28: every child of a predicate / CASE must itself be grouped-valid.
+        Expr::IsNull { expr, .. } => validate_grouped(expr, group_by),
+        Expr::InList { expr, list, .. } => {
+            validate_grouped(expr, group_by)?;
+            for e in list {
+                validate_grouped(e, group_by)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_grouped(expr, group_by)?;
+            validate_grouped(low, group_by)?;
+            validate_grouped(high, group_by)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_grouped(expr, group_by)?;
+            validate_grouped(pattern, group_by)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                validate_grouped(o, group_by)?;
+            }
+            for (c, r) in whens {
+                validate_grouped(c, group_by)?;
+                validate_grouped(r, group_by)?;
+            }
+            if let Some(e) = else_result {
+                validate_grouped(e, group_by)?;
+            }
+            Ok(())
+        }
         _ => Ok(()), // literals / params are constants
     }
 }
@@ -302,6 +394,50 @@ fn eval_grouped(
             let r = eval_grouped(right, table, group_by, key, specs, results)?;
             crate::eval::apply_binary(*op, &l, &r)
         }
+        // SP28: predicate + conditional expressions in a grouped context — same
+        // combinators as scalar `eval`, recursing through `eval_grouped`.
+        Expr::IsNull { expr, negated } => {
+            let v = eval_grouped(expr, table, group_by, key, specs, results)?;
+            Ok(Datum::Bool(v.is_null() ^ *negated))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let x = eval_grouped(expr, table, group_by, key, specs, results)?;
+            crate::eval::eval_in_list(&x, list, *negated, |e| {
+                eval_grouped(e, table, group_by, key, specs, results)
+            })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let x = eval_grouped(expr, table, group_by, key, specs, results)?;
+            let lo = eval_grouped(low, table, group_by, key, specs, results)?;
+            let hi = eval_grouped(high, table, group_by, key, specs, results)?;
+            crate::eval::eval_between(&x, &lo, &hi, *negated)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let s = eval_grouped(expr, table, group_by, key, specs, results)?;
+            let p = eval_grouped(pattern, table, group_by, key, specs, results)?;
+            crate::eval::eval_like(&s, &p, *negated, *case_insensitive)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => crate::eval::eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
+            eval_grouped(e, table, group_by, key, specs, results)
+        }),
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
     }
 }
@@ -483,8 +619,8 @@ pub(crate) fn execute_aggregate(
         accs.push(specs.iter().map(Acc::new).collect());
     }
 
-    // Finalize each group: HAVING filter, ORDER BY keys, projection.
-    let mut out: Vec<(Vec<Datum>, Vec<Option<Cell>>)> = Vec::with_capacity(keys.len());
+    // Finalize each group: HAVING filter, ORDER BY keys, projected output Datums.
+    let mut out: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(keys.len());
     for (key, group_accs) in keys.iter().zip(accs.iter()) {
         let results: Vec<Datum> = group_accs.iter().map(Acc::finish).collect();
         if let Some(h) = &s.having {
@@ -509,23 +645,28 @@ pub(crate) fn execute_aggregate(
                 &results,
             )?);
         }
-        let mut cells = Vec::with_capacity(out_exprs.len());
+        let mut projected = Vec::with_capacity(out_exprs.len());
         for e in &out_exprs {
-            let d = eval_grouped(e, table, &s.group_by, key, &specs, &results)?;
-            cells.push(crate::exec::datum_to_cell(&d));
+            projected.push(eval_grouped(e, table, &s.group_by, key, &specs, &results)?);
         }
-        out.push((order_keys, cells));
+        out.push((order_keys, projected));
     }
 
+    // SP28: SELECT DISTINCT dedups identical projected rows (first appearance).
+    if s.distinct {
+        let mut seen: HashSet<Vec<Datum>> = HashSet::new();
+        out.retain(|(_, proj)| seen.insert(proj.clone()));
+    }
     if !s.order_by.is_empty() {
         out.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, s));
     }
-    if let Some(limit) = s.limit {
-        let n = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-        out.truncate(n);
-    }
+    // SP28: OFFSET then LIMIT.
+    crate::exec::apply_offset_limit(&mut out, s.offset, s.limit);
 
-    let rows_out: Vec<Vec<Option<Cell>>> = out.into_iter().map(|(_, cells)| cells).collect();
+    let rows_out: Vec<Vec<Option<Cell>>> = out
+        .into_iter()
+        .map(|(_, proj)| proj.iter().map(crate::exec::datum_to_cell).collect())
+        .collect();
     let tag = format!("SELECT {}", rows_out.len());
     Ok(QueryResult::Rows {
         fields,
@@ -830,6 +971,86 @@ mod tests {
         assert_eq!(fields[2].type_oid, ColumnType::Text.oid());
         assert_eq!(fields[3].type_oid, ColumnType::Int4.oid());
         assert_eq!(fields[0].name, "count");
+    }
+
+    // ---- SP28: predicate / CASE expressions in a grouped context ----
+
+    #[test]
+    fn case_in_having_filters_groups() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(20)]),
+        ];
+        // A CASE over an aggregate in HAVING keeps only k=1 (count(*) > 1).
+        assert_eq!(
+            agg(
+                "SELECT k FROM t GROUP BY k \
+                 HAVING CASE WHEN count(*) > 1 THEN true ELSE false END ORDER BY k",
+                Some(&t),
+                rows
+            )
+            .expect("agg"),
+            vec![vec![int(1)]]
+        );
+    }
+
+    #[test]
+    fn in_list_over_grouped_column_projection() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(20)]),
+            r(&[Datum::Int4(3), Datum::Int4(30)]),
+        ];
+        // `k IN (1, 3)` is built from the grouping column -> valid; bool text "t"/"f".
+        assert_eq!(
+            agg(
+                "SELECT k IN (1, 3) FROM t GROUP BY k ORDER BY k",
+                Some(&t),
+                rows
+            )
+            .expect("agg"),
+            vec![
+                vec![Datum::Text("t".into())],
+                vec![Datum::Text("f".into())],
+                vec![Datum::Text("t".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn ungrouped_column_inside_case_is_42803() {
+        let t = table();
+        // `v` is neither grouped nor aggregated, even nested inside a CASE.
+        let err = agg(
+            "SELECT CASE WHEN v > 0 THEN 1 ELSE 0 END FROM t GROUP BY k",
+            Some(&t),
+            vec![],
+        )
+        .expect_err("ungrouped v in CASE");
+        assert_eq!(err.into_pg().code, "42803");
+    }
+
+    #[test]
+    fn distinct_aggregate_output_dedups() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(10)]),
+            r(&[Datum::Int4(3), Datum::Int4(20)]),
+        ];
+        // Per-group sum(v) is {10, 10, 20}; SELECT DISTINCT collapses to {10, 20}.
+        assert_eq!(
+            agg(
+                "SELECT DISTINCT sum(v) FROM t GROUP BY k ORDER BY sum(v)",
+                Some(&t),
+                rows
+            )
+            .expect("agg"),
+            vec![vec![int(10)], vec![int(20)]]
+        );
     }
 
     #[test]

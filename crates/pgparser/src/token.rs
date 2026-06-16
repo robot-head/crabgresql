@@ -71,6 +71,17 @@ pub enum Keyword {
     Having,
     Distinct,
     All,
+    // SP28: predicate + conditional expression breadth
+    Is,
+    In,
+    Between,
+    Like,
+    Ilike,
+    Case,
+    When,
+    Then,
+    Else,
+    Offset,
 }
 
 impl Keyword {
@@ -121,6 +132,17 @@ impl Keyword {
             "having" => Keyword::Having,
             "distinct" => Keyword::Distinct,
             "all" => Keyword::All,
+            // SP28: predicate + conditional expression breadth
+            "is" => Keyword::Is,
+            "in" => Keyword::In,
+            "between" => Keyword::Between,
+            "like" => Keyword::Like,
+            "ilike" => Keyword::Ilike,
+            "case" => Keyword::Case,
+            "when" => Keyword::When,
+            "then" => Keyword::Then,
+            "else" => Keyword::Else,
+            "offset" => Keyword::Offset,
             _ => return None,
         })
     }
