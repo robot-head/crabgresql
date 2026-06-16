@@ -85,9 +85,37 @@ pub(crate) fn join_relations(
             }
         }
         JoinKind::Left | JoinKind::Right | JoinKind::Full => {
-            return Err(ExecError::Unsupported(
-                "outer joins land in the next task".into(),
-            ));
+            let lw = left.scope.width();
+            let rw = right.scope.width();
+            let want_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+            let want_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            let mut right_matched = vec![false; right.rows.len()];
+            for l in &left.rows {
+                let mut any = false;
+                for (ri, r) in right.rows.iter().enumerate() {
+                    if matches(l, r)? {
+                        any = true;
+                        right_matched[ri] = true;
+                        let mut row = l.clone();
+                        row.extend(r.iter().cloned());
+                        rows.push(row);
+                    }
+                }
+                if !any && want_left {
+                    let mut row = l.clone();
+                    row.extend(vec![Datum::Null; rw]);
+                    rows.push(row);
+                }
+            }
+            if want_right {
+                for (ri, r) in right.rows.iter().enumerate() {
+                    if !right_matched[ri] {
+                        let mut row = vec![Datum::Null; lw];
+                        row.extend(r.iter().cloned());
+                        rows.push(row);
+                    }
+                }
+            }
         }
     }
     Ok(Relation {
@@ -156,5 +184,38 @@ mod tests {
         let j = join_relations(a, b, JoinKind::Cross, &JoinConstraint::None).expect("cross join");
         assert_eq!(j.rows.len(), 2);
         assert_eq!(j.scope.width(), 2);
+    }
+
+    #[test]
+    fn left_join_null_extends_unmatched_left_rows() {
+        let a = rel("a", &["id"], vec![vec![1], vec![2], vec![3]]);
+        let b = rel("b", &["id"], vec![vec![2], vec![3]]);
+        let j =
+            join_relations(a, b, JoinKind::Left, &on_eq("a", "id", "b", "id")).expect("left join");
+        // id=1 has no match -> (1, NULL); 2,3 match.
+        assert!(j.rows.contains(&vec![Datum::Int4(1), Datum::Null]));
+        assert_eq!(j.rows.len(), 3);
+    }
+
+    #[test]
+    fn right_join_null_extends_unmatched_right_rows() {
+        let a = rel("a", &["id"], vec![vec![2]]);
+        let b = rel("b", &["id"], vec![vec![1], vec![2]]);
+        let j = join_relations(a, b, JoinKind::Right, &on_eq("a", "id", "b", "id"))
+            .expect("right join");
+        assert!(j.rows.contains(&vec![Datum::Null, Datum::Int4(1)]));
+        assert_eq!(j.rows.len(), 2);
+    }
+
+    #[test]
+    fn full_join_keeps_unmatched_from_both_sides() {
+        let a = rel("a", &["id"], vec![vec![1], vec![2]]);
+        let b = rel("b", &["id"], vec![vec![2], vec![3]]);
+        let j =
+            join_relations(a, b, JoinKind::Full, &on_eq("a", "id", "b", "id")).expect("full join");
+        assert!(j.rows.contains(&vec![Datum::Int4(1), Datum::Null])); // unmatched left
+        assert!(j.rows.contains(&vec![Datum::Null, Datum::Int4(3)])); // unmatched right
+        assert!(j.rows.contains(&vec![Datum::Int4(2), Datum::Int4(2)])); // matched
+        assert_eq!(j.rows.len(), 3);
     }
 }

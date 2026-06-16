@@ -47,9 +47,7 @@ impl Scope {
         }
     }
 
-    /// The combined row width. Unused by the single-relation plumbing of this
-    /// slice; the multi-table join tasks (SP33 Task 5) size the joined row with it.
-    #[allow(dead_code)]
+    /// The combined row width; used by the join layer to size NULL-padded rows.
     pub fn width(&self) -> usize {
         self.columns.len()
     }

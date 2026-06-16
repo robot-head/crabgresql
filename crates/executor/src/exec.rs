@@ -1412,6 +1412,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn left_join_emits_nulls_for_unmatched() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE a (id int4)").await;
+        run(&engine, "CREATE TABLE b (id int4, bv text)").await;
+        run(&engine, "INSERT INTO a VALUES (1),(2)").await;
+        run(&engine, "INSERT INTO b VALUES (2,'two')").await;
+        let r = &run(
+            &engine,
+            "SELECT a.id, b.bv FROM a LEFT JOIN b ON a.id = b.id ORDER BY a.id",
+        )
+        .await[0];
+        let got: Vec<_> = rows_of(r)
+            .iter()
+            .map(|row| (text(&row[0]), text(&row[1])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("1".into()), None),
+                (Some("2".into()), Some("two".into())),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn select_command_tag_counts_rows() {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (id int4)").await;
