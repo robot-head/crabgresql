@@ -520,6 +520,19 @@ impl RangeRouter {
         stmt: &Statement,
     ) -> Result<QueryResult, ExecError> {
         if self.engines.contains_key(&range) && self.leads.leads(range) {
+            // Settle-before-serve, last write path: a locally-led participant Stage is a
+            // version-creating WRITE, so gate it on a freshly-risen, still-settling leader exactly
+            // like `dispatch`'s direct-write check and the remote `TxnService::stage` check. The
+            // newly-risen participant leader reconstructs every inherited in-doubt `Prepared(-> g)`
+            // marker (driving each to its durable global decision) in its rise sweep BEFORE the
+            // gate opens; admitting a local stage before that sweep settles could supersede an
+            // unsettled marker with a non-superseding version and destroy a committed `g`'s half.
+            // GATE ONLY — no `staged_local_for` idempotency no-op here: the router coordinates with
+            // a FRESH `g` per escalation (never legitimately re-stages the same `g` locally), and
+            // such a no-op is unsafe under GTM xid reuse. Retryable NotLeader -> 40001 -> retry.
+            if self.gate.as_ref().is_some_and(|g_| !g_.is_serving(range)) {
+                return Err(ExecError::NotLeader);
+            }
             self.ensure_began_on(range).await?;
             self.session_mut(range).join_global(g).await?;
             return self.session_mut(range).run(stmt).await;
@@ -1218,6 +1231,114 @@ mod gateway_seam_tests {
             router.scan_one_i32("SELECT id FROM b").await,
             vec![21],
             "the write applied once the range settled"
+        );
+    }
+
+    /// Settle-before-serve at the CROSS-RANGE escalation write path (`stage_on`'s local branch) —
+    /// the last write path the gate covers. A locally-led participant `Stage` into a global txn
+    /// is a version-creating write, so it is gated until the participant range's rise sweep has
+    /// settled the current term, exactly like the direct-write `dispatch` check. Without it, a
+    /// participant stage on a freshly-risen leader (before its rise sweep reconstructs the
+    /// inherited `Prepared(-> g)` markers) could supersede an unsettled committed half with a
+    /// non-superseding version and tear the cross-range total.
+    ///
+    /// A ONE-node cluster leads BOTH ranges on the same node, so a single gate `id` governs both:
+    /// range 0 is OPENED (its `acct_a` leg passes `dispatch`'s gate) while range 1 stays CLOSED, so
+    /// the escalated `acct_b` leg hits the `stage_on` local-branch gate. The `connect`-idiom router
+    /// (all-local engines + `AlwaysLeads`) makes `acct_b`'s stage take that local branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_gates_a_local_led_participant_stage_until_the_range_is_settled() {
+        let c = MultiRangeCluster::new(1, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        // Seed acct_a (id 1 -> range 0) + acct_b (id 2 -> range 1) through a normal router.
+        let mut admin = RangeRouter::connect(&c).await;
+        admin
+            .simple("CREATE TABLE acct_a (id int4, bal int4)")
+            .await
+            .expect("acct_a");
+        admin
+            .simple("CREATE TABLE acct_b (id int4, bal int4)")
+            .await
+            .expect("acct_b");
+        admin
+            .simple("INSERT INTO acct_a VALUES (0, 100)")
+            .await
+            .expect("seed acct_a");
+        admin
+            .simple("INSERT INTO acct_b VALUES (0, 100)")
+            .await
+            .expect("seed acct_b");
+        drop(admin);
+
+        // ONE gate over BOTH ranges (id = node 0, which leads both). Open range 0 for its term so
+        // the `acct_a` leg passes `dispatch`'s gate; leave range 1 CLOSED (gated-by-default) so the
+        // escalated `acct_b` stage is rejected by `stage_on`'s local-branch check.
+        let node0 = c.wait_for_leader(0).await;
+        let gate = crate::recovery_gate::RecoveryGate::new(node0);
+        gate.register_range(0, c.leader_raft(0).await);
+        gate.register_range(1, c.leader_raft(1).await);
+        gate.mark_served(0, c.leader_raft(0).await.metrics().borrow().current_term);
+
+        let mut engines = HashMap::new();
+        for r in c.range_map().range_ids() {
+            engines.insert(r, c.leader_engine(r).await);
+        }
+        let coordinator: Arc<dyn GlobalCoordinator> = Arc::new(LocalCoordinator {
+            range0: c.leader_engine(0).await,
+        });
+        let mut router = RangeRouter::new(
+            c.range_map().clone(),
+            engines,
+            Arc::new(AlwaysLeads),
+            c.catalog_kv().await,
+            Arc::new(RejectForward),
+            Some(coordinator),
+            Some(gate.clone()),
+        );
+
+        // BEGIN + the `acct_a` leg (range 0, OPEN) pass; the escalated `acct_b` stage (range 1,
+        // CLOSED) is rejected — retryable NotLeader -> 40001 — proving the local participant stage
+        // is gated. (The `acct_a` leg already passed `dispatch`'s gate, isolating the stage path.)
+        router.simple("BEGIN").await.expect("begin");
+        router
+            .simple("UPDATE acct_a SET bal = bal - 10 WHERE id = 0")
+            .await
+            .expect("acct_a leg passes (range 0 open)");
+        let err = router
+            .simple("UPDATE acct_b SET bal = bal + 10 WHERE id = 0")
+            .await
+            .expect_err("escalated acct_b stage rejected while range 1 is unsettled");
+        assert_eq!(
+            err.code, "40001",
+            "a participant stage to an unsettled range is retryable (NotLeader -> 40001), got {err:?}"
+        );
+        router
+            .simple("ROLLBACK")
+            .await
+            .expect("rollback half-staged");
+
+        // Open range 1 for its term → a fresh cross-range txn stages `acct_b` locally and commits.
+        gate.mark_served(1, c.leader_raft(1).await.metrics().borrow().current_term);
+        router.simple("BEGIN").await.expect("begin2");
+        router
+            .simple("UPDATE acct_a SET bal = bal - 10 WHERE id = 0")
+            .await
+            .expect("acct_a leg");
+        router
+            .simple("UPDATE acct_b SET bal = bal + 10 WHERE id = 0")
+            .await
+            .expect("acct_b stage now admitted once range 1 settled");
+        router.simple("COMMIT").await.expect("commit");
+        // Conserved: -10 on acct_a, +10 on acct_b — the cross-range txn committed atomically.
+        assert_eq!(
+            router.scan_one_i32("SELECT bal FROM acct_a").await,
+            vec![90]
+        );
+        assert_eq!(
+            router.scan_one_i32("SELECT bal FROM acct_b").await,
+            vec![110]
         );
     }
 }
