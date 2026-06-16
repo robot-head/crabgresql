@@ -252,4 +252,41 @@ mod tests {
         let lo = clog_scan_lo_key();
         assert!(lo < clog_prefix() || lo >= clog_scan_end());
     }
+
+    #[test]
+    fn clog_scan_lo_key_is_a_distinct_table_zero_meta_key() {
+        let lo = clog_scan_lo_key();
+        let zero = {
+            let mut z = Vec::new();
+            crate::keyenc::put_u32(&mut z, 0);
+            z
+        };
+        assert!(lo.starts_with(&zero), "under the table-zero system prefix");
+        // Lives in the meta namespace, NOT the clog prefix — a clog scan must
+        // never sweep the watermark.
+        assert!(!lo.starts_with(&clog_prefix()));
+        // Distinct from every other system/meta key.
+        assert_ne!(lo, next_xid_key());
+        assert_ne!(lo, meta_next_table_id_key());
+        assert_ne!(lo, meta_next_global_xid_key());
+        assert_ne!(lo, meta_range_map_key());
+        assert_ne!(lo, clog_key(0));
+    }
+
+    #[test]
+    fn clog_xid_of_roundtrips_only_clog_keys() {
+        // A real clog key decodes back to its xid (across the value range).
+        assert_eq!(clog_xid_of(&clog_key(42)), Some(42));
+        assert_eq!(clog_xid_of(&clog_key(0)), Some(0));
+        assert_eq!(clog_xid_of(&clog_key(u64::MAX)), Some(u64::MAX));
+        // A key in a different namespace is not a clog key.
+        assert_eq!(clog_xid_of(&next_xid_key()), None);
+        // Right LENGTH but wrong prefix is rejected (guards the prefix check, not
+        // merely the length check).
+        let mut wrong = clog_key(42);
+        wrong[0] ^= 0xFF;
+        assert_eq!(clog_xid_of(&wrong), None);
+        // Prefix only, no 8-byte xid suffix → too short.
+        assert_eq!(clog_xid_of(&clog_prefix()), None);
+    }
 }

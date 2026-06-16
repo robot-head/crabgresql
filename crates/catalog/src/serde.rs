@@ -132,4 +132,16 @@ mod tests {
     fn truncated_errors_not_panics() {
         assert!(deserialize_schema(&[SCHEMA_VERSION, 0, 0]).is_err());
     }
+
+    #[test]
+    fn take_n_consumes_exactly_all_remaining() {
+        // Taking exactly the remaining length succeeds and empties the cursor;
+        // only a STRICTLY shorter cursor is truncated (boundary at cur.len() == n).
+        let data = [1u8, 2, 3, 4];
+        let mut cur: &[u8] = &data;
+        assert_eq!(take_n(&mut cur, 4).expect("exact length is valid"), &data);
+        assert!(cur.is_empty());
+        let mut cur: &[u8] = &data;
+        assert!(take_n(&mut cur, 5).is_err());
+    }
 }

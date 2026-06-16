@@ -112,6 +112,13 @@ mod tests {
     }
 
     #[test]
+    fn row_prefix_of_at_exactly_the_suffix_length_is_an_empty_prefix() {
+        // A key of exactly the 8-byte xid suffix has an EMPTY row prefix — it is
+        // the boundary, not an error (only strictly-shorter keys are rejected).
+        assert_eq!(row_prefix_of(&[0u8; 8]).expect("8 bytes is valid"), b"");
+    }
+
+    #[test]
     fn version_key_xid_is_rowid_prefix_plus_ascending_xid() {
         let prefix = kv::key::row_key(7, 42);
         let k = version_key_xid(7, 42, 100);

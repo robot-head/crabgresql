@@ -119,4 +119,20 @@ mod tests {
         assert_eq!(Datum::Int4(1).column_type(), Some(ColumnType::Int4));
         assert_eq!(Datum::Null.column_type(), None);
     }
+
+    #[test]
+    fn column_type_names_match_postgres() {
+        assert_eq!(ColumnType::Bool.name(), "boolean");
+        assert_eq!(ColumnType::Int4.name(), "integer");
+        assert_eq!(ColumnType::Int8.name(), "bigint");
+        assert_eq!(ColumnType::Text.name(), "text");
+    }
+
+    #[test]
+    fn column_type_sizes_match_pg_typlen() {
+        assert_eq!(ColumnType::Bool.type_size(), 1);
+        assert_eq!(ColumnType::Int4.type_size(), 4);
+        assert_eq!(ColumnType::Int8.type_size(), 8);
+        assert_eq!(ColumnType::Text.type_size(), -1); // variable-length
+    }
 }

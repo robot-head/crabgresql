@@ -235,6 +235,81 @@ mod tests {
         assert_eq!(toks("$1")[0], Token::Param(1));
     }
 
+    #[test]
+    fn two_char_operators_advance_exactly_two_bytes() {
+        // No surrounding spaces: a position-arithmetic slip in the two-byte
+        // advance would mis-read the following byte as its own token.
+        assert_eq!(
+            toks("1<=2"),
+            vec![
+                Token::IntLit("1".into()),
+                Token::Le,
+                Token::IntLit("2".into()),
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            toks("1>=2"),
+            vec![
+                Token::IntLit("1".into()),
+                Token::Ge,
+                Token::IntLit("2".into()),
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            toks("1<>2"),
+            vec![
+                Token::IntLit("1".into()),
+                Token::Ne,
+                Token::IntLit("2".into()),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn line_comment_runs_to_eof_without_a_newline() {
+        // A `--` comment with no trailing newline must end cleanly at EOF, never
+        // reading one byte past the buffer.
+        assert_eq!(toks("1 --eof"), vec![Token::IntLit("1".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn block_comment_at_start_of_input() {
+        // A `/* */` comment at offset 0 exercises the comment-open advance from
+        // the very first byte.
+        assert_eq!(
+            toks("/* c */1"),
+            vec![Token::IntLit("1".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn block_comment_with_internal_star_only_closes_at_star_slash() {
+        // A lone `*` inside a block comment is NOT the terminator — only `*/` is.
+        assert_eq!(
+            toks("/* a * b */1"),
+            vec![Token::IntLit("1".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn unterminated_block_comment_errors_at_its_start() {
+        let e = lex("/* c").expect_err("unterminated block comment");
+        assert!(e.message.contains("unterminated block comment"));
+        assert_eq!(e.position, 0);
+    }
+
+    #[test]
+    fn lone_dollar_is_an_unexpected_character_not_a_bad_param() {
+        // `$` only begins a parameter when a digit follows; otherwise it is an
+        // unexpected character (this lexer has no dollar-quoting).
+        let e = lex("$x").expect_err("$x is not a token");
+        assert!(e.message.contains("unexpected character"));
+        assert_eq!(e.position, 0);
+    }
+
     proptest! {
         #[test]
         fn lex_never_panics(s: String) {

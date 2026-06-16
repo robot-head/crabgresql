@@ -2,3 +2,6 @@
 .worktrees
 parity.json
 parity.md
+# cargo-mutants writes its run output here (see .cargo/mutants.toml).
+/mutants.out
+/mutants.out.old
