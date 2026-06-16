@@ -21,6 +21,9 @@ pub enum Token {
     Concat,
     /// SP31: the `::` cast operator (`expr::type`).
     TypeCast,
+    /// SP33: the `.` qualified-name separator (`a.col`). Only lexed when it does
+    /// NOT begin a number lexeme — `.5` / `2.` stay a single `FloatLit`.
+    Dot,
     Eq,
     Ne,
     Lt,
@@ -91,6 +94,17 @@ pub enum Keyword {
     Offset,
     // SP31: explicit casts
     Cast,
+    // SP33: joins
+    Join,
+    Inner,
+    Left,
+    Right,
+    Full,
+    Outer,
+    Cross,
+    On,
+    Using,
+    Natural,
 }
 
 impl Keyword {
@@ -154,6 +168,17 @@ impl Keyword {
             "offset" => Keyword::Offset,
             // SP31: explicit casts
             "cast" => Keyword::Cast,
+            // SP33: joins
+            "join" => Keyword::Join,
+            "inner" => Keyword::Inner,
+            "left" => Keyword::Left,
+            "right" => Keyword::Right,
+            "full" => Keyword::Full,
+            "outer" => Keyword::Outer,
+            "cross" => Keyword::Cross,
+            "on" => Keyword::On,
+            "using" => Keyword::Using,
+            "natural" => Keyword::Natural,
             _ => return None,
         })
     }
@@ -211,6 +236,17 @@ mod tests {
             ("distinct", Keyword::Distinct),
             ("all", Keyword::All),
             ("cast", Keyword::Cast),
+            // SP33: joins
+            ("join", Keyword::Join),
+            ("inner", Keyword::Inner),
+            ("left", Keyword::Left),
+            ("right", Keyword::Right),
+            ("full", Keyword::Full),
+            ("outer", Keyword::Outer),
+            ("cross", Keyword::Cross),
+            ("on", Keyword::On),
+            ("using", Keyword::Using),
+            ("natural", Keyword::Natural),
         ];
         for (word, kw) in pairs {
             assert_eq!(Keyword::from_word(word), Some(*kw), "from_word({word:?})");

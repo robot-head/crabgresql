@@ -120,7 +120,7 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
             }
             // SP30: a numeric literal — an integer, or a `float8` literal if it has a
             // fractional part (`.`) or an exponent (`e`/`E`). A leading `.` only starts
-            // a number when a digit follows (so a bare `.` stays an error).
+            // a number when a digit follows; a bare `.` falls through to the SP33 Dot arm.
             c if c.is_ascii_digit()
                 || (c == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) =>
             {
@@ -158,6 +158,10 @@ pub fn lex(sql: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                     out.push((Token::IntLit(text), start));
                 }
             }
+            // SP33: a `.` that does not begin a number lexeme is the qualified-name
+            // separator. The numeric arm above already claimed `.5`/`2.`, so any `.`
+            // reaching here is a separator (`a.col`).
+            b'.' => push1(&mut out, Token::Dot, &mut i),
             c if c == b'_' || c.is_ascii_alphabetic() => {
                 let start = i;
                 while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
@@ -334,8 +338,9 @@ mod tests {
                 Token::Eof,
             ]
         );
-        // A bare `.` with no following digit is still an unexpected character.
-        assert!(lex(".").is_err());
+        // A bare `.` with no following digit is now the SP33 Dot token (qualified-name
+        // separator), not an error. The numeric arm only claims `.` when a digit follows.
+        assert_eq!(toks("."), vec![Token::Dot, Token::Eof]);
         // An `e` not followed by a (signed) digit is left for the identifier lexer.
         assert_eq!(
             toks("3 e"),
@@ -442,6 +447,49 @@ mod tests {
         let e = lex("$x").expect_err("$x is not a token");
         assert!(e.message.contains("unexpected character"));
         assert_eq!(e.position, 0);
+    }
+
+    #[test]
+    fn dot_is_a_token_between_identifiers() {
+        use crate::token::Token;
+        assert_eq!(
+            toks("a.col"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Dot,
+                Token::Ident("col".into()),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn dot_does_not_disturb_numeric_literals() {
+        use crate::token::Token;
+        // A leading/trailing-dot float is still one FloatLit, not <int> Dot.
+        assert_eq!(toks(".5"), vec![Token::FloatLit(".5".into()), Token::Eof]);
+        assert_eq!(toks("2."), vec![Token::FloatLit("2.".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn join_keywords_lex() {
+        use crate::token::{Keyword, Token};
+        assert_eq!(
+            toks("INNER JOIN ON USING NATURAL LEFT RIGHT FULL OUTER CROSS"),
+            vec![
+                Token::Keyword(Keyword::Inner),
+                Token::Keyword(Keyword::Join),
+                Token::Keyword(Keyword::On),
+                Token::Keyword(Keyword::Using),
+                Token::Keyword(Keyword::Natural),
+                Token::Keyword(Keyword::Left),
+                Token::Keyword(Keyword::Right),
+                Token::Keyword(Keyword::Full),
+                Token::Keyword(Keyword::Outer),
+                Token::Keyword(Keyword::Cross),
+                Token::Eof,
+            ]
+        );
     }
 
     proptest! {
