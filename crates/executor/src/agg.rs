@@ -505,6 +505,14 @@ fn eval_grouped(
             let v = eval_grouped(expr, scope, group_by, key, specs, results)?;
             Ok(pgtypes::cast::cast(&v, *ty)?)
         }
+        // SP34: a resolved subquery constant in a grouped context.
+        Expr::Const { value, .. } => Ok(value.clone()),
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::Quantified { .. } => Err(ExecError::Unsupported(
+            "subqueries are only supported in SELECT".into(),
+        )),
     }
 }
 

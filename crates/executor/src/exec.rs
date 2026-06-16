@@ -681,7 +681,7 @@ fn build_table_expr(
 /// its columns under the derived alias. Non-correlated only (the subquery's scope
 /// is built solely from its own FROM clause).
 #[allow(clippy::too_many_arguments)]
-fn select_to_relation(
+pub(crate) fn select_to_relation(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     global: &dyn Kv,
@@ -690,6 +690,18 @@ fn select_to_relation(
     own: Option<u64>,
     s: &SelectStmt,
 ) -> Result<Relation, ExecError> {
+    // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
+    // first, under the same snapshot handles. Nested subqueries recurse here.
+    let sub_ctx = crate::subquery::SubCtx {
+        catalog_kv,
+        kv,
+        global,
+        gsnap,
+        snapshot,
+        own,
+    };
+    let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
+    let s = &resolved;
     let relation = if s.from.is_empty() {
         Relation {
             scope: Scope::empty(),
@@ -730,7 +742,7 @@ fn select_to_relation(
 /// Schema-only relation builder for `describe` — parallels `build_from` but base
 /// tables produce no rows (no `scan_live`). Joining empty relations yields the
 /// correct combined scope with no rows, so it reuses `join_relations`.
-fn build_from_schema(
+pub(crate) fn build_from_schema(
     catalog_kv: &dyn Kv,
     from: &[pgparser::ast::TableExpr],
 ) -> Result<Relation, ExecError> {
@@ -813,6 +825,19 @@ pub(crate) fn execute_read(
         return Err(ExecError::Unsupported("not a SELECT".into()));
     };
 
+    // SP34: resolve uncorrelated subquery expressions to constants first, under this
+    // statement's snapshot handles (nested subqueries recurse via select_to_relation).
+    let sub_ctx = crate::subquery::SubCtx {
+        catalog_kv,
+        kv,
+        global,
+        gsnap,
+        snapshot,
+        own,
+    };
+    let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
+    let s = &resolved;
+
     // SP33: build the (possibly joined) relation. A FROM-less SELECT is one empty
     // row over the empty scope; otherwise `build_from` folds the comma list as
     // cross joins and recurses into each explicit join tree.
@@ -858,6 +883,18 @@ pub(crate) async fn execute_read_locking(
     mode: crate::lockmgr::LockMode,
     s: &SelectStmt,
 ) -> Result<QueryResult, ExecError> {
+    // SP34: resolve uncorrelated subqueries (e.g. in the WHERE of a FOR UPDATE) to
+    // constants first, under this statement's snapshot handles.
+    let sub_ctx = crate::subquery::SubCtx {
+        catalog_kv,
+        kv,
+        global,
+        gsnap,
+        snapshot,
+        own: Some(xid),
+    };
+    let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
+    let s = &resolved;
     // FOR UPDATE/SHARE is not allowed with aggregation (PostgreSQL 0A000).
     if crate::agg::is_aggregate_query(s) {
         return Err(ExecError::Unsupported(
@@ -1206,7 +1243,10 @@ pub(crate) fn describe(
     } else {
         build_from_schema(catalog_kv, &s.from)?.scope
     };
-    let (fields, _exprs, _tys) = resolve_projection(&s.projection, &scope)?;
+    // SP34: substitute scalar subqueries in the projection with typed-NULL consts so
+    // their column OIDs are known without executing (the catalog-only type pass).
+    let projection = crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
+    let (fields, _exprs, _tys) = resolve_projection(&projection, &scope)?;
     Ok(fields)
 }
 
