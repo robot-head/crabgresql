@@ -167,6 +167,19 @@ mod tests {
     }
 
     #[test]
+    fn numeric_with_an_overflowing_exponent_errors_not_ooms() {
+        // Regression (decode_row fuzz OOM): a NUMERIC field whose text parses to an
+        // adversarial exponent (`8e88888888`) must be rejected as corrupt, NOT
+        // materialized into ~88M digits. tag::NUMERIC = 6, then a u32-BE length and
+        // the text bytes.
+        let text = b"8e88888888";
+        let mut bytes = vec![ROW_VERSION, 6];
+        bytes.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(text);
+        assert!(decode_row(&bytes).is_err());
+    }
+
+    #[test]
     fn unknown_version_errors() {
         assert!(decode_row(&[99, 1, 1]).is_err());
     }

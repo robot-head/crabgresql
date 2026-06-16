@@ -22,6 +22,14 @@ const MIN_SIG_DIGITS: i64 = 16;
 const DEC_DIGITS: i64 = 4;
 const MAX_DISPLAY_SCALE: i64 = 1000;
 
+/// PostgreSQL's hard numeric-format limits: at most `131072` digits before the
+/// decimal point (leading-digit weight ≤ `131071`) and `16383` after it. A value
+/// outside these "overflows numeric format" — PostgreSQL rejects it, and so do we
+/// (which ALSO bounds materialization: a literal like `8e88888888` would otherwise
+/// expand to ~88M digits and OOM, as the `decode_row` fuzzer found).
+const MAX_WEIGHT: i64 = 131071;
+const MAX_DSCALE: i64 = 16383;
+
 /// Optional `numeric(precision, scale)` type modifier. Absent = unconstrained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Typmod {
@@ -41,14 +49,35 @@ pub fn canonical(bd: BigDecimal) -> BigDecimal {
 
 /// Parse a numeric literal / text value (PostgreSQL `numeric_in`, minus the
 /// deferred `NaN`/`Infinity` spellings). Leading/trailing whitespace is trimmed.
-/// Returns `None` on bad syntax (the caller maps that to 22P02).
+/// Returns `None` on bad syntax OR a value that overflows the numeric format
+/// (the caller maps either to an error). The overflow check runs BEFORE
+/// [`canonical`], whose `with_scale` would otherwise materialize an adversarial
+/// exponent's digits and OOM.
 pub fn parse(s: &str) -> Option<BigDecimal> {
     use std::str::FromStr;
     let t = s.trim();
     if t.is_empty() {
         return None;
     }
-    BigDecimal::from_str(t).ok().map(canonical)
+    let bd = BigDecimal::from_str(t).ok()?;
+    if !within_format_limits(&bd) {
+        return None;
+    }
+    Some(canonical(bd))
+}
+
+/// Is `bd` within PostgreSQL's numeric-format limits (weight ≤ 131071, dscale ≤
+/// 16383)? Computed from the compact `(mantissa, exponent)` form WITHOUT
+/// materializing, so an extreme exponent is rejected cheaply.
+fn within_format_limits(bd: &BigDecimal) -> bool {
+    let (mant, exp) = bd.as_bigint_and_exponent();
+    // dscale = displayed fractional digits = max(0, exp).
+    if exp > MAX_DSCALE {
+        return false;
+    }
+    // Decimal weight of the leading digit = (#mantissa digits) − 1 − exp.
+    let ndigits = mant.to_string().trim_start_matches('-').len() as i64;
+    ndigits - 1 - exp <= MAX_WEIGHT
 }
 
 /// PostgreSQL `numeric_out`: a plain decimal string (never scientific notation),
@@ -299,6 +328,21 @@ mod tests {
         assert!(parse("abc").is_none());
         assert!(parse("").is_none());
         assert!(parse("NaN").is_none()); // specials deferred
+    }
+
+    #[test]
+    fn parse_rejects_values_that_overflow_the_numeric_format() {
+        // PostgreSQL's boundary: weight ≤ 131071 (integer side), dscale ≤ 16383.
+        // Beyond it PG raises "value overflows numeric format"; we reject (None) —
+        // which ALSO prevents the OOM the `decode_row` fuzzer found (an adversarial
+        // exponent like `8e88888888` would otherwise materialize ~88M digits).
+        assert!(parse("8e88888888").is_none());
+        assert!(parse("8e-88888888").is_none());
+        assert!(parse("1e131072").is_none()); // just over the weight limit
+        assert!(parse("1e-16384").is_none()); // just over the dscale limit
+        // The in-range boundary values still parse (PG accepts these).
+        assert!(parse("1e131071").is_some());
+        assert!(parse("1e-16383").is_some());
     }
 
     #[test]
