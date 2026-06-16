@@ -42,4 +42,13 @@ exclude_re = [
     # buffers still flush on a clean drop, so a reopen sees the data either way.
     # Only a real power-cut (which no unit test can stage) tells them apart.
     "KeyspaceKv::sync",
+    # Parser::expr's `l_bp < min_bp` Pratt check is an EQUIVALENT mutant under
+    # `<=`: the binding-power scheme gives every operator an ODD left power
+    # (1,3,5,7,9) and an EVEN right power, so the `min_bp` threadeded down is only
+    # ever 0, an even right power, or 11 (unary minus) — never an odd value <= 9.
+    # `l_bp` (always odd, <= 9) therefore can never EQUAL `min_bp`, so `<` and
+    # `<=` decide identically on every reachable input; no test can distinguish
+    # them. (The arithmetic `+`/`<` mutants in expr are NOT excluded — those are
+    # killable and covered by the precedence tests.)
+    "replace < with <= in Parser::expr",
 ]
