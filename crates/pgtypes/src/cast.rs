@@ -29,13 +29,18 @@ use crate::{ColumnType, Datum, TypeError};
 /// at plan time so an undefined cast surfaces as 42846 before execution, and so
 /// the result column type is known for `RowDescription`.
 pub fn cast_allowed(from: ColumnType, to: ColumnType) -> bool {
-    use ColumnType::{Bool, Float8, Int4, Int8, Text};
+    use ColumnType::{Bool, Int4, Text};
+    // SP32: the numeric family — int4/int8/float8/numeric — all interconvert.
+    let num_family = |t: ColumnType| {
+        matches!(t, ColumnType::Int4 | ColumnType::Int8 | ColumnType::Float8) || t.is_numeric()
+    };
     match (from, to) {
-        // Identity.
+        // Identity (e.g. numeric → numeric, even across differing typmods).
         (a, b) if a == b => true,
-        // Numeric ↔ numeric, any direction.
-        (Int4 | Int8 | Float8, Int4 | Int8 | Float8) => true,
-        // PostgreSQL defines bool↔int only for int4 (not int8 / float8).
+        _ if from.is_numeric() && to.is_numeric() => true,
+        // Numeric family ↔ numeric family, any direction.
+        _ if num_family(from) && num_family(to) => true,
+        // PostgreSQL defines bool↔int only for int4 (not int8 / float8 / numeric).
         (Bool, Int4) | (Int4, Bool) => true,
         // Anything → text (the output function), and text → anything (the input
         // function). Together these also cover text→text (already by identity).
@@ -49,7 +54,7 @@ pub fn cast_allowed(from: ColumnType, to: ColumnType) -> bool {
 /// 22003; an undefined `(from, to)` pair is 42846 — though callers that gate on
 /// [`cast_allowed`] at plan time never reach that arm for a non-NULL value.
 pub fn cast(value: &Datum, to: ColumnType) -> Result<Datum, TypeError> {
-    use ColumnType::{Bool, Float8, Int4, Int8, Text};
+    use ColumnType::{Bool, Float8, Int4, Int8, Numeric, Text};
     if value.is_null() {
         return Ok(Datum::Null);
     }
@@ -60,13 +65,22 @@ pub fn cast(value: &Datum, to: ColumnType) -> Result<Datum, TypeError> {
         (Datum::Int8(n), Int8) => Ok(Datum::Int8(*n)),
         (Datum::Float8(f), Float8) => Ok(Datum::Float8(*f)),
         (Datum::Text(s), Text) => Ok(Datum::Text(s.clone())),
-        // Numeric ↔ numeric.
+        // Numeric (int/float) ↔ numeric (int/float).
         (Datum::Int4(n), Int8) => Ok(Datum::Int8(i64::from(*n))),
         (Datum::Int4(n), Float8) => Ok(Datum::Float8(f64::from(*n))),
         (Datum::Int8(n), Int4) => i4_from_i64(*n),
         (Datum::Int8(n), Float8) => Ok(Datum::Float8(*n as f64)),
         (Datum::Float8(f), Int4) => i4_from_f64(*f),
         (Datum::Float8(f), Int8) => i8_from_f64(*f),
+        // SP32: → numeric (applying any `numeric(p,s)` modifier on the target).
+        (Datum::Int4(n), Numeric(tm)) => to_numeric(crate::numeric::from_i64(i64::from(*n)), tm),
+        (Datum::Int8(n), Numeric(tm)) => to_numeric(crate::numeric::from_i64(*n), tm),
+        (Datum::Float8(f), Numeric(tm)) => to_numeric(crate::numeric::from_f64(*f)?, tm),
+        (Datum::Numeric(d), Numeric(tm)) => to_numeric(d.clone(), tm),
+        // SP32: numeric → int/float/text.
+        (Datum::Numeric(d), Int4) => crate::numeric::to_i32(d).map(Datum::Int4),
+        (Datum::Numeric(d), Int8) => crate::numeric::to_i64(d).map(Datum::Int8),
+        (Datum::Numeric(d), Float8) => Ok(Datum::Float8(crate::numeric::to_f64(d))),
         // bool ↔ int4.
         (Datum::Bool(b), Int4) => Ok(Datum::Int4(i32::from(*b))),
         (Datum::Int4(n), Bool) => Ok(Datum::Bool(*n != 0)),
@@ -79,8 +93,27 @@ pub fn cast(value: &Datum, to: ColumnType) -> Result<Datum, TypeError> {
         (Datum::Text(s), Int4) => text_to_i32(s),
         (Datum::Text(s), Int8) => text_to_i64(s),
         (Datum::Text(s), Float8) => text_to_f64(s),
+        (Datum::Text(s), Numeric(tm)) => {
+            let d = crate::numeric::parse(s).ok_or_else(|| TypeError::InvalidText {
+                type_name: "numeric",
+                value: s.to_string(),
+            })?;
+            to_numeric(d, tm)
+        }
         // No defined cast.
         (v, to) => Err(cannot_cast(v, to)),
+    }
+}
+
+/// Wrap a `BigDecimal` as a numeric `Datum`, applying a `numeric(p,s)` modifier
+/// (round to scale + precision overflow → 22003) when the target carries one.
+fn to_numeric(
+    d: bigdecimal::BigDecimal,
+    tm: Option<crate::numeric::Typmod>,
+) -> Result<Datum, TypeError> {
+    match tm {
+        Some(tm) => Ok(Datum::Numeric(crate::numeric::apply_typmod(&d, tm)?)),
+        None => Ok(Datum::Numeric(crate::numeric::canonical(d))),
     }
 }
 
@@ -223,6 +256,7 @@ mod tests {
 
     #[test]
     fn cast_allowed_matches_the_postgres_matrix() {
+        use crate::numeric::Typmod;
         use ColumnType::{Bool, Float8, Int4, Int8, Text};
         // Identity for every type.
         for t in [Bool, Int4, Int8, Text, Float8] {
@@ -247,6 +281,78 @@ mod tests {
         assert!(!cast_allowed(Int8, Bool));
         assert!(!cast_allowed(Bool, Float8));
         assert!(!cast_allowed(Float8, Bool));
+        // SP32: numeric joins the numeric family (↔ int4/int8/float8/numeric), but
+        // there is no numeric ↔ bool cast.
+        let num = ColumnType::Numeric(None);
+        for t in [Int4, Int8, Float8, num] {
+            assert!(cast_allowed(num, t), "numeric -> {t:?}");
+            assert!(cast_allowed(t, num), "{t:?} -> numeric");
+        }
+        assert!(cast_allowed(
+            num,
+            ColumnType::Numeric(Some(Typmod {
+                precision: 5,
+                scale: 2
+            }))
+        ));
+        assert!(cast_allowed(num, Text) && cast_allowed(Text, num));
+        assert!(!cast_allowed(num, Bool));
+        assert!(!cast_allowed(Bool, num));
+    }
+
+    #[test]
+    fn numeric_casts_convert_and_apply_typmod() {
+        use crate::numeric::{Typmod, to_text};
+        use ColumnType::{Float8, Int4};
+        let num = ColumnType::Numeric(None);
+        // int/float/text → numeric.
+        assert!(matches!(
+            cast(&Datum::Int4(5), num).expect("i4->num"),
+            Datum::Numeric(ref d) if to_text(d) == "5"
+        ));
+        assert!(matches!(
+            cast(&Datum::Text("12.34".into()), num).expect("text->num"),
+            Datum::Numeric(ref d) if to_text(d) == "12.34"
+        ));
+        assert!(matches!(
+            cast(&Datum::Float8(0.1), num).expect("f8->num"),
+            Datum::Numeric(ref d) if to_text(d) == "0.1" // shortest text, not binary expansion
+        ));
+        // numeric → int rounds half away from zero; → float8; → text.
+        assert_eq!(
+            cast(
+                &Datum::Numeric(crate::numeric::parse("2.5").expect("p")),
+                Int4
+            )
+            .expect("num->i4"),
+            Datum::Int4(3)
+        );
+        assert_eq!(
+            cast(
+                &Datum::Numeric(crate::numeric::parse("1.5").expect("p")),
+                Float8
+            )
+            .expect("f8"),
+            Datum::Float8(1.5)
+        );
+        // cast to numeric(p,s) rounds + overflows (22003).
+        let tm = ColumnType::Numeric(Some(Typmod {
+            precision: 4,
+            scale: 1,
+        }));
+        assert!(matches!(
+            cast(&Datum::Text("123.45".into()), tm).expect("ok"),
+            Datum::Numeric(ref d) if to_text(d) == "123.5"
+        ));
+        assert!(matches!(
+            cast(&Datum::Text("1234.5".into()), tm),
+            Err(TypeError::Overflow)
+        ));
+        // bad text → numeric is 22P02.
+        assert!(matches!(
+            cast(&Datum::Text("abc".into()), num),
+            Err(TypeError::InvalidText { .. })
+        ));
     }
 
     // ---- NULL ----

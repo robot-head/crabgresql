@@ -13,6 +13,8 @@ pub fn encode_text(d: &Datum) -> Vec<u8> {
         Datum::Int8(n) => n.to_string().into_bytes(),
         Datum::Text(s) => s.clone().into_bytes(),
         Datum::Float8(f) => encode_float8_text(*f).into_bytes(),
+        // SP32: PostgreSQL `numeric_out` (plain decimal, dscale fractional digits).
+        Datum::Numeric(d) => crate::numeric::to_text(d).into_bytes(),
     }
 }
 
@@ -42,6 +44,8 @@ pub fn encode_binary(d: &Datum) -> Vec<u8> {
         Datum::Text(s) => s.clone().into_bytes(),
         // IEEE-754 big-endian, matching PostgreSQL's float8send.
         Datum::Float8(f) => f.to_be_bytes().to_vec(),
+        // SP32: PostgreSQL `numeric_send` (base-10000 NBASE wire format).
+        Datum::Numeric(d) => crate::numeric::binary(d),
     }
 }
 

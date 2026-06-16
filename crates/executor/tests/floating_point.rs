@@ -102,8 +102,12 @@ async fn float_arithmetic_promotes_and_divides() {
     let (plus, div): (f64, f64) = (r.get(0), r.get(1));
     assert_eq!(plus, 5.0);
     assert_eq!(div, 2.0);
-    // int / float is real division too (3 / 2.0 = 1.5, not integer 1).
-    let r = client.query_one("SELECT 3 / 2.0", &[]).await.expect("div");
+    // int / float is real division too (SP32: a bare `2.0` is now numeric, so
+    // float8 division is exercised with an explicit `::float8`).
+    let r = client
+        .query_one("SELECT 3 / 2.0::float8", &[])
+        .await
+        .expect("div");
     assert_eq!(r.get::<_, f64>(0), 1.5);
     assert_eq!(*r.columns()[0].type_(), Type::FLOAT8);
 }
@@ -127,15 +131,19 @@ async fn aggregates_over_float8() {
     assert_eq!(*r.columns()[0].type_(), Type::FLOAT8);
     assert_eq!(*r.columns()[1].type_(), Type::FLOAT8);
 
-    // avg(int) returns float8 (SP30 deviation; PG returns numeric). Value is exact.
+    // SP32: avg over a float8 expression stays float8 (avg of int is now numeric —
+    // covered by the casts/aggregate numeric tests).
     let r = client
-        .query_one("SELECT avg(g) FROM m", &[])
+        .query_one("SELECT avg(g::float8) FROM m", &[])
         .await
-        .expect("avg int");
+        .expect("avg float");
     assert_eq!(*r.columns()[0].type_(), Type::FLOAT8);
     assert_eq!(r.get::<_, f64>(0), 1.8); // (1+1+2+2+3)/5
-    // abs over float8.
-    assert_eq!(text(&client, "SELECT abs(-2.5)").await, Some("2.5".into()));
+    // abs over a float8 value.
+    assert_eq!(
+        text(&client, "SELECT abs(-2.5::float8)").await,
+        Some("2.5".into())
+    );
 }
 
 #[tokio::test]
@@ -198,8 +206,9 @@ async fn error_surface() {
         err_code(&client, "SELECT x / 0 FROM m WHERE g = 1").await,
         "22012"
     );
-    // an out-of-range float literal is 22003.
-    assert_eq!(err_code(&client, "SELECT 1e400").await, "22003");
+    // SP32: a bare `1e400` is now an (exact, unbounded) numeric — no overflow.
+    // float8 overflow is reached via an explicit cast.
+    assert_eq!(err_code(&client, "SELECT '1e400'::float8").await, "22003");
     // an unknown function is 42883.
     assert_eq!(
         err_code(&client, "SELECT frobnicate(x) FROM m").await,

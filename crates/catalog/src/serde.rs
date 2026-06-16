@@ -4,6 +4,7 @@
 
 use kv::KvError;
 use pgtypes::ColumnType;
+use pgtypes::numeric::Typmod;
 
 use crate::Column;
 
@@ -17,25 +18,50 @@ mod type_tag {
     pub const TEXT: u8 = 3;
     /// SP30: `float8` / `double precision`. Append-only — no version bump.
     pub const FLOAT8: u8 = 4;
+    /// SP32: `numeric` — followed by a typmod byte (0 = unconstrained; 1 = a
+    /// `(precision: u16, scale: u16)` modifier). Append-only.
+    pub const NUMERIC: u8 = 5;
 }
 
-fn tag_of(ty: ColumnType) -> u8 {
+/// Append a column's type (tag byte, plus the numeric typmod payload).
+fn write_type(out: &mut Vec<u8>, ty: ColumnType) {
     match ty {
-        ColumnType::Bool => type_tag::BOOL,
-        ColumnType::Int4 => type_tag::INT4,
-        ColumnType::Int8 => type_tag::INT8,
-        ColumnType::Text => type_tag::TEXT,
-        ColumnType::Float8 => type_tag::FLOAT8,
+        ColumnType::Bool => out.push(type_tag::BOOL),
+        ColumnType::Int4 => out.push(type_tag::INT4),
+        ColumnType::Int8 => out.push(type_tag::INT8),
+        ColumnType::Text => out.push(type_tag::TEXT),
+        ColumnType::Float8 => out.push(type_tag::FLOAT8),
+        ColumnType::Numeric(tm) => {
+            out.push(type_tag::NUMERIC);
+            match tm {
+                Some(t) => {
+                    out.push(1);
+                    out.extend_from_slice(&t.precision.to_be_bytes());
+                    out.extend_from_slice(&t.scale.to_be_bytes());
+                }
+                None => out.push(0),
+            }
+        }
     }
 }
 
-fn type_of(tag: u8) -> Result<ColumnType, KvError> {
-    Ok(match tag {
+/// Read a column's type, consuming the tag (and the numeric typmod payload).
+fn read_type(cur: &mut &[u8]) -> Result<ColumnType, KvError> {
+    Ok(match take_u8(cur)? {
         type_tag::BOOL => ColumnType::Bool,
         type_tag::INT4 => ColumnType::Int4,
         type_tag::INT8 => ColumnType::Int8,
         type_tag::TEXT => ColumnType::Text,
         type_tag::FLOAT8 => ColumnType::Float8,
+        type_tag::NUMERIC => {
+            if take_u8(cur)? == 1 {
+                let precision = u16::from_be_bytes(take_n(cur, 2)?.try_into().expect("2"));
+                let scale = u16::from_be_bytes(take_n(cur, 2)?.try_into().expect("2"));
+                ColumnType::Numeric(Some(Typmod { precision, scale }))
+            } else {
+                ColumnType::Numeric(None)
+            }
+        }
         other => {
             return Err(KvError::CorruptRow(format!(
                 "unknown column type tag {other}"
@@ -51,7 +77,7 @@ pub fn serialize_schema(table_id: u32, columns: &[Column]) -> Vec<u8> {
     for c in columns {
         out.extend_from_slice(&(c.name.len() as u32).to_be_bytes());
         out.extend_from_slice(c.name.as_bytes());
-        out.push(tag_of(c.ty));
+        write_type(&mut out, c.ty);
     }
     out
 }
@@ -71,7 +97,7 @@ pub fn deserialize_schema(bytes: &[u8]) -> Result<(u32, Vec<Column>), KvError> {
         let nlen = u32::from_be_bytes(take_n(&mut cur, 4)?.try_into().expect("4")) as usize;
         let name = String::from_utf8(take_n(&mut cur, nlen)?.to_vec())
             .map_err(|_| KvError::CorruptRow("column name is not UTF-8".into()))?;
-        let ty = type_of(take_u8(&mut cur)?)?;
+        let ty = read_type(&mut cur)?;
         columns.push(Column { name, ty });
     }
     Ok((table_id, columns))
@@ -123,6 +149,17 @@ mod tests {
             Column {
                 name: "score".into(),
                 ty: ColumnType::Float8,
+            },
+            Column {
+                name: "amount".into(),
+                ty: ColumnType::Numeric(Some(pgtypes::numeric::Typmod {
+                    precision: 10,
+                    scale: 2,
+                })),
+            },
+            Column {
+                name: "ratio".into(),
+                ty: ColumnType::Numeric(None),
             },
         ];
         let bytes = serialize_schema(table_id, &columns);

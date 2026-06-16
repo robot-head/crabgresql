@@ -5,6 +5,7 @@ pub mod cast;
 pub mod datum;
 pub mod encoding;
 pub mod error;
+pub mod numeric;
 pub mod ops;
 
 pub use datum::{ColumnType, Datum, oids};

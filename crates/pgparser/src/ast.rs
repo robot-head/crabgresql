@@ -85,8 +85,10 @@ pub struct OrderItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(String),
-    /// SP30: a decimal/exponent literal, typed `float8` by the executor.
-    FloatLiteral(String),
+    /// SP32: a decimal/exponent literal. PostgreSQL types these as `numeric`
+    /// (SP30 typed them `float8`; SP32 introduced `numeric`, so a bare `1.5`/`1e3`
+    /// is now scale-faithful `numeric` — `float8` requires an explicit cast).
+    NumericLiteral(String),
     StringLiteral(String),
     BoolLiteral(bool),
     NullLiteral,

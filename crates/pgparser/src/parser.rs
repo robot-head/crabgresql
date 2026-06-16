@@ -84,8 +84,43 @@ impl Parser {
             self.bump();
             type_word = "double precision".to_string();
         }
-        pgtypes::ColumnType::from_sql_name(&type_word)
-            .ok_or_else(|| ParseError::new(format!("unknown type \"{type_word}\""), type_pos))
+        let ty = pgtypes::ColumnType::from_sql_name(&type_word)
+            .ok_or_else(|| ParseError::new(format!("unknown type \"{type_word}\""), type_pos))?;
+        // SP32: `numeric`/`decimal` may carry a `(precision[, scale])` modifier.
+        if ty.is_numeric() && *self.peek() == Token::LParen {
+            return self.parse_numeric_typmod();
+        }
+        Ok(ty)
+    }
+
+    /// Parse a `numeric(precision[, scale])` modifier, positioned at `(`. `scale`
+    /// defaults to 0 (PostgreSQL `numeric(p)` ≡ `numeric(p, 0)`).
+    fn parse_numeric_typmod(&mut self) -> Result<pgtypes::ColumnType, ParseError> {
+        self.expect(&Token::LParen)?;
+        let precision = self.expect_u16("numeric precision")?;
+        let scale = if self.eat_comma() {
+            self.expect_u16("numeric scale")?
+        } else {
+            0
+        };
+        self.expect(&Token::RParen)?;
+        Ok(pgtypes::ColumnType::Numeric(Some(
+            pgtypes::numeric::Typmod { precision, scale },
+        )))
+    }
+
+    /// Parse a small unsigned integer literal (a `numeric` precision/scale).
+    fn expect_u16(&mut self, what: &str) -> Result<u16, ParseError> {
+        let pos = self.peek_pos();
+        match self.bump() {
+            Token::IntLit(s) => s
+                .parse::<u16>()
+                .map_err(|_| ParseError::new(format!("invalid {what}"), pos)),
+            other => Err(ParseError::new(
+                format!("expected {what}, found {other:?}"),
+                pos,
+            )),
+        }
     }
 
     /// Pratt expression parser. `min_bp` is the minimum left binding power.
@@ -222,7 +257,7 @@ impl Parser {
             }
             Token::FloatLit(s) => {
                 self.bump();
-                Ok(Expr::FloatLiteral(s))
+                Ok(Expr::NumericLiteral(s))
             }
             Token::StringLit(s) => {
                 self.bump();
@@ -885,10 +920,49 @@ mod tests {
     }
 
     #[test]
-    fn parses_float_literals() {
-        assert_eq!(expr("1.5"), Expr::FloatLiteral("1.5".into()));
-        assert_eq!(expr(".25"), Expr::FloatLiteral(".25".into()));
-        assert_eq!(expr("1e3"), Expr::FloatLiteral("1e3".into()));
+    fn parses_numeric_column_types_with_optional_typmod() {
+        use pgtypes::numeric::Typmod;
+        let ty = |sql: &str| match one(sql) {
+            Statement::CreateTable { columns, .. } => columns[0].ty,
+            other => panic!("expected CreateTable, got {other:?}"),
+        };
+        // Unconstrained `numeric`/`decimal`.
+        assert_eq!(ty("CREATE TABLE t (x numeric)"), ColumnType::Numeric(None));
+        assert_eq!(ty("CREATE TABLE t (x decimal)"), ColumnType::Numeric(None));
+        // `numeric(p)` ≡ scale 0; `numeric(p, s)`.
+        assert_eq!(
+            ty("CREATE TABLE t (x numeric(10))"),
+            ColumnType::Numeric(Some(Typmod {
+                precision: 10,
+                scale: 0
+            }))
+        );
+        assert_eq!(
+            ty("CREATE TABLE t (x numeric(10, 2))"),
+            ColumnType::Numeric(Some(Typmod {
+                precision: 10,
+                scale: 2
+            }))
+        );
+        // The cast target accepts the same modifier.
+        assert!(matches!(
+            expr("x::numeric(5,1)"),
+            Expr::Cast {
+                ty: ColumnType::Numeric(Some(Typmod {
+                    precision: 5,
+                    scale: 1
+                })),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_numeric_literals() {
+        // SP32: bare decimal/exponent literals are `numeric` (was `float8` in SP30).
+        assert_eq!(expr("1.5"), Expr::NumericLiteral("1.5".into()));
+        assert_eq!(expr(".25"), Expr::NumericLiteral(".25".into()));
+        assert_eq!(expr("1e3"), Expr::NumericLiteral("1e3".into()));
         assert_eq!(expr("42"), Expr::IntLiteral("42".into()));
         // float participates in arithmetic with the usual precedence.
         match expr("1 + 2.5 * 2") {
