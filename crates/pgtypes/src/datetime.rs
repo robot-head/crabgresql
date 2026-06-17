@@ -2192,32 +2192,39 @@ pub fn make_interval(
 
 /// PostgreSQL `interval_justify_days`: roll whole 30-day groups of `days` into
 /// `months`, leaving `days` in `(-30, 30)` (truncating division keeps the sign).
-pub fn justify_days(iv: Interval) -> Interval {
-    let whole_months = iv.days / 30;
-    Interval {
-        months: iv.months + whole_months,
+/// The `months` sum is done in i64 and narrowed back, so a near-`i32::MAX` input
+/// raises 22008 (PG 15+ `ERROR: interval out of range`) rather than panicking
+/// (debug, overflow-checks on) or wrapping (release).
+pub fn justify_days(iv: Interval) -> Result<Interval, TypeError> {
+    let whole_months = i64::from(iv.days) / 30;
+    let months = i64::from(iv.months) + whole_months;
+    Ok(Interval {
+        months: i32::try_from(months).map_err(|_| field_overflow("justify_days"))?,
         days: iv.days % 30,
         micros: iv.micros,
-    }
+    })
 }
 
 /// PostgreSQL `interval_justify_hours`: roll whole 24-hour groups of `micros` into
 /// `days`, leaving `micros` in `(-1 day, 1 day)` (truncating division keeps the
-/// sign).
-pub fn justify_hours(iv: Interval) -> Interval {
-    let whole_days = (iv.micros / USECS_PER_DAY_I64) as i32;
-    Interval {
+/// sign). The `days` sum is done in i64 and narrowed back, so a near-`i32::MAX`
+/// input raises 22008 (PG 15+ `ERROR: interval out of range`) rather than
+/// panicking (debug, overflow-checks on) or wrapping (release).
+pub fn justify_hours(iv: Interval) -> Result<Interval, TypeError> {
+    let whole_days = iv.micros / USECS_PER_DAY_I64;
+    let days = i64::from(iv.days) + whole_days;
+    Ok(Interval {
         months: iv.months,
-        days: iv.days + whole_days,
+        days: i32::try_from(days).map_err(|_| field_overflow("justify_hours"))?,
         micros: iv.micros % USECS_PER_DAY_I64,
-    }
+    })
 }
 
 /// PostgreSQL `interval_justify_interval` (src/backend/utils/adt/timestamp.c):
 /// pre-justify micros→days (24h) and days→months (30d), then sign-normalize so no
 /// field's sign disagrees with a larger non-zero field. The result is PG's
 /// canonical form, e.g. `'1 mon -1 hour'` → `'29 days 23:00:00'`.
-pub fn justify_interval(iv: Interval) -> Interval {
+pub fn justify_interval(iv: Interval) -> Result<Interval, TypeError> {
     const DAYS_PER_MONTH: i32 = 30;
     // Pre-justify on widened fields (the rolls can briefly push `days` past i32).
     let mut months = i64::from(iv.months);
@@ -2248,13 +2255,16 @@ pub fn justify_interval(iv: Interval) -> Interval {
         days += 1;
     }
 
-    // After normalization the fields are within PG's canonical ranges, so the
-    // narrowing back to i32 is lossless for any in-range input.
-    Interval {
-        months: months as i32,
-        days: days as i32,
+    // Normalization keeps each field within a month/day of its pre-justify value,
+    // but `months` (and transiently `days`) can already exceed i32 after rolling
+    // the micros/days carries up — so the narrowing back to i32 is NOT lossless
+    // in general. Check it: an out-of-i32 result raises 22008 (PG 15+ `ERROR:
+    // interval out of range`) rather than silently wrapping.
+    Ok(Interval {
+        months: i32::try_from(months).map_err(|_| field_overflow("justify_interval"))?,
+        days: i32::try_from(days).map_err(|_| field_overflow("justify_interval"))?,
         micros,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3624,7 +3634,8 @@ mod make_justify_tests {
                 months: 0,
                 days: 35,
                 micros: 0
-            }),
+            })
+            .expect("35 days justifies in range"),
             Interval {
                 months: 1,
                 days: 5,
@@ -3637,7 +3648,8 @@ mod make_justify_tests {
                 months: 0,
                 days: 0,
                 micros: 27 * 3_600_000_000
-            }),
+            })
+            .expect("27 hours justifies in range"),
             Interval {
                 months: 0,
                 days: 1,
@@ -3650,7 +3662,8 @@ mod make_justify_tests {
                 months: 1,
                 days: 0,
                 micros: -3_600_000_000
-            }),
+            })
+            .expect("'1 mon -1 hour' justifies in range"),
             Interval {
                 months: 0,
                 days: 29,
@@ -3663,12 +3676,58 @@ mod make_justify_tests {
                 months: -1,
                 days: 0,
                 micros: 3_600_000_000
-            }),
+            })
+            .expect("'-1 mon +1 hour' justifies in range"),
             Interval {
                 months: 0,
                 days: -29,
                 micros: -23 * 3_600_000_000
             }
         );
+    }
+
+    // Each `justify_*` narrows an i64 month/day roll back to an i32 field; an
+    // input whose fields sit near i32::MAX overflows that narrowing (the old
+    // unchecked code panicked in debug / wrapped in release / silently truncated
+    // the i64→i32 cast). PG 15+ raises `ERROR: interval out of range` (22008).
+    #[test]
+    fn justify_days_overflow_is_22008() {
+        use super::{Interval, justify_days};
+        // months + days/30 ≈ i32::MAX + 71_582_788 overflows the i32 narrowing.
+        let err = justify_days(Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: 0,
+        })
+        .expect_err("near-i32::MAX months+days overflows justify_days");
+        assert_eq!(err.sqlstate(), "22008");
+    }
+
+    #[test]
+    fn justify_hours_overflow_is_22008() {
+        use super::{Interval, justify_hours};
+        // days + micros/USECS_PER_DAY ≈ i32::MAX + 106_751_991 overflows the i32
+        // narrowing.
+        let err = justify_hours(Interval {
+            months: 0,
+            days: i32::MAX,
+            micros: i64::MAX,
+        })
+        .expect_err("near-i32::MAX days plus a full i64 of micros overflows justify_hours");
+        assert_eq!(err.sqlstate(), "22008");
+    }
+
+    #[test]
+    fn justify_interval_overflow_is_22008() {
+        use super::{Interval, justify_interval};
+        // After rolling micros→days→months the month total exceeds i32::MAX; the
+        // old `months as i32` silently wrapped, the checked narrowing now errors.
+        let err = justify_interval(Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: i64::MAX,
+        })
+        .expect_err("rolled month total exceeds i32 in justify_interval");
+        assert_eq!(err.sqlstate(), "22008");
     }
 }
