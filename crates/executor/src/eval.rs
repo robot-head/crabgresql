@@ -10,6 +10,19 @@ use crate::clock::EvalCtx;
 use crate::error::ExecError;
 use crate::scope::Scope;
 
+/// The maximum expression-tree depth `eval` will recurse before returning
+/// `54001` (statement_too_complex). This is DEFENSE-IN-DEPTH: the parser already
+/// caps the AST depth at `pgparser::parser::MAX_DEPTH` (50) at parse time, so a
+/// tree deeper than 50 can never reach here in practice — `150` leaves 3x
+/// headroom above that cap so the guard never wrongly rejects a parser-admitted
+/// tree. The value also stays well below the depth at which `eval` itself would
+/// overflow: in production (tokio's ~2 MiB worker stack) `eval` handles many
+/// thousands of frames, and even on the SMALLER stack a `cargo nextest` test
+/// thread gets, the at-limit `eval_accepts_a_tree_at_the_limit` test (≈150
+/// frames) runs safely below the ~350-frame overflow point — so a hypothetical
+/// over-deep tree returns a clean error rather than aborting the process.
+const MAX_EVAL_DEPTH: usize = 150;
+
 /// Evaluate `expr` against a row (`values`, aligned to `scope.columns`). `ctx`
 /// carries the session time zone and the transaction/statement clock; non-temporal
 /// evaluation ignores it (UTC/epoch reproduces prior behavior).
@@ -19,6 +32,25 @@ pub(crate) fn eval(
     values: &[Datum],
     ctx: &EvalCtx,
 ) -> Result<Datum, ExecError> {
+    eval_depth(expr, scope, values, ctx, 0)
+}
+
+/// Depth-tracking core of [`eval`]. `depth` is the current recursion level; every
+/// recursive descent (direct calls AND the child-evaluation closures handed to
+/// the shared `eval_*`/`func::*` combinators) increments it, so a runaway tree is
+/// bounded on every path. Returns `54001` once it exceeds `MAX_EVAL_DEPTH`.
+fn eval_depth(
+    expr: &Expr,
+    scope: &Scope,
+    values: &[Datum],
+    ctx: &EvalCtx,
+    depth: usize,
+) -> Result<Datum, ExecError> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(ExecError::StackDepthExceeded);
+    }
+    // One level deeper for every child this frame evaluates.
+    let d = depth + 1;
     match expr {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
         // SP32: a bare decimal/exponent literal is `numeric` (arbitrary precision —
@@ -44,12 +76,12 @@ pub(crate) fn eval(
             Ok(values[idx].clone())
         }
         Expr::Unary { op, expr } => {
-            let v = eval(expr, scope, values, ctx)?;
+            let v = eval_depth(expr, scope, values, ctx, d)?;
             apply_unary(*op, &v, ctx)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval(left, scope, values, ctx)?;
-            let r = eval(right, scope, values, ctx)?;
+            let l = eval_depth(left, scope, values, ctx, d)?;
+            let r = eval_depth(right, scope, values, ctx, d)?;
             apply_binary(*op, &l, &r, ctx)
         }
         // A function call reached scalar `eval`: a SP29 scalar function evaluates
@@ -58,18 +90,18 @@ pub(crate) fn eval(
         // aggregates from accumulators) — a known aggregate here is misplaced /
         // nested (42803); any other name is undefined (42883).
         Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
-            crate::func::eval_scalar(fc, ctx, |e| eval(e, scope, values, ctx))
+            crate::func::eval_scalar(fc, ctx, |e| eval_depth(e, scope, values, ctx, d))
         }
         // SP37: a date/time function (clock family, extract/date_part, date_trunc,
         // age, timezone). Tried after scalar, before the aggregate-context error.
         Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
-            crate::datetime_fn::eval_datetime(fc, ctx, |e| eval(e, scope, values, ctx))
+            crate::datetime_fn::eval_datetime(fc, ctx, |e| eval_depth(e, scope, values, ctx, d))
         }
         // SP38: date/time formatting + constructors + numeric to_char
         // (to_char/to_timestamp/to_date/make_*/justify_*). Tried after scalar +
         // datetime, before the aggregate-context error.
         Expr::Func(fc) if crate::format_fn::is_format_func(&fc.name) => {
-            crate::format_fn::eval_format(fc, ctx, |e| eval(e, scope, values, ctx))
+            crate::format_fn::eval_format(fc, ctx, |e| eval_depth(e, scope, values, ctx, d))
         }
         Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
         // SP28: predicate + conditional expressions. The pure-Datum combinators
@@ -77,7 +109,7 @@ pub(crate) fn eval(
         // the grouped evaluator (`agg::eval_grouped`); only the child-evaluation
         // closure differs.
         Expr::IsNull { expr, negated } => {
-            let v = eval(expr, scope, values, ctx)?;
+            let v = eval_depth(expr, scope, values, ctx, d)?;
             Ok(Datum::Bool(v.is_null() ^ *negated))
         }
         Expr::InList {
@@ -85,8 +117,8 @@ pub(crate) fn eval(
             list,
             negated,
         } => {
-            let x = eval(expr, scope, values, ctx)?;
-            eval_in_list(&x, list, *negated, |e| eval(e, scope, values, ctx))
+            let x = eval_depth(expr, scope, values, ctx, d)?;
+            eval_in_list(&x, list, *negated, |e| eval_depth(e, scope, values, ctx, d))
         }
         Expr::Between {
             expr,
@@ -94,9 +126,9 @@ pub(crate) fn eval(
             high,
             negated,
         } => {
-            let x = eval(expr, scope, values, ctx)?;
-            let lo = eval(low, scope, values, ctx)?;
-            let hi = eval(high, scope, values, ctx)?;
+            let x = eval_depth(expr, scope, values, ctx, d)?;
+            let lo = eval_depth(low, scope, values, ctx, d)?;
+            let hi = eval_depth(high, scope, values, ctx, d)?;
             eval_between(&x, &lo, &hi, *negated, ctx)
         }
         Expr::Like {
@@ -105,8 +137,8 @@ pub(crate) fn eval(
             negated,
             case_insensitive,
         } => {
-            let s = eval(expr, scope, values, ctx)?;
-            let p = eval(pattern, scope, values, ctx)?;
+            let s = eval_depth(expr, scope, values, ctx, d)?;
+            let p = eval_depth(pattern, scope, values, ctx, d)?;
             eval_like(&s, &p, *negated, *case_insensitive)
         }
         Expr::Case {
@@ -114,13 +146,13 @@ pub(crate) fn eval(
             whens,
             else_result,
         } => eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
-            eval(e, scope, values, ctx)
+            eval_depth(e, scope, values, ctx, d)
         }),
         // SP31: explicit cast — evaluate the operand, then convert. A text-parse
         // failure (22P02), numeric overflow (22003), or undefined cast (42846)
         // surfaces here; NULL casts to NULL. The session zone comes from `ctx`.
         Expr::Cast { expr, ty } => {
-            let v = eval(expr, scope, values, ctx)?;
+            let v = eval_depth(expr, scope, values, ctx, d)?;
             Ok(pgtypes::cast::cast(&v, *ty, &ctx.time_zone)?)
         }
         // SP34: a resolved subquery folded to a constant.
@@ -696,6 +728,45 @@ mod tests {
     fn ev(sql: &str, t: Option<&Table>, vals: &[Datum]) -> Datum {
         let ctx = crate::clock::EvalCtx::test_default();
         eval(&pexpr(sql).expect("parse"), &scope_of(t), vals, &ctx).expect("eval")
+    }
+
+    /// Defense-in-depth: an expression tree deeper than `MAX_EVAL_DEPTH` — built
+    /// DIRECTLY here, bypassing the parser's parse-time cap — must return a clean
+    /// `54001` from `eval`, never overflow the stack. (In production the parser
+    /// cap means such a tree can't be built, but the guard must still hold.)
+    #[test]
+    fn eval_rejects_an_over_deep_tree_with_54001() {
+        let mut e = Expr::BoolLiteral(true);
+        for _ in 0..(MAX_EVAL_DEPTH + 50) {
+            e = Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(e),
+            };
+        }
+        let ctx = crate::clock::EvalCtx::test_default();
+        let err = eval(&e, &Scope::empty(), &[], &ctx).expect_err("must reject");
+        assert_eq!(err, ExecError::StackDepthExceeded);
+        assert_eq!(err.into_pg().code, "54001");
+    }
+
+    /// A tree right at the limit still evaluates (the guard does not fire early).
+    #[test]
+    fn eval_accepts_a_tree_at_the_limit() {
+        // `Not` chains of even length evaluate back to the base value.
+        let depth = MAX_EVAL_DEPTH - 1; // safely under, even count from `true`
+        let depth = depth - (depth % 2);
+        let mut e = Expr::BoolLiteral(true);
+        for _ in 0..depth {
+            e = Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(e),
+            };
+        }
+        let ctx = crate::clock::EvalCtx::test_default();
+        assert_eq!(
+            eval(&e, &Scope::empty(), &[], &ctx).expect("at-limit tree evaluates"),
+            Datum::Bool(true),
+        );
     }
 
     #[test]

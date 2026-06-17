@@ -59,6 +59,12 @@ pub enum ExecError {
     /// SP37: a `SET`/`SHOW`/`RESET` named a configuration parameter that does not
     /// exist (42704).
     UnrecognizedParameter(String),
+    /// An expression nested more deeply than the evaluator's `MAX_EVAL_DEPTH`
+    /// (54001 / statement_too_complex). Defense-in-depth: the parser already caps
+    /// the AST depth at parse time, so a tree this deep should never reach `eval`;
+    /// this guard ensures that even if one did, evaluation returns a clean error
+    /// rather than overflowing the stack and aborting the server process.
+    StackDepthExceeded,
 }
 
 impl ExecError {
@@ -121,6 +127,7 @@ impl ExecError {
                 "42704",
                 format!("unrecognized configuration parameter \"{n}\""),
             ),
+            ExecError::StackDepthExceeded => PgError::error("54001", "stack depth limit exceeded"),
         }
     }
 }
