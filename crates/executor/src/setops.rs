@@ -44,7 +44,12 @@ fn set_expr_schema(
             } else {
                 crate::exec::build_from_schema(catalog_kv, &s.from)?.scope
             };
-            let (fields, _exprs, tys) = crate::exec::resolve_projection(&s.projection, &scope)?;
+            // Match the plain-Select describe path: substitute scalar subqueries in
+            // the projection with typed-NULL consts so their OIDs are known without
+            // executing (SP34 type pass), then resolve.
+            let projection =
+                crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
+            let (fields, _exprs, tys) = crate::exec::resolve_projection(&projection, &scope)?;
             Ok(fields.into_iter().map(|f| f.name).zip(tys).collect())
         }
         SetExpr::SetOp {

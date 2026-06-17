@@ -1897,6 +1897,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_set_op_unifies_branch_types() {
+        // The Describe path must run cross-branch type unification: int4 ∪ int8 → int8.
+        let engine = SqlEngine::new();
+        let fields = engine
+            .connect()
+            .describe("SELECT 1 AS x UNION SELECT 2::int8")
+            .await
+            .expect("describe");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].type_oid, pgtypes::ColumnType::Int8.oid());
+    }
+
+    #[tokio::test]
     async fn two_inserts_are_both_visible() {
         let engine = SqlEngine::new();
         run(&engine, "CREATE TABLE t (id int4)").await;
