@@ -9,7 +9,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pgparser::ast::SetOp;
+use kv::Kv;
+use mvcc::visibility::Snapshot;
+use pgparser::ast::{Expr, SetExpr, SetOp, SetQuery};
 use pgtypes::{ColumnType, Datum};
 
 use crate::clock::EvalCtx;
@@ -17,13 +19,99 @@ use crate::error::ExecError;
 use crate::join::Relation;
 use crate::scope::{ColumnBinding, Scope};
 
+/// Evaluate a complete set-operation query to a wire result. Each leaf runs through
+/// the existing single-SELECT read path (`exec::select_to_relation`) under the
+/// statement's snapshot handles; the tree folds via `combine`; the query-level
+/// ORDER BY / OFFSET / LIMIT then apply to the combined output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_set_operation(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &Snapshot,
+    snapshot: &Snapshot,
+    own: Option<u64>,
+    q: &SetQuery,
+    ctx: &EvalCtx,
+) -> Result<pgwire::engine::QueryResult, ExecError> {
+    let rel = fold(catalog_kv, kv, global, gsnap, snapshot, own, &q.body, ctx)?;
+    let mut rows = rel.rows;
+
+    // Query-level ORDER BY over the OUTPUT columns: a bare integer is a 1-based
+    // position; anything else is evaluated against the output scope.
+    if !q.order_by.is_empty() {
+        let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut keys = Vec::with_capacity(q.order_by.len());
+            for item in &q.order_by {
+                keys.push(order_key(&item.expr, &rel.scope, &row, ctx)?);
+            }
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, &q.order_by));
+        rows = keyed.into_iter().map(|(_, r)| r).collect();
+    }
+    crate::exec::apply_offset_limit(&mut rows, q.offset, q.limit);
+
+    let fields = rel
+        .scope
+        .columns
+        .iter()
+        .map(|c| crate::exec::field(&c.name, c.ty))
+        .collect();
+    Ok(crate::exec::rows_result(fields, &rows, &ctx.time_zone))
+}
+
+/// One ORDER BY key for the set-op output: integer literal → 1-based position;
+/// otherwise evaluate against the output scope (output column name / expression).
+fn order_key(expr: &Expr, scope: &Scope, row: &[Datum], ctx: &EvalCtx) -> Result<Datum, ExecError> {
+    if let Expr::IntLiteral(s) = expr {
+        let pos: usize = s
+            .parse()
+            .map_err(|_| ExecError::Unsupported(format!("invalid ORDER BY position {s}")))?;
+        if pos == 0 || pos > scope.width() {
+            return Err(ExecError::Unsupported(format!(
+                "ORDER BY position {pos} is out of range (1..{})",
+                scope.width()
+            )));
+        }
+        return Ok(row[pos - 1].clone());
+    }
+    crate::eval::eval(expr, scope, row, ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold(
+    catalog_kv: &dyn Kv,
+    kv: &dyn Kv,
+    global: &dyn Kv,
+    gsnap: &Snapshot,
+    snapshot: &Snapshot,
+    own: Option<u64>,
+    e: &SetExpr,
+    ctx: &EvalCtx,
+) -> Result<Relation, ExecError> {
+    match e {
+        SetExpr::Select(s) => {
+            crate::exec::select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, s, ctx)
+        }
+        SetExpr::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            let l = fold(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
+            let r = fold(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
+            combine(*op, *all, l, r, ctx)
+        }
+    }
+}
+
 /// Combine two child relations under one set operator into a single relation.
 /// Output column NAMES come from the left child; TYPES are the per-column
 /// unification of both children (numeric tower + identical types; incompatible →
 /// 42804). Rows of both sides are coerced to the unified types before combining.
-// Wired into execution in Task 6; until then it is reached only by this module's
-// unit tests, so suppress the not-yet-live warning in non-test builds.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn combine(
     op: SetOp,
     all: bool,
@@ -298,5 +386,41 @@ mod tests {
             combine(SetOp::Union, false, l, r, &ctx).expect_err("incompatible"),
             ExecError::TypeMismatch(_)
         ));
+    }
+
+    /// End-to-end: UNION deduplicates across two tables and ORDER BY positions
+    /// the combined output — exercises `execute_set_operation` + session dispatch.
+    #[tokio::test]
+    async fn union_runs_end_to_end() {
+        use pgwire::engine::{Engine, QueryResult, Session};
+
+        use crate::SqlEngine;
+
+        let engine = SqlEngine::new();
+        let mut s = engine.connect();
+        for sql in [
+            "CREATE TABLE t (a int4)",
+            "INSERT INTO t VALUES (1),(2),(2)",
+            "CREATE TABLE u (a int4)",
+            "INSERT INTO u VALUES (2),(3)",
+        ] {
+            s.simple_query(sql).await.expect("setup");
+        }
+        let r = s
+            .simple_query("SELECT a FROM t UNION SELECT a FROM u ORDER BY a")
+            .await
+            .expect("union");
+        let QueryResult::Rows { rows, .. } = &r[0] else {
+            panic!("expected rows")
+        };
+        let got: Vec<_> = rows
+            .iter()
+            .map(|row| row[0].as_ref().expect("non-null").text.to_vec())
+            .collect();
+        assert_eq!(
+            got,
+            vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()],
+            "UNION should dedup and order: [1, 2, 3]"
+        );
     }
 }
