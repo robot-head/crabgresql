@@ -1685,6 +1685,406 @@ fn match_pattern(
     Ok(None)
 }
 
+/// The fields extracted by a template-driven parse (`to_timestamp`/`to_date`).
+/// Separate from `DateTimeFields` (which is for FORMATTING): this is the OUTPUT of
+/// parsing, holding whatever fields the template/input supplied, with PostgreSQL's
+/// defaults filled in for the rest. The caller (the executor) builds a jiff
+/// `Date`/`DateTime` from these fields, where the final civil-validity check (e.g.
+/// Feb 30) is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedDateTime {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub micros: u32,
+    pub tz_offset_secs: Option<i32>,
+}
+
+impl Default for ParsedDateTime {
+    /// PostgreSQL's defaults for fields no template pattern supplies: year 1,
+    /// month 1, day 1, all clock fields 0, no timezone.
+    fn default() -> Self {
+        ParsedDateTime {
+            year: 1,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            micros: 0,
+            tz_offset_secs: None,
+        }
+    }
+}
+
+/// Which half-of-day a meridiem pattern (`AM`/`PM`, dotted/lower) selected, so the
+/// 12-hour `HH12`/`HH` value can be converted to 24-hour AFTER the whole input is
+/// scanned (the meridiem may appear before or after the hour in the template).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Meridiem {
+    Am,
+    Pm,
+}
+
+/// Template-driven parse for `to_timestamp`/`to_date`. Tokenizes `template` with the
+/// SAME longest-match pattern recognition as the format engine (`matches_at`), then
+/// for each pattern consumes the corresponding piece of `input`: a numeric pattern
+/// consumes up to its max width of leading ASCII digits; a name pattern
+/// (`Mon`/`Month`) matches a month name case-insensitively; literal template chars
+/// are matched leniently (PostgreSQL largely ignores separators — a non-alphanumeric
+/// template char skips a run of non-alphanumeric input chars). Returns a
+/// `ParsedDateTime` with PG defaults for absent fields (year 1, month/day 1, time 0).
+/// Bad shape (a non-digit where a number is required, an unrecognized name) → 22007
+/// (`InvalidDatetimeFormat`); an out-of-range field (month 13, hour 24, …) → 22008
+/// (`DatetimeFieldOverflow`).
+pub fn parse_by_template(template: &str, input: &str) -> Result<ParsedDateTime, TypeError> {
+    let tchars: Vec<char> = template.chars().collect();
+    let ichars: Vec<char> = input.chars().collect();
+    let mut ti = 0usize; // cursor into the template
+    let mut ii = 0usize; // cursor into the input
+
+    let mut out = ParsedDateTime::default();
+    // Track whether a meridiem pattern was present and which half it selected, so we
+    // can fold the 12-hour clock to 24-hour after the full scan.
+    let mut meridiem: Option<Meridiem> = None;
+    let mut saw_hour12 = false;
+
+    let bad_shape = || TypeError::InvalidDatetimeFormat {
+        type_name: "timestamp",
+        value: input.to_string(),
+    };
+    let out_of_range = |what: &str, v: i64| TypeError::DatetimeFieldOverflow {
+        value: format!("{what}={v}"),
+    };
+
+    while ti < tchars.len() {
+        // A `"`-quoted literal run in the template: each char inside the quotes is a
+        // literal matched against the input the same way a bare literal char is — an
+        // alphanumeric must match (case-insensitively, else tolerated), a separator
+        // skips a run of input separators (PG's lenient literal matching).
+        if tchars[ti] == '"' {
+            ti += 1;
+            while ti < tchars.len() && tchars[ti] != '"' {
+                let lit = if tchars[ti] == '\\' && ti + 1 < tchars.len() {
+                    ti += 2;
+                    tchars[ti - 1]
+                } else {
+                    let c = tchars[ti];
+                    ti += 1;
+                    c
+                };
+                match_literal(lit, &ichars, &mut ii);
+            }
+            if tchars.get(ti) == Some(&'"') {
+                ti += 1;
+            }
+            continue;
+        }
+        // `FM` is a no-op for parsing (it only affects formatting fill).
+        if matches_at(&tchars, ti, "FM") {
+            ti += 2;
+            continue;
+        }
+
+        if let Some((consumed, field)) = match_parse_pattern(&tchars, ti) {
+            match field {
+                ParseField::Num { max, set } => {
+                    let v = consume_number(&ichars, &mut ii, max).ok_or_else(bad_shape)?;
+                    set(&mut out, v, &mut saw_hour12);
+                }
+                ParseField::MonthAbbrev => {
+                    let m = consume_month_name(&ichars, &mut ii, true).ok_or_else(bad_shape)?;
+                    out.month = m;
+                }
+                ParseField::MonthFull => {
+                    let m = consume_month_name(&ichars, &mut ii, false).ok_or_else(bad_shape)?;
+                    out.month = m;
+                }
+                ParseField::DayNameSkip { len } => {
+                    // A day-of-week NAME pattern (`Day`/`Dy`) does not set a value;
+                    // skip a run of input letters (PG accepts and ignores it).
+                    consume_day_name(&ichars, &mut ii, len);
+                }
+                ParseField::Meridiem => {
+                    meridiem = Some(consume_meridiem(&ichars, &mut ii).ok_or_else(bad_shape)?);
+                }
+            }
+            ti += consumed;
+            continue;
+        }
+
+        // A bare literal template char (matched leniently — see `match_literal`).
+        match_literal(tchars[ti], &ichars, &mut ii);
+        ti += 1;
+    }
+
+    // Fold the 12-hour clock to 24-hour if a meridiem pattern was present.
+    if let Some(m) = meridiem {
+        // PG only treats the hour as a 12-hour value when an HH12/HH pattern fed it;
+        // 12 AM → 0, 12 PM → 12, otherwise +12 for PM. (If no HH12 pattern set the
+        // hour, a stray AM/PM still applies the standard conversion to whatever hour
+        // value is present, matching PG's `tm` post-processing.)
+        let h = out.hour % 12; // 12 → 0
+        out.hour = match m {
+            Meridiem::Am => h,
+            Meridiem::Pm => h + 12,
+        };
+        let _ = saw_hour12;
+    }
+
+    // Range-validate the assembled fields. Full civil validity (Feb 30, etc.) is the
+    // caller's job; here we reject a clearly out-of-range single field.
+    if !(1..=12).contains(&out.month) {
+        return Err(out_of_range("month", out.month as i64));
+    }
+    if !(1..=31).contains(&out.day) {
+        return Err(out_of_range("day", out.day as i64));
+    }
+    if out.hour > 23 {
+        return Err(out_of_range("hour", out.hour as i64));
+    }
+    if out.minute > 59 {
+        return Err(out_of_range("minute", out.minute as i64));
+    }
+    if out.second > 59 {
+        return Err(out_of_range("second", out.second as i64));
+    }
+
+    Ok(out)
+}
+
+/// A parse-time pattern: what kind of input piece to consume and how to store it.
+enum ParseField {
+    /// A run of up to `max` leading digits; `set` records it into the right field
+    /// (and flips `saw_hour12` for `HH`/`HH12`).
+    Num {
+        max: usize,
+        set: fn(&mut ParsedDateTime, i64, &mut bool),
+    },
+    /// A 3-letter month abbreviation.
+    MonthAbbrev,
+    /// A full month name (longest match).
+    MonthFull,
+    /// A day-of-week name pattern that is accepted but sets no value.
+    DayNameSkip { len: usize },
+    /// An `AM`/`PM` meridiem marker (dotted/lower forms accepted).
+    Meridiem,
+}
+
+/// Recognize the parse pattern at `tchars[ti..]` (longest match), returning the
+/// number of TEMPLATE chars it spans and the field to consume. Mirrors the
+/// formatter's longest-first ordering for the patterns `to_timestamp`/`to_date`
+/// commonly use; unrecognized template text falls through to literal handling.
+fn match_parse_pattern(tchars: &[char], ti: usize) -> Option<(usize, ParseField)> {
+    // Numeric patterns, longest first within each family so `YYYY` beats `YY`, etc.
+    // The `max` is the max digits to consume; PG accepts fewer if a non-digit follows.
+    let num =
+        |max: usize, set: fn(&mut ParsedDateTime, i64, &mut bool)| ParseField::Num { max, set };
+
+    // -- year --
+    if matches_at(tchars, ti, "YYYY") {
+        return Some((4, num(4, |p, v, _| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "YYY") {
+        return Some((3, num(3, |p, v, _| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "YY") {
+        return Some((2, num(2, |p, v, _| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "Y") {
+        return Some((1, num(1, |p, v, _| p.year = v as i32)));
+    }
+    // -- month (numeric, then names; `Month` before `Mon`) --
+    if matches_at(tchars, ti, "MM") {
+        return Some((2, num(2, |p, v, _| p.month = v as u32)));
+    }
+    if matches_at(tchars, ti, "Month")
+        || matches_at(tchars, ti, "MONTH")
+        || matches_at(tchars, ti, "month")
+    {
+        return Some((5, ParseField::MonthFull));
+    }
+    if matches_at(tchars, ti, "Mon")
+        || matches_at(tchars, ti, "MON")
+        || matches_at(tchars, ti, "mon")
+    {
+        return Some((3, ParseField::MonthAbbrev));
+    }
+    // -- day-of-month / day-of-week name (accepted, sets nothing) --
+    if matches_at(tchars, ti, "DD") {
+        return Some((2, num(2, |p, v, _| p.day = v as u32)));
+    }
+    if matches_at(tchars, ti, "Day")
+        || matches_at(tchars, ti, "DAY")
+        || matches_at(tchars, ti, "day")
+    {
+        return Some((3, ParseField::DayNameSkip { len: 9 }));
+    }
+    if matches_at(tchars, ti, "Dy") || matches_at(tchars, ti, "DY") || matches_at(tchars, ti, "dy")
+    {
+        return Some((2, ParseField::DayNameSkip { len: 3 }));
+    }
+    // -- time (HH24 before HH12/HH; SS before nothing shorter here) --
+    if matches_at(tchars, ti, "HH24") {
+        return Some((4, num(2, |p, v, _| p.hour = v as u32)));
+    }
+    if matches_at(tchars, ti, "HH12") {
+        return Some((
+            4,
+            num(2, |p, v, s| {
+                p.hour = v as u32;
+                *s = true;
+            }),
+        ));
+    }
+    if matches_at(tchars, ti, "HH") {
+        return Some((
+            2,
+            num(2, |p, v, s| {
+                p.hour = v as u32;
+                *s = true;
+            }),
+        ));
+    }
+    if matches_at(tchars, ti, "MI") {
+        return Some((2, num(2, |p, v, _| p.minute = v as u32)));
+    }
+    if matches_at(tchars, ti, "SS") {
+        return Some((2, num(2, |p, v, _| p.second = v as u32)));
+    }
+    if matches_at(tchars, ti, "US") {
+        // Microseconds: up to 6 digits.
+        return Some((2, num(6, |p, v, _| p.micros = v as u32)));
+    }
+    if matches_at(tchars, ti, "MS") {
+        // Milliseconds: up to 3 digits, scaled to micros.
+        return Some((2, num(3, |p, v, _| p.micros = (v as u32) * 1000)));
+    }
+    // -- meridiem (dotted forms before plain; either case) --
+    for kw in ["A.M.", "P.M.", "a.m.", "p.m.", "AM", "PM", "am", "pm"] {
+        if matches_at(tchars, ti, kw) {
+            return Some((kw.chars().count(), ParseField::Meridiem));
+        }
+    }
+    None
+}
+
+/// Consume up to `max` leading ASCII digits from `chars` at `*i`, returning the
+/// value. Requires at least one digit (PG: a number-expecting pattern with a
+/// non-digit there is an error) — returns `None` otherwise.
+fn consume_number(chars: &[char], i: &mut usize, max: usize) -> Option<i64> {
+    let start = *i;
+    let mut v: i64 = 0;
+    let mut n = 0usize;
+    while *i < chars.len() && n < max && chars[*i].is_ascii_digit() {
+        v = v * 10 + (chars[*i] as u8 - b'0') as i64;
+        *i += 1;
+        n += 1;
+    }
+    if *i == start { None } else { Some(v) }
+}
+
+/// Consume a month name from `chars` at `*i`, case-insensitively. When `abbrev`,
+/// match a 3-letter abbreviation (the first 3 chars of a `MONTH_NAMES` entry);
+/// otherwise match a full month name (longest match — the input must begin with the
+/// full name). Returns the 1-based month, or `None` if no name matches.
+fn consume_month_name(chars: &[char], i: &mut usize, abbrev: bool) -> Option<u32> {
+    for (idx, name) in MONTH_NAMES.iter().enumerate() {
+        let needle: Vec<char> = if abbrev {
+            name.chars().take(3).collect()
+        } else {
+            name.chars().collect()
+        };
+        if input_starts_with_ci(chars, *i, &needle) {
+            *i += needle.len();
+            return Some(idx as u32 + 1);
+        }
+    }
+    None
+}
+
+/// Skip a day-of-week NAME in the input (accepted but value-less). Matches a known
+/// day name (full or 3-letter abbrev) case-insensitively; if none matches, skips a
+/// run of up to `len` leading letters as a lenient fallback.
+fn consume_day_name(chars: &[char], i: &mut usize, len: usize) {
+    for name in DAY_NAMES.iter() {
+        let full: Vec<char> = name.chars().collect();
+        if input_starts_with_ci(chars, *i, &full) {
+            *i += full.len();
+            return;
+        }
+        let abbrev: Vec<char> = name.chars().take(3).collect();
+        if input_starts_with_ci(chars, *i, &abbrev) {
+            *i += abbrev.len();
+            return;
+        }
+    }
+    // Lenient fallback: skip up to `len` leading alphabetic chars.
+    let mut n = 0;
+    while *i < chars.len() && n < len && chars[*i].is_alphabetic() {
+        *i += 1;
+        n += 1;
+    }
+}
+
+/// Consume an `AM`/`PM` meridiem at `*i` (dotted `A.M.`/`P.M.` and either case
+/// accepted). Returns the half-of-day, or `None` if neither matches.
+fn consume_meridiem(chars: &[char], i: &mut usize) -> Option<Meridiem> {
+    // Dotted forms first (longest match), then plain.
+    for (needle, m) in [
+        ("a.m.", Meridiem::Am),
+        ("p.m.", Meridiem::Pm),
+        ("am", Meridiem::Am),
+        ("pm", Meridiem::Pm),
+    ] {
+        let nchars: Vec<char> = needle.chars().collect();
+        if input_starts_with_ci(chars, *i, &nchars) {
+            *i += nchars.len();
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Does `chars[i..]` begin with `needle` (already a `&[char]`), ASCII-case-insensitive?
+fn input_starts_with_ci(chars: &[char], i: usize, needle: &[char]) -> bool {
+    if i + needle.len() > chars.len() {
+        return false;
+    }
+    chars[i..i + needle.len()]
+        .iter()
+        .zip(needle)
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Advance `*i` over a run of leading non-alphanumeric (separator/whitespace/punct)
+/// input chars. PostgreSQL is lenient about separators between fields, so a literal
+/// template separator matches zero-or-more input separators.
+fn skip_separators(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && !chars[*i].is_alphanumeric() {
+        *i += 1;
+    }
+}
+
+/// Match a single literal template char `lit` against the input at `*i`. An
+/// alphanumeric literal consumes one matching input char (case-insensitive; a
+/// mismatch is tolerated — PG does not hard-fail a literal mismatch — leaving the
+/// cursor in place). A separator/punctuation literal matches leniently: it skips a
+/// run of leading separator chars in the input (PG largely ignores separators, so
+/// e.g. an input `-` matches a template `/`).
+fn match_literal(lit: char, chars: &[char], i: &mut usize) {
+    if lit.is_alphanumeric() {
+        if *i < chars.len() && chars[*i].eq_ignore_ascii_case(&lit) {
+            *i += 1;
+        }
+    } else {
+        skip_separators(chars, i);
+    }
+}
+
 #[cfg(test)]
 mod format_tests {
     use super::{DateTimeFields, format_datetime};
@@ -2827,5 +3227,128 @@ mod mutation_tests {
         );
         // A positive sub-second-only clock (the subsec multiply, line 869).
         assert_eq!(interval_to_text(iv(0, 0, 250_000)), "00:00:00.25");
+    }
+}
+
+#[cfg(test)]
+mod parse_template_tests {
+    #[test]
+    fn parse_by_template_extracts_fields() {
+        use super::parse_by_template;
+        let p = parse_by_template("YYYY-MM-DD HH24:MI:SS", "2024-01-15 13:45:06").expect("p");
+        assert_eq!((p.year, p.month, p.day), (2024, 1, 15));
+        assert_eq!((p.hour, p.minute, p.second), (13, 45, 6));
+        // month name + 12-hour + meridiem
+        let q = parse_by_template("Mon DD YYYY HH12:MI PM", "Jul 04 2024 01:30 PM").expect("q");
+        assert_eq!(
+            (q.year, q.month, q.day, q.hour, q.minute),
+            (2024, 7, 4, 13, 30)
+        );
+        // absent fields default (PG): year→1, month→1, day→1, time→0.
+        let d = parse_by_template("YYYY", "2030").expect("d");
+        assert_eq!((d.year, d.month, d.day, d.hour), (2030, 1, 1, 0));
+    }
+
+    #[test]
+    fn parse_by_template_errors() {
+        use super::parse_by_template;
+        // non-digit where a digit is required → 22007.
+        assert_eq!(
+            parse_by_template("YYYY-MM-DD", "abcd-01-01")
+                .expect_err("non-digit")
+                .sqlstate(),
+            "22007"
+        );
+        // out-of-range field → 22008.
+        assert_eq!(
+            parse_by_template("YYYY-MM-DD", "2024-13-01")
+                .expect_err("month 13")
+                .sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn parse_by_template_meridiem_conversions() {
+        use super::parse_by_template;
+        // 12 AM → 0 (midnight).
+        let mid = parse_by_template("HH12:MI AM", "12:00 AM").expect("mid");
+        assert_eq!((mid.hour, mid.minute), (0, 0));
+        // 12 PM → 12 (noon).
+        let noon = parse_by_template("HH12:MI PM", "12:00 PM").expect("noon");
+        assert_eq!(noon.hour, 12);
+        // 11 PM → 23.
+        let eve = parse_by_template("HH12 PM", "11 PM").expect("eve");
+        assert_eq!(eve.hour, 23);
+        // lowercase meridiem accepted.
+        let low = parse_by_template("HH12:MI am", "07:15 am").expect("am");
+        assert_eq!((low.hour, low.minute), (7, 15));
+        // dotted meridiem accepted.
+        let dot = parse_by_template("HH12 P.M.", "03 P.M.").expect("dot");
+        assert_eq!(dot.hour, 15);
+        // No meridiem: HH12 value used as-is (PG: 13 stays 13 in HH12 w/o AM/PM).
+        let raw = parse_by_template("HH12:MI:SS", "13:05:09").expect("raw");
+        assert_eq!((raw.hour, raw.minute, raw.second), (13, 5, 9));
+    }
+
+    #[test]
+    fn parse_by_template_full_month_name_and_us() {
+        use super::parse_by_template;
+        // Full month name (longest match, case-insensitive).
+        let m = parse_by_template("Month DD, YYYY", "September 09, 1999").expect("m");
+        assert_eq!((m.year, m.month, m.day), (1999, 9, 9));
+        let m2 = parse_by_template("MONTH", "DECEMBER").expect("m2");
+        assert_eq!(m2.month, 12);
+        // Microseconds.
+        let us = parse_by_template("HH24:MI:SS.US", "01:02:03.123456").expect("us");
+        assert_eq!(
+            (us.hour, us.minute, us.second, us.micros),
+            (1, 2, 3, 123456)
+        );
+    }
+
+    #[test]
+    fn parse_by_template_leniency() {
+        use super::parse_by_template;
+        // PG is lenient about separators: a slash template against dashes still parses.
+        let p = parse_by_template("YYYY/MM/DD", "2024-01-15").expect("p");
+        assert_eq!((p.year, p.month, p.day), (2024, 1, 15));
+        // Fewer digits than the field width are accepted when a non-digit follows.
+        let q = parse_by_template("YYYY-MM-DD", "2024-1-5").expect("q");
+        assert_eq!((q.month, q.day), (1, 5));
+        // A quoted literal run in the template is skipped over the matching input.
+        let r = parse_by_template("YYYY\"-the-\"MM", "2024-the-07").expect("r");
+        assert_eq!((r.year, r.month), (2024, 7));
+    }
+
+    #[test]
+    fn parse_by_template_range_errors() {
+        use super::parse_by_template;
+        // hour 24 (after no meridiem) is out of range → 22008.
+        assert_eq!(
+            parse_by_template("HH24:MI", "24:00")
+                .expect_err("hour 24")
+                .sqlstate(),
+            "22008"
+        );
+        // minute 60 → 22008.
+        assert_eq!(
+            parse_by_template("MI", "60")
+                .expect_err("minute 60")
+                .sqlstate(),
+            "22008"
+        );
+        // day 0 → 22008.
+        assert_eq!(
+            parse_by_template("DD", "00").expect_err("day 0").sqlstate(),
+            "22008"
+        );
+        // An unrecognized month name → 22007 (bad shape, no digits to consume).
+        assert_eq!(
+            parse_by_template("Mon", "Xyz")
+                .expect_err("bad month name")
+                .sqlstate(),
+            "22007"
+        );
     }
 }
