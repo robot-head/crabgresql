@@ -1041,8 +1041,10 @@ impl Parser {
     }
 
     /// Parse a single SELECT body INCLUDING its trailing ORDER BY / LIMIT / OFFSET /
-    /// locking. Unchanged behavior for the recursive callers (derived tables,
-    /// subquery expressions) — they still get a fully-populated `SelectStmt`.
+    /// locking. The refactor that split this into `select_core` + `parse_set_tail` +
+    /// `parse_locking` leaves the recursive callers (derived tables, subquery
+    /// expressions) unaffected: they still get a fully-parsed `SelectStmt` with any
+    /// trailing ORDER BY / LIMIT / OFFSET / locking, exactly as before.
     fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
         let mut s = self.select_core()?;
         let (order_by, limit, offset) = self.parse_set_tail()?;
@@ -1142,8 +1144,8 @@ impl Parser {
     }
 
     /// Parse an optional `ORDER BY …`, then `LIMIT`/`OFFSET` in either order.
-    // The tuple is the three result-level tail components (order_by, limit, offset);
-    // a named struct would not read more clearly than the positional triple.
+    /// The tuple is the three result-level tail components (order_by, limit, offset);
+    /// a named struct would not read more clearly than the positional triple.
     #[allow(clippy::type_complexity)]
     fn parse_set_tail(
         &mut self,
@@ -2946,5 +2948,20 @@ mod tests {
     fn order_by_on_parenthesized_set_op_subtree_is_rejected() {
         // Deferred non-goal: a tail on a parenthesized MULTI-branch subtree.
         assert!(crate::parse("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3").is_err());
+    }
+
+    #[test]
+    fn union_distinct_is_the_default_form() {
+        use crate::ast::{SetExpr, Statement};
+        // `UNION DISTINCT` is the explicit spelling of the default (dedup) form:
+        // it parses to the same tree as a bare `UNION` (all == false).
+        let s = crate::parse("SELECT 1 UNION DISTINCT SELECT 2").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op, got {:?}", s[0])
+        };
+        let SetExpr::SetOp { all, .. } = &q.body else {
+            panic!("expected SetOp")
+        };
+        assert!(!*all, "UNION DISTINCT is the dedup (all == false) form");
     }
 }
