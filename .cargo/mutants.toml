@@ -81,4 +81,58 @@ exclude_re = [
     # estimate is EXACTLY MAX_WEIGHT (131071), which would require materializing a
     # 131072-digit result to observe — a benign off-by-one at the numeric-format edge.
     "replace > with >= in num_power",
+    # SP33: parse_clock_term's `while frac_digits.len() < 6` pad-loop is EQUIVALENT
+    # under `<=`. The loop only ever APPENDS '0', and the result is sliced
+    # `frac_digits[..6]` — the first six chars. `<` stops at exactly 6 chars; `<=`
+    # overshoots to 7, but `[..6]` discards the extra, so both yield the identical
+    # six-digit fraction for EVERY input (proven over the full input space). The
+    # `< → ==` and `< → >` mutants on the SAME line ARE killable (they stop early,
+    # leaving < 6 chars → a slice panic) and are covered by the `.5`-fraction test.
+    "replace < with <= in parse_clock_term",
+    # SP33: format_clock's `let neg = total_micros < 0` is EQUIVALENT under `<= 0`.
+    # `< 0` and `<= 0` differ ONLY at total_micros == 0, but format_clock has a
+    # single caller (interval_to_text) gated by `has_clock = iv.micros != 0`, so it
+    # is NEVER invoked with 0. For every value it actually sees (non-zero), the two
+    # comparisons decide the sign identically; no test can distinguish them.
+    "replace < with <= in format_clock",
+    # SP33: accumulate_unit's year arm has `*micros += 0;` (line 774 — a documented
+    # no-op: a whole/fractional YEAR contributes no microseconds). `+= 0` and
+    # `-= 0` are IDENTICAL (zero is its own negation), so the `+= → -=` mutant on
+    # THIS line is equivalent. The `+= → *=` mutant on the same line is NOT
+    # equivalent (`*micros *= 0` wipes any micros accumulated by a prior term) and
+    # is killed by `accumulate_unit_year_term_does_not_clobber_prior_micros`. The
+    # exclusion is line-scoped so the killable `+= → -=` mutants on the OTHER
+    # accumulate_unit lines stay in the signal.
+    "datetime\\.rs:774:21: replace \\+= with -=",
+    # ops.rs `arith`'s own `if a.is_null() || b.is_null()` (line 116) is EQUIVALENT
+    # under `&&`. Every caller — add/sub/mul/div — already returns early on a NULL
+    # operand BEFORE calling `arith`, so `arith` never observes a null: both
+    # `is_null()` calls are always false, and `false || false` == `false && false`.
+    # The true-branch is dead, so no test can distinguish `||` from `&&` here. (The
+    # `||→&&` mutants on `arith`'s line 130 `is_numeric` check and in
+    # `div`/`rem`/`compare` are NOT excluded — those guards are live and are killed
+    # by the numeric/float dispatch tests.) Line-scoped so only this dead check is
+    # excluded.
+    "ops\\.rs:116:20: replace \\|\\| with &&",
+    # ops.rs `div`'s `arith(..., |x, y| x / y, ...)` 5th arg (line 376) is the
+    # FLOAT op_f8 closure, and it is DEAD on the div→arith path: `div` returns
+    # before `arith` for every float operand (line 345's float fast-path) and every
+    # numeric operand (line 358), so only pure-INTEGER pairs reach `arith` from
+    # `div`, and `arith` invokes op_f8 only for a float operand. The closure is
+    # therefore never called, so `/ → %` and `/ → *` on it are equivalent (the code
+    # comment at lines 369-370 documents this dead-arg intent). Both `/`-mutants on
+    # this exact line are excluded; the live integer/float division behaviour is
+    # covered by `division_dispatches_float_numeric_and_integer_paths`.
+    "ops\\.rs:376:18: replace / with [%*]",
+    # ops.rs `compare`'s `_ if is_numeric(a) || is_numeric(b)` guard (line 465) is
+    # EQUIVALENT under `... with true`. Earlier match arms already peel off text,
+    # bool, every temporal pair, and (line 460) any float pair, so the only pairs
+    # reaching line 465 are integer pairs or genuinely-incompatible pairs. For an
+    # integer pair, the numeric arm (`as_numeric` → BigDecimal cmp) yields the
+    # IDENTICAL ordering as the final integer arm (`as_i64` cmp); for an
+    # incompatible pair both arms return the same `cannot_compare` error. So forcing
+    # the guard true changes no observable result. (The `→ false` and `||→&&`
+    # mutants on this line ARE killable — a real numeric operand needs the arm — and
+    # are covered by `compare_routes_float_numeric_and_integer_pairs_distinctly`.)
+    "ops\\.rs:465:14: replace match guard is_numeric\\(a\\) \\|\\| is_numeric\\(b\\) with true",
 ]

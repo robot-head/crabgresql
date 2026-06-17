@@ -21,6 +21,20 @@ mod type_tag {
     /// SP32: `numeric` — followed by a typmod byte (0 = unconstrained; 1 = a
     /// `(precision: u16, scale: u16)` modifier). Append-only.
     pub const NUMERIC: u8 = 5;
+    /// SP37: `date`. Append-only — no version bump.
+    pub const DATE: u8 = 6;
+    /// SP37: `time without time zone` — followed by a reserved precision byte (0).
+    /// Append-only — no version bump.
+    pub const TIME: u8 = 7;
+    /// SP37: `timestamp without time zone` — followed by a reserved precision byte (0).
+    /// Append-only — no version bump.
+    pub const TIMESTAMP: u8 = 8;
+    /// SP37: `timestamp with time zone` — followed by a reserved precision byte (0).
+    /// Append-only — no version bump.
+    pub const TIMESTAMPTZ: u8 = 9;
+    /// SP37: `interval` — followed by a reserved precision byte (0).
+    /// Append-only — no version bump.
+    pub const INTERVAL: u8 = 10;
 }
 
 /// Append a column's type (tag byte, plus the numeric typmod payload).
@@ -42,6 +56,23 @@ fn write_type(out: &mut Vec<u8>, ty: ColumnType) {
                 None => out.push(0),
             }
         }
+        ColumnType::Date => out.push(type_tag::DATE),
+        ColumnType::Time => {
+            out.push(type_tag::TIME);
+            out.push(0); // reserved fractional-second typmod byte (deferred)
+        }
+        ColumnType::Timestamp => {
+            out.push(type_tag::TIMESTAMP);
+            out.push(0); // reserved fractional-second typmod byte (deferred)
+        }
+        ColumnType::Timestamptz => {
+            out.push(type_tag::TIMESTAMPTZ);
+            out.push(0); // reserved fractional-second typmod byte (deferred)
+        }
+        ColumnType::Interval => {
+            out.push(type_tag::INTERVAL);
+            out.push(0); // reserved fractional-second typmod byte (deferred)
+        }
     }
 }
 
@@ -61,6 +92,35 @@ fn read_type(cur: &mut &[u8]) -> Result<ColumnType, KvError> {
             } else {
                 ColumnType::Numeric(None)
             }
+        }
+        type_tag::DATE => ColumnType::Date,
+        type_tag::TIME => {
+            let reserved = take_u8(cur)?;
+            if reserved != 0 {
+                return Err(KvError::CorruptRow("unsupported datetime precision".into()));
+            }
+            ColumnType::Time
+        }
+        type_tag::TIMESTAMP => {
+            let reserved = take_u8(cur)?;
+            if reserved != 0 {
+                return Err(KvError::CorruptRow("unsupported datetime precision".into()));
+            }
+            ColumnType::Timestamp
+        }
+        type_tag::TIMESTAMPTZ => {
+            let reserved = take_u8(cur)?;
+            if reserved != 0 {
+                return Err(KvError::CorruptRow("unsupported datetime precision".into()));
+            }
+            ColumnType::Timestamptz
+        }
+        type_tag::INTERVAL => {
+            let reserved = take_u8(cur)?;
+            if reserved != 0 {
+                return Err(KvError::CorruptRow("unsupported datetime precision".into()));
+            }
+            ColumnType::Interval
         }
         other => {
             return Err(KvError::CorruptRow(format!(
@@ -160,6 +220,37 @@ mod tests {
             Column {
                 name: "ratio".into(),
                 ty: ColumnType::Numeric(None),
+            },
+        ];
+        let bytes = serialize_schema(table_id, &columns);
+        let (id, cols) = deserialize_schema(&bytes).expect("decode");
+        assert_eq!(id, table_id);
+        assert_eq!(cols, columns);
+    }
+
+    #[test]
+    fn roundtrip_schema_datetime_types() {
+        let table_id = 99u32;
+        let columns = vec![
+            Column {
+                name: "created".into(),
+                ty: ColumnType::Date,
+            },
+            Column {
+                name: "alarm".into(),
+                ty: ColumnType::Time,
+            },
+            Column {
+                name: "fired_at".into(),
+                ty: ColumnType::Timestamp,
+            },
+            Column {
+                name: "fired_utc".into(),
+                ty: ColumnType::Timestamptz,
+            },
+            Column {
+                name: "duration".into(),
+                ty: ColumnType::Interval,
             },
         ];
         let bytes = serialize_schema(table_id, &columns);

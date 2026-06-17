@@ -305,13 +305,16 @@ impl RangeRouter {
                     )),
                 }
             }
-            // DDL and transaction control resolve to range 0 but do not pin: a txn
-            // can still be pinned to a data range by a later DML.
+            // DDL, transaction control, and GUC control resolve to range 0 but do
+            // not pin: a txn can still be pinned to a data range by a later DML.
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::Begin { .. }
             | Statement::Commit
-            | Statement::Rollback => Ok(None),
+            | Statement::Rollback
+            | Statement::Set { .. }
+            | Statement::Show { .. }
+            | Statement::Reset { .. } => Ok(None),
         }
     }
 

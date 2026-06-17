@@ -68,6 +68,34 @@ const ACCEPTED: &[&str] = &[
     "SELECT t.* FROM t JOIN u ON t.id = u.id",
     "SELECT d.n FROM (SELECT a AS n FROM t) AS d",
     "SELECT d.n FROM (SELECT a AS n FROM t) d",
+    // SP37: date/time type names, typed literals, EXTRACT, AT TIME ZONE
+    "CREATE TABLE t (a date, b time, c timestamp, d timestamptz, e interval)",
+    "CREATE TABLE t (a timestamp with time zone, b time without time zone)",
+    "CREATE TABLE t (a timestamp without time zone)",
+    "SELECT DATE '2024-01-01'",
+    "SELECT TIMESTAMP '2024-01-01 00:00:00'",
+    "SELECT INTERVAL '1 day'",
+    "SELECT a::timestamp with time zone FROM t",
+    "SELECT extract(year FROM a) FROM t",
+    "SELECT a AT TIME ZONE 'UTC' FROM t",
+    "SELECT a AT TIME ZONE 'UTC' = b FROM t",
+    // SP37 Task 13: clock funcs + date/time functions
+    "SELECT current_date",
+    "SELECT current_timestamp",
+    "SELECT now()",
+    "SELECT date_part('hour', a) FROM t",
+    "SELECT date_trunc('month', a) FROM t",
+    // SP37: SET / SHOW / RESET GUC
+    "SET timezone = 'America/New_York'",
+    "SET timezone TO 'UTC'",
+    "SET TIME ZONE 'America/New_York'",
+    "SET LOCAL timezone = 'UTC'",
+    "SET TIME ZONE LOCAL",
+    "SET TIME ZONE DEFAULT",
+    "SET timezone = DEFAULT",
+    "SHOW timezone",
+    "SHOW TIME ZONE",
+    "RESET timezone",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.

@@ -31,6 +31,29 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+    /// SP37: `SET [LOCAL] <name> = <value>` / `SET <name> TO <value>` / `SET TIME ZONE ...`.
+    Set {
+        local: bool,
+        name: String,
+        value: SetValue,
+    },
+    /// SP37: `SHOW <name>` / `SHOW TIME ZONE`.
+    Show {
+        name: String,
+    },
+    /// SP37: `RESET <name>`.
+    Reset {
+        name: String,
+    },
+}
+
+/// SP37: the right-hand side of a `SET` (or the value form of `SET TIME ZONE`).
+/// `Default` is `SET ... = DEFAULT` / `SET TIME ZONE { DEFAULT | LOCAL }` (resets
+/// the parameter to its built-in default); `Value` is a literal/identifier value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetValue {
+    Default,
+    Value(String),
 }
 
 /// Transaction isolation levels supported by SP4.

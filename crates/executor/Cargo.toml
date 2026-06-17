@@ -20,6 +20,7 @@ tokio.workspace = true
 async-trait = { workspace = true }
 zerocopy.workspace = true
 bigdecimal.workspace = true
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

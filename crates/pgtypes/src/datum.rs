@@ -14,11 +14,21 @@ pub mod oids {
     pub const FLOAT8: u32 = 701;
     /// SP32: arbitrary-precision `numeric`/`decimal`.
     pub const NUMERIC: u32 = 1700;
+    /// SP37: `date` — days since 2000-01-01, stored as i32.
+    pub const DATE: u32 = 1082;
+    /// SP37: `time without time zone` — microseconds since midnight, stored as i64.
+    pub const TIME: u32 = 1083;
+    /// SP37: `timestamp without time zone` — microseconds since 2000-01-01 00:00:00.
+    pub const TIMESTAMP: u32 = 1114;
+    /// SP37: `timestamp with time zone` — microseconds since Unix epoch (UTC), stored as i64.
+    pub const TIMESTAMPTZ: u32 = 1184;
+    /// SP37: `interval` — months (i32) + days (i32) + microseconds (i64), stored as 16 bytes.
+    pub const INTERVAL: u32 = 1186;
 }
 
 /// A SQL column type. SP30 added `Float8`; SP32 added `Numeric` (which carries an
 /// optional `numeric(precision, scale)` modifier for column definitions / casts —
-/// `None` is unconstrained `numeric`).
+/// `None` is unconstrained `numeric`). SP37 adds five date/time types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Bool,
@@ -30,6 +40,16 @@ pub enum ColumnType {
     /// SP32: PostgreSQL `numeric`/`decimal`. The `Typmod` (precision, scale) is
     /// significant only when storing/casting; OID/name/typlen ignore it.
     Numeric(Option<Typmod>),
+    /// SP37: PostgreSQL `date` (OID 1082) — a calendar date with no time-of-day.
+    Date,
+    /// SP37: PostgreSQL `time without time zone` (OID 1083).
+    Time,
+    /// SP37: PostgreSQL `timestamp without time zone` (OID 1114).
+    Timestamp,
+    /// SP37: PostgreSQL `timestamp with time zone` (OID 1184) — stored as UTC.
+    Timestamptz,
+    /// SP37: PostgreSQL `interval` (OID 1186) — months + days + microseconds.
+    Interval,
 }
 
 impl ColumnType {
@@ -47,6 +67,12 @@ impl ColumnType {
             "float8" | "float" | "double precision" => Some(ColumnType::Float8),
             // SP32: `numeric`/`decimal` (unconstrained here; typmod added by parser).
             "numeric" | "decimal" => Some(ColumnType::Numeric(None)),
+            // SP37: date/time types. `timetz`/`time with time zone` is unsupported (None).
+            "date" => Some(ColumnType::Date),
+            "time" | "time without time zone" => Some(ColumnType::Time),
+            "timestamp" | "timestamp without time zone" => Some(ColumnType::Timestamp),
+            "timestamptz" | "timestamp with time zone" => Some(ColumnType::Timestamptz),
+            "interval" => Some(ColumnType::Interval),
             _ => None,
         }
     }
@@ -59,6 +85,11 @@ impl ColumnType {
             ColumnType::Text => oids::TEXT,
             ColumnType::Float8 => oids::FLOAT8,
             ColumnType::Numeric(_) => oids::NUMERIC,
+            ColumnType::Date => oids::DATE,
+            ColumnType::Time => oids::TIME,
+            ColumnType::Timestamp => oids::TIMESTAMP,
+            ColumnType::Timestamptz => oids::TIMESTAMPTZ,
+            ColumnType::Interval => oids::INTERVAL,
         }
     }
 
@@ -71,6 +102,11 @@ impl ColumnType {
             ColumnType::Text => "text",
             ColumnType::Float8 => "double precision",
             ColumnType::Numeric(_) => "numeric",
+            ColumnType::Date => "date",
+            ColumnType::Time => "time without time zone",
+            ColumnType::Timestamp => "timestamp without time zone",
+            ColumnType::Timestamptz => "timestamp with time zone",
+            ColumnType::Interval => "interval",
         }
     }
 
@@ -83,6 +119,11 @@ impl ColumnType {
             ColumnType::Text => -1,
             ColumnType::Float8 => 8,
             ColumnType::Numeric(_) => -1,
+            ColumnType::Date => 4,
+            ColumnType::Time => 8,
+            ColumnType::Timestamp => 8,
+            ColumnType::Timestamptz => 8,
+            ColumnType::Interval => 16,
         }
     }
 
@@ -101,6 +142,10 @@ impl ColumnType {
 /// *grouping* equality (the `float8` btree equality `GROUP BY`/`DISTINCT` use): all
 /// `NaN`s are one value, and `-0.0 == +0.0`. The four non-float variants behave exactly
 /// as the old derive did. This keys `GROUP BY` group maps and aggregate `DISTINCT` sets.
+///
+/// SP37 adds five date/time variants using `jiff` types. Their `PartialEq`/`Hash` arms
+/// are added in Task 3 (grouping equality); for now they use the `_ => false` catch-all
+/// in `PartialEq` and real `Hash` arms (required because `Hash` is exhaustive).
 #[derive(Debug, Clone)]
 pub enum Datum {
     Null,
@@ -112,6 +157,16 @@ pub enum Datum {
     Float8(f64),
     /// SP32: PostgreSQL `numeric` — arbitrary-precision exact decimal.
     Numeric(BigDecimal),
+    /// SP37: PostgreSQL `date` — a calendar date (no time-of-day, no timezone).
+    Date(jiff::civil::Date),
+    /// SP37: PostgreSQL `time without time zone` — time-of-day only.
+    Time(jiff::civil::Time),
+    /// SP37: PostgreSQL `timestamp without time zone` — date + time-of-day, no timezone.
+    Timestamp(jiff::civil::DateTime),
+    /// SP37: PostgreSQL `timestamp with time zone` — an instant in UTC.
+    Timestamptz(jiff::Timestamp),
+    /// SP37: PostgreSQL `interval` — months + days + microseconds.
+    Interval(crate::datetime::Interval),
 }
 
 impl PartialEq for Datum {
@@ -128,6 +183,14 @@ impl PartialEq for Datum {
             // SP32: numeric grouping equality is by VALUE, ignoring scale, so
             // `1.0` and `1.00` group together (`bigdecimal`'s `==` already does this).
             (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
+            // SP37: jiff civil types implement PartialEq by calendar/clock value.
+            (Datum::Date(a), Datum::Date(b)) => a == b,
+            (Datum::Time(a), Datum::Time(b)) => a == b,
+            (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
+            // timestamptz equality is by absolute instant (jiff Timestamp).
+            (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a == b,
+            // interval uses its canonical-estimate Eq (Task 2).
+            (Datum::Interval(a), Datum::Interval(b)) => a == b,
             _ => false,
         }
     }
@@ -162,6 +225,14 @@ impl std::hash::Hash for Datum {
             // SP32: hash the scale-normalized form so values that compare equal
             // (`1.0` and `1.00`) hash equally (the Hash/Eq contract).
             Datum::Numeric(d) => d.normalized().to_string().hash(state),
+            // SP37: jiff types all implement Hash; Interval derives Hash.
+            // (Grouping equality arms come in Task 3; Hash arms are required now
+            // because the `impl Hash` is exhaustive — no catch-all.)
+            Datum::Date(d) => d.hash(state),
+            Datum::Time(t) => t.hash(state),
+            Datum::Timestamp(dt) => dt.hash(state),
+            Datum::Timestamptz(ts) => ts.hash(state),
+            Datum::Interval(i) => i.hash(state),
         }
     }
 }
@@ -178,6 +249,11 @@ impl Datum {
             Datum::Float8(_) => Some(ColumnType::Float8),
             // The runtime value carries no typmod — it is unconstrained `numeric`.
             Datum::Numeric(_) => Some(ColumnType::Numeric(None)),
+            Datum::Date(_) => Some(ColumnType::Date),
+            Datum::Time(_) => Some(ColumnType::Time),
+            Datum::Timestamp(_) => Some(ColumnType::Timestamp),
+            Datum::Timestamptz(_) => Some(ColumnType::Timestamptz),
+            Datum::Interval(_) => Some(ColumnType::Interval),
         }
     }
 
@@ -250,6 +326,11 @@ mod tests {
         assert_eq!(h(&neg0), h(&pos0));
         // Distinct finite values are distinct.
         assert_ne!(Datum::Float8(1.5), Datum::Float8(2.5));
+        // A NaN is NOT equal to a non-NaN finite value: this pins the `&&` in
+        // `a == b || (a.is_nan() && b.is_nan())` — under `&&→||` (a.is_nan() ||
+        // b.is_nan()) a NaN would spuriously equal any finite value.
+        assert_ne!(Datum::Float8(f64::NAN), Datum::Float8(1.0));
+        assert_ne!(Datum::Float8(1.0), Datum::Float8(f64::NAN));
         // Cross-variant never equal (and an int and a float never collide as equal).
         assert_ne!(Datum::Float8(1.0), Datum::Int4(1));
     }
@@ -282,5 +363,166 @@ mod tests {
         assert_eq!(ColumnType::Int4.type_size(), 4);
         assert_eq!(ColumnType::Int8.type_size(), 8);
         assert_eq!(ColumnType::Text.type_size(), -1); // variable-length
+    }
+
+    #[test]
+    fn datetime_oids_names_sizes_match_postgres() {
+        assert_eq!(ColumnType::Date.oid(), 1082);
+        assert_eq!(ColumnType::Time.oid(), 1083);
+        assert_eq!(ColumnType::Timestamp.oid(), 1114);
+        assert_eq!(ColumnType::Timestamptz.oid(), 1184);
+        assert_eq!(ColumnType::Interval.oid(), 1186);
+        assert_eq!(ColumnType::Date.name(), "date");
+        assert_eq!(ColumnType::Time.name(), "time without time zone");
+        assert_eq!(ColumnType::Timestamp.name(), "timestamp without time zone");
+        assert_eq!(ColumnType::Timestamptz.name(), "timestamp with time zone");
+        assert_eq!(ColumnType::Interval.name(), "interval");
+        assert_eq!(ColumnType::Date.type_size(), 4);
+        assert_eq!(ColumnType::Time.type_size(), 8);
+        assert_eq!(ColumnType::Timestamp.type_size(), 8);
+        assert_eq!(ColumnType::Timestamptz.type_size(), 8);
+        assert_eq!(ColumnType::Interval.type_size(), 16);
+    }
+
+    #[test]
+    fn datetime_datum_grouping_equality_and_hash() {
+        use crate::datetime::Interval;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        fn h(d: &Datum) -> u64 {
+            let mut s = DefaultHasher::new();
+            d.hash(&mut s);
+            s.finish()
+        }
+        let d1 = Datum::Date(
+            "2024-01-15"
+                .parse::<jiff::civil::Date>()
+                .expect("valid date literal"),
+        );
+        let d2 = Datum::Date(
+            "2024-01-15"
+                .parse::<jiff::civil::Date>()
+                .expect("valid date literal"),
+        );
+        assert_eq!(d1, d2);
+        assert_eq!(h(&d1), h(&d2));
+        let m = Datum::Interval(Interval {
+            months: 1,
+            days: 0,
+            micros: 0,
+        });
+        let dd = Datum::Interval(Interval {
+            months: 0,
+            days: 30,
+            micros: 0,
+        });
+        assert_eq!(m, dd);
+        assert_eq!(h(&m), h(&dd));
+        assert_ne!(
+            d1,
+            Datum::Timestamp(
+                "2024-01-15T00:00:00"
+                    .parse::<jiff::civil::DateTime>()
+                    .expect("valid datetime literal"),
+            )
+        );
+    }
+
+    #[test]
+    fn datetime_type_names_resolve_and_timetz_is_unsupported() {
+        assert_eq!(ColumnType::from_sql_name("date"), Some(ColumnType::Date));
+        assert_eq!(ColumnType::from_sql_name("time"), Some(ColumnType::Time));
+        assert_eq!(
+            ColumnType::from_sql_name("time without time zone"),
+            Some(ColumnType::Time)
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("timestamp"),
+            Some(ColumnType::Timestamp)
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("timestamp without time zone"),
+            Some(ColumnType::Timestamp)
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("timestamptz"),
+            Some(ColumnType::Timestamptz)
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("timestamp with time zone"),
+            Some(ColumnType::Timestamptz)
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("interval"),
+            Some(ColumnType::Interval)
+        );
+        assert_eq!(ColumnType::from_sql_name("timetz"), None);
+        assert_eq!(ColumnType::from_sql_name("time with time zone"), None);
+    }
+
+    /// SP37 mutation-killer: the `(Timestamptz, Timestamptz)` arm of `Datum`'s
+    /// `PartialEq` + `Hash` — two timestamptz Datums at the SAME absolute instant
+    /// (parsed from different wall-clock/offset spellings) are EQUAL and hash-equal,
+    /// and two at DIFFERENT instants are unequal. Pins the deleted-arm (#147),
+    /// `== → !=` (#148), and `hash with ()` (#149) mutants. The existing
+    /// `datetime_datum_grouping_equality_and_hash` covers Date/Interval but not
+    /// Timestamptz distinctly.
+    #[test]
+    fn timestamptz_datum_equality_and_hash_by_instant() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        fn h(d: &Datum) -> u64 {
+            let mut s = DefaultHasher::new();
+            d.hash(&mut s);
+            s.finish()
+        }
+        let tz = jiff::tz::TimeZone::UTC;
+        // 12:00+00 and 14:00+02 denote the SAME instant (both 12:00 UTC).
+        let a = Datum::Timestamptz(
+            crate::datetime::parse_timestamptz("2024-01-15 12:00:00+00", &tz).expect("a"),
+        );
+        let b = Datum::Timestamptz(
+            crate::datetime::parse_timestamptz("2024-01-15 14:00:00+02", &tz).expect("b"),
+        );
+        assert_eq!(a, b, "same absolute instant compares equal");
+        assert_eq!(h(&a), h(&b), "equal instants hash equally");
+        // A different instant is unequal (kills `== → !=`, which would make these
+        // two — same instant — UNequal and make a different instant EQUAL).
+        let c = Datum::Timestamptz(
+            crate::datetime::parse_timestamptz("2024-01-15 13:00:00+00", &tz).expect("c"),
+        );
+        assert_ne!(a, c, "a one-hour-later instant is not equal");
+        // Distinct-instant hashes differ (kills `hash with ()`, which collapses all
+        // Timestamptz to one hash). Two distinct instants must hash differently.
+        assert_ne!(h(&a), h(&c), "distinct instants hash differently");
+    }
+
+    /// Pins three SP32 `numeric` lines that a full-file mutation sweep flagged as
+    /// uncovered: the `numeric`/`decimal` name arm (from_sql_name), the `-1`
+    /// variable typlen for `numeric`, and the `(Numeric, Numeric)` equality arm.
+    #[test]
+    fn numeric_column_type_name_size_and_equality() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+        // from_sql_name: both `numeric` and `decimal` resolve (kills the deleted arm).
+        assert_eq!(
+            ColumnType::from_sql_name("numeric"),
+            Some(ColumnType::Numeric(None))
+        );
+        assert_eq!(
+            ColumnType::from_sql_name("decimal"),
+            Some(ColumnType::Numeric(None))
+        );
+        // type_size: numeric is variable-length (-1), NOT a fixed positive size
+        // (kills `delete -` which would make it +1).
+        assert_eq!(ColumnType::Numeric(None).type_size(), -1);
+        // (Numeric, Numeric) equality compares by value, ignoring scale (kills the
+        // deleted arm, which would fall to `_ => false` and make equal values
+        // UNequal).
+        let a = Datum::Numeric(BigDecimal::from_str("1.0").expect("1.0"));
+        let b = Datum::Numeric(BigDecimal::from_str("1.00").expect("1.00"));
+        assert_eq!(a, b, "numeric equality is by value, ignoring scale");
+        let c = Datum::Numeric(BigDecimal::from_str("2.0").expect("2.0"));
+        assert_ne!(a, c);
     }
 }

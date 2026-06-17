@@ -44,6 +44,10 @@ pub(crate) struct TxnCtx {
     /// SECOND version under a fresh `g'` that could commit independently — so each
     /// cross-range row resolves under EXACTLY ONE global decision (abort atomicity).
     pub(crate) written_rows: Vec<(u32, u64)>,
+    /// SP37: the transaction-start instant (captured from the session clock at
+    /// BEGIN). `now()`/`current_timestamp` are PG transaction-stable, so every
+    /// statement in this block evaluates them against this single instant.
+    pub(crate) txn_now: jiff::Timestamp,
 }
 
 /// Per-connection transaction state. `Failed` carries the aborted block's
@@ -53,6 +57,80 @@ enum TxnState {
     Idle,
     InTransaction(TxnCtx),
     Failed(TxnCtx),
+}
+
+/// SP37: the transactional state of a configuration parameter (currently only
+/// `timezone`). Mirrors PostgreSQL's GUC commit/rollback semantics:
+///
+/// - `committed` is the value that survives across transactions.
+/// - `txn_session_override` is a `SET <name>` made inside an open transaction —
+///   it becomes the new `committed` value on COMMIT, and is discarded on ROLLBACK.
+/// - `txn_local_override` is a `SET LOCAL <name>` — it shadows the session value
+///   for the rest of the transaction but is ALWAYS discarded at end-of-transaction
+///   (both COMMIT and ROLLBACK), never promoted.
+///
+/// `effective()` resolves the value a statement sees: a LOCAL override wins, else
+/// a (txn) session override, else the committed value. An autocommit `SET` is a
+/// transaction of its own, so the session driver applies it then `commit()`s
+/// immediately (so it persists); an autocommit `SET LOCAL` is `commit()`ed too,
+/// which drops it — matching PostgreSQL.
+#[derive(Debug, Clone)]
+pub(crate) struct GucState {
+    committed: String,
+    txn_session_override: Option<String>,
+    txn_local_override: Option<String>,
+}
+
+impl Default for GucState {
+    fn default() -> Self {
+        Self {
+            committed: "UTC".into(),
+            txn_session_override: None,
+            txn_local_override: None,
+        }
+    }
+}
+
+impl GucState {
+    /// The value a statement sees right now: LOCAL override > session override >
+    /// committed.
+    pub(crate) fn effective(&self) -> &str {
+        self.txn_local_override
+            .as_deref()
+            .or(self.txn_session_override.as_deref())
+            .unwrap_or(&self.committed)
+    }
+
+    /// `SET <name> = v` (non-LOCAL): stage a session override (promoted on COMMIT).
+    pub(crate) fn set_session(&mut self, v: String) {
+        self.txn_session_override = Some(v);
+    }
+
+    /// `SET LOCAL <name> = v`: stage a local override (always dropped at txn end).
+    pub(crate) fn set_local(&mut self, v: String) {
+        self.txn_local_override = Some(v);
+    }
+
+    /// `RESET <name>`: stage a session override back to the built-in default
+    /// (`UTC`). Like any session override, it is promoted on COMMIT.
+    pub(crate) fn reset(&mut self) {
+        self.txn_session_override = Some("UTC".into());
+    }
+
+    /// End-of-transaction COMMIT: promote any pending session override to the
+    /// committed value, and always discard the local override.
+    pub(crate) fn commit(&mut self) {
+        if let Some(v) = self.txn_session_override.take() {
+            self.committed = v;
+        }
+        self.txn_local_override = None;
+    }
+
+    /// End-of-transaction ROLLBACK: discard both pending overrides.
+    pub(crate) fn rollback(&mut self) {
+        self.txn_session_override = None;
+        self.txn_local_override = None;
+    }
 }
 
 /// Reconstruct the global visibility snapshot from range 0's DURABLE state (never
@@ -100,6 +178,14 @@ pub struct SqlSession {
     /// write also stamps a `Prepared(local_xid -> g)` clog marker and deregisters
     /// the local xid at prepare time. `None` for ordinary single-range txns.
     global_xid: Option<u64>,
+    /// SP37: the injectable clock (shared from the engine). Backs the per-statement
+    /// `EvalCtx`'s `now`/`stmt_now` and `clock_timestamp()`. `SystemClock` in
+    /// production; a `FixedClock` in tests for deterministic temporal evaluation.
+    clock: Arc<dyn crate::clock::Clock>,
+    /// SP37: the transactional `timezone` GUC. `effective()` feeds the per-statement
+    /// `EvalCtx`'s `time_zone`; `SET`/`SHOW`/`RESET timezone` mutate/read it, and
+    /// COMMIT/ROLLBACK promote/revert it in lockstep with the transaction outcome.
+    guc: GucState,
     state: TxnState,
 }
 
@@ -120,6 +206,7 @@ impl SqlSession {
         persist_mode: crate::PersistMode,
         gtm: Option<Arc<crate::gtm::Gtm>>,
         range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
+        clock: Arc<dyn crate::clock::Clock>,
     ) -> Self {
         Self {
             kv,
@@ -134,8 +221,150 @@ impl SqlSession {
             gtm,
             range0_barrier,
             global_xid: None,
+            clock,
+            guc: GucState::default(),
             state: TxnState::Idle,
         }
+    }
+
+    /// Build the per-statement evaluation context. `now` is the transaction-start
+    /// instant (PG transaction-stable) inside a txn, else this statement's instant.
+    fn eval_ctx(&self) -> crate::clock::EvalCtx {
+        let stmt_now = self.clock.now();
+        let now = match &self.state {
+            TxnState::InTransaction(c) | TxnState::Failed(c) => c.txn_now,
+            TxnState::Idle => stmt_now,
+        };
+        // SP37: the effective session zone (validated at SET time, so `get`
+        // succeeds; `unwrap_or(UTC)` is a defensive fallback). `UTC` is
+        // special-cased to the const so the common case never touches the tzdb.
+        let tzname = self.guc.effective();
+        let time_zone = if tzname.eq_ignore_ascii_case("UTC") {
+            jiff::tz::TimeZone::UTC
+        } else {
+            jiff::tz::TimeZone::get(tzname).unwrap_or(jiff::tz::TimeZone::UTC)
+        };
+        crate::clock::EvalCtx {
+            now,
+            stmt_now,
+            time_zone,
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
+    /// SP37: `SET [LOCAL] <name> = <value>`. Only `timezone` is a real, mutable
+    /// parameter; `datestyle`/`intervalstyle` are accepted ONLY at their PG default
+    /// (a no-op, so the conformance corpus's standard preamble succeeds), and any
+    /// other name is unrecognized (42704). Returns the `SET` command tag.
+    ///
+    /// Transactional application mirrors PostgreSQL: inside an open block a `SET`
+    /// stages a session override and `SET LOCAL` stages a local override (promoted/
+    /// reverted by COMMIT/ROLLBACK); in autocommit the change is its own
+    /// transaction, so it is applied then immediately committed (a bare `SET LOCAL`
+    /// in autocommit is therefore dropped, matching PG).
+    fn set_guc(
+        &mut self,
+        local: bool,
+        name: &str,
+        value: &pgparser::ast::SetValue,
+    ) -> Result<QueryResult, ExecError> {
+        use pgparser::ast::SetValue;
+        if !name.eq_ignore_ascii_case("timezone") {
+            // A handful of parameters are tolerated at their PG default value so a
+            // standard session preamble (psql/sqlx) does not error; a non-default
+            // value is an invalid value (22023); any other name is unknown (42704).
+            let default_ok = match name {
+                "datestyle" => {
+                    matches!(value, SetValue::Value(v) if v.eq_ignore_ascii_case("ISO, MDY"))
+                        || matches!(value, SetValue::Default)
+                }
+                "intervalstyle" => {
+                    matches!(value, SetValue::Value(v) if v.eq_ignore_ascii_case("postgres"))
+                        || matches!(value, SetValue::Default)
+                }
+                _ => return Err(ExecError::UnrecognizedParameter(name.to_string())),
+            };
+            if !default_ok {
+                let shown = match value {
+                    SetValue::Value(v) => v.clone(),
+                    SetValue::Default => "DEFAULT".into(),
+                };
+                return Err(ExecError::InvalidParameterValue(shown));
+            }
+            // Accepted no-op (default value). Still returns the SET tag.
+            return Ok(QueryResult::Command { tag: "SET".into() });
+        }
+        // Resolve the zone string and validate it (UTC special-cases to the const).
+        let zone = match value {
+            SetValue::Default => "UTC".to_string(),
+            SetValue::Value(v) => v.clone(),
+        };
+        if !zone.eq_ignore_ascii_case("UTC") && jiff::tz::TimeZone::get(&zone).is_err() {
+            return Err(ExecError::InvalidParameterValue(zone));
+        }
+        // Apply with the right transactional scope.
+        let in_txn = matches!(self.state, TxnState::InTransaction(_));
+        if in_txn {
+            if local {
+                self.guc.set_local(zone);
+            } else {
+                self.guc.set_session(zone);
+            }
+        } else {
+            // Autocommit: this SET is its own transaction. A plain SET persists
+            // (set_session + commit); a SET LOCAL is committed too, which drops it.
+            if local {
+                self.guc.set_local(zone);
+            } else {
+                self.guc.set_session(zone);
+            }
+            self.guc.commit();
+        }
+        Ok(QueryResult::Command { tag: "SET".into() })
+    }
+
+    /// SP37: `RESET <name>` — reset the parameter to its built-in default. Only
+    /// `timezone` is recognized (any other name is 42704). Transactional like SET.
+    fn reset_guc(&mut self, name: &str) -> Result<QueryResult, ExecError> {
+        if !name.eq_ignore_ascii_case("timezone") {
+            return Err(ExecError::UnrecognizedParameter(name.to_string()));
+        }
+        self.guc.reset();
+        if matches!(self.state, TxnState::Idle) {
+            self.guc.commit(); // autocommit: persist the reset immediately
+        }
+        Ok(QueryResult::Command {
+            tag: "RESET".into(),
+        })
+    }
+
+    /// SP37: `SHOW <name>` — return the parameter's effective value as a single
+    /// text row (column name `TimeZone`, matching PostgreSQL). Only `timezone` is
+    /// recognized (any other name is 42704). A read, so it does NOT mutate the GUC.
+    fn show_guc(&self, name: &str) -> Result<QueryResult, ExecError> {
+        use bytes::Bytes;
+        use pgwire::engine::Cell;
+        if !name.eq_ignore_ascii_case("timezone") {
+            return Err(ExecError::UnrecognizedParameter(name.to_string()));
+        }
+        let value = self.guc.effective().as_bytes().to_vec();
+        let field = FieldDescription {
+            name: "TimeZone".into(),
+            table_oid: 0,
+            column_id: 0,
+            type_oid: pgtypes::ColumnType::Text.oid(),
+            type_size: pgtypes::ColumnType::Text.type_size(),
+            type_modifier: -1,
+            format: 0,
+        };
+        Ok(QueryResult::Rows {
+            fields: vec![field],
+            rows: vec![vec![Some(Cell {
+                text: Bytes::from(value.clone()),
+                binary: Bytes::from(value),
+            })]],
+            tag: "SHOW".into(),
+        })
     }
 
     /// Catch range 0's LOCAL replica up to its leader's linearizable applied index
@@ -170,6 +399,12 @@ impl SqlSession {
             }
             Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
             Statement::Select(_) => self.run_select(stmt).await,
+            // SP37: GUC control. These are NOT exempt from the failed-txn guard
+            // above (only COMMIT/ROLLBACK are), so a SET in an aborted block is
+            // rejected — matching PostgreSQL.
+            Statement::Set { local, name, value } => self.set_guc(*local, name, value),
+            Statement::Reset { name } => self.reset_guc(name),
+            Statement::Show { name } => self.show_guc(name),
         };
         // Any error inside a transaction block aborts it (PostgreSQL 25P02): the
         // block stays Failed (carrying its ctx, so the xid and any row locks it
@@ -236,6 +471,8 @@ impl SqlSession {
             repeatable_read: rr,
             global_snapshot,
             written_rows: Vec::new(),
+            // PG transaction-stable `now()`/`current_timestamp`: fix it once at BEGIN.
+            txn_now: self.clock.now(),
         });
         Ok(QueryResult::Command {
             tag: "BEGIN".into(),
@@ -268,6 +505,9 @@ impl SqlSession {
                     self.lockmgr.release_all(xid);
                     r?;
                 }
+                // SP37: a real COMMIT of an open block promotes any staged session
+                // GUC override and drops any LOCAL override.
+                self.guc.commit();
                 Ok(QueryResult::Command {
                     tag: "COMMIT".into(),
                 })
@@ -275,6 +515,8 @@ impl SqlSession {
             // COMMIT of a failed transaction behaves as a ROLLBACK.
             TxnState::Failed(ctx) => {
                 self.abort_ctx(ctx).await?;
+                // SP37: a failed block discards every staged GUC override.
+                self.guc.rollback();
                 Ok(QueryResult::Command {
                     tag: "ROLLBACK".into(),
                 })
@@ -290,6 +532,8 @@ impl SqlSession {
             TxnState::InTransaction(ctx) | TxnState::Failed(ctx) => self.abort_ctx(ctx).await?,
             TxnState::Idle => {}
         }
+        // SP37: ROLLBACK discards every staged GUC override (session and LOCAL).
+        self.guc.rollback();
         Ok(QueryResult::Command {
             tag: "ROLLBACK".into(),
         })
@@ -316,6 +560,7 @@ impl SqlSession {
 
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let (snapshot, own, gsnap) = self.read_context().await?;
+        let ctx = self.eval_ctx();
         crate::exec::execute_read(
             &*self.catalog_kv,
             &*self.kv,
@@ -324,6 +569,7 @@ impl SqlSession {
             &snapshot,
             own,
             stmt,
+            &ctx,
         )
     }
 
@@ -378,6 +624,7 @@ impl SqlSession {
                     _ => unreachable!(),
                 };
                 let kv = Arc::clone(&self.kv);
+                let ctx = self.eval_ctx();
                 // Errors propagate to run_one which transitions to Failed,
                 // keeping the xid + locks until COMMIT/ROLLBACK.
                 crate::exec::execute_read_locking(
@@ -392,6 +639,7 @@ impl SqlSession {
                     repeatable_read,
                     mode,
                     s,
+                    &ctx,
                 )
                 .await
             }
@@ -407,6 +655,7 @@ impl SqlSession {
                 let snapshot = self.procarray.snapshot();
                 let gsnap = self.global_read_snapshot(None)?;
                 let kv = Arc::clone(&self.kv);
+                let ctx = self.eval_ctx();
                 let result = crate::exec::execute_read_locking(
                     &*self.catalog_kv,
                     &*kv,
@@ -419,6 +668,7 @@ impl SqlSession {
                     false, // autocommit is always READ COMMITTED
                     mode,
                     s,
+                    &ctx,
                 )
                 .await;
                 // Release regardless of success or error.
@@ -535,6 +785,7 @@ impl SqlSession {
                     _ => unreachable!(),
                 };
                 let kv = Arc::clone(&self.kv);
+                let ctx = self.eval_ctx();
                 // An error here propagates to run_one, which transitions the
                 // block to Failed (keeping the xid + row locks until
                 // COMMIT/ROLLBACK, which calls release_all). In Durable mode
@@ -554,6 +805,7 @@ impl SqlSession {
                     xid,
                     repeatable_read,
                     stmt,
+                    &ctx,
                 )
                 .await?;
                 // Record the (table_id, rowid)s this write touched (from the version
@@ -610,6 +862,7 @@ impl SqlSession {
                 let snapshot = self.procarray.snapshot();
                 let gsnap = self.global_read_snapshot(None)?;
                 let kv = Arc::clone(&self.kv);
+                let ctx = self.eval_ctx();
                 let outcome = crate::exec::execute_write(
                     &*self.catalog_kv,
                     &*kv,
@@ -622,6 +875,7 @@ impl SqlSession {
                     xid,
                     false,
                     stmt,
+                    &ctx,
                 )
                 .await;
                 let (result, mut ops) = match outcome {
@@ -856,6 +1110,137 @@ mod tests {
     use pgwire::engine::{Engine, Session};
 
     use crate::SqlEngine;
+
+    /// SP37: the GUC transactional state machine — PostgreSQL's commit-keeps,
+    /// rollback-reverts, and SET-LOCAL-always-reverts semantics for `timezone`.
+    #[test]
+    fn guc_timezone_transactional_semantics() {
+        use crate::session::GucState;
+        let mut g = GucState::default();
+        assert_eq!(g.effective(), "UTC");
+        g.set_session("America/New_York".into());
+        g.commit();
+        assert_eq!(g.effective(), "America/New_York");
+        g.set_session("UTC".into());
+        assert_eq!(g.effective(), "UTC");
+        g.rollback();
+        assert_eq!(g.effective(), "America/New_York");
+        g.set_session("UTC".into());
+        g.commit();
+        assert_eq!(g.effective(), "UTC");
+        g.set_local("America/New_York".into());
+        assert_eq!(g.effective(), "America/New_York");
+        g.commit();
+        assert_eq!(g.effective(), "UTC");
+        g.set_session("America/New_York".into());
+        g.commit();
+        g.reset();
+        g.commit();
+        assert_eq!(g.effective(), "UTC");
+    }
+
+    /// Extract the single text cell of a one-row, one-column result.
+    fn single_text(results: &[pgwire::engine::QueryResult]) -> String {
+        use pgwire::engine::QueryResult;
+        match results {
+            [QueryResult::Rows { rows, .. }] => {
+                let cell = rows[0][0].as_ref().expect("non-null cell");
+                String::from_utf8(cell.text.to_vec()).expect("utf8")
+            }
+            other => panic!("expected one Rows result, got {other:?}"),
+        }
+    }
+
+    /// SP37: `SET TIME ZONE` flows through the GUC into `eval_ctx()`, so a
+    /// `timestamptz` renders in the session zone; `SHOW timezone` reads it back;
+    /// and a ROLLBACK reverts a `SET` made inside a transaction.
+    #[tokio::test]
+    async fn set_timezone_flows_into_rendering_and_show() {
+        let engine = SqlEngine::new();
+        let mut s = engine.connect();
+
+        // Default zone is UTC.
+        let show = s.simple_query("SHOW timezone").await.expect("show");
+        assert_eq!(single_text(&show), "UTC");
+        let utc = s
+            .simple_query("SELECT TIMESTAMPTZ '2024-01-15 12:00:00+00'")
+            .await
+            .expect("select utc");
+        assert_eq!(single_text(&utc), "2024-01-15 12:00:00+00");
+
+        // SET TIME ZONE (autocommit) persists and feeds eval_ctx().
+        s.simple_query("SET TIME ZONE 'America/New_York'")
+            .await
+            .expect("set tz");
+        let show_ny = s.simple_query("SHOW timezone").await.expect("show ny");
+        assert_eq!(single_text(&show_ny), "America/New_York");
+        let ny = s
+            .simple_query("SELECT TIMESTAMPTZ '2024-01-15 12:00:00+00'")
+            .await
+            .expect("select ny");
+        assert_eq!(single_text(&ny), "2024-01-15 07:00:00-05");
+
+        // A SET inside a transaction reverts on ROLLBACK.
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("SET TIME ZONE 'UTC'")
+            .await
+            .expect("set utc");
+        let inside = s.simple_query("SHOW timezone").await.expect("show inside");
+        assert_eq!(single_text(&inside), "UTC");
+        s.simple_query("ROLLBACK").await.expect("rollback");
+        let after = s.simple_query("SHOW timezone").await.expect("show after");
+        assert_eq!(single_text(&after), "America/New_York");
+
+        // A SET inside a transaction persists on COMMIT.
+        s.simple_query("BEGIN").await.expect("begin2");
+        s.simple_query("SET TIME ZONE 'UTC'")
+            .await
+            .expect("set utc2");
+        s.simple_query("COMMIT").await.expect("commit");
+        let committed = s
+            .simple_query("SHOW timezone")
+            .await
+            .expect("show committed");
+        assert_eq!(single_text(&committed), "UTC");
+    }
+
+    /// SP37: SET LOCAL is always reverted at end-of-transaction; an unknown
+    /// parameter is 42704; a bad zone is 22023.
+    #[tokio::test]
+    async fn set_local_reverts_and_errors_have_right_sqlstate() {
+        let engine = SqlEngine::new();
+        let mut s = engine.connect();
+
+        s.simple_query("BEGIN").await.expect("begin");
+        s.simple_query("SET LOCAL TIME ZONE 'America/New_York'")
+            .await
+            .expect("set local");
+        let inside = s.simple_query("SHOW timezone").await.expect("show local");
+        assert_eq!(single_text(&inside), "America/New_York");
+        // COMMIT drops a LOCAL override (never promoted).
+        s.simple_query("COMMIT").await.expect("commit");
+        let after = s.simple_query("SHOW timezone").await.expect("show after");
+        assert_eq!(single_text(&after), "UTC");
+
+        // Unknown parameter → 42704.
+        let unknown = s
+            .simple_query("SET nonexistent_param = 'x'")
+            .await
+            .expect_err("unknown param");
+        assert_eq!(unknown.code, "42704");
+        let unknown_show = s
+            .simple_query("SHOW nonexistent_param")
+            .await
+            .expect_err("unknown show");
+        assert_eq!(unknown_show.code, "42704");
+
+        // Invalid zone → 22023.
+        let bad = s
+            .simple_query("SET timezone = 'Not/AZone'")
+            .await
+            .expect_err("bad zone");
+        assert_eq!(bad.code, "22023");
+    }
 
     /// A session dropped while a write transaction is open (client disconnect)
     /// must deregister its xid from the ProcArray so it no longer pins

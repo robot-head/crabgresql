@@ -27,6 +27,9 @@ pub(crate) struct SubCtx<'a> {
     pub gsnap: &'a mvcc::visibility::Snapshot,
     pub snapshot: &'a mvcc::visibility::Snapshot,
     pub own: Option<u64>,
+    /// The session eval context (zone + clock) — forwarded to the subquery's read
+    /// path so a temporal expression inside a subquery evaluates in the session zone.
+    pub eval_ctx: &'a crate::clock::EvalCtx,
 }
 
 /// Rewrite every uncorrelated subquery in `s`'s expr-bearing clauses to a resolved
@@ -207,6 +210,7 @@ fn run_relation(ctx: &SubCtx, s: &SelectStmt) -> Result<crate::join::Relation, E
         ctx.snapshot,
         ctx.own,
         s,
+        ctx.eval_ctx,
     )
 }
 

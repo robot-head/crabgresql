@@ -20,6 +20,21 @@ mod tag {
     /// SP32: `numeric` — stored as its canonical decimal text (length-prefixed),
     /// which round-trips the value AND its display scale. Append-only.
     pub const NUMERIC: u8 = 6;
+    /// SP37: `date` — i32 big-endian days since the PostgreSQL epoch (2000-01-01).
+    /// Append-only — no version bump.
+    pub const DATE: u8 = 7;
+    /// SP37: `time without time zone` — i64 big-endian microseconds since midnight.
+    /// Append-only — no version bump.
+    pub const TIME: u8 = 8;
+    /// SP37: `timestamp without time zone` — i64 big-endian microseconds since the
+    /// PostgreSQL epoch. Append-only — no version bump.
+    pub const TIMESTAMP: u8 = 9;
+    /// SP37: `timestamp with time zone` — i64 big-endian microseconds since the
+    /// PostgreSQL epoch (UTC). Append-only — no version bump.
+    pub const TIMESTAMPTZ: u8 = 10;
+    /// SP37: `interval` — i64 µs ++ i32 days ++ i32 months, all big-endian (16 bytes).
+    /// Append-only — no version bump.
+    pub const INTERVAL: u8 = 11;
 }
 
 pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
@@ -55,6 +70,26 @@ pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
                 let len = u32::try_from(s.len()).expect("numeric text exceeds 4 GiB");
                 out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(s.as_bytes());
+            }
+            Datum::Date(d) => {
+                out.push(tag::DATE);
+                out.extend_from_slice(&pgtypes::datetime::date_to_binary(*d));
+            }
+            Datum::Time(t) => {
+                out.push(tag::TIME);
+                out.extend_from_slice(&pgtypes::datetime::time_to_binary(*t));
+            }
+            Datum::Timestamp(ts) => {
+                out.push(tag::TIMESTAMP);
+                out.extend_from_slice(&pgtypes::datetime::timestamp_to_binary(*ts));
+            }
+            Datum::Timestamptz(ts) => {
+                out.push(tag::TIMESTAMPTZ);
+                out.extend_from_slice(&pgtypes::datetime::timestamptz_to_binary(*ts));
+            }
+            Datum::Interval(iv) => {
+                out.push(tag::INTERVAL);
+                out.extend_from_slice(&pgtypes::datetime::interval_to_binary(*iv));
             }
         }
     }
@@ -105,6 +140,41 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Datum>, KvError> {
                 Datum::Numeric(
                     pgtypes::numeric::parse(s)
                         .ok_or_else(|| KvError::CorruptRow(format!("invalid numeric {s:?}")))?,
+                )
+            }
+            tag::DATE => {
+                let raw = take_n(&mut cur, 4)?;
+                Datum::Date(
+                    pgtypes::datetime::date_from_binary(raw)
+                        .map_err(|e| KvError::CorruptRow(format!("corrupt date: {e}")))?,
+                )
+            }
+            tag::TIME => {
+                let raw = take_n(&mut cur, 8)?;
+                Datum::Time(
+                    pgtypes::datetime::time_from_binary(raw)
+                        .map_err(|e| KvError::CorruptRow(format!("corrupt time: {e}")))?,
+                )
+            }
+            tag::TIMESTAMP => {
+                let raw = take_n(&mut cur, 8)?;
+                Datum::Timestamp(
+                    pgtypes::datetime::timestamp_from_binary(raw)
+                        .map_err(|e| KvError::CorruptRow(format!("corrupt timestamp: {e}")))?,
+                )
+            }
+            tag::TIMESTAMPTZ => {
+                let raw = take_n(&mut cur, 8)?;
+                Datum::Timestamptz(
+                    pgtypes::datetime::timestamptz_from_binary(raw)
+                        .map_err(|e| KvError::CorruptRow(format!("corrupt timestamptz: {e}")))?,
+                )
+            }
+            tag::INTERVAL => {
+                let raw = take_n(&mut cur, 16)?;
+                Datum::Interval(
+                    pgtypes::datetime::interval_from_binary(raw)
+                        .map_err(|e| KvError::CorruptRow(format!("corrupt interval: {e}")))?,
                 )
             }
             other => return Err(KvError::CorruptRow(format!("unknown field tag {other}"))),
@@ -205,5 +275,30 @@ mod tests {
             let bytes = encode_row(&row);
             prop_assert_eq!(decode_row(&bytes).expect("decode"), row);
         }
+    }
+
+    #[test]
+    fn datetime_row_round_trip() {
+        use pgtypes::datetime::Interval;
+        let row = vec![
+            Datum::Date(pgtypes::datetime::parse_date("2024-01-15").expect("d")),
+            Datum::Time(pgtypes::datetime::parse_time("13:45:06.5").expect("t")),
+            Datum::Timestamp(
+                pgtypes::datetime::parse_timestamp("2024-01-15 13:45:06").expect("ts"),
+            ),
+            Datum::Timestamptz(
+                pgtypes::datetime::parse_timestamptz(
+                    "2024-01-15 13:45:06+00",
+                    &jiff::tz::TimeZone::UTC,
+                )
+                .expect("tstz"),
+            ),
+            Datum::Interval(Interval {
+                months: 14,
+                days: -3,
+                micros: 4_500_000,
+            }),
+        ];
+        assert_eq!(decode_row(&encode_row(&row)).expect("decode"), row);
     }
 }
