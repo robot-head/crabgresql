@@ -44,6 +44,30 @@ enum ScalarFunc {
     NullIf,
     Greatest,
     Least,
+    // SP33: rounding family (type-preserving).
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Sign,
+    // SP33: transcendental family (always float8).
+    Sqrt,
+    Power,
+    Exp,
+    Ln,
+    Log,
+    Pi,
+    // SP33: string family.
+    Lpad,
+    Rpad,
+    Left,
+    Right,
+    Repeat,
+    Reverse,
+    Strpos,
+    Initcap,
+    Ascii,
+    Chr,
 }
 
 /// Classify a (lowercased — the lexer lowercases unquoted idents) function name.
@@ -66,6 +90,27 @@ fn scalar_func(name: &str) -> Option<ScalarFunc> {
         "nullif" => ScalarFunc::NullIf,
         "greatest" => ScalarFunc::Greatest,
         "least" => ScalarFunc::Least,
+        "floor" => ScalarFunc::Floor,
+        "ceil" | "ceiling" => ScalarFunc::Ceil,
+        "round" => ScalarFunc::Round,
+        "trunc" => ScalarFunc::Trunc,
+        "sign" => ScalarFunc::Sign,
+        "sqrt" => ScalarFunc::Sqrt,
+        "power" | "pow" => ScalarFunc::Power,
+        "exp" => ScalarFunc::Exp,
+        "ln" => ScalarFunc::Ln,
+        "log" => ScalarFunc::Log,
+        "pi" => ScalarFunc::Pi,
+        "lpad" => ScalarFunc::Lpad,
+        "rpad" => ScalarFunc::Rpad,
+        "left" => ScalarFunc::Left,
+        "right" => ScalarFunc::Right,
+        "repeat" => ScalarFunc::Repeat,
+        "reverse" => ScalarFunc::Reverse,
+        "strpos" => ScalarFunc::Strpos,
+        "initcap" => ScalarFunc::Initcap,
+        "ascii" => ScalarFunc::Ascii,
+        "chr" => ScalarFunc::Chr,
         _ => return None,
     })
 }
@@ -182,6 +227,81 @@ pub(crate) fn scalar_result_type(fc: &FuncCall, scope: &Scope) -> Result<ColumnT
             } else {
                 crate::eval::infer_type(&args[0], scope)
             }
+        }
+        ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Sign => {
+            require_arity(fc, n == 1)?;
+            // preserves the input numeric type (int4/int8/float8/numeric).
+            require_numeric(&args[0], scope)
+        }
+        ScalarFunc::Round | ScalarFunc::Trunc => {
+            require_arity(fc, n == 1 || n == 2)?;
+            if n == 1 {
+                require_numeric(&args[0], scope)
+            } else {
+                // two-arg: numeric (or int promoted to numeric) first arg, int
+                // second arg, → numeric. A float8 first arg has no 2-arg form.
+                let t0 = require_numeric(&args[0], scope)?;
+                if t0 == ColumnType::Float8 {
+                    return Err(no_matching_function());
+                }
+                require_int(&args[1], scope)?;
+                Ok(ColumnType::Numeric(None))
+            }
+        }
+        ScalarFunc::Sqrt | ScalarFunc::Exp | ScalarFunc::Ln | ScalarFunc::Log => {
+            require_arity(fc, n == 1)?;
+            let at = require_numeric(&args[0], scope)?;
+            Ok(if at.is_numeric() {
+                ColumnType::Numeric(None)
+            } else {
+                ColumnType::Float8
+            })
+        }
+        ScalarFunc::Power => {
+            require_arity(fc, n == 2)?;
+            let a = require_numeric(&args[0], scope)?;
+            let b = require_numeric(&args[1], scope)?;
+            Ok(power_result_type(a, b))
+        }
+        ScalarFunc::Pi => {
+            require_arity(fc, n == 0)?;
+            Ok(ColumnType::Float8)
+        }
+        ScalarFunc::Lpad | ScalarFunc::Rpad => {
+            require_arity(fc, n == 2 || n == 3)?;
+            require_text(&args[0], scope)?;
+            require_int(&args[1], scope)?;
+            if n == 3 {
+                require_text(&args[2], scope)?;
+            }
+            Ok(ColumnType::Text)
+        }
+        ScalarFunc::Left | ScalarFunc::Right | ScalarFunc::Repeat => {
+            require_arity(fc, n == 2)?;
+            require_text(&args[0], scope)?;
+            require_int(&args[1], scope)?;
+            Ok(ColumnType::Text)
+        }
+        ScalarFunc::Reverse | ScalarFunc::Initcap => {
+            require_arity(fc, n == 1)?;
+            require_text(&args[0], scope)?;
+            Ok(ColumnType::Text)
+        }
+        ScalarFunc::Strpos => {
+            require_arity(fc, n == 2)?;
+            require_text(&args[0], scope)?;
+            require_text(&args[1], scope)?;
+            Ok(ColumnType::Int4)
+        }
+        ScalarFunc::Ascii => {
+            require_arity(fc, n == 1)?;
+            require_text(&args[0], scope)?;
+            Ok(ColumnType::Int4)
+        }
+        ScalarFunc::Chr => {
+            require_arity(fc, n == 1)?;
+            require_int(&args[0], scope)?;
+            Ok(ColumnType::Text)
         }
     }
 }
@@ -349,6 +469,140 @@ fn eval_eager(f: ScalarFunc, fc: &FuncCall, vals: &[Datum]) -> Result<Datum, Exe
             require_arity(fc, vals.len() == 2)?;
             Ok(ops::rem(&vals[0], &vals[1])?)
         }
+        ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Sign => {
+            require_arity(fc, vals.len() == 1)?;
+            round_family(f, &vals[0], None)
+        }
+        ScalarFunc::Round | ScalarFunc::Trunc => {
+            require_arity(fc, vals.len() == 1 || vals.len() == 2)?;
+            let scale = match vals.get(1) {
+                None => None,
+                Some(s) => Some(int_arg(s)?),
+            };
+            round_family(f, &vals[0], scale)
+        }
+        ScalarFunc::Sqrt => {
+            require_arity(fc, vals.len() == 1)?;
+            if let Datum::Numeric(d) = &vals[0] {
+                return pgtypes::numeric::num_sqrt(d)
+                    .map(Datum::Numeric)
+                    .map_err(ExecError::Type);
+            }
+            let x = as_f64(&vals[0])?;
+            if x < 0.0 {
+                return Err(domain(
+                    "2201F",
+                    "cannot take square root of a negative number",
+                ));
+            }
+            Ok(Datum::Float8(x.sqrt()))
+        }
+        ScalarFunc::Exp => {
+            require_arity(fc, vals.len() == 1)?;
+            if let Datum::Numeric(d) = &vals[0] {
+                return pgtypes::numeric::num_exp(d)
+                    .map(Datum::Numeric)
+                    .map_err(ExecError::Type);
+            }
+            finite_or_overflow(as_f64(&vals[0])?.exp())
+        }
+        ScalarFunc::Ln => {
+            require_arity(fc, vals.len() == 1)?;
+            if let Datum::Numeric(d) = &vals[0] {
+                return pgtypes::numeric::num_ln(d)
+                    .map(Datum::Numeric)
+                    .map_err(ExecError::Type);
+            }
+            let x = as_f64(&vals[0])?;
+            if x <= 0.0 {
+                return Err(domain(
+                    "2201E",
+                    "cannot take logarithm of a non-positive number",
+                ));
+            }
+            Ok(Datum::Float8(x.ln()))
+        }
+        ScalarFunc::Log => {
+            require_arity(fc, vals.len() == 1)?;
+            if let Datum::Numeric(d) = &vals[0] {
+                return pgtypes::numeric::num_log10(d)
+                    .map(Datum::Numeric)
+                    .map_err(ExecError::Type);
+            }
+            let x = as_f64(&vals[0])?;
+            if x <= 0.0 {
+                return Err(domain(
+                    "2201E",
+                    "cannot take logarithm of a non-positive number",
+                ));
+            }
+            Ok(Datum::Float8(x.log10()))
+        }
+        ScalarFunc::Power => {
+            require_arity(fc, vals.len() == 2)?;
+            let any_num =
+                matches!(&vals[0], Datum::Numeric(_)) || matches!(&vals[1], Datum::Numeric(_));
+            let any_f64 =
+                matches!(&vals[0], Datum::Float8(_)) || matches!(&vals[1], Datum::Float8(_));
+            if any_num && !any_f64 {
+                let b = to_numeric(&vals[0])?;
+                let e = to_numeric(&vals[1])?;
+                return pgtypes::numeric::num_power(&b, &e)
+                    .map(Datum::Numeric)
+                    .map_err(ExecError::Type);
+            }
+            power(as_f64(&vals[0])?, as_f64(&vals[1])?)
+        }
+        ScalarFunc::Pi => {
+            require_arity(fc, vals.is_empty())?;
+            Ok(Datum::Float8(std::f64::consts::PI))
+        }
+        ScalarFunc::Lpad | ScalarFunc::Rpad => {
+            require_arity(fc, vals.len() == 2 || vals.len() == 3)?;
+            let s = text_arg(&vals[0])?;
+            let width = int_arg(&vals[1])?;
+            let fill = match vals.get(2) {
+                None => " ",
+                Some(d) => text_arg(d)?,
+            };
+            Ok(Datum::Text(pad(f, s, width, fill)?))
+        }
+        ScalarFunc::Left | ScalarFunc::Right => {
+            require_arity(fc, vals.len() == 2)?;
+            let s = text_arg(&vals[0])?;
+            let n = int_arg(&vals[1])?;
+            Ok(Datum::Text(left_right(f, s, n)))
+        }
+        ScalarFunc::Repeat => {
+            require_arity(fc, vals.len() == 2)?;
+            let s = text_arg(&vals[0])?;
+            let n = int_arg(&vals[1])?;
+            repeat_str(s, n)
+        }
+        ScalarFunc::Reverse => {
+            require_arity(fc, vals.len() == 1)?;
+            Ok(Datum::Text(text_arg(&vals[0])?.chars().rev().collect()))
+        }
+        ScalarFunc::Initcap => {
+            require_arity(fc, vals.len() == 1)?;
+            Ok(Datum::Text(initcap(text_arg(&vals[0])?)))
+        }
+        ScalarFunc::Strpos => {
+            require_arity(fc, vals.len() == 2)?;
+            Ok(Datum::Int4(strpos(
+                text_arg(&vals[0])?,
+                text_arg(&vals[1])?,
+            )))
+        }
+        ScalarFunc::Ascii => {
+            require_arity(fc, vals.len() == 1)?;
+            let code = text_arg(&vals[0])?.chars().next().map_or(0, |c| c as i32);
+            Ok(Datum::Int4(code))
+        }
+        ScalarFunc::Chr => {
+            require_arity(fc, vals.len() == 1)?;
+            chr(int_arg(&vals[0])?)
+        }
         // concat / coalesce / nullif / greatest / least are handled before here.
         _ => unreachable!("non-eager scalar function reached eval_eager"),
     }
@@ -460,6 +714,142 @@ fn text_render(d: &Datum) -> String {
         .expect("a Datum's text encoding is always valid UTF-8")
 }
 
+// ---- rounding helpers (SP33) ----
+
+/// Rounding-family value transform. `scale` is `Some` only for the two-arg
+/// `round`/`trunc` form, which always yields numeric (an int first arg is
+/// promoted to numeric). The one-arg form preserves the input numeric type.
+fn round_family(f: ScalarFunc, v: &Datum, scale: Option<i64>) -> Result<Datum, ExecError> {
+    use pgtypes::numeric as num;
+    if let Some(n) = scale {
+        let bd = match v {
+            Datum::Int4(i) => num::from_i64(i64::from(*i)),
+            Datum::Int8(i) => num::from_i64(*i),
+            Datum::Numeric(d) => d.clone(),
+            other => return Err(type_error("function", other)),
+        };
+        return Ok(Datum::Numeric(match f {
+            ScalarFunc::Round => num::round(&bd, n),
+            ScalarFunc::Trunc => num::trunc(&bd, n),
+            _ => unreachable!("scale is only set for round/trunc"),
+        }));
+    }
+    match v {
+        Datum::Int4(_) | Datum::Int8(_) => match f {
+            ScalarFunc::Sign => sign_int(v),
+            _ => Ok(v.clone()), // floor/ceil/round/trunc of an integer is itself
+        },
+        Datum::Float8(x) => Ok(Datum::Float8(match f {
+            ScalarFunc::Floor => x.floor(),
+            ScalarFunc::Ceil => x.ceil(),
+            ScalarFunc::Round => x.round_ties_even(), // PG float8 round = half-to-even
+            ScalarFunc::Trunc => x.trunc(),
+            ScalarFunc::Sign => float_sign(*x),
+            _ => unreachable!(),
+        })),
+        Datum::Numeric(d) => Ok(Datum::Numeric(match f {
+            ScalarFunc::Floor => num::floor(d),
+            ScalarFunc::Ceil => num::ceil(d),
+            ScalarFunc::Round => num::round(d, 0),
+            ScalarFunc::Trunc => num::trunc(d, 0),
+            ScalarFunc::Sign => num::sign(d),
+            _ => unreachable!(),
+        })),
+        other => Err(type_error("function", other)),
+    }
+}
+
+/// `sign` of an integer, preserving its width.
+fn sign_int(v: &Datum) -> Result<Datum, ExecError> {
+    Ok(match v {
+        Datum::Int4(n) => Datum::Int4(n.signum()),
+        Datum::Int8(n) => Datum::Int8(n.signum()),
+        other => return Err(type_error("sign", other)),
+    })
+}
+
+// ---- transcendental helpers (SP33) ----
+
+/// Coerce any numeric Datum (int4/int8/float8/numeric) to f64 for the
+/// transcendental functions, which always compute in float8.
+fn as_f64(d: &Datum) -> Result<f64, ExecError> {
+    Ok(match d {
+        Datum::Int4(n) => f64::from(*n),
+        Datum::Int8(n) => *n as f64,
+        Datum::Float8(x) => *x,
+        Datum::Numeric(d) => pgtypes::numeric::to_f64(d),
+        other => return Err(type_error("function", other)),
+    })
+}
+
+/// Build a domain error carrying its PostgreSQL SQLSTATE.
+fn domain(sqlstate: &'static str, message: &'static str) -> ExecError {
+    ExecError::Type(pgtypes::TypeError::Domain { sqlstate, message })
+}
+
+/// Wrap an f64 result, mapping an overflow-to-infinity to 22003 (matching the
+/// engine's float8 arithmetic, which treats a finite→∞ overflow as out-of-range).
+fn finite_or_overflow(x: f64) -> Result<Datum, ExecError> {
+    if x.is_infinite() {
+        Err(ExecError::Type(pgtypes::TypeError::Overflow))
+    } else {
+        Ok(Datum::Float8(x))
+    }
+}
+
+/// PostgreSQL power result type: float8 if any operand is float8; else numeric if
+/// any operand is numeric; else float8 (all-int, PG's preferred type).
+fn power_result_type(a: ColumnType, b: ColumnType) -> ColumnType {
+    if a == ColumnType::Float8 || b == ColumnType::Float8 {
+        ColumnType::Float8
+    } else if a.is_numeric() || b.is_numeric() {
+        ColumnType::Numeric(None)
+    } else {
+        ColumnType::Float8
+    }
+}
+
+/// Promote an int4/int8/numeric Datum to a numeric BigDecimal (for the numeric
+/// power path, where one operand may be an integer).
+fn to_numeric(d: &Datum) -> Result<bigdecimal::BigDecimal, ExecError> {
+    match d {
+        Datum::Int4(n) => Ok(pgtypes::numeric::from_i64(i64::from(*n))),
+        Datum::Int8(n) => Ok(pgtypes::numeric::from_i64(*n)),
+        Datum::Numeric(d) => Ok(d.clone()),
+        other => Err(type_error("power", other)),
+    }
+}
+
+/// `power(base, exp)` with PostgreSQL's domain checks (2201F).
+fn power(base: f64, exp: f64) -> Result<Datum, ExecError> {
+    if base == 0.0 && exp < 0.0 {
+        return Err(domain(
+            "2201F",
+            "zero raised to a negative power is undefined",
+        ));
+    }
+    if base < 0.0 && exp.fract() != 0.0 {
+        return Err(domain(
+            "2201F",
+            "a negative number raised to a non-integer power yields a complex result",
+        ));
+    }
+    finite_or_overflow(base.powf(exp))
+}
+
+/// `sign` of a float8: −1 / 0 / 1, with `NaN` → `NaN` (PostgreSQL `dsign`).
+fn float_sign(x: f64) -> f64 {
+    if x.is_nan() {
+        f64::NAN
+    } else if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 // ---- string helpers ----
 
 fn trim_ws(f: ScalarFunc, s: &str) -> String {
@@ -506,6 +896,118 @@ fn substr(s: &str, start: i64, count: Option<i64>) -> Result<Datum, ExecError> {
     Ok(Datum::Text(out))
 }
 
+// ---- string-family helpers (SP33) ----
+
+/// PostgreSQL's ~1 GB field-size limit — guards `repeat`/`lpad`/`rpad` against
+/// minting an adversarially huge string (raised as 54000, "requested length too
+/// large", rather than aborting the process on an out-of-memory allocation).
+const MAX_FIELD_SIZE: usize = 1 << 30;
+
+/// 54000 (`program_limit_exceeded`) — a string function was asked to produce a
+/// field larger than the engine permits.
+fn length_too_large() -> ExecError {
+    domain("54000", "requested length too large")
+}
+
+/// `lpad`/`rpad`: pad `s` to `width` chars with `fill`; when `s` is longer than
+/// `width`, truncate to its first `width` chars (both forms). A `width <= 0`
+/// yields the empty string; an empty `fill` that cannot pad leaves `s` unchanged.
+/// A `width` beyond [`MAX_FIELD_SIZE`] is 54000 (rather than an OOM allocation).
+fn pad(f: ScalarFunc, s: &str, width: i64, fill: &str) -> Result<String, ExecError> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    if width <= 0 {
+        return Ok(String::new());
+    }
+    if width as usize > MAX_FIELD_SIZE {
+        return Err(length_too_large());
+    }
+    if len >= width {
+        return Ok(chars[..width as usize].iter().collect());
+    }
+    let fill_chars: Vec<char> = fill.chars().collect();
+    if fill_chars.is_empty() {
+        return Ok(s.to_string());
+    }
+    let pad_len = (width - len) as usize;
+    let padding: String = fill_chars.iter().cycle().take(pad_len).collect();
+    Ok(match f {
+        ScalarFunc::Lpad => format!("{padding}{s}"),
+        _ => format!("{s}{padding}"), // Rpad
+    })
+}
+
+/// `left`/`right`: first/last `n` chars; a negative `n` drops `|n|` chars from the
+/// far end (PostgreSQL semantics).
+fn left_right(f: ScalarFunc, s: &str, n: i64) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let take = if n < 0 { (len + n).max(0) } else { n.min(len) };
+    match f {
+        ScalarFunc::Left => chars[..take as usize].iter().collect(),
+        _ => chars[(len - take) as usize..].iter().collect(), // Right
+    }
+}
+
+/// `repeat(s, n)`: `n <= 0` → empty; guarded against exceeding the field-size limit.
+fn repeat_str(s: &str, n: i64) -> Result<Datum, ExecError> {
+    if n <= 0 {
+        return Ok(Datum::Text(String::new()));
+    }
+    let n = n as usize;
+    match s.len().checked_mul(n) {
+        Some(total) if total <= MAX_FIELD_SIZE => Ok(Datum::Text(s.repeat(n))),
+        _ => Err(length_too_large()),
+    }
+}
+
+/// `initcap(s)`: uppercase the first alphanumeric of each word, lowercase the rest.
+fn initcap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alnum = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if prev_alnum {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+            }
+            prev_alnum = true;
+        } else {
+            out.push(c);
+            prev_alnum = false;
+        }
+    }
+    out
+}
+
+/// `strpos(s, sub)`: 1-based char index of the first `sub` in `s`; `0` if absent;
+/// an empty `sub` matches at position `1` (PostgreSQL).
+fn strpos(s: &str, sub: &str) -> i32 {
+    if sub.is_empty() {
+        return 1;
+    }
+    match s.find(sub) {
+        None => 0,
+        Some(byte_idx) => (s[..byte_idx].chars().count() + 1) as i32,
+    }
+}
+
+/// `chr(n)`: the one-character string for Unicode code point `n`. `0` or an
+/// out-of-range / surrogate code point is 54000.
+fn chr(n: i64) -> Result<Datum, ExecError> {
+    if n == 0 {
+        return Err(domain("54000", "null character not permitted"));
+    }
+    match u32::try_from(n).ok().and_then(char::from_u32) {
+        Some(c) => Ok(Datum::Text(c.to_string())),
+        None => Err(domain(
+            "54000",
+            "requested character too large for encoding",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +1031,17 @@ mod tests {
         }
     }
 
+    fn table_n() -> Table {
+        Table {
+            id: 1,
+            name: "t".into(),
+            columns: vec![Column {
+                name: "qn".into(),
+                ty: ColumnType::Numeric(None),
+            }],
+        }
+    }
+
     /// The table's single-relation scope, or the empty (FROM-less) scope.
     fn scope_of(t: Option<&Table>) -> Scope {
         match t {
@@ -540,6 +1053,14 @@ mod tests {
     /// Evaluate a scalar-function expression with no row context.
     fn ev(sql: &str) -> Datum {
         crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[]).expect("eval")
+    }
+
+    /// SQLSTATE of a runtime eval error (no row context).
+    fn ec_eval(sql: &str) -> String {
+        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[])
+            .expect_err("expected error")
+            .into_pg()
+            .code
     }
 
     fn err_code(sql: &str, t: Option<&Table>) -> String {
@@ -702,5 +1223,174 @@ mod tests {
         assert_eq!(ev("'a' || 'b' || 'c'"), Datum::Text("abc".into()));
         assert_eq!(ev("'id=' || 5"), Datum::Text("id=5".into()));
         assert_eq!(ev("'x' || null"), Datum::Null);
+    }
+
+    #[test]
+    fn rounding_family_preserves_type() {
+        let num = |s: &str| Datum::Numeric(pgtypes::numeric::parse(s).expect("n"));
+        // int in → int out (unchanged)
+        assert_eq!(ev("floor(5)"), Datum::Int4(5));
+        assert_eq!(ev("ceil(5)"), Datum::Int4(5));
+        assert_eq!(ev("trunc(5)"), Datum::Int4(5));
+        assert_eq!(ev("round(5)"), Datum::Int4(5));
+        assert_eq!(ev("sign(-7)"), Datum::Int4(-1));
+        // numeric in → numeric out
+        assert_eq!(ev("floor(2.9)"), num("2"));
+        assert_eq!(ev("ceiling(2.1)"), num("3"));
+        assert_eq!(ev("round(2.5)"), num("3"));
+        assert_eq!(ev("round(2.567, 2)"), num("2.57"));
+        assert_eq!(ev("trunc(2.99)"), num("2"));
+        assert_eq!(ev("trunc(2.567, 1)"), num("2.5"));
+        assert_eq!(ev("sign(-0.3)"), num("-1"));
+        // float8 in → float8 out (round half-to-even)
+        assert_eq!(ev("floor(2.9::float8)"), Datum::Float8(2.0));
+        assert_eq!(ev("round(2.5::float8)"), Datum::Float8(2.0)); // half-to-even
+        assert_eq!(ev("round(3.5::float8)"), Datum::Float8(4.0));
+        assert_eq!(ev("sign(-3.0::float8)"), Datum::Float8(-1.0));
+        // two-arg round/trunc on an int → numeric
+        assert_eq!(ev("round(1234, -2)"), num("1200"));
+        // strict NULL
+        assert_eq!(ev("floor(null)"), Datum::Null);
+    }
+
+    #[test]
+    fn rounding_family_types_and_errors() {
+        let t = table();
+        let ty = |sql: &str| {
+            crate::eval::infer_type(&pexpr(sql).expect("p"), &scope_of(Some(&t))).expect("ty")
+        };
+        assert_eq!(ty("floor(n)"), ColumnType::Int4);
+        assert_eq!(ty("round(2.5)"), ColumnType::Numeric(None));
+        assert_eq!(ty("floor(2.5::float8)"), ColumnType::Float8);
+        assert_eq!(ty("round(2.5, 1)"), ColumnType::Numeric(None));
+        // two-arg round on a float8 first arg → 42883 (PG has no round(float8,int)).
+        assert_eq!(err_code("round(2.5::float8, 1)", Some(&t)), "42883");
+        // non-numeric arg → 42883.
+        assert_eq!(err_code("floor(s)", Some(&t)), "42883");
+    }
+
+    #[test]
+    fn transcendental_family_returns_float8() {
+        assert_eq!(ev("sqrt(4)"), Datum::Float8(2.0));
+        assert_eq!(ev("sqrt(2.25::float8)"), Datum::Float8(1.5));
+        assert_eq!(ev("power(2, 10)"), Datum::Float8(1024.0));
+        assert_eq!(ev("pow(2, 0.5::float8)"), Datum::Float8(2.0_f64.sqrt()));
+        assert_eq!(ev("exp(0)"), Datum::Float8(1.0));
+        assert_eq!(ev("ln(1)"), Datum::Float8(0.0));
+        assert_eq!(ev("log(1000)"), Datum::Float8(3.0));
+        assert_eq!(ev("pi()"), Datum::Float8(std::f64::consts::PI));
+        // strict NULL
+        assert_eq!(ev("sqrt(null)"), Datum::Null);
+    }
+
+    #[test]
+    fn string_family_values() {
+        assert_eq!(ev("lpad('hi', 5)"), Datum::Text("   hi".into()));
+        assert_eq!(ev("lpad('hi', 5, '*')"), Datum::Text("***hi".into()));
+        assert_eq!(ev("lpad('hello', 3)"), Datum::Text("hel".into()));
+        assert_eq!(ev("rpad('hi', 5, 'ab')"), Datum::Text("hiaba".into()));
+        assert_eq!(ev("rpad('hello', 3)"), Datum::Text("hel".into()));
+        assert_eq!(ev("left('abcdef', 2)"), Datum::Text("ab".into()));
+        assert_eq!(ev("left('abcdef', -2)"), Datum::Text("abcd".into()));
+        assert_eq!(ev("right('abcdef', 2)"), Datum::Text("ef".into()));
+        assert_eq!(ev("right('abcdef', -2)"), Datum::Text("cdef".into()));
+        assert_eq!(ev("repeat('ab', 3)"), Datum::Text("ababab".into()));
+        assert_eq!(ev("repeat('ab', 0)"), Datum::Text("".into()));
+        assert_eq!(ev("reverse('abc')"), Datum::Text("cba".into()));
+        assert_eq!(
+            ev("initcap('hello WORLD')"),
+            Datum::Text("Hello World".into())
+        );
+        assert_eq!(ev("strpos('abcde', 'cd')"), Datum::Int4(3));
+        assert_eq!(ev("strpos('abcde', 'xy')"), Datum::Int4(0));
+        assert_eq!(ev("strpos('abc', '')"), Datum::Int4(1));
+        assert_eq!(ev("ascii('A')"), Datum::Int4(65));
+        assert_eq!(ev("ascii('')"), Datum::Int4(0));
+        assert_eq!(ev("chr(65)"), Datum::Text("A".into()));
+        // strict NULL
+        assert_eq!(ev("lpad(null, 5)"), Datum::Null);
+        assert_eq!(ev("reverse(null)"), Datum::Null);
+    }
+
+    #[test]
+    fn string_family_types_and_errors() {
+        let t = table();
+        let ty = |sql: &str| {
+            crate::eval::infer_type(&pexpr(sql).expect("p"), &scope_of(Some(&t))).expect("ty")
+        };
+        assert_eq!(ty("lpad(s, 5)"), ColumnType::Text);
+        assert_eq!(ty("strpos(s, 'x')"), ColumnType::Int4);
+        assert_eq!(ty("ascii(s)"), ColumnType::Int4);
+        assert_eq!(ty("chr(n)"), ColumnType::Text);
+        // chr(0) and an out-of-range code point → 54000.
+        assert_eq!(ec_eval("chr(0)"), "54000");
+        assert_eq!(ec_eval("chr(99999999999)"), "54000");
+        // wrong arg type → 42883.
+        assert_eq!(err_code("left(n, 2)", Some(&t)), "42883");
+        assert_eq!(err_code("ascii(n)", Some(&t)), "42883");
+        // an adversarially huge lpad/rpad width or repeat count is 54000
+        // ("requested length too large"), guarded against OOM — not a process abort.
+        assert_eq!(ec_eval("lpad('x', 9999999999)"), "54000");
+        assert_eq!(ec_eval("rpad('x', 9999999999)"), "54000");
+        assert_eq!(ec_eval("repeat('x', 9999999999)"), "54000");
+    }
+
+    #[test]
+    fn transcendental_domain_errors() {
+        let t = table();
+        let ty = |sql: &str| {
+            crate::eval::infer_type(&pexpr(sql).expect("p"), &scope_of(Some(&t))).expect("ty")
+        };
+        assert_eq!(ty("sqrt(n)"), ColumnType::Float8);
+        assert_eq!(ty("pi()"), ColumnType::Float8);
+        // sqrt(negative) → 2201F
+        assert_eq!(ec_eval("sqrt(-1)"), "2201F");
+        // ln/log of a non-positive number → 2201E
+        assert_eq!(ec_eval("ln(0)"), "2201E");
+        assert_eq!(ec_eval("ln(-1)"), "2201E");
+        assert_eq!(ec_eval("log(0)"), "2201E");
+        // zero to a negative power → 2201F
+        assert_eq!(ec_eval("power(0, -1)"), "2201F");
+        // wrong arity → 42883
+        assert_eq!(err_code("pi(1)", Some(&t)), "42883");
+        assert_eq!(err_code("power(2)", Some(&t)), "42883");
+    }
+
+    #[test]
+    fn transcendentals_are_numeric_for_numeric_input() {
+        let num = |s: &str| Datum::Numeric(pgtypes::numeric::parse(s).expect("n"));
+        // numeric in -> numeric out (oracle-validated exact values from pgtypes unit tests)
+        assert_eq!(ev("sqrt(2.0)"), num("1.414213562373095"));
+        assert_eq!(ev("exp(1.0)"), num("2.7182818284590452"));
+        assert_eq!(ev("ln(2.0)"), num("0.6931471805599453"));
+        assert_eq!(ev("power(2.0, 3.0)"), num("8.0000000000000000"));
+        // int in -> float8 out (unchanged)
+        assert_eq!(ev("sqrt(4)"), Datum::Float8(2.0));
+        assert_eq!(ev("exp(0)"), Datum::Float8(1.0));
+        // float8 in -> float8 out (unchanged)
+        assert_eq!(ev("sqrt(4.0::float8)"), Datum::Float8(2.0));
+        // strict NULL
+        assert_eq!(ev("sqrt(null)"), Datum::Null);
+        // numeric-path domain errors (2201E/2201F) and overflow (22003) surface
+        // end-to-end from SQL — never a panic, hang, or silently-wrong value.
+        assert_eq!(ec_eval("sqrt(-1::numeric)"), "2201F");
+        assert_eq!(ec_eval("ln(0::numeric)"), "2201E");
+        assert_eq!(ec_eval("power(0::numeric, -1::numeric)"), "2201F");
+        assert_eq!(ec_eval("exp(6000::numeric)"), "22003");
+        assert_eq!(ec_eval("power(10::numeric, 200000::numeric)"), "22003");
+    }
+
+    #[test]
+    fn transcendental_result_types() {
+        let t = table_n();
+        let ty = |sql: &str| {
+            crate::eval::infer_type(&pexpr(sql).expect("p"), &scope_of(Some(&t))).expect("ty")
+        };
+        assert_eq!(ty("sqrt(qn)"), ColumnType::Numeric(None)); // qn is numeric
+        assert_eq!(ty("ln(qn)"), ColumnType::Numeric(None));
+        assert_eq!(ty("sqrt(4)"), ColumnType::Float8); // int literal
+        assert_eq!(ty("sqrt(4.0::float8)"), ColumnType::Float8);
+        assert_eq!(ty("power(qn, 2)"), ColumnType::Numeric(None)); // numeric base
+        assert_eq!(ty("power(2, 3)"), ColumnType::Float8); // all-int
     }
 }

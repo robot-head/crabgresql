@@ -51,4 +51,34 @@ exclude_re = [
     # them. (The arithmetic `+`/`<` mutants in expr are NOT excluded — those are
     # killable and covered by the precedence tests.)
     "replace < with <= in Parser::expr",
+
+    # --- SP35 numeric transcendentals (sqrt/ln/log/exp/power): equivalent mutants ---
+    # The values are computed by dashu-float to a DELIBERATELY over-provisioned
+    # precision (`transc_prec` = needed digits + a 16-digit guard) and only THEN
+    # rounded to PostgreSQL's display scale (rscale). A mutation of any precision
+    # INPUT keeps precision >= the needed digits (or pushes it higher / times out) —
+    # never below the guard — so the correctly-rounded result is byte-identical. No
+    # value test can distinguish these. (The result-CHANGING arithmetic — the
+    # `exp·log10(base)` overflow estimate, the `16 - rweight` rscale, the power-of-ten
+    # display-scale, `sqrt(0)`, and the non-exact `log(2)`/`log(5)` division scale —
+    # is NOT excluded; those mutants are killed by targeted tests.)
+    "replace \\+ with (-|\\*) in transc_prec", # the MAX_WEIGHT+64 clamp ceiling never binds (inputs are pre-bounded)
+    "replace / with (%|\\*) in num_sqrt",      # decimal_weight/2 feeds over-provisioned precision
+    "replace \\+ with (-|\\*) in num_ln",      # estimate_ln_dweight+1 feeds over-provisioned precision
+    "replace \\+ with (-|\\*) in num_log10",   # estimate+1 / prec+8 / rscale*4 feed over-provisioned precision
+    "replace \\* with \\+ in num_exp",         # val*log10(e) feeds over-provisioned precision
+    # Redundant defensive domain guard: the outer `is_zero || negative` short-circuit
+    # is ALSO enforced by the inner `bf_ln` guard, so `||`->`&&` rejects the same
+    # non-positive inputs downstream — no observable change.
+    "replace \\|\\| with && in num_ln",
+    "replace \\|\\| with && in num_log10",
+    # Unreachable f64 fallback: `BigDecimal::to_f64` returns `Some(±inf)` for every
+    # finite numeric, so the `None` arm (and its sign test) is dead under all real
+    # inputs; `==`->`!=` flips an unreachable branch.
+    "replace == with != in num_exp",
+    "replace == with != in num_power",
+    # Knife-edge format boundary: `est_weight > MAX_WEIGHT` vs `>=` differ ONLY when the
+    # estimate is EXACTLY MAX_WEIGHT (131071), which would require materializing a
+    # 131072-digit result to observe — a benign off-by-one at the numeric-format edge.
+    "replace > with >= in num_power",
 ]

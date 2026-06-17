@@ -326,6 +326,11 @@ impl Parser {
             }
             Token::Keyword(Keyword::Case) => self.case_expr(),
             Token::Keyword(Keyword::Cast) => self.cast_expr(),
+            // `left`/`right` are PostgreSQL scalar functions AND (LEFT/RIGHT) join
+            // keywords. In expression position they are valid only as a function
+            // call — `left(s, n)` / `right(s, n)` — so route them to `func_call`.
+            Token::Keyword(Keyword::Left) => self.keyword_func_call("left"),
+            Token::Keyword(Keyword::Right) => self.keyword_func_call("right"),
             Token::Param(n) => {
                 self.bump();
                 Ok(Expr::Param(n))
@@ -396,6 +401,21 @@ impl Parser {
             distinct,
             args: FuncArgs::Exprs(args),
         }))
+    }
+
+    /// A keyword that doubles as a scalar function name (`left`/`right`, which are
+    /// also join keywords) used in expression position: positioned at the keyword,
+    /// it is valid only as a function call `kw (`.
+    fn keyword_func_call(&mut self, name: &str) -> Result<Expr, ParseError> {
+        self.bump();
+        if *self.peek() == Token::LParen {
+            self.func_call(name.to_string())
+        } else {
+            Err(ParseError::new(
+                format!("`{name}` is reserved here; use it as a function call `{name}(...)`"),
+                self.peek_pos(),
+            ))
+        }
     }
 
     /// `expr IS [NOT] NULL`, positioned at `IS`. (`IS TRUE`/`IS DISTINCT FROM`
@@ -1078,6 +1098,30 @@ mod tests {
         let mut v = parse(sql).expect("parse");
         assert_eq!(v.len(), 1);
         v.pop().expect("one statement")
+    }
+
+    #[test]
+    fn left_and_right_keywords_parse_as_functions_in_expression_position() {
+        use crate::ast::{FuncArgs, FuncCall};
+        // `LEFT`/`RIGHT` are join keywords, but in expression position they are
+        // the scalar functions `left(s, n)` / `right(s, n)` (PostgreSQL allows it).
+        for (sql, name) in [("left('abc', 2)", "left"), ("right('abc', 2)", "right")] {
+            match parse_expr_for_test(sql).expect("parse fn") {
+                Expr::Func(FuncCall {
+                    name: n,
+                    args: FuncArgs::Exprs(a),
+                    ..
+                }) => {
+                    assert_eq!(n, name);
+                    assert_eq!(a.len(), 2);
+                }
+                other => panic!("expected a function call, got {other:?}"),
+            }
+        }
+        // A bare `left`/`right` not followed by `(` is rejected (still reserved).
+        assert!(parse_expr_for_test("left + 1").is_err());
+        // And `LEFT JOIN` still parses as a join (keyword role preserved).
+        assert!(parse("SELECT * FROM a LEFT JOIN b ON a.id = b.id").is_ok());
     }
 
     #[test]

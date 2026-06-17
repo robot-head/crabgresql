@@ -64,6 +64,7 @@ openraft = { version = "0.9", features = ["serde"] }
 arc-swap = "1"
 async-trait = "0.1"
 bigdecimal = "0.4"
+dashu-float = "0.4"
 stateright = "0.31"
 zerocopy = { version = "0.8", features = ["derive"] }
 tempfile = "3"
