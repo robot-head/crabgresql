@@ -2069,6 +2069,194 @@ fn match_literal(lit: char, chars: &[char], i: &mut usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SP38: `make_*` constructors and `justify_*` normalization.
+//
+// PostgreSQL's `make_date`/`make_time`/`make_timestamp`/`make_interval` build a
+// value from positional numeric fields; an out-of-range field is a
+// `DatetimeFieldOverflow` (22008). The `interval_justify_{days,hours,interval}`
+// functions re-balance an interval's months/days/micros into PG's canonical
+// 30-day-month / 24-hour-day buckets, then sign-normalize so no field's sign
+// disagrees with the whole (`justify_interval`). Pure value helpers — the
+// executor wires them into `make_*`/`justify_*` SQL functions in a later task.
+// ---------------------------------------------------------------------------
+
+/// Map a jiff civil-constructor error (an out-of-range field) to a
+/// `DatetimeFieldOverflow` (22008), labelling the offending field set.
+fn field_overflow(value: impl Into<String>) -> TypeError {
+    TypeError::DatetimeFieldOverflow {
+        value: value.into(),
+    }
+}
+
+/// Split a fractional-seconds `f64` into whole seconds + nanoseconds at µs
+/// resolution (PG stores microseconds, so the nanos are always a multiple of
+/// 1000). Returns `None` when the whole-second part does not fit an `i8` (the
+/// jiff `Time`/`DateTime` second field), which a civil time would reject anyway.
+fn split_seconds(sec: f64) -> Option<(i8, i32)> {
+    if !sec.is_finite() {
+        return None;
+    }
+    let whole = sec.trunc();
+    if !(-128.0..=127.0).contains(&whole) {
+        return None;
+    }
+    let whole = whole as i8;
+    // Fractional part → microseconds (truncate to µs precision), then ×1000 for
+    // jiff's nanosecond field. `.round()` matches PG's `rint` on the µs value.
+    let micros = (sec.fract() * 1_000_000.0).round() as i32;
+    let nanos = micros * 1_000;
+    Some((whole, nanos))
+}
+
+/// `make_date(year, month, day)`. An out-of-range field (month 13, day 0, …) →
+/// 22008 (`DatetimeFieldOverflow`).
+pub fn make_date(year: i32, month: i32, day: i32) -> Result<Date, TypeError> {
+    let label = || format!("{year}-{month}-{day}");
+    let y = i16::try_from(year).map_err(|_| field_overflow(label()))?;
+    let mo = i8::try_from(month).map_err(|_| field_overflow(label()))?;
+    let d = i8::try_from(day).map_err(|_| field_overflow(label()))?;
+    Date::new(y, mo, d).map_err(|_| field_overflow(label()))
+}
+
+/// `make_time(hour, min, sec)`; the fractional part of `sec` becomes microseconds
+/// (PG resolution). An out-of-range field (hour 24, minute 60, …) → 22008.
+pub fn make_time(hour: i32, min: i32, sec: f64) -> Result<Time, TypeError> {
+    let label = || format!("{hour}:{min}:{sec}");
+    let h = i8::try_from(hour).map_err(|_| field_overflow(label()))?;
+    let mi = i8::try_from(min).map_err(|_| field_overflow(label()))?;
+    let (s, nanos) = split_seconds(sec).ok_or_else(|| field_overflow(label()))?;
+    Time::new(h, mi, s, nanos).map_err(|_| field_overflow(label()))
+}
+
+/// Civil-`DateTime` builder shared by `make_timestamp` / `make_timestamptz` (the
+/// executor wraps the time-zone step for the latter). An out-of-range field →
+/// 22008.
+pub fn make_timestamp_civil(
+    y: i32,
+    mo: i32,
+    d: i32,
+    h: i32,
+    mi: i32,
+    sec: f64,
+) -> Result<DateTime, TypeError> {
+    let date = make_date(y, mo, d)?;
+    let time = make_time(h, mi, sec)?;
+    Ok(date.to_datetime(time))
+}
+
+/// `make_interval(years, months, weeks, days, hours, mins, secs)`: weeks fold into
+/// days, years into months, and the clock fields (hours/mins/secs, fractional secs
+/// included) into microseconds. All arithmetic is checked; any field overflow →
+/// 22008.
+pub fn make_interval(
+    years: i32,
+    months: i32,
+    weeks: i32,
+    days: i32,
+    hours: i32,
+    mins: i32,
+    secs: f64,
+) -> Result<Interval, TypeError> {
+    let label = "make_interval";
+    // months = years*12 + months (checked, i32).
+    let months = years
+        .checked_mul(12)
+        .and_then(|m| m.checked_add(months))
+        .ok_or_else(|| field_overflow(label))?;
+    // days = weeks*7 + days (checked, i32).
+    let days = weeks
+        .checked_mul(7)
+        .and_then(|d| d.checked_add(days))
+        .ok_or_else(|| field_overflow(label))?;
+    // micros = (((hours*60 + mins)*60) * 1e6) + round(secs*1e6) (checked, i64).
+    if !secs.is_finite() {
+        return Err(field_overflow(label));
+    }
+    let sec_micros_f = (secs * 1_000_000.0).round();
+    if sec_micros_f.abs() >= 9_223_372_036_854_775_808.0_f64 {
+        return Err(field_overflow(label));
+    }
+    let sec_micros = sec_micros_f as i64;
+    let micros = (i64::from(hours) * 60 + i64::from(mins))
+        .checked_mul(60)
+        .and_then(|s| s.checked_mul(1_000_000))
+        .and_then(|us| us.checked_add(sec_micros))
+        .ok_or_else(|| field_overflow(label))?;
+    Ok(Interval {
+        months,
+        days,
+        micros,
+    })
+}
+
+/// PostgreSQL `interval_justify_days`: roll whole 30-day groups of `days` into
+/// `months`, leaving `days` in `(-30, 30)` (truncating division keeps the sign).
+pub fn justify_days(iv: Interval) -> Interval {
+    let whole_months = iv.days / 30;
+    Interval {
+        months: iv.months + whole_months,
+        days: iv.days % 30,
+        micros: iv.micros,
+    }
+}
+
+/// PostgreSQL `interval_justify_hours`: roll whole 24-hour groups of `micros` into
+/// `days`, leaving `micros` in `(-1 day, 1 day)` (truncating division keeps the
+/// sign).
+pub fn justify_hours(iv: Interval) -> Interval {
+    let whole_days = (iv.micros / USECS_PER_DAY_I64) as i32;
+    Interval {
+        months: iv.months,
+        days: iv.days + whole_days,
+        micros: iv.micros % USECS_PER_DAY_I64,
+    }
+}
+
+/// PostgreSQL `interval_justify_interval` (src/backend/utils/adt/timestamp.c):
+/// pre-justify micros→days (24h) and days→months (30d), then sign-normalize so no
+/// field's sign disagrees with a larger non-zero field. The result is PG's
+/// canonical form, e.g. `'1 mon -1 hour'` → `'29 days 23:00:00'`.
+pub fn justify_interval(iv: Interval) -> Interval {
+    const DAYS_PER_MONTH: i32 = 30;
+    // Pre-justify on widened fields (the rolls can briefly push `days` past i32).
+    let mut months = i64::from(iv.months);
+    let mut days = i64::from(iv.days);
+    let mut micros = iv.micros;
+
+    // micros → days (24h), then days → months (30d).
+    days += micros / USECS_PER_DAY_I64;
+    micros %= USECS_PER_DAY_I64;
+    months += days / i64::from(DAYS_PER_MONTH);
+    days %= i64::from(DAYS_PER_MONTH);
+
+    // Sign-normalize months↔days: if months and days disagree (or days==0 and
+    // micros disagrees with months), borrow/carry a whole 30-day month.
+    if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+        days += i64::from(DAYS_PER_MONTH);
+        months -= 1;
+    } else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+        days -= i64::from(DAYS_PER_MONTH);
+        months += 1;
+    }
+    // Sign-normalize days↔micros: borrow/carry a whole 24-hour day.
+    if days > 0 && micros < 0 {
+        micros += USECS_PER_DAY_I64;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= USECS_PER_DAY_I64;
+        days += 1;
+    }
+
+    // After normalization the fields are within PG's canonical ranges, so the
+    // narrowing back to i32 is lossless for any in-range input.
+    Interval {
+        months: months as i32,
+        days: days as i32,
+        micros,
+    }
+}
+
 #[cfg(test)]
 mod format_tests {
     use super::{DateTimeFields, format_datetime};
@@ -3355,5 +3543,132 @@ mod parse_template_tests {
         assert_eq!((p.year, p.month, p.day), (2024, 7, 4));
         // Defaults for the unset time fields are unchanged (no field corruption).
         assert_eq!((p.hour, p.minute, p.second, p.micros), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod make_justify_tests {
+    #[test]
+    fn make_constructors() {
+        use super::{Interval, make_date, make_interval, make_time, make_timestamp_civil};
+        assert_eq!(
+            make_date(2024, 7, 4).expect("d"),
+            jiff::civil::date(2024, 7, 4)
+        );
+        // make_time(hour, min, sec) — fractional seconds → micros.
+        assert_eq!(
+            make_time(13, 45, 6.5).expect("t"),
+            jiff::civil::time(13, 45, 6, 500_000_000)
+        );
+        assert_eq!(
+            make_timestamp_civil(2024, 7, 4, 13, 45, 6.0).expect("ts"),
+            jiff::civil::datetime(2024, 7, 4, 13, 45, 6, 0)
+        );
+        // make_interval positional: 1 year, 2 months, 0 weeks, 3 days.
+        assert_eq!(
+            make_interval(1, 2, 0, 3, 0, 0, 0.0).expect("iv"),
+            Interval {
+                months: 14,
+                days: 3,
+                micros: 0
+            }
+        );
+        // weeks fold into days; fractional secs into micros.
+        assert_eq!(
+            make_interval(0, 0, 2, 0, 0, 0, 1.5).expect("iv"),
+            Interval {
+                months: 0,
+                days: 14,
+                micros: 1_500_000
+            }
+        );
+        // out-of-range field → 22008.
+        assert_eq!(
+            make_date(2024, 13, 1).expect_err("month 13").sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn make_boundary_and_overflow() {
+        use super::{Interval, make_interval, make_time};
+        // make_time(24, 0, 0) is out of range → 22008.
+        assert_eq!(
+            make_time(24, 0, 0.0).expect_err("hour 24").sqlstate(),
+            "22008"
+        );
+        // A negative interval field is representable (PG allows negative make_interval).
+        assert_eq!(
+            make_interval(0, -1, 0, 0, -2, 0, 0.0).expect("neg"),
+            Interval {
+                months: -1,
+                days: 0,
+                micros: -2 * 3_600_000_000
+            }
+        );
+        // years*12 overflowing i32 → 22008.
+        assert_eq!(
+            make_interval(i32::MAX, 1, 0, 0, 0, 0, 0.0)
+                .expect_err("months overflow")
+                .sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn justify_helpers() {
+        use super::{Interval, justify_days, justify_hours, justify_interval};
+        // 35 days → 1 month 5 days.
+        assert_eq!(
+            justify_days(Interval {
+                months: 0,
+                days: 35,
+                micros: 0
+            }),
+            Interval {
+                months: 1,
+                days: 5,
+                micros: 0
+            }
+        );
+        // 27 hours → 1 day 3 hours.
+        assert_eq!(
+            justify_hours(Interval {
+                months: 0,
+                days: 0,
+                micros: 27 * 3_600_000_000
+            }),
+            Interval {
+                months: 0,
+                days: 1,
+                micros: 3 * 3_600_000_000
+            }
+        );
+        // PG: justify_interval('1 mon -1 hour') = '29 days 23:00:00'.
+        assert_eq!(
+            justify_interval(Interval {
+                months: 1,
+                days: 0,
+                micros: -3_600_000_000
+            }),
+            Interval {
+                months: 0,
+                days: 29,
+                micros: 23 * 3_600_000_000
+            }
+        );
+        // The symmetric mixed-sign case: '-1 mon +1 hour' → '-29 days -23:00:00'.
+        assert_eq!(
+            justify_interval(Interval {
+                months: -1,
+                days: 0,
+                micros: 3_600_000_000
+            }),
+            Interval {
+                months: 0,
+                days: -29,
+                micros: -23 * 3_600_000_000
+            }
+        );
     }
 }
