@@ -6,11 +6,19 @@ use std::cmp::Ordering;
 use pgparser::ast::{BinaryOp, Expr, UnaryOp};
 use pgtypes::{ColumnType, Datum, TypeError, ops};
 
+use crate::clock::EvalCtx;
 use crate::error::ExecError;
 use crate::scope::Scope;
 
-/// Evaluate `expr` against a row (`values`, aligned to `scope.columns`).
-pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum, ExecError> {
+/// Evaluate `expr` against a row (`values`, aligned to `scope.columns`). `ctx`
+/// carries the session time zone and the transaction/statement clock; non-temporal
+/// evaluation ignores it (UTC/epoch reproduces prior behavior).
+pub(crate) fn eval(
+    expr: &Expr,
+    scope: &Scope,
+    values: &[Datum],
+    ctx: &EvalCtx,
+) -> Result<Datum, ExecError> {
     match expr {
         Expr::IntLiteral(s) => Ok(ops::int_literal(s)?),
         // SP32: a bare decimal/exponent literal is `numeric` (arbitrary precision —
@@ -36,13 +44,13 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
             Ok(values[idx].clone())
         }
         Expr::Unary { op, expr } => {
-            let v = eval(expr, scope, values)?;
-            apply_unary(*op, &v)
+            let v = eval(expr, scope, values, ctx)?;
+            apply_unary(*op, &v, ctx)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval(left, scope, values)?;
-            let r = eval(right, scope, values)?;
-            apply_binary(*op, &l, &r)
+            let l = eval(left, scope, values, ctx)?;
+            let r = eval(right, scope, values, ctx)?;
+            apply_binary(*op, &l, &r, ctx)
         }
         // A function call reached scalar `eval`: a SP29 scalar function evaluates
         // here (its arguments recurse through this same `eval`). Otherwise it is
@@ -50,7 +58,12 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
         // aggregates from accumulators) — a known aggregate here is misplaced /
         // nested (42803); any other name is undefined (42883).
         Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
-            crate::func::eval_scalar(fc, |e| eval(e, scope, values))
+            crate::func::eval_scalar(fc, ctx, |e| eval(e, scope, values, ctx))
+        }
+        // SP37: a date/time function (clock family, extract/date_part, date_trunc,
+        // age, timezone). Tried after scalar, before the aggregate-context error.
+        Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
+            crate::datetime_fn::eval_datetime(fc, ctx, |e| eval(e, scope, values, ctx))
         }
         Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
         // SP28: predicate + conditional expressions. The pure-Datum combinators
@@ -58,7 +71,7 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
         // the grouped evaluator (`agg::eval_grouped`); only the child-evaluation
         // closure differs.
         Expr::IsNull { expr, negated } => {
-            let v = eval(expr, scope, values)?;
+            let v = eval(expr, scope, values, ctx)?;
             Ok(Datum::Bool(v.is_null() ^ *negated))
         }
         Expr::InList {
@@ -66,8 +79,8 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
             list,
             negated,
         } => {
-            let x = eval(expr, scope, values)?;
-            eval_in_list(&x, list, *negated, |e| eval(e, scope, values))
+            let x = eval(expr, scope, values, ctx)?;
+            eval_in_list(&x, list, *negated, |e| eval(e, scope, values, ctx))
         }
         Expr::Between {
             expr,
@@ -75,10 +88,10 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
             high,
             negated,
         } => {
-            let x = eval(expr, scope, values)?;
-            let lo = eval(low, scope, values)?;
-            let hi = eval(high, scope, values)?;
-            eval_between(&x, &lo, &hi, *negated)
+            let x = eval(expr, scope, values, ctx)?;
+            let lo = eval(low, scope, values, ctx)?;
+            let hi = eval(high, scope, values, ctx)?;
+            eval_between(&x, &lo, &hi, *negated, ctx)
         }
         Expr::Like {
             expr,
@@ -86,8 +99,8 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
             negated,
             case_insensitive,
         } => {
-            let s = eval(expr, scope, values)?;
-            let p = eval(pattern, scope, values)?;
+            let s = eval(expr, scope, values, ctx)?;
+            let p = eval(pattern, scope, values, ctx)?;
             eval_like(&s, &p, *negated, *case_insensitive)
         }
         Expr::Case {
@@ -95,14 +108,14 @@ pub(crate) fn eval(expr: &Expr, scope: &Scope, values: &[Datum]) -> Result<Datum
             whens,
             else_result,
         } => eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
-            eval(e, scope, values)
+            eval(e, scope, values, ctx)
         }),
         // SP31: explicit cast — evaluate the operand, then convert. A text-parse
         // failure (22P02), numeric overflow (22003), or undefined cast (42846)
-        // surfaces here; NULL casts to NULL.
+        // surfaces here; NULL casts to NULL. The session zone comes from `ctx`.
         Expr::Cast { expr, ty } => {
-            let v = eval(expr, scope, values)?;
-            Ok(pgtypes::cast::cast(&v, *ty)?)
+            let v = eval(expr, scope, values, ctx)?;
+            Ok(pgtypes::cast::cast(&v, *ty, &ctx.time_zone)?)
         }
         // SP34: a resolved subquery folded to a constant.
         Expr::Const { value, .. } => Ok(value.clone()),
@@ -154,9 +167,10 @@ pub(crate) fn eval_between(
     lo: &Datum,
     hi: &Datum,
     negated: bool,
+    ctx: &EvalCtx,
 ) -> Result<Datum, ExecError> {
-    let ge = apply_binary(BinaryOp::Ge, x, lo)?;
-    let le = apply_binary(BinaryOp::Le, x, hi)?;
+    let ge = apply_binary(BinaryOp::Ge, x, lo, ctx)?;
+    let le = apply_binary(BinaryOp::Le, x, hi, ctx)?;
     let res = ops::and(&ge, &le)?;
     Ok(if negated { ops::not(&res)? } else { res })
 }
@@ -300,17 +314,38 @@ pub(crate) fn eval_case(
 }
 
 /// Apply a unary operator to an already-evaluated operand. Shared by scalar
-/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`).
-pub(crate) fn apply_unary(op: UnaryOp, v: &Datum) -> Result<Datum, ExecError> {
+/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`). `ctx` is threaded
+/// uniformly (no unary operator consumes it yet).
+pub(crate) fn apply_unary(op: UnaryOp, v: &Datum, _ctx: &EvalCtx) -> Result<Datum, ExecError> {
     match op {
         UnaryOp::Not => Ok(ops::not(v)?),
-        UnaryOp::Neg => Ok(ops::sub(&Datum::Int4(0), v)?),
+        // SP37: unary minus on an interval negates each field (`0 - interval` has no
+        // defined operator). Everything else is `0 - v` (int/numeric/float negation).
+        UnaryOp::Neg => match v {
+            Datum::Interval(i) => Ok(Datum::Interval(pgtypes::datetime::neg_interval(*i)?)),
+            _ => Ok(ops::sub(&Datum::Int4(0), v)?),
+        },
     }
 }
 
 /// Apply a binary operator to two already-evaluated operands. Shared by scalar
-/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`).
-pub(crate) fn apply_binary(op: BinaryOp, l: &Datum, r: &Datum) -> Result<Datum, ExecError> {
+/// `eval` and the SP27 grouped evaluator (`agg::eval_grouped`). `ctx` supplies the
+/// session zone used by `||`'s text rendering.
+pub(crate) fn apply_binary(
+    op: BinaryOp,
+    l: &Datum,
+    r: &Datum,
+    ctx: &EvalCtx,
+) -> Result<Datum, ExecError> {
+    // SP37: tz-AWARE temporal arithmetic involving `timestamptz` is computed here
+    // (where `ctx.time_zone` is available) — `pgtypes::ops` would `TypeMismatch` on
+    // a `Timestamptz` operand. A non-timestamptz pair falls through to `ops`, so all
+    // existing (tz-free) behavior is unchanged.
+    if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+        && let Some(result) = apply_timestamptz_arith(op, l, r, ctx)?
+    {
+        return Ok(result);
+    }
     match op {
         BinaryOp::Add => Ok(ops::add(l, r)?),
         BinaryOp::Sub => Ok(ops::sub(l, r)?),
@@ -318,12 +353,58 @@ pub(crate) fn apply_binary(op: BinaryOp, l: &Datum, r: &Datum) -> Result<Datum, 
         BinaryOp::Div => Ok(ops::div(l, r)?),
         BinaryOp::And => Ok(ops::and(l, r)?),
         BinaryOp::Or => Ok(ops::or(l, r)?),
-        BinaryOp::Concat => Ok(ops::concat(l, r)?),
+        BinaryOp::Concat => Ok(ops::concat(l, r, &ctx.time_zone)?),
         BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             let ord = ops::compare(l, r)?;
             Ok(cmp_result(op, ord))
         }
     }
+}
+
+/// SP37: tz-AWARE `timestamptz` arithmetic — the cells deferred from
+/// `pgtypes::ops` because they need the session zone (`ctx.time_zone`):
+/// `timestamptz ± interval → timestamptz` (calendar-aware in the zone) and
+/// `timestamptz − timestamptz → interval` (absolute-instant difference). Returns
+/// `Ok(None)` when neither operand is a `Timestamptz` (so the caller falls through
+/// to `pgtypes::ops`), and propagates NULL like `ops` does. Result types match
+/// `datetime_result_type`'s `Timestamptz`/`Interval` predictions, so plan-time
+/// inference and runtime never disagree.
+fn apply_timestamptz_arith(
+    op: BinaryOp,
+    l: &Datum,
+    r: &Datum,
+    ctx: &EvalCtx,
+) -> Result<Option<Datum>, ExecError> {
+    use pgtypes::datetime::{timestamptz_diff, timestamptz_plus_interval};
+    // Only engage when a Timestamptz operand is present.
+    if !matches!(l, Datum::Timestamptz(_)) && !matches!(r, Datum::Timestamptz(_)) {
+        return Ok(None);
+    }
+    // NULL propagates (mirrors `ops::add`/`ops::sub`).
+    if l.is_null() || r.is_null() {
+        return Ok(Some(Datum::Null));
+    }
+    let tz = &ctx.time_zone;
+    let result = match (op, l, r) {
+        // timestamptz + interval → timestamptz; interval + timestamptz → timestamptz.
+        (BinaryOp::Add, Datum::Timestamptz(ts), Datum::Interval(iv))
+        | (BinaryOp::Add, Datum::Interval(iv), Datum::Timestamptz(ts)) => {
+            Datum::Timestamptz(timestamptz_plus_interval(*ts, *iv, tz)?)
+        }
+        // timestamptz - interval → timestamptz.
+        (BinaryOp::Sub, Datum::Timestamptz(ts), Datum::Interval(iv)) => {
+            let neg = pgtypes::datetime::neg_interval(*iv)?;
+            Datum::Timestamptz(timestamptz_plus_interval(*ts, neg, tz)?)
+        }
+        // timestamptz - timestamptz → interval (absolute-instant difference).
+        (BinaryOp::Sub, Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
+            Datum::Interval(timestamptz_diff(*a, *b))
+        }
+        // Any other combination with a timestamptz operand is undefined — surface
+        // the genuine type error via `pgtypes::ops` (which yields TypeMismatch).
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
 }
 
 fn cmp_result(op: BinaryOp, ord: Option<Ordering>) -> Datum {
@@ -370,32 +451,41 @@ pub(crate) fn infer_type(expr: &Expr, scope: &Scope) -> Result<ColumnType, ExecE
             UnaryOp::Not => Ok(ColumnType::Bool),
             UnaryOp::Neg => infer_type(expr, scope),
         },
-        Expr::Binary { op, left, right } => match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
-                Ok(numeric_result_type(lt, rt))
-            }
-            // SP29: `||` yields text. PostgreSQL resolves the operator at plan
-            // time and requires at least one operand to be text (`text || anynonarray`
-            // / `anynonarray || text`); neither-text (e.g. `int || int`) is 42883.
-            BinaryOp::Concat => {
-                let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
-                if lt != ColumnType::Text && rt != ColumnType::Text {
-                    return Err(ExecError::UndefinedFunction(format!(
-                        "operator does not exist: {} || {}",
-                        lt.name(),
-                        rt.name()
-                    )));
+        Expr::Binary { op, left, right } => {
+            match op {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                    let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
+                    // SP37: a temporal operand resolves via PG's date/time arithmetic
+                    // matrix first; a non-temporal pair falls through to the numeric tower.
+                    Ok(datetime_result_type(*op, lt, rt)
+                        .unwrap_or_else(|| numeric_result_type(lt, rt)))
                 }
-                Ok(ColumnType::Text)
+                // SP29: `||` yields text. PostgreSQL resolves the operator at plan
+                // time and requires at least one operand to be text (`text || anynonarray`
+                // / `anynonarray || text`); neither-text (e.g. `int || int`) is 42883.
+                BinaryOp::Concat => {
+                    let (lt, rt) = (infer_type(left, scope)?, infer_type(right, scope)?);
+                    if lt != ColumnType::Text && rt != ColumnType::Text {
+                        return Err(ExecError::UndefinedFunction(format!(
+                            "operator does not exist: {} || {}",
+                            lt.name(),
+                            rt.name()
+                        )));
+                    }
+                    Ok(ColumnType::Text)
+                }
+                _ => Ok(ColumnType::Bool),
             }
-            _ => Ok(ColumnType::Bool),
-        },
+        }
         // SP29: a scalar function's result type; otherwise an aggregate result
         // type for RowDescription (count/sum -> int8, min/max -> the argument's
         // type); unknown names / bad arity / bad argument type -> 42883.
         Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
             crate::func::scalar_result_type(fc, scope)
+        }
+        // SP37: a date/time function's static result type.
+        Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
+            crate::datetime_fn::datetime_func_result_type(fc, scope)
         }
         Expr::Func(fc) => crate::agg::func_result_type(fc, scope),
         // SP28: predicates are boolean; CASE unifies its branch result types.
@@ -491,6 +581,58 @@ pub(crate) fn unify_types(a: ColumnType, b: ColumnType) -> Result<ColumnType, Ex
     })
 }
 
+/// Whether a column type is one of the SP37 date/time types.
+fn is_temporal(t: ColumnType) -> bool {
+    use ColumnType::{Date, Interval, Time, Timestamp, Timestamptz};
+    matches!(t, Date | Time | Timestamp | Timestamptz | Interval)
+}
+
+/// PostgreSQL's date/time arithmetic result-type matrix. Returns `Some(result)`
+/// for a defined `(op, lt, rt)` combination where at least one operand is
+/// temporal; `None` otherwise — including a temporal operand in an UNdefined
+/// combination, so the caller falls through to `numeric_result_type` and the real
+/// type error surfaces at evaluation (it never invents a numeric result for a
+/// temporal pair that PG would reject — eval is the authority).
+fn datetime_result_type(op: BinaryOp, lt: ColumnType, rt: ColumnType) -> Option<ColumnType> {
+    use BinaryOp::{Add, Div, Mul, Sub};
+    use ColumnType::{Date, Float8, Int4, Int8, Interval, Numeric, Time, Timestamp, Timestamptz};
+    // Only engage the matrix when a temporal operand is present; a purely numeric
+    // pair belongs to the numeric tower.
+    if !is_temporal(lt) && !is_temporal(rt) {
+        return None;
+    }
+    let is_int = |t: ColumnType| matches!(t, Int4 | Int8);
+    let is_number = |t: ColumnType| matches!(t, Int4 | Int8 | Float8 | Numeric(_));
+    Some(match (op, lt, rt) {
+        // date ± integer → date; integer + date → date.
+        (Add, Date, r) | (Sub, Date, r) if is_int(r) => Date,
+        (Add, l, Date) if is_int(l) => Date,
+        // date − date → int4 (number of days).
+        (Sub, Date, Date) => Int4,
+        // date ± interval → timestamp; interval + date → timestamp.
+        (Add | Sub, Date, Interval) | (Add, Interval, Date) => Timestamp,
+        // timestamp ± interval → timestamp; interval + timestamp → timestamp.
+        (Add | Sub, Timestamp, Interval) | (Add, Interval, Timestamp) => Timestamp,
+        // timestamptz ± interval → timestamptz; interval + timestamptz → timestamptz.
+        (Add | Sub, Timestamptz, Interval) | (Add, Interval, Timestamptz) => Timestamptz,
+        // timestamp − timestamp / timestamptz − timestamptz → interval.
+        (Sub, Timestamp, Timestamp) | (Sub, Timestamptz, Timestamptz) => Interval,
+        // interval ± interval → interval.
+        (Add | Sub, Interval, Interval) => Interval,
+        // interval * / number → interval; number * interval → interval.
+        (Mul | Div, Interval, r) if is_number(r) => Interval,
+        (Mul, l, Interval) if is_number(l) => Interval,
+        // time ± interval → time; interval + time → time.
+        (Add | Sub, Time, Interval) | (Add, Interval, Time) => Time,
+        // date + time / time + date → timestamp (combine the calendar date and
+        // the wall-clock time).
+        (Add, Date, Time) | (Add, Time, Date) => Timestamp,
+        // Any other combination with a temporal operand is undefined here — fall
+        // through so eval raises the genuine type error.
+        _ => return None,
+    })
+}
+
 /// The result type of `+ - * /` on two operand types. The numeric tower is
 /// int < numeric < float8: any float8 makes the result float8; else any numeric
 /// makes it numeric; else int4 only if both are int4, else int8. Permissive about
@@ -542,7 +684,18 @@ mod tests {
     }
 
     fn ev(sql: &str, t: Option<&Table>, vals: &[Datum]) -> Datum {
-        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals).expect("eval")
+        let ctx = crate::clock::EvalCtx::test_default();
+        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals, &ctx).expect("eval")
+    }
+
+    #[test]
+    fn eval_takes_ctx_and_ignores_it_for_non_temporal() {
+        let ctx = crate::clock::EvalCtx::test_default();
+        let e = pgparser::parser::parse_expr_for_test("1 + 2").expect("parse");
+        assert_eq!(
+            eval(&e, &Scope::empty(), &[], &ctx).expect("eval"),
+            Datum::Int4(3)
+        );
     }
 
     #[test]
@@ -606,13 +759,95 @@ mod tests {
         assert_eq!(ev("3 / 2.0::float8", None, &[]), Datum::Float8(1.5));
     }
 
+    /// SP37 §8: the tz-AWARE temporal cells that live in `apply_binary` (because
+    /// they need the session zone) — `timestamptz ± interval → timestamptz` and
+    /// `timestamptz − timestamptz → interval`. Each asserts BOTH the produced value
+    /// AND that `infer_type` predicts the same type (no infer/eval mismatch).
+    #[test]
+    fn timestamptz_arithmetic_is_tz_aware_in_apply_binary() {
+        use pgtypes::datetime;
+        // A non-UTC session zone proves the tz path is actually exercised
+        // (a `timestamptz` literal without an explicit offset is interpreted in it,
+        // and the calendar shift is applied in it).
+        let tz = jiff::tz::TimeZone::get("America/New_York").expect("tzdb has NY");
+        let ctx = crate::clock::EvalCtx {
+            time_zone: tz.clone(),
+            ..crate::clock::EvalCtx::test_default()
+        };
+        let tstz = |s: &str| Datum::Timestamptz(datetime::parse_timestamptz(s, &tz).expect("tstz"));
+        let iv = |s: &str| Datum::Interval(datetime::parse_interval(s).expect("iv"));
+
+        // timestamptz + interval '1 hour' → an absolute-instant shift of +1h.
+        // 2024-01-15 12:00:00 in NY (EST, -05) is the instant 17:00:00 UTC;
+        // + 1 hour → 18:00:00 UTC = 2024-01-15 13:00:00 NY.
+        let base = tstz("2024-01-15 12:00:00");
+        let got = apply_binary(BinaryOp::Add, &base, &iv("1 hour"), &ctx).expect("add");
+        assert_eq!(got, tstz("2024-01-15 13:00:00"));
+        assert!(matches!(got, Datum::Timestamptz(_)));
+
+        // The same via a calendar-aware `+ 1 day` ACROSS the US spring-forward DST
+        // boundary (2024-03-10 02:00 → 03:00 in NY): a wall-clock `+1 day` keeps the
+        // same wall-clock hour, so 2024-03-09 12:00 NY + 1 day = 2024-03-10 12:00 NY
+        // even though only 23 absolute hours elapsed.
+        let pre_dst = tstz("2024-03-09 12:00:00");
+        let after_day = apply_binary(BinaryOp::Add, &pre_dst, &iv("1 day"), &ctx).expect("add day");
+        assert_eq!(after_day, tstz("2024-03-10 12:00:00"));
+
+        // timestamptz - interval → timestamptz (the reverse).
+        let back = apply_binary(BinaryOp::Sub, &got, &iv("1 hour"), &ctx).expect("sub");
+        assert_eq!(back, base);
+
+        // timestamptz - timestamptz → interval (absolute-instant difference: the two
+        // instants are 1 h apart, which PG stores as `01:00:00`).
+        let diff = apply_binary(BinaryOp::Sub, &got, &base, &ctx).expect("diff");
+        assert_eq!(diff, iv("1 hour"));
+        assert!(matches!(diff, Datum::Interval(_)));
+
+        // NULL propagates on either operand.
+        assert_eq!(
+            apply_binary(BinaryOp::Add, &Datum::Null, &iv("1 hour"), &ctx).expect("null"),
+            Datum::Null
+        );
+
+        // infer_type agrees on the result types for these cells (no plan/eval drift).
+        let tstz_col = Table {
+            id: 9,
+            name: "tz".into(),
+            columns: vec![
+                Column {
+                    name: "ts".into(),
+                    ty: ColumnType::Timestamptz,
+                },
+                Column {
+                    name: "iv".into(),
+                    ty: ColumnType::Interval,
+                },
+            ],
+        };
+        let tstz_scope = scope_of(Some(&tstz_col));
+        assert_eq!(
+            infer_type(&pexpr("ts + iv").expect("parse"), &tstz_scope).expect("infer"),
+            ColumnType::Timestamptz
+        );
+        assert_eq!(
+            infer_type(&pexpr("ts - iv").expect("parse"), &tstz_scope).expect("infer"),
+            ColumnType::Timestamptz
+        );
+        assert_eq!(
+            infer_type(&pexpr("ts - ts").expect("parse"), &tstz_scope).expect("infer"),
+            ColumnType::Interval
+        );
+    }
+
     #[test]
     fn undefined_column_is_42703() {
         let t = table();
+        let ctx = crate::clock::EvalCtx::test_default();
         let err = eval(
             &pexpr("zzz").expect("parse"),
             &scope_of(Some(&t)),
             &[Datum::Int4(1), Datum::Int4(1)],
+            &ctx,
         )
         .expect_err("eval zzz should fail");
         assert_eq!(err.into_pg().code, "42703");
@@ -620,7 +855,8 @@ mod tests {
 
     #[test]
     fn parameter_is_0a000() {
-        let err = eval(&pexpr("$1").expect("parse"), &scope_of(None), &[])
+        let ctx = crate::clock::EvalCtx::test_default();
+        let err = eval(&pexpr("$1").expect("parse"), &scope_of(None), &[], &ctx)
             .expect_err("eval $1 should fail");
         assert_eq!(err.into_pg().code, "0A000");
     }
@@ -649,7 +885,8 @@ mod tests {
     // ---- SP28: predicate + conditional expression breadth ----
 
     fn err_code(sql: &str, t: Option<&Table>, vals: &[Datum]) -> String {
-        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals)
+        let ctx = crate::clock::EvalCtx::test_default();
+        eval(&pexpr(sql).expect("parse"), &scope_of(t), vals, &ctx)
             .expect_err("expected error")
             .into_pg()
             .code
@@ -857,5 +1094,45 @@ mod tests {
         )
         .expect_err("incompatible");
         assert_eq!(err.into_pg().code, "42804");
+    }
+
+    // ---- SP37 Task 11: temporal result-type inference + unary-minus interval ----
+
+    #[test]
+    fn datetime_literal_eval_and_infer() {
+        let ctx = crate::clock::EvalCtx::test_default();
+        let scope = Scope::empty();
+        let p = |s: &str| pgparser::parser::parse_expr_for_test(s).expect("parse");
+        assert_eq!(
+            eval(&p("DATE '2024-01-15'"), &scope, &[], &ctx).expect("eval"),
+            Datum::Date(pgtypes::datetime::parse_date("2024-01-15").expect("d"))
+        );
+        assert_eq!(
+            infer_type(&p("DATE '2024-01-15'"), &scope).expect("inf"),
+            ColumnType::Date
+        );
+        assert_eq!(
+            infer_type(&p("DATE '2024-02-01' - DATE '2024-01-01'"), &scope).expect("inf"),
+            ColumnType::Int4
+        );
+        assert_eq!(
+            infer_type(&p("DATE '2024-01-01' + INTERVAL '1 day'"), &scope).expect("inf"),
+            ColumnType::Timestamp
+        );
+    }
+
+    #[test]
+    fn unary_minus_interval() {
+        let ctx = crate::clock::EvalCtx::test_default();
+        let scope = Scope::empty();
+        let p = pgparser::parser::parse_expr_for_test("- INTERVAL '1 day'").expect("parse");
+        assert_eq!(
+            eval(&p, &scope, &[], &ctx).expect("eval"),
+            Datum::Interval(pgtypes::datetime::Interval {
+                months: 0,
+                days: -1,
+                micros: 0
+            })
+        );
     }
 }

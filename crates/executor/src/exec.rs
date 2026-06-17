@@ -105,6 +105,7 @@ pub(crate) async fn execute_write(
     xid: u64,
     repeatable_read: bool,
     stmt: &Statement,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<(QueryResult, Vec<kv::WriteOp>), ExecError> {
     let mut ops: Vec<kv::WriteOp> = Vec::new();
     match stmt {
@@ -141,8 +142,8 @@ pub(crate) async fn execute_write(
                 let mut full = vec![pgtypes::Datum::Null; t.columns.len()];
                 for (slot, expr) in target_idx.iter().zip(row_exprs.iter()) {
                     // VALUES expressions are literal (no FROM/columns in scope).
-                    let v = crate::eval::eval(expr, &Scope::empty(), &[])?;
-                    full[*slot] = coerce(v, t.columns[*slot].ty)?;
+                    let v = crate::eval::eval(expr, &Scope::empty(), &[], ctx)?;
+                    full[*slot] = coerce(v, t.columns[*slot].ty, ctx)?;
                 }
                 ops.push(kv::WriteOp::Put {
                     key: mvcc::version::version_key_xid(t.id, rowid, xid),
@@ -179,7 +180,7 @@ pub(crate) async fn execute_write(
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause (avoids over-locking and
                 //    restores row-level write concurrency for different rows).
-                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row, ctx)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -207,13 +208,13 @@ pub(crate) async fn execute_write(
                 };
                 // 4. Re-check the filter on the (possibly re-found) current row —
                 //    under READ COMMITTED the row may have changed since the scan.
-                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row, ctx)? {
                     continue; // no longer matches the WHERE clause
                 }
                 let mut next = cur_row.clone();
                 for (idx, expr) in &targets {
-                    let v = crate::eval::eval(expr, &scope, &cur_row)?;
-                    next[*idx] = coerce(v, t.columns[*idx].ty)?;
+                    let v = crate::eval::eval(expr, &scope, &cur_row, ctx)?;
+                    next[*idx] = coerce(v, t.columns[*idx].ty, ctx)?;
                 }
                 if cur_xmin == xid {
                     // Updating my own uncommitted version: overwrite in place
@@ -253,7 +254,7 @@ pub(crate) async fn execute_write(
             {
                 // 1. Filter on the snapshot-visible row FIRST — do not lock rows
                 //    that don't match the WHERE clause.
-                if !row_matches(filter.as_ref(), &scope, &scanned_row)? {
+                if !row_matches(filter.as_ref(), &scope, &scanned_row, ctx)? {
                     continue;
                 }
                 // 2. Lock only matching candidates.
@@ -279,7 +280,7 @@ pub(crate) async fn execute_write(
                     continue; // already deleted by a concurrent committed txn
                 };
                 // 4. Re-check filter on the (possibly re-found) current row.
-                if !row_matches(filter.as_ref(), &scope, &cur_row)? {
+                if !row_matches(filter.as_ref(), &scope, &cur_row, ctx)? {
                     continue; // no longer matches the WHERE clause
                 }
                 if cur_xmin == xid {
@@ -464,8 +465,13 @@ fn eval_plan_qual(
     find_visible_one(kv, global, &settled_global, snapshot, Some(xid), &versions)
 }
 
-/// Coerce an evaluated value into a target column type (assignment context).
-fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes::Datum, ExecError> {
+/// Coerce an evaluated value into a target column type (assignment context). `ctx`
+/// supplies the session zone for any temporal numeric conversion.
+fn coerce(
+    value: pgtypes::Datum,
+    target: pgtypes::ColumnType,
+    ctx: &crate::clock::EvalCtx,
+) -> Result<pgtypes::Datum, ExecError> {
     use pgtypes::{ColumnType, Datum, TypeError};
     // SP32: assignment to a `numeric` column — any numeric-family value (int4/
     // int8/float8/numeric) converts, applying the column's `(p,s)` modifier (round
@@ -477,7 +483,7 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
             Datum::Int4(_) | Datum::Int8(_) | Datum::Float8(_) | Datum::Numeric(_)
         )
     {
-        return Ok(pgtypes::cast::cast(&value, target)?);
+        return Ok(pgtypes::cast::cast(&value, target, &ctx.time_zone)?);
     }
     Ok(match (value, target) {
         (Datum::Null, _) => Datum::Null,
@@ -518,6 +524,13 @@ fn coerce(value: pgtypes::Datum, target: pgtypes::ColumnType) -> Result<pgtypes:
         (Datum::Numeric(d), ColumnType::Float8) => Datum::Float8(pgtypes::numeric::to_f64(&d)),
         (Datum::Numeric(d), ColumnType::Int4) => pgtypes::numeric::to_i32(&d).map(Datum::Int4)?,
         (Datum::Numeric(d), ColumnType::Int8) => pgtypes::numeric::to_i64(&d).map(Datum::Int8)?,
+        // SP37: date/time assignment — same-type pass-through (no implicit
+        // cross-type coercion between temporal types; mismatches hit the catch-all).
+        (Datum::Date(d), ColumnType::Date) => Datum::Date(d),
+        (Datum::Time(t), ColumnType::Time) => Datum::Time(t),
+        (Datum::Timestamp(ts), ColumnType::Timestamp) => Datum::Timestamp(ts),
+        (Datum::Timestamptz(ts), ColumnType::Timestamptz) => Datum::Timestamptz(ts),
+        (Datum::Interval(iv), ColumnType::Interval) => Datum::Interval(iv),
         (v, target) => {
             return Err(ExecError::TypeMismatch(format!(
                 "column is of type {} but expression is of type {}",
@@ -583,10 +596,11 @@ fn row_matches(
     filter: Option<&Expr>,
     scope: &Scope,
     row: &[pgtypes::Datum],
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<bool, ExecError> {
     match filter {
         None => Ok(true),
-        Some(f) => match crate::eval::eval(f, scope, row)? {
+        Some(f) => match crate::eval::eval(f, scope, row, ctx)? {
             pgtypes::Datum::Bool(b) => Ok(b),
             pgtypes::Datum::Null => Ok(false),
             _ => Err(ExecError::TypeMismatch(
@@ -606,19 +620,21 @@ fn build_from(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     from: &[pgparser::ast::TableExpr],
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
-    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first)?;
+    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first, ctx)?;
     for te in iter {
-        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te)?;
+        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctx)?;
         acc = join_relations(
             acc,
             next,
             pgparser::ast::JoinKind::Cross,
             &pgparser::ast::JoinConstraint::None,
+            ctx,
         )?;
     }
     Ok(acc)
@@ -633,6 +649,7 @@ fn build_table_expr(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     te: &pgparser::ast::TableExpr,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
@@ -652,12 +669,13 @@ fn build_table_expr(
             kind,
             constraint,
         } => {
-            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left)?;
-            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right)?;
-            join_relations(l, r, *kind, constraint)
+            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
+            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
+            join_relations(l, r, *kind, constraint, ctx)
         }
         TableExpr::Derived { subquery, alias } => {
-            let inner = select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, subquery)?;
+            let inner =
+                select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx)?;
             // Re-qualify every output column under the derived alias.
             let columns = inner
                 .scope
@@ -689,6 +707,7 @@ pub(crate) fn select_to_relation(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     s: &SelectStmt,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
@@ -699,6 +718,7 @@ pub(crate) fn select_to_relation(
         gsnap,
         snapshot,
         own,
+        eval_ctx: ctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -708,11 +728,11 @@ pub(crate) fn select_to_relation(
             rows: vec![vec![]],
         }
     } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
     };
     let mut kept = Vec::new();
     for row in &relation.rows {
-        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
+        if row_matches(s.filter.as_ref(), &relation.scope, row, ctx)? {
             kept.push(row.clone());
         }
     }
@@ -729,9 +749,9 @@ pub(crate) fn select_to_relation(
             .collect(),
     };
     let rows = if crate::agg::is_aggregate_query(s) {
-        crate::agg::aggregate_rows(s, &relation.scope, kept)?
+        crate::agg::aggregate_rows(s, &relation.scope, kept, ctx)?
     } else {
-        project_rows_ordered(s, &relation.scope, &out_exprs, kept)?
+        project_rows_ordered(s, &relation.scope, &out_exprs, kept, ctx)?
     };
     Ok(Relation {
         scope: out_scope,
@@ -753,11 +773,14 @@ pub(crate) fn build_from_schema(
     let mut acc = build_table_expr_schema(catalog_kv, first)?;
     for te in iter {
         let next = build_table_expr_schema(catalog_kv, te)?;
+        // Schema-only: no rows, so no ON predicate is ever evaluated — a default
+        // (UTC/epoch) eval context is correct here.
         acc = join_relations(
             acc,
             next,
             pgparser::ast::JoinKind::Cross,
             &pgparser::ast::JoinConstraint::None,
+            &crate::clock::EvalCtx::test_default(),
         )?;
     }
     Ok(acc)
@@ -785,7 +808,14 @@ fn build_table_expr_schema(
         } => {
             let l = build_table_expr_schema(catalog_kv, left)?;
             let r = build_table_expr_schema(catalog_kv, right)?;
-            join_relations(l, r, *kind, constraint)
+            // Schema-only: no rows, so no ON predicate is ever evaluated.
+            join_relations(
+                l,
+                r,
+                *kind,
+                constraint,
+                &crate::clock::EvalCtx::test_default(),
+            )
         }
         TableExpr::Derived { subquery, alias } => {
             let inner_scope = if subquery.from.is_empty() {
@@ -820,6 +850,7 @@ pub(crate) fn execute_read(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     stmt: &Statement,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<QueryResult, ExecError> {
     let Statement::Select(s) = stmt else {
         return Err(ExecError::Unsupported("not a SELECT".into()));
@@ -834,6 +865,7 @@ pub(crate) fn execute_read(
         gsnap,
         snapshot,
         own,
+        eval_ctx: ctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -847,13 +879,13 @@ pub(crate) fn execute_read(
             rows: vec![vec![]],
         }
     } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from)?
+        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
     };
 
     // Filter (WHERE runs before grouping).
     let mut kept: Vec<Vec<Datum>> = Vec::new();
     for row in &relation.rows {
-        if row_matches(s.filter.as_ref(), &relation.scope, row)? {
+        if row_matches(s.filter.as_ref(), &relation.scope, row, ctx)? {
             kept.push(row.clone());
         }
     }
@@ -861,9 +893,9 @@ pub(crate) fn execute_read(
     // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
     // groups; everything else projects rows one-for-one.
     if crate::agg::is_aggregate_query(s) {
-        return crate::agg::execute_aggregate(s, &relation.scope, kept);
+        return crate::agg::execute_aggregate(s, &relation.scope, kept, ctx);
     }
-    project_order_limit(s, &relation.scope, kept)
+    project_order_limit(s, &relation.scope, kept, ctx)
 }
 
 /// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
@@ -882,6 +914,7 @@ pub(crate) async fn execute_read_locking(
     repeatable_read: bool,
     mode: crate::lockmgr::LockMode,
     s: &SelectStmt,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<QueryResult, ExecError> {
     // SP34: resolve uncorrelated subqueries (e.g. in the WHERE of a FOR UPDATE) to
     // constants first, under this statement's snapshot handles.
@@ -892,6 +925,7 @@ pub(crate) async fn execute_read_locking(
         gsnap,
         snapshot,
         own: Some(xid),
+        eval_ctx: ctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -930,7 +964,7 @@ pub(crate) async fn execute_read_locking(
         // 1. Filter on the snapshot-visible row FIRST — only lock rows that
         //    match the WHERE clause (a FOR UPDATE/SHARE with no WHERE still
         //    locks all rows because row_matches(None, ..) returns true).
-        if !row_matches(s.filter.as_ref(), &scope, &scanned_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &scanned_row, ctx)? {
             continue;
         }
 
@@ -957,28 +991,30 @@ pub(crate) async fn execute_read_locking(
         };
 
         // 4. Re-apply the WHERE filter against the (possibly newer) row.
-        if !row_matches(s.filter.as_ref(), &scope, &cur_row)? {
+        if !row_matches(s.filter.as_ref(), &scope, &cur_row, ctx)? {
             continue; // no longer matches
         }
         kept.push(cur_row);
     }
 
-    project_order_limit(s, &scope, kept)
+    project_order_limit(s, &scope, kept, ctx)
 }
 
 /// Apply DISTINCT / ORDER BY / OFFSET / LIMIT and projection, returning the
 /// projected output Datum rows. Shared by the top-level row path and derived
-/// tables.
+/// tables. `ctx` carries the session zone + transaction/statement clock used by
+/// temporal eval.
 fn project_rows_ordered(
     s: &SelectStmt,
     scope: &Scope,
     out_exprs: &[Expr],
     mut kept: Vec<Vec<Datum>>,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     // SP28: SELECT DISTINCT projects FIRST, dedups output rows, then ORDER BY
     // sorts the deduped output (keys must be select-list columns).
     if s.distinct {
-        let mut projected = project_rows(out_exprs, scope, &kept)?;
+        let mut projected = project_rows(out_exprs, scope, &kept, ctx)?;
         let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
         projected.retain(|r| seen.insert(r.clone()));
         if !s.order_by.is_empty() {
@@ -1002,7 +1038,7 @@ fn project_rows_ordered(
         for row in kept {
             let mut keys = Vec::with_capacity(s.order_by.len());
             for item in &s.order_by {
-                keys.push(crate::eval::eval(&item.expr, scope, &row)?);
+                keys.push(crate::eval::eval(&item.expr, scope, &row, ctx)?);
             }
             keyed.push((keys, row));
         }
@@ -1010,20 +1046,24 @@ fn project_rows_ordered(
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
     apply_offset_limit(&mut kept, s.offset, s.limit);
-    project_rows(out_exprs, scope, &kept)
+    project_rows(out_exprs, scope, &kept, ctx)
 }
 
 /// Apply ORDER BY, LIMIT, and projection to a set of already-filtered source
 /// rows, producing the final `QueryResult::Rows`. Used by both `execute_read`
 /// and `execute_read_locking` to avoid duplication.
+///
+/// `ctx` carries the session zone (forwarded to `rows_result` for `Timestamptz`
+/// text rendering) and the transaction/statement clock used by temporal eval.
 fn project_order_limit(
     s: &SelectStmt,
     scope: &Scope,
     kept: Vec<Vec<Datum>>,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<QueryResult, ExecError> {
     let (fields, out_exprs, _tys) = resolve_projection(&s.projection, scope)?;
-    let rows = project_rows_ordered(s, scope, &out_exprs, kept)?;
-    Ok(rows_result(fields, &rows))
+    let rows = project_rows_ordered(s, scope, &out_exprs, kept, ctx)?;
+    Ok(rows_result(fields, &rows, &ctx.time_zone))
 }
 
 /// Evaluate the projection expressions for each source row, yielding output
@@ -1032,12 +1072,13 @@ fn project_rows(
     out_exprs: &[Expr],
     scope: &Scope,
     rows: &[Vec<Datum>],
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = Vec::with_capacity(out_exprs.len());
         for e in out_exprs {
-            cells.push(crate::eval::eval(e, scope, row)?);
+            cells.push(crate::eval::eval(e, scope, row, ctx)?);
         }
         out.push(cells);
     }
@@ -1045,10 +1086,18 @@ fn project_rows(
 }
 
 /// Encode projected Datum rows into a `QueryResult::Rows` (text + binary cells).
-pub(crate) fn rows_result(fields: Vec<FieldDescription>, projected: &[Vec<Datum>]) -> QueryResult {
+///
+/// `tz` is the session time zone (`EvalCtx::time_zone`) used for `Timestamptz`
+/// text rendering. Task 9 threads it from the per-statement `EvalCtx`; a
+/// UTC/epoch context reproduces prior behavior until the session builds it.
+pub(crate) fn rows_result(
+    fields: Vec<FieldDescription>,
+    projected: &[Vec<Datum>],
+    tz: &jiff::tz::TimeZone,
+) -> QueryResult {
     let rows: Vec<Vec<Option<Cell>>> = projected
         .iter()
-        .map(|r| r.iter().map(datum_to_cell).collect())
+        .map(|r| r.iter().map(|d| datum_to_cell(d, tz)).collect())
         .collect();
     let tag = format!("SELECT {}", rows.len());
     QueryResult::Rows { fields, rows, tag }
@@ -1171,12 +1220,12 @@ fn field(name: &str, ty: ColumnType) -> FieldDescription {
     }
 }
 
-pub(crate) fn datum_to_cell(d: &Datum) -> Option<Cell> {
+pub(crate) fn datum_to_cell(d: &Datum, tz: &jiff::tz::TimeZone) -> Option<Cell> {
     if d.is_null() {
         return None;
     }
     Some(Cell {
-        text: Bytes::from(pgtypes::encoding::encode_text(d)),
+        text: Bytes::from(pgtypes::encoding::encode_text(d, tz)),
         binary: Bytes::from(pgtypes::encoding::encode_binary(d)),
     })
 }

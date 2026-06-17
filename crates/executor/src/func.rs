@@ -23,6 +23,7 @@ use std::cmp::Ordering;
 use pgparser::ast::{Expr, FuncArgs, FuncCall};
 use pgtypes::{ColumnType, Datum, ops};
 
+use crate::clock::EvalCtx;
 use crate::error::ExecError;
 use crate::scope::Scope;
 
@@ -313,6 +314,7 @@ pub(crate) fn scalar_result_type(fc: &FuncCall, scope: &Scope) -> Result<ColumnT
 /// lazy ones evaluate arguments only as far as needed.
 pub(crate) fn eval_scalar(
     fc: &FuncCall,
+    ctx: &EvalCtx,
     mut eval_child: impl FnMut(&Expr) -> Result<Datum, ExecError>,
 ) -> Result<Datum, ExecError> {
     let f = scalar_func(&fc.name).ok_or_else(|| undefined_function(&fc.name))?;
@@ -370,7 +372,7 @@ pub(crate) fn eval_scalar(
                 .iter()
                 .map(&mut eval_child)
                 .collect::<Result<Vec<_>, _>>()?;
-            eval_eager(f, fc, &vals)
+            eval_eager(f, fc, &vals, ctx)
         }
     }
 }
@@ -378,12 +380,20 @@ pub(crate) fn eval_scalar(
 /// Apply an eager scalar function to its already-evaluated arguments. Every
 /// function here except `concat` is strict (any NULL argument → NULL); `concat`
 /// skips NULLs and never returns NULL.
-fn eval_eager(f: ScalarFunc, fc: &FuncCall, vals: &[Datum]) -> Result<Datum, ExecError> {
+fn eval_eager(
+    f: ScalarFunc,
+    fc: &FuncCall,
+    vals: &[Datum],
+    ctx: &EvalCtx,
+) -> Result<Datum, ExecError> {
     if let ScalarFunc::Concat = f {
+        // `concat` renders each argument via its canonical wire text encoding,
+        // using the session zone from `ctx` (so `Timestamptz` agrees with DataRow).
+        let tz = &ctx.time_zone;
         let mut s = String::new();
         for v in vals {
             if !v.is_null() {
-                s.push_str(&text_render(v));
+                s.push_str(&text_render(v, tz));
             }
         }
         return Ok(Datum::Text(s));
@@ -709,8 +719,8 @@ fn type_error(what: &str, got: &Datum) -> ExecError {
 
 /// The canonical text rendering of a non-NULL Datum (the wire text encoding), so
 /// `concat` agrees with the DataRow output and with the `||` operator.
-fn text_render(d: &Datum) -> String {
-    String::from_utf8(pgtypes::encoding::encode_text(d))
+fn text_render(d: &Datum, tz: &jiff::tz::TimeZone) -> String {
+    String::from_utf8(pgtypes::encoding::encode_text(d, tz))
         .expect("a Datum's text encoding is always valid UTF-8")
 }
 
@@ -1052,12 +1062,14 @@ mod tests {
 
     /// Evaluate a scalar-function expression with no row context.
     fn ev(sql: &str) -> Datum {
-        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[]).expect("eval")
+        let ctx = crate::clock::EvalCtx::test_default();
+        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[], &ctx).expect("eval")
     }
 
     /// SQLSTATE of a runtime eval error (no row context).
     fn ec_eval(sql: &str) -> String {
-        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[])
+        let ctx = crate::clock::EvalCtx::test_default();
+        crate::eval::eval(&pexpr(sql).expect("parse"), &Scope::empty(), &[], &ctx)
             .expect_err("expected error")
             .into_pg()
             .code
@@ -1066,11 +1078,12 @@ mod tests {
     fn err_code(sql: &str, t: Option<&Table>) -> String {
         // Drive both the static (projection) and runtime path: infer first (this
         // is what a projected expression hits), falling back to eval.
+        let ctx = crate::clock::EvalCtx::test_default();
         let e = pexpr(sql).expect("parse");
         let scope = scope_of(t);
         crate::eval::infer_type(&e, &scope)
             .err()
-            .or_else(|| crate::eval::eval(&e, &scope, &[Datum::Null, Datum::Null]).err())
+            .or_else(|| crate::eval::eval(&e, &scope, &[Datum::Null, Datum::Null], &ctx).err())
             .expect("expected error")
             .into_pg()
             .code
@@ -1111,10 +1124,12 @@ mod tests {
             Datum::Text("a-b-c".into())
         );
         // negative substring length is 22011-class (mapped to 42804 here).
+        let ctx = crate::clock::EvalCtx::test_default();
         let err = crate::eval::eval(
             &pexpr("substr('abc', 1, -1)").expect("p"),
             &Scope::empty(),
             &[],
+            &ctx,
         )
         .expect_err("neg len");
         assert_eq!(err.into_pg().code, "42804");
@@ -1132,6 +1147,7 @@ mod tests {
 
     #[test]
     fn abs_and_mod() {
+        let ctx = crate::clock::EvalCtx::test_default();
         let num = |s: &str| Datum::Numeric(pgtypes::numeric::parse(s).expect("n"));
         assert_eq!(ev("abs(-5)"), Datum::Int4(5));
         assert_eq!(ev("abs(7)"), Datum::Int4(7));
@@ -1153,11 +1169,12 @@ mod tests {
             &pexpr("abs(n)").expect("p"),
             &scope_of(Some(&t)),
             &[Datum::Null, Datum::Int4(i32::MIN)],
+            &ctx,
         )
         .expect_err("overflow");
         assert_eq!(err.into_pg().code, "22003");
         // mod by zero is 22012.
-        let err = crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), &Scope::empty(), &[])
+        let err = crate::eval::eval(&pexpr("mod(1, 0)").expect("p"), &Scope::empty(), &[], &ctx)
             .expect_err("div0");
         assert_eq!(err.into_pg().code, "22012");
     }

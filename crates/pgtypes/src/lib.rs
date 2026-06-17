@@ -2,6 +2,7 @@
 //! encodings, and operator semantics matching PostgreSQL.
 
 pub mod cast;
+pub mod datetime;
 pub mod datum;
 pub mod encoding;
 pub mod error;

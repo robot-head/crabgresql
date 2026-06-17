@@ -17,6 +17,7 @@ use pgparser::ast::{Expr, FuncArgs, FuncCall, SelectItem, SelectStmt};
 use pgtypes::{ColumnType, Datum, TypeError, ops};
 use pgwire::engine::QueryResult;
 
+use crate::clock::EvalCtx;
 use crate::error::ExecError;
 use crate::scope::Scope;
 
@@ -261,9 +262,15 @@ fn collect_specs(e: &Expr, scope: &Scope, specs: &mut Vec<AggSpec>) -> Result<()
                 specs.push(spec);
             }
         }
-        // SP29: a scalar function may wrap aggregates / grouped columns — gather
-        // aggregates from its arguments (the call itself is not an aggregate).
-        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+        // SP29/SP37: a scalar or date/time function may wrap aggregates / grouped
+        // columns — gather aggregates from its arguments (the call itself is not an
+        // aggregate). `max(extract(year from ts))` reaches the aggregate via the
+        // outer scalar/agg traversal; this arm handles a datetime func wrapping an
+        // aggregate (`date_trunc('day', max(ts))`).
+        Expr::Func(fc)
+            if crate::func::is_scalar(&fc.name)
+                || crate::datetime_fn::is_datetime_func(&fc.name) =>
+        {
             if let FuncArgs::Exprs(args) = &fc.args {
                 for a in args {
                     collect_specs(a, scope, specs)?;
@@ -337,8 +344,13 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
             validate_grouped(left, group_by)?;
             validate_grouped(right, group_by)
         }
-        // SP29: every argument of a scalar function must itself be grouped-valid.
-        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+        // SP29/SP37: every argument of a scalar or date/time function must itself be
+        // grouped-valid (the call as a whole, if it matches a GROUP BY key, was
+        // already accepted above).
+        Expr::Func(fc)
+            if crate::func::is_scalar(&fc.name)
+                || crate::datetime_fn::is_datetime_func(&fc.name) =>
+        {
             if let FuncArgs::Exprs(args) = &fc.args {
                 for a in args {
                     validate_grouped(a, group_by)?;
@@ -401,6 +413,7 @@ fn ungrouped_column(name: &str) -> ExecError {
 /// finalized per-group result; subexpressions matching a `GROUP BY` expression
 /// resolve to the group key; everything else recurses. (Validation already
 /// guarantees no ungrouped column reaches the `Column` arm.)
+#[allow(clippy::too_many_arguments)]
 fn eval_grouped(
     e: &Expr,
     scope: &Scope,
@@ -408,6 +421,7 @@ fn eval_grouped(
     key: &[Datum],
     specs: &[AggSpec],
     results: &[Datum],
+    ctx: &EvalCtx,
 ) -> Result<Datum, ExecError> {
     if let Expr::Func(fc) = e
         && aggregate_func(&fc.name).is_some()
@@ -442,18 +456,18 @@ fn eval_grouped(
         )),
         Expr::Column { name, .. } => Err(ungrouped_column(name)),
         Expr::Unary { op, expr } => {
-            let v = eval_grouped(expr, scope, group_by, key, specs, results)?;
-            crate::eval::apply_unary(*op, &v)
+            let v = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
+            crate::eval::apply_unary(*op, &v, ctx)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval_grouped(left, scope, group_by, key, specs, results)?;
-            let r = eval_grouped(right, scope, group_by, key, specs, results)?;
-            crate::eval::apply_binary(*op, &l, &r)
+            let l = eval_grouped(left, scope, group_by, key, specs, results, ctx)?;
+            let r = eval_grouped(right, scope, group_by, key, specs, results, ctx)?;
+            crate::eval::apply_binary(*op, &l, &r, ctx)
         }
         // SP28: predicate + conditional expressions in a grouped context — same
         // combinators as scalar `eval`, recursing through `eval_grouped`.
         Expr::IsNull { expr, negated } => {
-            let v = eval_grouped(expr, scope, group_by, key, specs, results)?;
+            let v = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
             Ok(Datum::Bool(v.is_null() ^ *negated))
         }
         Expr::InList {
@@ -461,9 +475,9 @@ fn eval_grouped(
             list,
             negated,
         } => {
-            let x = eval_grouped(expr, scope, group_by, key, specs, results)?;
+            let x = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
             crate::eval::eval_in_list(&x, list, *negated, |e| {
-                eval_grouped(e, scope, group_by, key, specs, results)
+                eval_grouped(e, scope, group_by, key, specs, results, ctx)
             })
         }
         Expr::Between {
@@ -472,10 +486,10 @@ fn eval_grouped(
             high,
             negated,
         } => {
-            let x = eval_grouped(expr, scope, group_by, key, specs, results)?;
-            let lo = eval_grouped(low, scope, group_by, key, specs, results)?;
-            let hi = eval_grouped(high, scope, group_by, key, specs, results)?;
-            crate::eval::eval_between(&x, &lo, &hi, *negated)
+            let x = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
+            let lo = eval_grouped(low, scope, group_by, key, specs, results, ctx)?;
+            let hi = eval_grouped(high, scope, group_by, key, specs, results, ctx)?;
+            crate::eval::eval_between(&x, &lo, &hi, *negated, ctx)
         }
         Expr::Like {
             expr,
@@ -483,8 +497,8 @@ fn eval_grouped(
             negated,
             case_insensitive,
         } => {
-            let s = eval_grouped(expr, scope, group_by, key, specs, results)?;
-            let p = eval_grouped(pattern, scope, group_by, key, specs, results)?;
+            let s = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
+            let p = eval_grouped(pattern, scope, group_by, key, specs, results, ctx)?;
             crate::eval::eval_like(&s, &p, *negated, *case_insensitive)
         }
         Expr::Case {
@@ -492,18 +506,28 @@ fn eval_grouped(
             whens,
             else_result,
         } => crate::eval::eval_case(operand.as_deref(), whens, else_result.as_deref(), |e| {
-            eval_grouped(e, scope, group_by, key, specs, results)
+            eval_grouped(e, scope, group_by, key, specs, results, ctx)
         }),
         // SP29: a scalar function over grouped/aggregate arguments — evaluate it
         // with the grouped evaluator as its child-eval closure.
-        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => crate::func::eval_scalar(fc, |e| {
-            eval_grouped(e, scope, group_by, key, specs, results)
-        }),
+        Expr::Func(fc) if crate::func::is_scalar(&fc.name) => {
+            crate::func::eval_scalar(fc, ctx, |e| {
+                eval_grouped(e, scope, group_by, key, specs, results, ctx)
+            })
+        }
+        // SP37: a date/time function over grouped/aggregate arguments (e.g.
+        // `date_trunc('day', max(ts))`) — same pattern, grouped child-eval closure.
+        Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
+            crate::datetime_fn::eval_datetime(fc, ctx, |e| {
+                eval_grouped(e, scope, group_by, key, specs, results, ctx)
+            })
+        }
         Expr::Func(fc) => Err(undefined_function(&fc.name)),
-        // SP31: cast in a grouped context — convert the grouped-evaluated operand.
+        // SP31: cast in a grouped context — convert the grouped-evaluated operand
+        // using the session zone from `ctx`.
         Expr::Cast { expr, ty } => {
-            let v = eval_grouped(expr, scope, group_by, key, specs, results)?;
-            Ok(pgtypes::cast::cast(&v, *ty)?)
+            let v = eval_grouped(expr, scope, group_by, key, specs, results, ctx)?;
+            Ok(pgtypes::cast::cast(&v, *ty, &ctx.time_zone)?)
         }
         // SP34: a resolved subquery constant in a grouped context.
         Expr::Const { value, .. } => Ok(value.clone()),
@@ -604,7 +628,13 @@ impl Acc {
     }
 
     /// Fold one source row into this accumulator.
-    fn fold_row(&mut self, spec: &AggSpec, scope: &Scope, row: &[Datum]) -> Result<(), ExecError> {
+    fn fold_row(
+        &mut self,
+        spec: &AggSpec,
+        scope: &Scope,
+        row: &[Datum],
+        ctx: &EvalCtx,
+    ) -> Result<(), ExecError> {
         // count(*) counts every row, ignoring NULL/DISTINCT.
         if let (AggFunc::Count, None) = (spec.func, &spec.arg) {
             if let Acc::Count { n, .. } = self {
@@ -616,7 +646,7 @@ impl Acc {
             .arg
             .as_ref()
             .expect("non-star aggregate has an argument");
-        let v = crate::eval::eval(arg, scope, row)?;
+        let v = crate::eval::eval(arg, scope, row, ctx)?;
         // count(x)/sum/min/max ignore NULL arguments.
         if v.is_null() {
             return Ok(());
@@ -657,7 +687,7 @@ impl Acc {
                 });
             }
             Acc::AvgN { sum, n, .. } => {
-                let vn = pgtypes::cast::cast(&v, ColumnType::Numeric(None))?;
+                let vn = pgtypes::cast::cast(&v, ColumnType::Numeric(None), &ctx.time_zone)?;
                 *sum = Some(match sum.take() {
                     None => vn,
                     Some(cur) => ops::add(&cur, &vn)?,
@@ -741,15 +771,18 @@ fn as_f64(d: &Datum) -> Option<f64> {
 
 /// Execute an aggregate query over the already-`WHERE`-filtered `rows`, returning
 /// the final `QueryResult::Rows`. Thin wrapper over `aggregate_rows` — the row-
-/// producing core shared with derived tables (`select_to_relation`).
+/// producing core shared with derived tables (`select_to_relation`). `ctx` carries
+/// the session zone + clock for any temporal evaluation; non-temporal aggregation
+/// ignores it (UTC/epoch reproduces prior behavior).
 pub(crate) fn execute_aggregate(
     s: &SelectStmt,
     scope: &Scope,
     rows: Vec<Vec<Datum>>,
+    ctx: &EvalCtx,
 ) -> Result<QueryResult, ExecError> {
     let (fields, _exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
-    let out_rows = aggregate_rows(s, scope, rows)?;
-    Ok(crate::exec::rows_result(fields, &out_rows))
+    let out_rows = aggregate_rows(s, scope, rows, ctx)?;
+    Ok(crate::exec::rows_result(fields, &out_rows, &ctx.time_zone))
 }
 
 /// Fold an aggregate query over the already-`WHERE`-filtered `rows`, returning the
@@ -760,6 +793,7 @@ pub(crate) fn aggregate_rows(
     s: &SelectStmt,
     scope: &Scope,
     rows: Vec<Vec<Datum>>,
+    ctx: &EvalCtx,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     // Output columns: the expressions that produce each column via the shared
     // projection resolver (infer_type now understands aggregate result types).
@@ -794,7 +828,7 @@ pub(crate) fn aggregate_rows(
     for row in &rows {
         let mut key = Vec::with_capacity(s.group_by.len());
         for g in &s.group_by {
-            key.push(crate::eval::eval(g, scope, row)?);
+            key.push(crate::eval::eval(g, scope, row, ctx)?);
         }
         let gi = match index.get(&key) {
             Some(&i) => i,
@@ -807,7 +841,7 @@ pub(crate) fn aggregate_rows(
             }
         };
         for (spec, acc) in specs.iter().zip(accs[gi].iter_mut()) {
-            acc.fold_row(spec, scope, row)?;
+            acc.fold_row(spec, scope, row, ctx)?;
         }
     }
     // A bare aggregate (no GROUP BY) over zero rows still yields ONE group.
@@ -824,7 +858,7 @@ pub(crate) fn aggregate_rows(
             .map(Acc::finish)
             .collect::<Result<_, ExecError>>()?;
         if let Some(h) = &s.having {
-            match eval_grouped(h, scope, &s.group_by, key, &specs, &results)? {
+            match eval_grouped(h, scope, &s.group_by, key, &specs, &results, ctx)? {
                 Datum::Bool(true) => {}
                 Datum::Bool(false) | Datum::Null => continue,
                 _ => {
@@ -843,11 +877,20 @@ pub(crate) fn aggregate_rows(
                 key,
                 &specs,
                 &results,
+                ctx,
             )?);
         }
         let mut projected = Vec::with_capacity(out_exprs.len());
         for e in &out_exprs {
-            projected.push(eval_grouped(e, scope, &s.group_by, key, &specs, &results)?);
+            projected.push(eval_grouped(
+                e,
+                scope,
+                &s.group_by,
+                key,
+                &specs,
+                &results,
+                ctx,
+            )?);
         }
         out.push((order_keys, projected));
     }
@@ -912,7 +955,8 @@ mod tests {
             is_aggregate_query(&s),
             "test sql must be an aggregate query"
         );
-        match execute_aggregate(&s, &scope_of(t), rows)? {
+        let ctx = crate::clock::EvalCtx::test_default();
+        match execute_aggregate(&s, &scope_of(t), rows, &ctx)? {
             QueryResult::Rows { rows, .. } => Ok(rows
                 .into_iter()
                 .map(|r| r.into_iter().map(cell_to_datum).collect())
@@ -947,7 +991,8 @@ mod tests {
         let Statement::Select(s) = stmt else {
             panic!("not a select");
         };
-        match execute_aggregate(&s, &scope_of(t), rows)? {
+        let ctx = crate::clock::EvalCtx::test_default();
+        match execute_aggregate(&s, &scope_of(t), rows, &ctx)? {
             QueryResult::Rows { rows, .. } => Ok(rows
                 .into_iter()
                 .map(|row| {
@@ -1135,7 +1180,13 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let err = execute_aggregate(&s, &scope_of(Some(&t)), vec![]).expect_err("unknown fn");
+        let err = execute_aggregate(
+            &s,
+            &scope_of(Some(&t)),
+            vec![],
+            &crate::clock::EvalCtx::test_default(),
+        )
+        .expect_err("unknown fn");
         assert_eq!(err.into_pg().code, "42883");
     }
 
@@ -1148,7 +1199,13 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let err = execute_aggregate(&s, &scope_of(Some(&t)), vec![]).expect_err("sum(text)");
+        let err = execute_aggregate(
+            &s,
+            &scope_of(Some(&t)),
+            vec![],
+            &crate::clock::EvalCtx::test_default(),
+        )
+        .expect_err("sum(text)");
         assert_eq!(err.into_pg().code, "42883");
     }
 
@@ -1160,7 +1217,13 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let err = execute_aggregate(&s, &scope_of(Some(&t)), vec![]).expect_err("nested");
+        let err = execute_aggregate(
+            &s,
+            &scope_of(Some(&t)),
+            vec![],
+            &crate::clock::EvalCtx::test_default(),
+        )
+        .expect_err("nested");
         assert_eq!(err.into_pg().code, "42803");
     }
 
@@ -1396,7 +1459,13 @@ mod tests {
             .pop()
             .expect("one");
         let Statement::Select(s) = stmt else { panic!() };
-        let err = execute_aggregate(&s, &scope_of(Some(&t)), vec![]).expect_err("avg(text)");
+        let err = execute_aggregate(
+            &s,
+            &scope_of(Some(&t)),
+            vec![],
+            &crate::clock::EvalCtx::test_default(),
+        )
+        .expect_err("avg(text)");
         assert_eq!(err.into_pg().code, "42883");
     }
 

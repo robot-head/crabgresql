@@ -11,6 +11,7 @@ workspace = true
 thiserror.workspace = true
 bigdecimal.workspace = true
 dashu-float.workspace = true
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 
 [dev-dependencies]
 proptest.workspace = true

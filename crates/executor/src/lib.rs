@@ -6,7 +6,9 @@
 //! `SequenceManager` and DDL serialized behind a small catalog lock.
 
 mod agg;
+pub mod clock;
 mod commit;
+mod datetime_fn;
 mod error;
 mod eval;
 mod exec;
@@ -77,6 +79,10 @@ pub struct SqlEngine {
     /// range 0's linearizable applied index. `None` on range 0's own engine (it
     /// reads its own current store) and on single-range engines.
     pub(crate) range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
+    /// SP37: the clock backing each session's transaction/statement instant (and,
+    /// later, `now()`/`current_timestamp`). `SystemClock` in production; tests
+    /// inject a `FixedClock` via `with_clock` for deterministic temporal eval.
+    pub(crate) clock: Arc<dyn crate::clock::Clock>,
 }
 
 impl Default for SqlEngine {
@@ -114,6 +120,7 @@ impl SqlEngine {
             persist_mode: PersistMode::Durable,
             gtm: None,
             range0_barrier: None,
+            clock: Arc::new(crate::clock::SystemClock),
         })
     }
 
@@ -146,6 +153,7 @@ impl SqlEngine {
             persist_mode: PersistMode::Replicated,
             gtm: None,
             range0_barrier: None,
+            clock: Arc::new(crate::clock::SystemClock),
         })
     }
 
@@ -173,7 +181,14 @@ impl SqlEngine {
             persist_mode: self.persist_mode,
             gtm: self.gtm.as_ref().map(Arc::clone),
             range0_barrier: self.range0_barrier.as_ref().map(Arc::clone),
+            clock: Arc::clone(&self.clock),
         }
+    }
+
+    /// Inject a clock (tests use FixedClock for deterministic now()/current_timestamp).
+    pub fn with_clock(mut self, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Open a GTM over this engine's `kv` (range 0's store) and make this engine
@@ -509,6 +524,7 @@ impl Engine for SqlEngine {
             self.persist_mode,
             self.gtm.as_ref().map(Arc::clone),
             self.range0_barrier.as_ref().map(Arc::clone),
+            Arc::clone(&self.clock),
         )
     }
 }

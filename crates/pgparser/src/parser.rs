@@ -33,6 +33,15 @@ impl Parser {
         &self.toks[i].0
     }
 
+    /// The token two positions after the current one (saturates at EOF). Used by
+    /// the SP37 `AT TIME ZONE` postfix, whose three-token lead-in (`at time zone`)
+    /// needs a three-token lookahead so a bare column named `at` is never mistaken
+    /// for the operator.
+    fn peek3(&self) -> &Token {
+        let i = (self.pos + 2).min(self.toks.len() - 1);
+        &self.toks[i].0
+    }
+
     fn peek_pos(&self) -> usize {
         self.toks[self.pos].1
     }
@@ -76,6 +85,20 @@ impl Parser {
         }
     }
 
+    /// Consume an identifier that must equal `want` (case-insensitively). Used by
+    /// the SP37 keyword-free multi-word type fold (`time`/`zone`) so those words
+    /// stay non-reserved (still usable as identifiers elsewhere).
+    fn expect_ident_eq(&mut self, want: &str) -> Result<(), ParseError> {
+        let pos = self.peek_pos();
+        match self.bump() {
+            Token::Ident(s) if s.eq_ignore_ascii_case(want) => Ok(()),
+            other => Err(ParseError::new(
+                format!("expected `{want}`, found {other:?}"),
+                pos,
+            )),
+        }
+    }
+
     /// Parse a SQL type name into a [`ColumnType`] — shared by `CREATE TABLE`
     /// column definitions and the SP31 cast target (`CAST(_ AS ty)` / `_::ty`).
     /// Folds the two-word `double precision` (SP30) into one normalized name; an
@@ -89,6 +112,23 @@ impl Parser {
         {
             self.bump();
             type_word = "double precision".to_string();
+        }
+        // SP37: fold the multi-word `timestamp`/`time` { with | without } `time zone`
+        // spellings into one normalized name (keyword-free — the lexer lowercases
+        // idents, so the three trailing words are matched as plain `Token::Ident`s).
+        // `timestamp with time zone` / `timestamp without time zone` /
+        // `time with time zone` / `time without time zone`.
+        if (type_word.eq_ignore_ascii_case("timestamp") || type_word.eq_ignore_ascii_case("time"))
+            && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with") || w.eq_ignore_ascii_case("without"))
+            && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
+        {
+            // Consume `{with|without}`; require `time` `zone` to follow.
+            let with_zone =
+                matches!(self.bump(), Token::Ident(w) if w.eq_ignore_ascii_case("with"));
+            self.expect_ident_eq("time")?;
+            self.expect_ident_eq("zone")?;
+            let qualifier = if with_zone { "with" } else { "without" };
+            type_word = format!("{} {qualifier} time zone", type_word.to_ascii_lowercase());
         }
         let ty = pgtypes::ColumnType::from_sql_name(&type_word)
             .ok_or_else(|| ParseError::new(format!("unknown type \"{type_word}\""), type_pos))?;
@@ -146,6 +186,31 @@ impl Parser {
                     expr: Box::new(lhs),
                     ty,
                 };
+                continue;
+            }
+            // SP37: `x AT TIME ZONE z` — a postfix operator that lowers onto PG's
+            // internal `timezone(z, x)` form (note arg ORDER: zone first, value
+            // second). It binds TIGHTER than every binary operator (so
+            // `ts AT TIME ZONE 'UTC' = y` groups as `(ts AT TIME ZONE 'UTC') = y`),
+            // so — like `::` — it is consumed unconditionally (no `min_bp` gate).
+            // Keyword-free: `at`/`time`/`zone` are matched as lowercased idents via
+            // a three-token lookahead, so a bare column named `at` is never the
+            // operator. The zone operand is parsed at bp 11 (a high-precedence
+            // operand, like the `*`/`/` level), and recursion terminates because
+            // each iteration consumes the `at time zone` lead-in before recursing.
+            if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("at"))
+                && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
+                && matches!(self.peek3(), Token::Ident(w) if w.eq_ignore_ascii_case("zone"))
+            {
+                self.bump(); // at
+                self.bump(); // time
+                self.bump(); // zone
+                let zone = self.expr(11)?;
+                lhs = Expr::Func(crate::ast::FuncCall {
+                    name: "timezone".into(),
+                    distinct: false,
+                    args: crate::ast::FuncArgs::Exprs(vec![zone, lhs]),
+                });
                 continue;
             }
             // SP28: postfix predicates (IS [NOT] NULL, [NOT] IN, [NOT] BETWEEN,
@@ -336,7 +401,62 @@ impl Parser {
                 Ok(Expr::Param(n))
             }
             Token::Ident(s) => {
+                // SP37: a typed datetime literal — `DATE '…'` / `TIME '…'` /
+                // `TIMESTAMP '…'` / `TIMESTAMPTZ '…'` / `INTERVAL '…'` — lowers onto
+                // an explicit cast of a string literal. Only the single-word
+                // spellings are typed-literal prefixes (multi-word `TIMESTAMP WITH
+                // TIME ZONE '…'` is out of scope — use `'…'::timestamptz`). This is
+                // checked BEFORE the function-call path so `date('…')` is not
+                // shadowed (a typed literal has NO parenthesis — `peek2` is the
+                // string literal, not `(`).
+                let lower = s.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "date" | "time" | "timestamp" | "timestamptz" | "interval"
+                ) && matches!(self.peek2(), Token::StringLit(_))
+                {
+                    self.bump(); // the type-name ident
+                    let ty = pgtypes::ColumnType::from_sql_name(&lower)
+                        .expect("single-word datetime type name resolves");
+                    let string = match self.bump() {
+                        Token::StringLit(v) => v,
+                        _ => unreachable!("peek2 guaranteed a string literal"),
+                    };
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::StringLiteral(string)),
+                        ty,
+                    });
+                }
                 self.bump();
+                // SP37: niladic keyword functions — `current_date`, `current_time`,
+                // `localtimestamp`, `localtime`, `current_timestamp` — have NO
+                // parentheses. When one of these names is NOT followed by `(`, build
+                // a zero-arg `Func` call (the executor resolves it against the session
+                // clock/zone). These names are effectively reserved in PostgreSQL, so
+                // shadowing a column of the same name is acceptable. The paren forms
+                // (`now()`, `current_timestamp(0)`, etc.) fall through to `func_call`.
+                if matches!(
+                    lower.as_str(),
+                    "current_date"
+                        | "current_time"
+                        | "localtimestamp"
+                        | "localtime"
+                        | "current_timestamp"
+                ) && *self.peek() != Token::LParen
+                {
+                    return Ok(Expr::Func(crate::ast::FuncCall {
+                        name: lower,
+                        distinct: false,
+                        args: crate::ast::FuncArgs::Exprs(vec![]),
+                    }));
+                }
+                // SP37: `EXTRACT(field FROM source)` — a special call form that
+                // lowers onto `extract('<field>', source)` (field lowercased to a
+                // string literal). Checked before the generic comma-arg `func_call`
+                // so the `FROM` keyword inside the parens is not mis-parsed.
+                if lower == "extract" && *self.peek() == Token::LParen {
+                    return self.extract_expr();
+                }
                 // SP27: `ident (` is a function call; a bare ident is a column.
                 // SP33: `ident . ident` is a table-qualified column reference.
                 if *self.peek() == Token::LParen {
@@ -416,6 +536,24 @@ impl Parser {
                 self.peek_pos(),
             ))
         }
+    }
+
+    /// `EXTRACT(field FROM source)` — positioned at `(`, after the `extract` ident.
+    /// Lowers onto PostgreSQL's internal `extract('<field>', source)` form: the
+    /// field is an identifier (lowercased to a string literal), the source is a
+    /// full expression. The executor resolves the field at runtime.
+    fn extract_expr(&mut self) -> Result<Expr, ParseError> {
+        use crate::ast::{FuncArgs, FuncCall};
+        self.expect(&Token::LParen)?;
+        let field = self.expect_ident()?.to_ascii_lowercase();
+        self.expect(&Token::Keyword(Keyword::From))?;
+        let source = self.expr(0)?;
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Func(FuncCall {
+            name: "extract".into(),
+            distinct: false,
+            args: FuncArgs::Exprs(vec![Expr::StringLiteral(field), source]),
+        }))
     }
 
     /// `expr IS [NOT] NULL`, positioned at `IS`. (`IS TRUE`/`IS DISTINCT FROM`
@@ -612,11 +750,148 @@ impl Parser {
             // SP4: DML
             Token::Keyword(Keyword::Update) => self.update(),
             Token::Keyword(Keyword::Delete) => self.delete(),
+            // SP37: GUC control. `SET` is a keyword; `SHOW`/`RESET` are matched as
+            // plain (lowercased) idents — keyword-free so they stay usable as names.
+            Token::Keyword(Keyword::Set) => self.set_stmt(),
+            Token::Ident(s) if s == "show" => self.show_stmt(),
+            Token::Ident(s) if s == "reset" => self.reset_stmt(),
             other => Err(ParseError::new(
                 format!("unexpected statement start {other:?}"),
                 self.peek_pos(),
             )),
         }
+    }
+
+    /// SP37: `SET [LOCAL] <name> (= | TO) <value>` / `SET [LOCAL] TIME ZONE <value>`.
+    /// Keyword-free for `LOCAL`/`TO`/`TIME ZONE`/`DEFAULT`/`LOCAL` (the value) —
+    /// they are matched as lowercased idents, so none becomes a reserved keyword.
+    /// The GUC name is normalized to lowercase; `TIME ZONE` normalizes to
+    /// `"timezone"`.
+    fn set_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Set))?;
+        // `LOCAL` is the flag only when it leads and is followed by a parameter
+        // name (an ident or `TIME ZONE`). It is NEVER a flag after `TIME ZONE`
+        // (there it is the value `LOCAL`), and the `set_stmt` entry is before any
+        // `TIME ZONE` is consumed, so a leading `LOCAL` here is unambiguous.
+        let local = matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("local"))
+            && !matches!(self.peek2(), Token::Eq);
+        if local {
+            self.bump(); // LOCAL
+        }
+        // The `TIME ZONE` special spelling: `SET [LOCAL] TIME ZONE <value>`.
+        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
+            && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("zone"))
+        {
+            self.bump(); // time
+            self.bump(); // zone
+            let value = self.set_time_zone_value()?;
+            return Ok(Statement::Set {
+                local,
+                name: "timezone".into(),
+                value,
+            });
+        }
+        // `SET [LOCAL] <name> (= | TO) <value>`.
+        let name = self.expect_ident()?.to_ascii_lowercase();
+        // `=` is a token; `TO` is a (lowercased) ident — either separates name from value.
+        let sep = *self.peek() == Token::Eq
+            || matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("to"));
+        if !sep {
+            return Err(ParseError::new(
+                "expected `=` or `TO` in SET",
+                self.peek_pos(),
+            ));
+        }
+        self.bump(); // = or TO
+        let value = self.set_value()?;
+        Ok(Statement::Set { local, name, value })
+    }
+
+    /// The value after `=`/`TO`: a string literal, a `DEFAULT` ident (→ Default),
+    /// or any other identifier (→ that ident verbatim).
+    fn set_value(&mut self) -> Result<crate::ast::SetValue, ParseError> {
+        use crate::ast::SetValue;
+        match self.peek().clone() {
+            Token::StringLit(s) => {
+                self.bump();
+                Ok(SetValue::Value(s))
+            }
+            Token::Ident(w) if w.eq_ignore_ascii_case("default") => {
+                self.bump();
+                Ok(SetValue::Default)
+            }
+            Token::Ident(w) => {
+                self.bump();
+                Ok(SetValue::Value(w))
+            }
+            other => Err(ParseError::new(
+                format!("expected a SET value, found {other:?}"),
+                self.peek_pos(),
+            )),
+        }
+    }
+
+    /// The value after `SET [LOCAL] TIME ZONE`: like [`set_value`], but the bare
+    /// idents `LOCAL` and `DEFAULT` both mean "reset to default" (PostgreSQL).
+    fn set_time_zone_value(&mut self) -> Result<crate::ast::SetValue, ParseError> {
+        use crate::ast::SetValue;
+        match self.peek().clone() {
+            Token::StringLit(s) => {
+                self.bump();
+                Ok(SetValue::Value(s))
+            }
+            Token::Ident(w)
+                if w.eq_ignore_ascii_case("default") || w.eq_ignore_ascii_case("local") =>
+            {
+                self.bump();
+                Ok(SetValue::Default)
+            }
+            Token::Ident(w) => {
+                self.bump();
+                Ok(SetValue::Value(w))
+            }
+            other => Err(ParseError::new(
+                format!("expected a TIME ZONE value, found {other:?}"),
+                self.peek_pos(),
+            )),
+        }
+    }
+
+    /// SP37: `SHOW <name>` / `SHOW TIME ZONE`. Positioned at the `show` ident.
+    fn show_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.bump(); // show
+        // `SHOW TIME ZONE` → name `"timezone"`.
+        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
+            && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("zone"))
+        {
+            self.bump(); // time
+            self.bump(); // zone
+            return Ok(Statement::Show {
+                name: "timezone".into(),
+            });
+        }
+        let name = self.expect_ident()?.to_ascii_lowercase();
+        Ok(Statement::Show { name })
+    }
+
+    /// SP37: `RESET <name>`. Positioned at the `reset` ident.
+    fn reset_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.bump(); // reset
+        // `RESET TIME ZONE` → name `"timezone"` (symmetry with SHOW; PG accepts it).
+        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
+            && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("zone"))
+        {
+            self.bump(); // time
+            self.bump(); // zone
+            return Ok(Statement::Reset {
+                name: "timezone".into(),
+            });
+        }
+        let name = self.expect_ident()?.to_ascii_lowercase();
+        Ok(Statement::Reset { name })
     }
 
     fn begin(&mut self) -> Result<crate::ast::Statement, ParseError> {
@@ -1219,6 +1494,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_niladic_keyword_functions_without_parens() {
+        use crate::ast::{FuncArgs, FuncCall};
+        // `current_date` etc. parse as zero-arg func calls (no parens).
+        for name in [
+            "current_date",
+            "current_time",
+            "localtimestamp",
+            "localtime",
+            "current_timestamp",
+        ] {
+            assert_eq!(
+                expr(name),
+                Expr::Func(FuncCall {
+                    name: name.into(),
+                    distinct: false,
+                    args: FuncArgs::Exprs(vec![]),
+                }),
+                "niladic `{name}`"
+            );
+        }
+        // The paren forms still parse via the normal func-call path.
+        assert_eq!(
+            expr("now()"),
+            Expr::Func(FuncCall {
+                name: "now".into(),
+                distinct: false,
+                args: FuncArgs::Exprs(vec![]),
+            })
+        );
+        match expr("current_timestamp(0)") {
+            Expr::Func(FuncCall { name, args, .. }) => {
+                assert_eq!(name, "current_timestamp");
+                assert!(matches!(args, FuncArgs::Exprs(ref v) if v.len() == 1));
+            }
+            other => panic!("expected a Func call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2001,6 +2315,211 @@ mod tests {
         assert!(parse("SELECT CAST(1 AS widget)").is_err());
         // `cast` is a reserved keyword now, so `CAST(... )` requires `AS`.
         assert!(parse("SELECT CAST(1 int4)").is_err());
+    }
+
+    // ---- SP37: date/time type names, typed literals, EXTRACT, AT TIME ZONE ----
+
+    #[test]
+    fn parses_typed_datetime_literals() {
+        use crate::ast::Expr;
+        assert!(matches!(
+            parse_expr_for_test("DATE '2024-01-01'").expect("d"),
+            Expr::Cast { .. }
+        ));
+        assert!(matches!(
+            parse_expr_for_test("INTERVAL '1 day'").expect("iv"),
+            Expr::Cast { .. }
+        ));
+        assert!(matches!(
+            parse_expr_for_test("TIMESTAMP '2024-01-01 00:00:00'").expect("ts"),
+            Expr::Cast { .. }
+        ));
+        assert!(matches!(
+            parse_expr_for_test("TIMESTAMPTZ '2024-01-01 00:00:00+00'").expect("tstz"),
+            Expr::Cast { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_extract_and_at_time_zone() {
+        use crate::ast::Expr;
+        assert!(matches!(
+            parse_expr_for_test("extract(year from x)").expect("ex"),
+            Expr::Func(_)
+        ));
+        let e = parse_expr_for_test("ts AT TIME ZONE 'UTC' = ts2").expect("attz");
+        assert!(matches!(
+            e,
+            Expr::Binary {
+                op: crate::ast::BinaryOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_multiword_type_in_create_and_cast() {
+        use crate::ast::{Expr, Statement};
+        let stmts = crate::parser::parse(
+            "CREATE TABLE t (a timestamp with time zone, b time without time zone)",
+        )
+        .expect("ct");
+        assert!(matches!(&stmts[0], Statement::CreateTable { .. }));
+        assert!(matches!(
+            parse_expr_for_test("x::timestamp with time zone").expect("c"),
+            Expr::Cast {
+                ty: pgtypes::ColumnType::Timestamptz,
+                ..
+            }
+        ));
+    }
+
+    // ---- SP37: SET / SHOW / RESET timezone GUC ----
+
+    #[test]
+    fn parses_set_timezone_all_spellings() {
+        use crate::ast::SetValue;
+        // SET timezone = '...' / SET timezone TO '...'
+        assert_eq!(
+            one("SET timezone = 'America/New_York'"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Value("America/New_York".into()),
+            }
+        );
+        assert_eq!(
+            one("SET timezone TO 'UTC'"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Value("UTC".into()),
+            }
+        );
+        // SET TIME ZONE '...' (the special two-word spelling normalizes to `timezone`).
+        assert_eq!(
+            one("SET TIME ZONE 'America/New_York'"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Value("America/New_York".into()),
+            }
+        );
+        // An identifier value (no quotes) is accepted too.
+        assert_eq!(
+            one("SET timezone TO utc"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Value("utc".into()),
+            }
+        );
+        // The GUC name is normalized to lowercase.
+        assert_eq!(
+            one("SET TimeZone = 'UTC'"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Value("UTC".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_set_local_flag_vs_local_value() {
+        use crate::ast::SetValue;
+        // `SET LOCAL timezone ...` — LOCAL is the flag (followed by a param name).
+        assert_eq!(
+            one("SET LOCAL timezone = 'UTC'"),
+            Statement::Set {
+                local: true,
+                name: "timezone".into(),
+                value: SetValue::Value("UTC".into()),
+            }
+        );
+        assert_eq!(
+            one("SET LOCAL TIME ZONE 'America/New_York'"),
+            Statement::Set {
+                local: true,
+                name: "timezone".into(),
+                value: SetValue::Value("America/New_York".into()),
+            }
+        );
+        // `SET TIME ZONE LOCAL` — here LOCAL is the VALUE (→ Default), not the flag.
+        assert_eq!(
+            one("SET TIME ZONE LOCAL"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Default,
+            }
+        );
+        // `SET TIME ZONE DEFAULT` is likewise the Default value.
+        assert_eq!(
+            one("SET TIME ZONE DEFAULT"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Default,
+            }
+        );
+        // `SET timezone = DEFAULT` — DEFAULT as the value.
+        assert_eq!(
+            one("SET timezone = DEFAULT"),
+            Statement::Set {
+                local: false,
+                name: "timezone".into(),
+                value: SetValue::Default,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_show_and_reset() {
+        assert_eq!(
+            one("SHOW timezone"),
+            Statement::Show {
+                name: "timezone".into()
+            }
+        );
+        assert_eq!(
+            one("SHOW TIME ZONE"),
+            Statement::Show {
+                name: "timezone".into()
+            }
+        );
+        assert_eq!(
+            one("SHOW TimeZone"),
+            Statement::Show {
+                name: "timezone".into()
+            }
+        );
+        assert_eq!(
+            one("RESET timezone"),
+            Statement::Reset {
+                name: "timezone".into()
+            }
+        );
+    }
+
+    #[test]
+    fn set_show_reset_accept_unknown_names_at_parse_time() {
+        // Name validation is the executor's job (42704); the parser accepts any name.
+        use crate::ast::SetValue;
+        assert_eq!(
+            one("SET datestyle = 'ISO, MDY'"),
+            Statement::Set {
+                local: false,
+                name: "datestyle".into(),
+                value: SetValue::Value("ISO, MDY".into()),
+            }
+        );
+        assert_eq!(
+            one("SHOW search_path"),
+            Statement::Show {
+                name: "search_path".into()
+            }
+        );
     }
 
     #[test]

@@ -20,12 +20,15 @@ pub(crate) struct Relation {
 }
 
 /// Join two relations under `kind` + `constraint`, returning the combined
-/// relation.
+/// relation. `ctx` carries the session zone + clock used to evaluate an `ON`
+/// predicate that contains temporal expressions (a USING/NATURAL/CROSS join, or a
+/// rows-free schema join, never touches it).
 pub(crate) fn join_relations(
     left: Relation,
     right: Relation,
     kind: JoinKind,
     constraint: &JoinConstraint,
+    ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     use std::cmp::Ordering;
 
@@ -83,7 +86,7 @@ pub(crate) fn join_relations(
         let Some(e) = on_pred else { return Ok(true) };
         let mut combined = lrow.to_vec();
         combined.extend_from_slice(rrow);
-        match crate::eval::eval(e, &combined_scope, &combined)? {
+        match crate::eval::eval(e, &combined_scope, &combined, ctx)? {
             Datum::Bool(b) => Ok(b),
             Datum::Null => Ok(false),
             _ => Err(ExecError::TypeMismatch(
@@ -248,6 +251,12 @@ mod tests {
     use super::*;
     use pgtypes::ColumnType;
 
+    /// A default (UTC/epoch) eval context — these pure relational-algebra tests use
+    /// no temporal ON predicate, so the zone never affects the result.
+    fn tctx() -> crate::clock::EvalCtx {
+        crate::clock::EvalCtx::test_default()
+    }
+
     fn rel(qual: &str, cols: &[&str], rows: Vec<Vec<i32>>) -> Relation {
         let scope = Scope {
             columns: cols
@@ -286,7 +295,8 @@ mod tests {
     fn inner_join_keeps_only_matches() {
         let a = rel("a", &["id"], vec![vec![1], vec![2], vec![3]]);
         let b = rel("b", &["id"], vec![vec![2], vec![3], vec![4]]);
-        let j = join_relations(a, b, JoinKind::Inner, &on_eq("a", "id", "b", "id")).expect("join");
+        let j = join_relations(a, b, JoinKind::Inner, &on_eq("a", "id", "b", "id"), &tctx())
+            .expect("join");
         assert_eq!(
             j.rows,
             vec![
@@ -300,7 +310,8 @@ mod tests {
     fn cross_join_is_the_product() {
         let a = rel("a", &["x"], vec![vec![1], vec![2]]);
         let b = rel("b", &["y"], vec![vec![9]]);
-        let j = join_relations(a, b, JoinKind::Cross, &JoinConstraint::None).expect("cross join");
+        let j = join_relations(a, b, JoinKind::Cross, &JoinConstraint::None, &tctx())
+            .expect("cross join");
         assert_eq!(j.rows.len(), 2);
         assert_eq!(j.scope.width(), 2);
     }
@@ -309,8 +320,8 @@ mod tests {
     fn left_join_null_extends_unmatched_left_rows() {
         let a = rel("a", &["id"], vec![vec![1], vec![2], vec![3]]);
         let b = rel("b", &["id"], vec![vec![2], vec![3]]);
-        let j =
-            join_relations(a, b, JoinKind::Left, &on_eq("a", "id", "b", "id")).expect("left join");
+        let j = join_relations(a, b, JoinKind::Left, &on_eq("a", "id", "b", "id"), &tctx())
+            .expect("left join");
         // id=1 has no match -> (1, NULL); 2,3 match.
         assert!(j.rows.contains(&vec![Datum::Int4(1), Datum::Null]));
         assert_eq!(j.rows.len(), 3);
@@ -320,7 +331,7 @@ mod tests {
     fn right_join_null_extends_unmatched_right_rows() {
         let a = rel("a", &["id"], vec![vec![2]]);
         let b = rel("b", &["id"], vec![vec![1], vec![2]]);
-        let j = join_relations(a, b, JoinKind::Right, &on_eq("a", "id", "b", "id"))
+        let j = join_relations(a, b, JoinKind::Right, &on_eq("a", "id", "b", "id"), &tctx())
             .expect("right join");
         assert!(j.rows.contains(&vec![Datum::Null, Datum::Int4(1)]));
         assert_eq!(j.rows.len(), 2);
@@ -330,8 +341,8 @@ mod tests {
     fn full_join_keeps_unmatched_from_both_sides() {
         let a = rel("a", &["id"], vec![vec![1], vec![2]]);
         let b = rel("b", &["id"], vec![vec![2], vec![3]]);
-        let j =
-            join_relations(a, b, JoinKind::Full, &on_eq("a", "id", "b", "id")).expect("full join");
+        let j = join_relations(a, b, JoinKind::Full, &on_eq("a", "id", "b", "id"), &tctx())
+            .expect("full join");
         assert!(j.rows.contains(&vec![Datum::Int4(1), Datum::Null])); // unmatched left
         assert!(j.rows.contains(&vec![Datum::Null, Datum::Int4(3)])); // unmatched right
         assert!(j.rows.contains(&vec![Datum::Int4(2), Datum::Int4(2)])); // matched
@@ -347,6 +358,7 @@ mod tests {
             b,
             JoinKind::Inner,
             &JoinConstraint::Using(vec!["id".into()]),
+            &tctx(),
         )
         .expect("using");
         // Output schema: merged unqualified `id` first, then a.av, then b.bv.
@@ -370,7 +382,8 @@ mod tests {
     fn natural_join_uses_all_common_columns() {
         let a = rel("a", &["id"], vec![vec![1], vec![2]]);
         let b = rel("b", &["id"], vec![vec![2], vec![3]]);
-        let j = join_relations(a, b, JoinKind::Inner, &JoinConstraint::Natural).expect("natural");
+        let j = join_relations(a, b, JoinKind::Inner, &JoinConstraint::Natural, &tctx())
+            .expect("natural");
         assert_eq!(j.scope.columns.len(), 1); // single merged `id`
         assert_eq!(j.rows, vec![vec![Datum::Int4(2)]]);
     }
@@ -386,6 +399,7 @@ mod tests {
             b,
             JoinKind::Left,
             &JoinConstraint::Using(vec!["id".into()]),
+            &tctx(),
         )
         .expect("left using");
         // rows: id=1 unmatched -> (1, 10, NULL); id=2 matched -> (2, 20, 200).

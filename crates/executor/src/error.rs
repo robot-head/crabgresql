@@ -53,6 +53,12 @@ pub enum ExecError {
     /// The write could not reach a majority (partition/timeout); no partial state
     /// was applied; the client should retry.
     Unavailable,
+    /// SP37: a `SET`/`RESET` supplied a value the parameter cannot accept (22023) —
+    /// e.g. an unknown time-zone name, or a non-default `datestyle`.
+    InvalidParameterValue(String),
+    /// SP37: a `SET`/`SHOW`/`RESET` named a configuration parameter that does not
+    /// exist (42704).
+    UnrecognizedParameter(String),
 }
 
 impl ExecError {
@@ -108,6 +114,13 @@ impl ExecError {
                 PgError::error("40001", "could not complete: not the leader, retry")
             }
             ExecError::Unavailable => PgError::error("08006", "connection failure: no quorum"),
+            ExecError::InvalidParameterValue(v) => {
+                PgError::error("22023", format!("invalid value for parameter: \"{v}\""))
+            }
+            ExecError::UnrecognizedParameter(n) => PgError::error(
+                "42704",
+                format!("unrecognized configuration parameter \"{n}\""),
+            ),
         }
     }
 }

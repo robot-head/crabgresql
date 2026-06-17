@@ -24,7 +24,7 @@ pub enum TypeError {
         from: &'static str,
         to: &'static str,
     },
-    /// SP33: a math/string domain error carrying its own PostgreSQL SQLSTATE —
+    /// a math/string domain error carrying its own PostgreSQL SQLSTATE —
     /// e.g. `ln(0)` (2201E), `sqrt(-1)` (2201F), `chr(0)` (54000). One
     /// code-carrying variant rather than one per domain.
     #[error("{message}")]
@@ -32,6 +32,15 @@ pub enum TypeError {
         sqlstate: &'static str,
         message: &'static str,
     },
+    /// SP37: malformed date/time/interval literal or text (22007).
+    #[error("invalid input syntax for type {type_name}: \"{value}\"")]
+    InvalidDatetimeFormat {
+        type_name: &'static str,
+        value: String,
+    },
+    /// SP37: a date/time field out of range (e.g. month 13) (22008).
+    #[error("date/time field value out of range: \"{value}\"")]
+    DatetimeFieldOverflow { value: String },
 }
 
 impl TypeError {
@@ -45,6 +54,8 @@ impl TypeError {
             TypeError::InvalidEscape => "22025",
             TypeError::CannotCast { .. } => "42846",
             TypeError::Domain { sqlstate, .. } => sqlstate,
+            TypeError::InvalidDatetimeFormat { .. } => "22007",
+            TypeError::DatetimeFieldOverflow { .. } => "22008",
         }
     }
 }
@@ -88,6 +99,21 @@ mod tests {
             }
             .sqlstate(),
             "2201E"
+        );
+        assert_eq!(
+            TypeError::InvalidDatetimeFormat {
+                type_name: "date",
+                value: "not-a-date".into(),
+            }
+            .sqlstate(),
+            "22007"
+        );
+        assert_eq!(
+            TypeError::DatetimeFieldOverflow {
+                value: "2023-02-29".into(),
+            }
+            .sqlstate(),
+            "22008"
         );
     }
 }
