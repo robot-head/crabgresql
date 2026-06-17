@@ -48,6 +48,9 @@ pub enum ExecError {
         left: usize,
         right: usize,
     },
+    /// SP38: an `ORDER BY <n>` positional reference is 0 or past the number of
+    /// output columns (42P10 — invalid_column_reference).
+    InvalidColumnReference(String),
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -109,6 +112,7 @@ impl ExecError {
                     format!("each {op_name} query must have the same number of columns"),
                 )
             }
+            ExecError::InvalidColumnReference(m) => PgError::error("42P10", m),
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",
                 format!("missing FROM-clause entry for table \"{t}\""),

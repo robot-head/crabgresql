@@ -66,13 +66,16 @@ pub(crate) fn execute_set_operation(
 /// otherwise evaluate against the output scope (output column name / expression).
 fn order_key(expr: &Expr, scope: &Scope, row: &[Datum], ctx: &EvalCtx) -> Result<Datum, ExecError> {
     if let Expr::IntLiteral(s) = expr {
-        let pos: usize = s
-            .parse()
-            .map_err(|_| ExecError::Unsupported(format!("invalid ORDER BY position {s}")))?;
+        // PG: a positional ORDER BY out of range is 42P10 (invalid_column_reference),
+        // not 0A000 — the feature IS supported, the position is just invalid.
+        let pos: usize = s.parse().map_err(|_| {
+            ExecError::InvalidColumnReference(format!(
+                "ORDER BY position {s} is not in select list"
+            ))
+        })?;
         if pos == 0 || pos > scope.width() {
-            return Err(ExecError::Unsupported(format!(
-                "ORDER BY position {pos} is out of range (1..{})",
-                scope.width()
+            return Err(ExecError::InvalidColumnReference(format!(
+                "ORDER BY position {pos} is not in select list"
             )));
         }
         return Ok(row[pos - 1].clone());
@@ -422,5 +425,22 @@ mod tests {
             vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()],
             "UNION should dedup and order: [1, 2, 3]"
         );
+    }
+
+    /// A positional ORDER BY past the number of output columns is PG 42P10
+    /// (invalid_column_reference), NOT 0A000.
+    #[tokio::test]
+    async fn order_by_position_out_of_range_is_42p10() {
+        use pgwire::engine::{Engine, Session};
+
+        use crate::SqlEngine;
+
+        let engine = SqlEngine::new();
+        let err = engine
+            .connect()
+            .simple_query("SELECT 1 UNION SELECT 2 ORDER BY 5")
+            .await
+            .expect_err("out-of-range ORDER BY position");
+        assert_eq!(err.code, "42P10");
     }
 }
