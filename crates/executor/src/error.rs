@@ -40,6 +40,12 @@ pub enum ExecError {
     /// A subquery used as an expression / IN / quantified source returned more than
     /// one column (42601).
     SubqueryColumns,
+    /// SP38: the branches of a UNION/INTERSECT/EXCEPT have different column counts
+    /// (42601).
+    SetOpColumnCount {
+        left: usize,
+        right: usize,
+    },
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -88,6 +94,13 @@ impl ExecError {
             ExecError::SubqueryColumns => {
                 PgError::error("42601", "subquery must return only one column")
             }
+            ExecError::SetOpColumnCount { left, right } => PgError::error(
+                "42601",
+                format!(
+                    "each UNION/INTERSECT/EXCEPT query must have the same number of columns \
+                     (got {left} and {right})"
+                ),
+            ),
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",
                 format!("missing FROM-clause entry for table \"{t}\""),

@@ -1026,7 +1026,7 @@ fn project_rows_ordered(
                     (keys, r)
                 })
                 .collect();
-            keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+            keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, &s.order_by));
             projected = keyed.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_limit(&mut projected, s.offset, s.limit);
@@ -1042,7 +1042,7 @@ fn project_rows_ordered(
             }
             keyed.push((keys, row));
         }
-        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, &s.order_by));
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
     apply_offset_limit(&mut kept, s.offset, s.limit);
@@ -1208,7 +1208,7 @@ fn derived_name(expr: &Expr) -> String {
     }
 }
 
-fn field(name: &str, ty: ColumnType) -> FieldDescription {
+pub(crate) fn field(name: &str, ty: ColumnType) -> FieldDescription {
     FieldDescription {
         name: name.to_string(),
         table_oid: 0,
@@ -1232,9 +1232,13 @@ pub(crate) fn datum_to_cell(d: &Datum, tz: &jiff::tz::TimeZone) -> Option<Cell> 
 
 /// Compare two order-key vectors per the SELECT's ASC/DESC flags, with PG's
 /// default null placement (NULLS LAST for ASC, NULLS FIRST for DESC).
-pub(crate) fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
+pub(crate) fn order_cmp(
+    a: &[Datum],
+    b: &[Datum],
+    order_by: &[pgparser::ast::OrderItem],
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    for (i, item) in s.order_by.iter().enumerate() {
+    for (i, item) in order_by.iter().enumerate() {
         let (x, y) = (&a[i], &b[i]);
         let ord = match (x.is_null(), y.is_null()) {
             (true, true) => Ordering::Equal,

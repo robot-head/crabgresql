@@ -399,6 +399,11 @@ impl SqlSession {
             }
             Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
             Statement::Select(_) => self.run_select(stmt).await,
+            // SP38: real handler lands in Task 6; this temporary arm keeps the
+            // exhaustive match complete so the crate compiles in the interim.
+            Statement::SetOperation(_) => Err(ExecError::Unsupported(
+                "set operations not yet wired (SP38 Task 6)".into(),
+            )),
             // SP37: GUC control. These are NOT exempt from the failed-txn guard
             // above (only COMMIT/ROLLBACK are), so a SET in an aborted block is
             // rejected — matching PostgreSQL.
