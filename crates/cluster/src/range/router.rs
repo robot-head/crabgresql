@@ -305,6 +305,22 @@ impl RangeRouter {
                     )),
                 }
             }
+            // SP38: a set-operation query (UNION / INTERSECT / EXCEPT). Walk every
+            // leaf SELECT in the set-op tree; if they all touch one range, route
+            // there; if they span ranges, reject 0A000.
+            Statement::SetOperation(q) => {
+                let mut ranges = std::collections::BTreeSet::new();
+                collect_set_expr_ranges(self, &q.body, &mut ranges)?;
+                match ranges.len() {
+                    0 => Ok(None),
+                    1 => Ok(Some(
+                        *ranges.iter().next().expect("len()==1 has one element"),
+                    )),
+                    _ => Err(ExecError::Unsupported(
+                        "set operations spanning ranges are not supported".into(),
+                    )),
+                }
+            }
             // DDL, transaction control, and GUC control resolve to range 0 but do
             // not pin: a txn can still be pinned to a data range by a later DML.
             Statement::CreateTable { .. }
@@ -650,6 +666,23 @@ fn collect_select_ranges(
     Ok(())
 }
 
+/// SP38: collect every base-table range a set-operation tree references by walking
+/// each leaf SELECT through `collect_select_ranges`.
+fn collect_set_expr_ranges(
+    router: &RangeRouter,
+    e: &pgparser::ast::SetExpr,
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    use pgparser::ast::SetExpr;
+    match e {
+        SetExpr::Select(s) => collect_select_ranges(router, s, out),
+        SetExpr::SetOp { left, right, .. } => {
+            collect_set_expr_ranges(router, left, out)?;
+            collect_set_expr_ranges(router, right, out)
+        }
+    }
+}
+
 fn collect_table_expr_ranges(
     router: &RangeRouter,
     te: &pgparser::ast::TableExpr,
@@ -928,6 +961,48 @@ mod tests {
                 .scan_one_i32("SELECT id FROM a WHERE id IN (SELECT id FROM a)")
                 .await,
             vec![1]
+        );
+    }
+
+    /// SP38: a set-operation whose branches reference tables on different ranges is
+    /// rejected `0A000` by the router (`pinning_range` walks every leaf SELECT in the
+    /// set-op tree and rejects when more than one range is touched), while a
+    /// co-located set-op (both branches on the same range) routes and executes fine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_range_set_op_is_rejected_while_colocated_runs() {
+        // boundary at table 2: a (id 1) -> range 0, b (id 2) -> range 1.
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        router.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("seed a");
+
+        // Cross-range: a (range 0) UNION b (range 1) -> rejected 0A000.
+        let err = router
+            .simple("SELECT id FROM a UNION SELECT id FROM b")
+            .await
+            .expect_err("cross-range set op rejected");
+        assert_eq!(
+            err.code, "0A000",
+            "a set-op spanning ranges surfaces 0A000, got {err:?}"
+        );
+        assert!(
+            err.message.contains("set operations spanning ranges"),
+            "the router rejected it; got {err:?}"
+        );
+
+        // Co-located: both branches reference range-0 table a -> routes and executes.
+        assert_eq!(
+            router
+                .scan_one_i32("SELECT id FROM a UNION ALL SELECT id FROM a")
+                .await,
+            vec![1, 1]
         );
     }
 
