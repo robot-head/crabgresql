@@ -65,6 +65,12 @@ pub(crate) fn eval(
         Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
             crate::datetime_fn::eval_datetime(fc, ctx, |e| eval(e, scope, values, ctx))
         }
+        // SP38: date/time formatting + constructors + numeric to_char
+        // (to_char/to_timestamp/to_date/make_*/justify_*). Tried after scalar +
+        // datetime, before the aggregate-context error.
+        Expr::Func(fc) if crate::format_fn::is_format_func(&fc.name) => {
+            crate::format_fn::eval_format(fc, ctx, |e| eval(e, scope, values, ctx))
+        }
         Expr::Func(fc) => Err(crate::agg::func_in_scalar_context_error(fc)),
         // SP28: predicate + conditional expressions. The pure-Datum combinators
         // (`eval_in_list`/`eval_between`/`eval_like`/`eval_case`) are shared with
@@ -486,6 +492,10 @@ pub(crate) fn infer_type(expr: &Expr, scope: &Scope) -> Result<ColumnType, ExecE
         // SP37: a date/time function's static result type.
         Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
             crate::datetime_fn::datetime_func_result_type(fc, scope)
+        }
+        // SP38: a formatting/constructor function's static result type.
+        Expr::Func(fc) if crate::format_fn::is_format_func(&fc.name) => {
+            crate::format_fn::format_func_result_type(fc, scope)
         }
         Expr::Func(fc) => crate::agg::func_result_type(fc, scope),
         // SP28: predicates are boolean; CASE unifies its branch result types.
