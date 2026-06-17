@@ -12,6 +12,7 @@ mod datetime_fn;
 mod error;
 mod eval;
 mod exec;
+mod format_fn;
 mod func;
 mod gtm;
 mod join;

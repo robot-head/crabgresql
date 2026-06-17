@@ -262,14 +262,16 @@ fn collect_specs(e: &Expr, scope: &Scope, specs: &mut Vec<AggSpec>) -> Result<()
                 specs.push(spec);
             }
         }
-        // SP29/SP37: a scalar or date/time function may wrap aggregates / grouped
-        // columns — gather aggregates from its arguments (the call itself is not an
-        // aggregate). `max(extract(year from ts))` reaches the aggregate via the
-        // outer scalar/agg traversal; this arm handles a datetime func wrapping an
-        // aggregate (`date_trunc('day', max(ts))`).
+        // SP29/SP37/SP38: a scalar, date/time, or formatting function may wrap
+        // aggregates / grouped columns — gather aggregates from its arguments (the
+        // call itself is not an aggregate). `max(extract(year from ts))` reaches the
+        // aggregate via the outer scalar/agg traversal; this arm handles such a
+        // function wrapping an aggregate (`date_trunc('day', max(ts))`,
+        // `to_char(max(ts), 'YYYY')`).
         Expr::Func(fc)
             if crate::func::is_scalar(&fc.name)
-                || crate::datetime_fn::is_datetime_func(&fc.name) =>
+                || crate::datetime_fn::is_datetime_func(&fc.name)
+                || crate::format_fn::is_format_func(&fc.name) =>
         {
             if let FuncArgs::Exprs(args) = &fc.args {
                 for a in args {
@@ -344,12 +346,13 @@ fn validate_grouped(e: &Expr, group_by: &[Expr]) -> Result<(), ExecError> {
             validate_grouped(left, group_by)?;
             validate_grouped(right, group_by)
         }
-        // SP29/SP37: every argument of a scalar or date/time function must itself be
-        // grouped-valid (the call as a whole, if it matches a GROUP BY key, was
-        // already accepted above).
+        // SP29/SP37/SP38: every argument of a scalar, date/time, or formatting
+        // function must itself be grouped-valid (the call as a whole, if it matches a
+        // GROUP BY key, was already accepted above).
         Expr::Func(fc)
             if crate::func::is_scalar(&fc.name)
-                || crate::datetime_fn::is_datetime_func(&fc.name) =>
+                || crate::datetime_fn::is_datetime_func(&fc.name)
+                || crate::format_fn::is_format_func(&fc.name) =>
         {
             if let FuncArgs::Exprs(args) = &fc.args {
                 for a in args {
@@ -519,6 +522,13 @@ fn eval_grouped(
         // `date_trunc('day', max(ts))`) — same pattern, grouped child-eval closure.
         Expr::Func(fc) if crate::datetime_fn::is_datetime_func(&fc.name) => {
             crate::datetime_fn::eval_datetime(fc, ctx, |e| {
+                eval_grouped(e, scope, group_by, key, specs, results, ctx)
+            })
+        }
+        // SP38: a formatting function over grouped/aggregate arguments (e.g.
+        // `to_char(max(ts), 'YYYY')`) — same pattern, grouped child-eval closure.
+        Expr::Func(fc) if crate::format_fn::is_format_func(&fc.name) => {
+            crate::format_fn::eval_format(fc, ctx, |e| {
                 eval_grouped(e, scope, group_by, key, specs, results, ctx)
             })
         }
@@ -1489,5 +1499,74 @@ mod tests {
         assert!(!is_aggregate_query(&sel(
             "SELECT k FROM t WHERE v > 1 ORDER BY k"
         )));
+    }
+
+    // ---- SP38: format functions compose with aggregates ----
+
+    /// A table with a `timestamp` column `ts` (and the int key `k`), for the
+    /// format-function-over-aggregate composition tests.
+    fn ts_table() -> Table {
+        Table {
+            id: 1,
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "k".into(),
+                    ty: ColumnType::Int4,
+                },
+                Column {
+                    name: "ts".into(),
+                    ty: ColumnType::Timestamp,
+                },
+            ],
+        }
+    }
+
+    fn ts(s: &str) -> Datum {
+        Datum::Timestamp(pgtypes::datetime::parse_timestamp(s).expect("timestamp"))
+    }
+
+    #[test]
+    fn format_func_wrapping_an_aggregate_composes() {
+        // `to_char(max(ts), 'YYYY')`: the format function WRAPS an aggregate.
+        // `ts` lives inside `max(...)`, so it must NOT raise 42803 ("must appear in
+        // GROUP BY"); the aggregate is collected + computed, and `to_char` is applied
+        // to each group's max. Two groups: k=1 max year 2024, k=2 max year 2025.
+        let t = ts_table();
+        let rows = vec![
+            r(&[Datum::Int4(1), ts("2020-03-04 00:00:00")]),
+            r(&[Datum::Int4(1), ts("2024-12-31 23:59:59")]),
+            r(&[Datum::Int4(2), ts("2025-01-01 00:00:00")]),
+        ];
+        assert_eq!(
+            agg_text(
+                "SELECT k, to_char(max(ts), 'YYYY') FROM t GROUP BY k ORDER BY k",
+                Some(&t),
+                rows
+            )
+            .expect("format func over aggregate"),
+            vec![
+                vec![Some("1".into()), Some("2024".into())],
+                vec![Some("2".into()), Some("2025".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_wrapping_a_format_func_composes() {
+        // `max(to_char(ts, 'YYYY'))`: an aggregate WRAPS a format function — the
+        // `to_char(ts, 'YYYY')` text is the aggregated argument. max over the
+        // year-text {"2020", "2024", "2025"} is "2025".
+        let t = ts_table();
+        let rows = vec![
+            r(&[Datum::Int4(1), ts("2020-03-04 00:00:00")]),
+            r(&[Datum::Int4(1), ts("2024-12-31 23:59:59")]),
+            r(&[Datum::Int4(1), ts("2025-01-01 00:00:00")]),
+        ];
+        assert_eq!(
+            agg_text("SELECT max(to_char(ts, 'YYYY')) FROM t", Some(&t), rows)
+                .expect("aggregate over format func"),
+            vec![vec![Some("2025".into())]]
+        );
     }
 }

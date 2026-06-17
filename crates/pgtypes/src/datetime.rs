@@ -917,6 +917,1803 @@ pub fn interval_from_binary(b: &[u8]) -> Result<Interval, TypeError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// SP38: the date/time `to_char` template engine.
+//
+// PostgreSQL's `to_char(timestamp, fmt)` walks the template left-to-right,
+// matching the LONGEST pattern keyword at each point (so `HH24` wins over `HH`,
+// `YYYY` over `YY`), emitting a `"..."`-quoted run or any non-pattern character
+// verbatim, and honoring the `FM` (fill-mode: drop padding/leading-zeros for the
+// next field) and `TH`/`th` (ordinal suffix on the preceding number) modifiers.
+// This module is pure value logic: the executor fills `DateTimeFields` from a
+// `Datum` and calls `format_datetime`.
+// ---------------------------------------------------------------------------
+
+/// Pre-extracted civil fields for the `to_char` date/time engine. The executor
+/// fills this from a `Datum`; a `timestamptz` supplies `tz_offset_secs`, a plain
+/// `timestamp`/`date`/`time` leaves it `None` (so TZ patterns render empty, the
+/// PostgreSQL behavior).
+#[derive(Debug, Clone, Copy)]
+pub struct DateTimeFields {
+    pub year: i32,
+    pub month: u32,         // 1..=12
+    pub day: u32,           // 1..=31
+    pub hour: u32,          // 0..=23
+    pub minute: u32,        // 0..=59
+    pub second: u32,        // 0..=59
+    pub micros: u32,        // 0..=999_999
+    pub iso_dow: u32,       // Mon=1 .. Sun=7   (PG `ID`)
+    pub dow: u32,           // Sun=1 .. Sat=7   (PG `D`)
+    pub doy: u32,           // 1..=366          (PG `DDD`)
+    pub iso_week: u32,      // 1..=53           (PG `IW`)
+    pub iso_year: i32,      // ISO week-numbering year (PG `IYYY`)
+    pub week_of_year: u32,  // (doy-1)/7 + 1    (PG `WW`)
+    pub week_of_month: u32, // (day-1)/7 + 1    (PG `W`)
+    pub tz_offset_secs: Option<i32>,
+}
+
+impl DateTimeFields {
+    /// Build the field struct from a `jiff` civil `DateTime`. `tz_offset_secs` is
+    /// `Some` only when the source value is a `timestamptz` rendered in a zone.
+    pub fn from_civil(dt: DateTime, tz_offset_secs: Option<i32>) -> Self {
+        let date = dt.date();
+        let time = dt.time();
+        let iso = date.iso_week_date();
+        // jiff returns signed civil components (i8/i16); all are non-negative for
+        // a valid in-range datetime, so the `as u32` casts are exact.
+        let doy = date.day_of_year() as u32;
+        let day = date.day() as u32;
+        DateTimeFields {
+            year: i32::from(date.year()),
+            month: date.month() as u32,
+            day,
+            hour: time.hour() as u32,
+            minute: time.minute() as u32,
+            second: time.second() as u32,
+            micros: (time.subsec_nanosecond() / 1_000) as u32,
+            iso_dow: date.weekday().to_monday_one_offset() as u32,
+            dow: date.weekday().to_sunday_zero_offset() as u32 + 1,
+            doy,
+            iso_week: iso.week() as u32,
+            iso_year: i32::from(iso.year()),
+            week_of_year: (doy - 1) / 7 + 1,
+            week_of_month: (day - 1) / 7 + 1,
+            tz_offset_secs,
+        }
+    }
+}
+
+/// The field source the `to_char` renderer reads. Both `DateTimeFields` (a
+/// civil date/time, fields already normalized to `0..=23` hours etc.) and an
+/// interval field-set (PG `interval2tm`: hours may be `≥ 24` or negative, no
+/// meaningful dow/doy/ISO fields) implement it, so `format_datetime` and
+/// `format_interval` share ONE tokenizer/renderer (`match_pattern` + the
+/// `render_tokens` body).
+///
+/// Every numeric getter returns `i64` so an interval's un-normalized hour count
+/// (e.g. `36`, or a negative offset) is representable; `DateTimeFields` widens
+/// its narrow civil fields losslessly.
+trait FieldSource {
+    fn year(&self) -> i64;
+    fn month(&self) -> i64; // 1..=12 for a datetime; 0..=11 (months % 12) for an interval
+    fn day(&self) -> i64;
+    fn hour(&self) -> i64; // 0..=23 for a datetime; may be ≥ 24 / negative for an interval
+    fn minute(&self) -> i64;
+    fn second(&self) -> i64;
+    fn micros(&self) -> i64; // 0..=999_999 sub-second microseconds
+    fn iso_dow(&self) -> i64;
+    fn dow(&self) -> i64;
+    fn doy(&self) -> i64;
+    fn iso_week(&self) -> i64;
+    fn iso_year(&self) -> i64;
+    fn week_of_year(&self) -> i64;
+    fn week_of_month(&self) -> i64;
+    fn tz_offset_secs(&self) -> Option<i32>;
+
+    /// Index into the 12-entry month-name/Roman tables. A datetime's `month` is
+    /// always `1..=12`; an interval's `months % 12` can be `0..=11` (or negative),
+    /// so this maps the raw value into `0..=11` rather than panicking on an
+    /// out-of-range subscript. (Month NAMES on an interval are not a corpus case;
+    /// this just keeps the shared renderer total — see Task 9.)
+    fn month_name_index(&self) -> usize {
+        (self.month().rem_euclid(12)) as usize
+    }
+
+    /// Index into the 7-entry day-name table (`DAY_NAMES`, 0 = Sunday). A datetime's
+    /// `dow` is `1..=7`; an interval has no day-of-week, so this clamps into range
+    /// to keep the renderer total (day NAMES on an interval are not a corpus case).
+    fn day_name_index(&self) -> usize {
+        ((self.dow() - 1).rem_euclid(7)) as usize
+    }
+}
+
+impl FieldSource for DateTimeFields {
+    fn year(&self) -> i64 {
+        i64::from(self.year)
+    }
+    fn month(&self) -> i64 {
+        i64::from(self.month)
+    }
+    fn day(&self) -> i64 {
+        i64::from(self.day)
+    }
+    fn hour(&self) -> i64 {
+        i64::from(self.hour)
+    }
+    fn minute(&self) -> i64 {
+        i64::from(self.minute)
+    }
+    fn second(&self) -> i64 {
+        i64::from(self.second)
+    }
+    fn micros(&self) -> i64 {
+        i64::from(self.micros)
+    }
+    fn iso_dow(&self) -> i64 {
+        i64::from(self.iso_dow)
+    }
+    fn dow(&self) -> i64 {
+        i64::from(self.dow)
+    }
+    fn doy(&self) -> i64 {
+        i64::from(self.doy)
+    }
+    fn iso_week(&self) -> i64 {
+        i64::from(self.iso_week)
+    }
+    fn iso_year(&self) -> i64 {
+        i64::from(self.iso_year)
+    }
+    fn week_of_year(&self) -> i64 {
+        i64::from(self.week_of_year)
+    }
+    fn week_of_month(&self) -> i64 {
+        i64::from(self.week_of_month)
+    }
+    fn tz_offset_secs(&self) -> Option<i32> {
+        self.tz_offset_secs
+    }
+    // For a datetime, `month`/`dow` are in range, so the default index maps are
+    // exact (`month - 1 == month.rem_euclid(12)` for 1..=12, etc.); we override
+    // to make that obvious and avoid relying on the wrap path.
+    fn month_name_index(&self) -> usize {
+        (self.month - 1) as usize
+    }
+    fn day_name_index(&self) -> usize {
+        (self.dow - 1) as usize
+    }
+}
+
+/// The interval field-set for the `to_char(interval, fmt)` renderer, mirroring
+/// PostgreSQL `interval2tm`: the stored `months`/`days`/`micros` are read
+/// component-wise WITHOUT normalizing across the day/month boundary —
+/// `year = months / 12`, `month = months % 12`, `day = days`, and from `micros`
+/// `hour = micros / 3_600_000_000` (which may be `≥ 24` or negative), then
+/// minute/second/sub-second from the remainder.
+struct IntervalFields {
+    months: i64,
+    days: i64,
+    micros: i64,
+}
+
+impl IntervalFields {
+    fn new(iv: Interval) -> Self {
+        IntervalFields {
+            months: i64::from(iv.months),
+            days: i64::from(iv.days),
+            micros: iv.micros,
+        }
+    }
+}
+
+impl FieldSource for IntervalFields {
+    fn year(&self) -> i64 {
+        self.months / 12
+    }
+    fn month(&self) -> i64 {
+        self.months % 12
+    }
+    fn day(&self) -> i64 {
+        self.days
+    }
+    fn hour(&self) -> i64 {
+        // PG `interval2tm`: hours are NOT folded into days — `36 h` stays `36`.
+        self.micros / 3_600_000_000
+    }
+    fn minute(&self) -> i64 {
+        (self.micros / 60_000_000) % 60
+    }
+    fn second(&self) -> i64 {
+        (self.micros / 1_000_000) % 60
+    }
+    fn micros(&self) -> i64 {
+        // Sub-second microseconds; the sign rides along on negative intervals.
+        self.micros % 1_000_000
+    }
+    // An interval has no calendar day-of-week / day-of-year / ISO week fields.
+    // PG's `to_char(interval, …)` leaves these as the raw `tm` defaults (0); we
+    // return 0 so a numeric ISO/dow/doy pattern renders its zero rather than
+    // panicking — these patterns are not part of the interval corpus (Task 9).
+    fn iso_dow(&self) -> i64 {
+        0
+    }
+    fn dow(&self) -> i64 {
+        0
+    }
+    fn doy(&self) -> i64 {
+        0
+    }
+    fn iso_week(&self) -> i64 {
+        0
+    }
+    fn iso_year(&self) -> i64 {
+        0
+    }
+    fn week_of_year(&self) -> i64 {
+        0
+    }
+    fn week_of_month(&self) -> i64 {
+        0
+    }
+    fn tz_offset_secs(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// The Roman-numeral month table (1-indexed: `ROMAN_MONTHS[m-1]`).
+const ROMAN_MONTHS: [&str; 12] = [
+    "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+];
+
+/// Full English month names (1-indexed). C/English locale only — `TM` (locale
+/// translation) is out of scope for this slice.
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Full English day names (index 0 = Sunday .. 6 = Saturday).
+const DAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// The date/time `to_char` engine: render `template` from the pre-extracted
+/// `fields`. Returns `Err(TypeError)` only on an internal range failure; an
+/// unrecognized character is emitted literally (PostgreSQL behavior), never an
+/// error.
+pub fn format_datetime(template: &str, fields: &DateTimeFields) -> Result<String, TypeError> {
+    render_tokens(template, fields)
+}
+
+/// The `to_char(interval, fmt)` engine: render `template` from an interval's
+/// STORED `months`/`days`/`micros` (PG `interval2tm` — clock fields are NOT
+/// normalized across the day/month boundary, so e.g. `HH24` of a `36 hour`
+/// interval is `36`). Shares the exact tokenizer/renderer as `format_datetime`
+/// via the `FieldSource` indirection.
+pub fn format_interval(iv: Interval, template: &str) -> Result<String, TypeError> {
+    render_tokens(template, &IntervalFields::new(iv))
+}
+
+/// The shared `to_char` tokenizer/renderer: walk `template` left-to-right,
+/// longest-pattern-match at each point, honoring quoted runs, `FM`, and `TH`/`th`.
+/// The field VALUES come from `src` (a civil datetime or an interval), so the same
+/// engine serves `to_char(timestamp, …)` and `to_char(interval, …)`.
+fn render_tokens(template: &str, src: &dyn FieldSource) -> Result<String, TypeError> {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    // `fill_mode` is the one-shot FM flag: it suppresses padding/leading-zeros for
+    // the NEXT pattern, then resets.
+    let mut fill_mode = false;
+    // The value of the most-recently-rendered numeric pattern, for a following
+    // `TH`/`th` ordinal suffix. `None` if the previous token was not numeric.
+    let mut last_number: Option<i64> = None;
+
+    while i < chars.len() {
+        // A `"`-quoted literal run: emit verbatim, honoring `\"` and `\\`.
+        if chars[i] == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            // Skip the closing quote — but only an ACTUAL `"` (an unterminated
+            // run stops at end-of-input, where there is nothing to skip).
+            if chars.get(i) == Some(&'"') {
+                i += 1;
+            }
+            last_number = None;
+            continue;
+        }
+
+        // `FM`: set the one-shot fill-mode flag (it modifies the NEXT pattern).
+        if matches_at(&chars, i, "FM") {
+            fill_mode = true;
+            i += 2;
+            continue;
+        }
+
+        // `TH`/`th`: ordinal suffix on the preceding number (no-op otherwise).
+        if let Some(n) = last_number
+            && (matches_at(&chars, i, "TH") || matches_at(&chars, i, "th"))
+        {
+            let upper = chars[i] == 'T';
+            out.push_str(&ordinal_suffix(n, upper));
+            i += 2;
+            last_number = None;
+            continue;
+        }
+
+        // Try the longest matching pattern keyword.
+        if let Some((kw, rendered, number)) = match_pattern(&chars, i, src, fill_mode)? {
+            out.push_str(&rendered);
+            last_number = number;
+            fill_mode = false;
+            i += kw;
+            continue;
+        }
+
+        // No pattern matched: emit the character literally.
+        out.push(chars[i]);
+        last_number = None;
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Does `chars[i..]` start with the ASCII keyword `kw` (exact, case-sensitive)?
+fn matches_at(chars: &[char], i: usize, kw: &str) -> bool {
+    let kw: Vec<char> = kw.chars().collect();
+    if i + kw.len() > chars.len() {
+        return false;
+    }
+    chars[i..i + kw.len()] == kw[..]
+}
+
+/// The English ordinal suffix (`st`/`nd`/`rd`/`th`) for `n`, upper- or
+/// lower-cased per the `TH` vs `th` spelling. PostgreSQL keys the suffix off the
+/// last two decimal digits (so 11/12/13 → `th`).
+fn ordinal_suffix(n: i64, upper: bool) -> String {
+    let abs = n.unsigned_abs() % 100;
+    let s = if (11..=13).contains(&abs) {
+        "th"
+    } else {
+        match abs % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    if upper {
+        s.to_ascii_uppercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Zero-pad `value` to `width` unless `fm` (fill-mode) is set, in which case the
+/// natural (un-padded) decimal is returned. Negative values keep their sign.
+fn pad_num(value: i64, width: usize, fm: bool) -> String {
+    if fm {
+        value.to_string()
+    } else if value < 0 {
+        format!("-{:0width$}", value.unsigned_abs(), width = width)
+    } else {
+        format!("{value:0width$}")
+    }
+}
+
+/// Blank-pad `name` to `width` on the RIGHT unless `fm` is set (PG pads month/day
+/// names to a fixed 9-char field). Always returns the trimmed name under FM.
+fn pad_name(name: &str, width: usize, fm: bool) -> String {
+    if fm {
+        name.to_string()
+    } else {
+        format!("{name:<width$}")
+    }
+}
+
+/// Blank-pad a Roman-numeral month on the RIGHT to width 4 (PG LEFT-justifies
+/// `RM`/`rm` in a field as wide as the widest numeral, "VIII" — oracle-confirmed,
+/// PG 18: `RM` for January → `'I   '`, for March → `'III '`); `fm` strips it.
+fn pad_roman(numeral: &str, fm: bool) -> String {
+    if fm {
+        numeral.to_string()
+    } else {
+        format!("{numeral:<4}")
+    }
+}
+
+/// Render the meridiem string variants. `lower` lowercases; `dotted` inserts the
+/// dots (`A.M.`/`P.M.`). `hour` is `i64` so the shared renderer also serves an
+/// interval source (where AM/PM has no clock meaning — not a corpus case); for a
+/// civil `0..=23` hour the `>= 12` test is unchanged.
+fn meridiem(hour: i64, lower: bool, dotted: bool) -> String {
+    let pm = hour >= 12;
+    let s = match (pm, dotted) {
+        (false, false) => "AM",
+        (true, false) => "PM",
+        (false, true) => "A.M.",
+        (true, true) => "P.M.",
+    };
+    if lower {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Render the era string variants (`AD`/`BC`, dotted, lowercase). PostgreSQL uses
+/// `AD` for year > 0 and `BC` for year ≤ 0.
+fn era(year: i32, lower: bool, dotted: bool) -> String {
+    let bc = year <= 0;
+    let s = match (bc, dotted) {
+        (false, false) => "AD",
+        (true, false) => "BC",
+        (false, true) => "A.D.",
+        (true, true) => "B.C.",
+    };
+    if lower {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Case-fold a name per the pattern's casing: `Title` (first upper), `UPPER`, or
+/// `lower`. `style` is the matched keyword's casing template.
+#[derive(Clone, Copy)]
+enum NameCase {
+    Title,
+    Upper,
+    Lower,
+}
+
+fn cased(name: &str, case: NameCase) -> String {
+    match case {
+        NameCase::Title => name.to_string(), // table entries are already Title-case
+        NameCase::Upper => name.to_ascii_uppercase(),
+        NameCase::Lower => name.to_ascii_lowercase(),
+    }
+}
+
+/// 12-hour clock hour for `HH`/`HH12`: `((h + 11) % 12) + 1` (so 0→12, 13→1).
+/// `hour` is `i64` so the shared renderer also serves an interval source (where
+/// `HH`/`HH12` has no clock meaning — not a corpus case); `rem_euclid` keeps the
+/// result in `1..=12` for any input, matching the civil `0..=23` mapping exactly.
+fn hour12(hour: i64) -> i64 {
+    (hour + 11).rem_euclid(12) + 1
+}
+
+/// Render the `±HH` / `±HH:MM` etc. timezone forms from an offset in seconds.
+/// `secs` is the signed UTC offset. The returned string carries the sign.
+fn offset_hh(secs: i32) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let h = secs.unsigned_abs() / 3600;
+    format!("{sign}{h:02}")
+}
+
+/// Try to match the longest pattern keyword at `chars[i..]`. On a match, returns
+/// `Some((consumed_len, rendered_text, numeric_value_for_TH))`. A non-match is
+/// `Ok(None)`. `fm` is the one-shot fill-mode flag for the keyword being matched.
+fn match_pattern(
+    chars: &[char],
+    i: usize,
+    f: &dyn FieldSource,
+    fm: bool,
+) -> Result<Option<(usize, String, Option<i64>)>, TypeError> {
+    // -- year (longest first) --
+    if matches_at(chars, i, "YYYY") {
+        return Ok(Some((4, pad_num(f.year(), 4, fm), Some(f.year()))));
+    }
+    if matches_at(chars, i, "YYY") {
+        let v = f.year().rem_euclid(1000);
+        return Ok(Some((3, pad_num(v, 3, fm), Some(v))));
+    }
+    // `Y,YYY`: comma-grouped 4-digit year (the comma grouping is kept even under
+    // FM; PG's FM only suppresses leading zeros, not the group separator).
+    if matches_at(chars, i, "Y,YYY") {
+        let y = f.year();
+        let s = format!("{},{:03}", y / 1000, (y % 1000).abs());
+        return Ok(Some((5, s, Some(y))));
+    }
+    if matches_at(chars, i, "YY") {
+        let v = f.year().rem_euclid(100);
+        return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
+    }
+    if matches_at(chars, i, "Y") {
+        let v = f.year().rem_euclid(10);
+        return Ok(Some((1, pad_num(v, 1, fm), Some(v))));
+    }
+    // -- ISO patterns (longest first so `IDDD`/`IYYY` win over `IY`/`IW`/`ID`/`I`) --
+    if matches_at(chars, i, "IDDD") {
+        // ISO day-of-year: (iso_week - 1) * 7 + iso_dow.
+        let v = (f.iso_week() - 1) * 7 + f.iso_dow();
+        return Ok(Some((4, pad_num(v, 3, fm), Some(v))));
+    }
+    if matches_at(chars, i, "IYYY") {
+        return Ok(Some((4, pad_num(f.iso_year(), 4, fm), Some(f.iso_year()))));
+    }
+    if matches_at(chars, i, "IYY") {
+        let v = f.iso_year().rem_euclid(1000);
+        return Ok(Some((3, pad_num(v, 3, fm), Some(v))));
+    }
+    if matches_at(chars, i, "IW") {
+        return Ok(Some((2, pad_num(f.iso_week(), 2, fm), Some(f.iso_week()))));
+    }
+    if matches_at(chars, i, "IY") {
+        let v = f.iso_year().rem_euclid(100);
+        return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
+    }
+    if matches_at(chars, i, "ID") {
+        let v = f.iso_dow();
+        return Ok(Some((2, v.to_string(), Some(v))));
+    }
+    if matches_at(chars, i, "I") {
+        let v = f.iso_year().rem_euclid(10);
+        return Ok(Some((1, pad_num(v, 1, fm), Some(v))));
+    }
+    // -- century --
+    if matches_at(chars, i, "CC") {
+        // Century of year Y: `ceil(Y/100)` for AD years (Y ≥ 1 → `(Y+99)/100`),
+        // and the floor form `(Y-99)/100` for Y ≤ 0 (BC / proleptic year 0). The
+        // test is written `y < 1` (not `y > 0`) so the boundary year 1 — which the
+        // two branches map to 1 vs 0 — makes the comparison observable (a year-1
+        // unit test pins it).
+        let y = f.year();
+        let c = if y < 1 {
+            (y - 99) / 100
+        } else {
+            (y + 99) / 100
+        };
+        return Ok(Some((2, pad_num(c, 2, fm), Some(c))));
+    }
+    // -- era (dotted forms first, then plain; upper before lower) --
+    for (kw, lower, dotted) in [
+        ("A.D.", false, true),
+        ("B.C.", false, true),
+        ("a.d.", true, true),
+        ("b.c.", true, true),
+        ("AD", false, false),
+        ("BC", false, false),
+        ("ad", true, false),
+        ("bc", true, false),
+    ] {
+        if matches_at(chars, i, kw) {
+            return Ok(Some((
+                kw.chars().count(),
+                era(f.year() as i32, lower, dotted),
+                None,
+            )));
+        }
+    }
+    // -- month --
+    if matches_at(chars, i, "MM") {
+        return Ok(Some((2, pad_num(f.month(), 2, fm), Some(f.month()))));
+    }
+    for (kw, case) in [
+        ("Month", NameCase::Title),
+        ("MONTH", NameCase::Upper),
+        ("month", NameCase::Lower),
+    ] {
+        if matches_at(chars, i, kw) {
+            let name = cased(MONTH_NAMES[f.month_name_index()], case);
+            return Ok(Some((5, pad_name(&name, 9, fm), None)));
+        }
+    }
+    for (kw, case) in [
+        ("Mon", NameCase::Title),
+        ("MON", NameCase::Upper),
+        ("mon", NameCase::Lower),
+    ] {
+        if matches_at(chars, i, kw) {
+            let name = cased(&MONTH_NAMES[f.month_name_index()][..3], case);
+            return Ok(Some((3, name, None)));
+        }
+    }
+    // `RM`/`rm`: PostgreSQL left-justifies the Roman month numeral in a width-4
+    // field (the widest is "VIII"); `FM` strips that padding.
+    if matches_at(chars, i, "RM") {
+        return Ok(Some((
+            2,
+            pad_roman(ROMAN_MONTHS[f.month_name_index()], fm),
+            None,
+        )));
+    }
+    if matches_at(chars, i, "rm") {
+        let lower = ROMAN_MONTHS[f.month_name_index()].to_ascii_lowercase();
+        return Ok(Some((2, pad_roman(&lower, fm), None)));
+    }
+    // -- day (DDD before DD before D; the ISO `IDDD`/`ID` are handled above) --
+    if matches_at(chars, i, "DDD") {
+        return Ok(Some((3, pad_num(f.doy(), 3, fm), Some(f.doy()))));
+    }
+    if matches_at(chars, i, "DD") {
+        return Ok(Some((2, pad_num(f.day(), 2, fm), Some(f.day()))));
+    }
+    for (kw, case) in [
+        ("Day", NameCase::Title),
+        ("DAY", NameCase::Upper),
+        ("day", NameCase::Lower),
+    ] {
+        if matches_at(chars, i, kw) {
+            let name = cased(DAY_NAMES[f.day_name_index()], case);
+            return Ok(Some((3, pad_name(&name, 9, fm), None)));
+        }
+    }
+    for (kw, case) in [
+        ("Dy", NameCase::Title),
+        ("DY", NameCase::Upper),
+        ("dy", NameCase::Lower),
+    ] {
+        if matches_at(chars, i, kw) {
+            let name = cased(&DAY_NAMES[f.day_name_index()][..3], case);
+            return Ok(Some((2, name, None)));
+        }
+    }
+    if matches_at(chars, i, "D") {
+        let v = f.dow();
+        return Ok(Some((1, v.to_string(), Some(v))));
+    }
+    // -- week / quarter (the ISO `IW` is handled in the ISO group above) --
+    if matches_at(chars, i, "WW") {
+        return Ok(Some((
+            2,
+            pad_num(f.week_of_year(), 2, fm),
+            Some(f.week_of_year()),
+        )));
+    }
+    if matches_at(chars, i, "W") {
+        let v = f.week_of_month();
+        return Ok(Some((1, v.to_string(), Some(v))));
+    }
+    if matches_at(chars, i, "Q") {
+        let v = (f.month() - 1) / 3 + 1;
+        return Ok(Some((1, v.to_string(), Some(v))));
+    }
+    // -- time (HH24 before HH12/HH; SSSSS before SSSS before SS) --
+    if matches_at(chars, i, "HH24") {
+        return Ok(Some((4, pad_num(f.hour(), 2, fm), Some(f.hour()))));
+    }
+    if matches_at(chars, i, "HH12") {
+        let v = hour12(f.hour());
+        return Ok(Some((4, pad_num(v, 2, fm), Some(v))));
+    }
+    if matches_at(chars, i, "HH") {
+        let v = hour12(f.hour());
+        return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
+    }
+    if matches_at(chars, i, "MI") {
+        return Ok(Some((2, pad_num(f.minute(), 2, fm), Some(f.minute()))));
+    }
+    // `SSSS`/`SSSSS` (seconds past midnight): PostgreSQL does NOT zero-pad these
+    // (e.g. `00:00:05` → `5`, not `0005`); they render as a bare decimal.
+    if matches_at(chars, i, "SSSSS") {
+        let v = f.hour() * 3600 + f.minute() * 60 + f.second();
+        return Ok(Some((5, v.to_string(), Some(v))));
+    }
+    if matches_at(chars, i, "SSSS") {
+        let v = f.hour() * 3600 + f.minute() * 60 + f.second();
+        return Ok(Some((4, v.to_string(), Some(v))));
+    }
+    if matches_at(chars, i, "SS") {
+        return Ok(Some((2, pad_num(f.second(), 2, fm), Some(f.second()))));
+    }
+    if matches_at(chars, i, "MS") {
+        // Milliseconds: micros / 1000, 3 digits.
+        let v = f.micros() / 1000;
+        return Ok(Some((2, pad_num(v, 3, fm), Some(v))));
+    }
+    if matches_at(chars, i, "US") {
+        let v = f.micros();
+        return Ok(Some((2, pad_num(v, 6, fm), Some(v))));
+    }
+    // FF1..FF6: fractional seconds to N digits.
+    if matches_at(chars, i, "FF") && i + 2 < chars.len() && chars[i + 2].is_ascii_digit() {
+        let n = (chars[i + 2] as u8 - b'0') as usize;
+        if (1..=6).contains(&n) {
+            // Six-digit micros, take the first `n` digits.
+            let full = format!("{:06}", f.micros());
+            return Ok(Some((3, full[..n].to_string(), None)));
+        }
+    }
+    // -- meridiem (dotted forms before plain; upper before lower) --
+    for (kw, lower, dotted) in [
+        ("A.M.", false, true),
+        ("P.M.", false, true),
+        ("a.m.", true, true),
+        ("p.m.", true, true),
+        ("AM", false, false),
+        ("PM", false, false),
+        ("am", true, false),
+        ("pm", true, false),
+    ] {
+        if matches_at(chars, i, kw) {
+            return Ok(Some((
+                kw.chars().count(),
+                meridiem(f.hour(), lower, dotted),
+                None,
+            )));
+        }
+    }
+    // -- timezone (only with an offset present; else empty) --
+    if matches_at(chars, i, "TZH") {
+        let s = match f.tz_offset_secs() {
+            Some(secs) => offset_hh(secs),
+            None => String::new(),
+        };
+        return Ok(Some((3, s, None)));
+    }
+    if matches_at(chars, i, "TZM") {
+        let s = match f.tz_offset_secs() {
+            Some(secs) => format!("{:02}", (secs.unsigned_abs() % 3600) / 60),
+            None => String::new(),
+        };
+        return Ok(Some((3, s, None)));
+    }
+    if matches_at(chars, i, "OF") {
+        let s = match f.tz_offset_secs() {
+            Some(secs) => {
+                let mins = (secs.unsigned_abs() % 3600) / 60;
+                if mins == 0 {
+                    offset_hh(secs)
+                } else {
+                    format!("{}:{:02}", offset_hh(secs), mins)
+                }
+            }
+            None => String::new(),
+        };
+        return Ok(Some((2, s, None)));
+    }
+    if matches_at(chars, i, "TZ") || matches_at(chars, i, "tz") {
+        let s = match f.tz_offset_secs() {
+            Some(secs) => offset_hh(secs),
+            None => String::new(),
+        };
+        return Ok(Some((2, s, None)));
+    }
+    Ok(None)
+}
+
+/// The fields extracted by a template-driven parse (`to_timestamp`/`to_date`).
+/// Separate from `DateTimeFields` (which is for FORMATTING): this is the OUTPUT of
+/// parsing, holding whatever fields the template/input supplied, with PostgreSQL's
+/// defaults filled in for the rest. The caller (the executor) builds a jiff
+/// `Date`/`DateTime` from these fields, where the final civil-validity check (e.g.
+/// Feb 30) is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedDateTime {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub micros: u32,
+    pub tz_offset_secs: Option<i32>,
+}
+
+impl Default for ParsedDateTime {
+    /// PostgreSQL's defaults for fields no template pattern supplies: year 1,
+    /// month 1, day 1, all clock fields 0, no timezone.
+    fn default() -> Self {
+        ParsedDateTime {
+            year: 1,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            micros: 0,
+            tz_offset_secs: None,
+        }
+    }
+}
+
+/// Which half-of-day a meridiem pattern (`AM`/`PM`, dotted/lower) selected, so the
+/// 12-hour `HH12`/`HH` value can be converted to 24-hour AFTER the whole input is
+/// scanned (the meridiem may appear before or after the hour in the template).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Meridiem {
+    Am,
+    Pm,
+}
+
+/// Template-driven parse for `to_timestamp`/`to_date`. Tokenizes `template` with the
+/// SAME longest-match pattern recognition as the format engine (`matches_at`), then
+/// for each pattern consumes the corresponding piece of `input`: a numeric pattern
+/// consumes up to its max width of leading ASCII digits; a name pattern
+/// (`Mon`/`Month`) matches a month name case-insensitively; literal template chars
+/// are matched leniently (PostgreSQL largely ignores separators — a non-alphanumeric
+/// template char skips a run of non-alphanumeric input chars). Returns a
+/// `ParsedDateTime` with PG defaults for absent fields (year 1, month/day 1, time 0).
+/// Bad shape (a non-digit where a number is required, an unrecognized name) → 22007
+/// (`InvalidDatetimeFormat`); an out-of-range field (month 13, hour 24, …) → 22008
+/// (`DatetimeFieldOverflow`).
+pub fn parse_by_template(template: &str, input: &str) -> Result<ParsedDateTime, TypeError> {
+    let tchars: Vec<char> = template.chars().collect();
+    let ichars: Vec<char> = input.chars().collect();
+    let mut ti = 0usize; // cursor into the template
+    let mut ii = 0usize; // cursor into the input
+
+    let mut out = ParsedDateTime::default();
+    // Track whether a meridiem pattern was present and which half it selected, so we
+    // can fold the 12-hour clock to 24-hour after the full scan.
+    let mut meridiem: Option<Meridiem> = None;
+
+    let bad_shape = || TypeError::InvalidDatetimeFormat {
+        type_name: "timestamp",
+        value: input.to_string(),
+    };
+    let out_of_range = |what: &str, v: i64| TypeError::DatetimeFieldOverflow {
+        value: format!("{what}={v}"),
+    };
+
+    while ti < tchars.len() {
+        // A `"`-quoted literal run in the template: each char inside the quotes is a
+        // literal matched against the input the same way a bare literal char is — an
+        // alphanumeric must match (case-insensitively, else tolerated), a separator
+        // skips a run of input separators (PG's lenient literal matching).
+        if tchars[ti] == '"' {
+            ti += 1;
+            while ti < tchars.len() && tchars[ti] != '"' {
+                let lit = if tchars[ti] == '\\' && ti + 1 < tchars.len() {
+                    ti += 2;
+                    tchars[ti - 1]
+                } else {
+                    let c = tchars[ti];
+                    ti += 1;
+                    c
+                };
+                match_literal(lit, &ichars, &mut ii);
+            }
+            if tchars.get(ti) == Some(&'"') {
+                ti += 1;
+            }
+            continue;
+        }
+        // `FM` is a no-op for parsing (it only affects formatting fill).
+        if matches_at(&tchars, ti, "FM") {
+            ti += 2;
+            continue;
+        }
+
+        if let Some((consumed, field)) = match_parse_pattern(&tchars, ti) {
+            match field {
+                ParseField::Num { max, set } => {
+                    let v = consume_number(&ichars, &mut ii, max).ok_or_else(bad_shape)?;
+                    set(&mut out, v);
+                }
+                ParseField::MonthAbbrev => {
+                    let m = consume_month_name(&ichars, &mut ii, true).ok_or_else(bad_shape)?;
+                    out.month = m;
+                }
+                ParseField::MonthFull => {
+                    let m = consume_month_name(&ichars, &mut ii, false).ok_or_else(bad_shape)?;
+                    out.month = m;
+                }
+                ParseField::DayNameSkip { len } => {
+                    // A day-of-week NAME pattern (`Day`/`Dy`) does not set a value;
+                    // skip a run of input letters (PG accepts and ignores it).
+                    consume_day_name(&ichars, &mut ii, len);
+                }
+                ParseField::Meridiem => {
+                    meridiem = Some(consume_meridiem(&ichars, &mut ii).ok_or_else(bad_shape)?);
+                }
+            }
+            ti += consumed;
+            continue;
+        }
+
+        // A bare literal template char (matched leniently — see `match_literal`).
+        match_literal(tchars[ti], &ichars, &mut ii);
+        ti += 1;
+    }
+
+    // Fold the 12-hour clock to 24-hour if a meridiem pattern was present.
+    if let Some(m) = meridiem {
+        // PG only treats the hour as a 12-hour value when an HH12/HH pattern fed it;
+        // 12 AM → 0, 12 PM → 12, otherwise +12 for PM. (If no HH12 pattern set the
+        // hour, a stray AM/PM still applies the standard conversion to whatever hour
+        // value is present, matching PG's `tm` post-processing.)
+        let h = out.hour % 12; // 12 → 0
+        out.hour = match m {
+            Meridiem::Am => h,
+            Meridiem::Pm => h + 12,
+        };
+    }
+
+    // Range-validate the assembled fields. Full civil validity (Feb 30, etc.) is the
+    // caller's job; here we reject a clearly out-of-range single field.
+    if !(1..=12).contains(&out.month) {
+        return Err(out_of_range("month", out.month as i64));
+    }
+    if !(1..=31).contains(&out.day) {
+        return Err(out_of_range("day", out.day as i64));
+    }
+    if out.hour > 23 {
+        return Err(out_of_range("hour", out.hour as i64));
+    }
+    if out.minute > 59 {
+        return Err(out_of_range("minute", out.minute as i64));
+    }
+    if out.second > 59 {
+        return Err(out_of_range("second", out.second as i64));
+    }
+
+    Ok(out)
+}
+
+/// A parse-time pattern: what kind of input piece to consume and how to store it.
+enum ParseField {
+    /// A run of up to `max` leading digits; `set` records it into the right field.
+    Num {
+        max: usize,
+        set: fn(&mut ParsedDateTime, i64),
+    },
+    /// A 3-letter month abbreviation.
+    MonthAbbrev,
+    /// A full month name (longest match).
+    MonthFull,
+    /// A day-of-week name pattern that is accepted but sets no value.
+    DayNameSkip { len: usize },
+    /// An `AM`/`PM` meridiem marker (dotted/lower forms accepted).
+    Meridiem,
+}
+
+/// Recognize the parse pattern at `tchars[ti..]` (longest match), returning the
+/// number of TEMPLATE chars it spans and the field to consume. Mirrors the
+/// formatter's longest-first ordering for the patterns `to_timestamp`/`to_date`
+/// commonly use; unrecognized template text falls through to literal handling.
+fn match_parse_pattern(tchars: &[char], ti: usize) -> Option<(usize, ParseField)> {
+    // Numeric patterns, longest first within each family so `YYYY` beats `YY`, etc.
+    // The `max` is the max digits to consume; PG accepts fewer if a non-digit follows.
+    let num = |max: usize, set: fn(&mut ParsedDateTime, i64)| ParseField::Num { max, set };
+
+    // -- year --
+    if matches_at(tchars, ti, "YYYY") {
+        return Some((4, num(4, |p, v| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "YYY") {
+        return Some((3, num(3, |p, v| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "YY") {
+        return Some((2, num(2, |p, v| p.year = v as i32)));
+    }
+    if matches_at(tchars, ti, "Y") {
+        return Some((1, num(1, |p, v| p.year = v as i32)));
+    }
+    // -- month (numeric, then names; `Month` before `Mon`) --
+    if matches_at(tchars, ti, "MM") {
+        return Some((2, num(2, |p, v| p.month = v as u32)));
+    }
+    if matches_at(tchars, ti, "Month")
+        || matches_at(tchars, ti, "MONTH")
+        || matches_at(tchars, ti, "month")
+    {
+        return Some((5, ParseField::MonthFull));
+    }
+    if matches_at(tchars, ti, "Mon")
+        || matches_at(tchars, ti, "MON")
+        || matches_at(tchars, ti, "mon")
+    {
+        return Some((3, ParseField::MonthAbbrev));
+    }
+    // -- day-of-month / day-of-week name (accepted, sets nothing) --
+    if matches_at(tchars, ti, "DD") {
+        return Some((2, num(2, |p, v| p.day = v as u32)));
+    }
+    if matches_at(tchars, ti, "Day")
+        || matches_at(tchars, ti, "DAY")
+        || matches_at(tchars, ti, "day")
+    {
+        return Some((3, ParseField::DayNameSkip { len: 9 }));
+    }
+    if matches_at(tchars, ti, "Dy") || matches_at(tchars, ti, "DY") || matches_at(tchars, ti, "dy")
+    {
+        return Some((2, ParseField::DayNameSkip { len: 3 }));
+    }
+    // -- time (HH24 before HH12/HH; SS before nothing shorter here) --
+    if matches_at(tchars, ti, "HH24") {
+        return Some((4, num(2, |p, v| p.hour = v as u32)));
+    }
+    if matches_at(tchars, ti, "HH12") {
+        return Some((4, num(2, |p, v| p.hour = v as u32)));
+    }
+    if matches_at(tchars, ti, "HH") {
+        return Some((2, num(2, |p, v| p.hour = v as u32)));
+    }
+    if matches_at(tchars, ti, "MI") {
+        return Some((2, num(2, |p, v| p.minute = v as u32)));
+    }
+    if matches_at(tchars, ti, "SS") {
+        return Some((2, num(2, |p, v| p.second = v as u32)));
+    }
+    if matches_at(tchars, ti, "US") {
+        // Microseconds: up to 6 digits.
+        return Some((2, num(6, |p, v| p.micros = v as u32)));
+    }
+    if matches_at(tchars, ti, "MS") {
+        // Milliseconds: up to 3 digits, scaled to micros.
+        return Some((2, num(3, |p, v| p.micros = (v as u32) * 1000)));
+    }
+    // -- meridiem (dotted forms before plain; either case) --
+    for kw in ["A.M.", "P.M.", "a.m.", "p.m.", "AM", "PM", "am", "pm"] {
+        if matches_at(tchars, ti, kw) {
+            return Some((kw.chars().count(), ParseField::Meridiem));
+        }
+    }
+    None
+}
+
+/// Consume up to `max` leading ASCII digits from `chars` at `*i`, returning the
+/// value. Requires at least one digit (PG: a number-expecting pattern with a
+/// non-digit there is an error) — returns `None` otherwise.
+fn consume_number(chars: &[char], i: &mut usize, max: usize) -> Option<i64> {
+    let start = *i;
+    let mut v: i64 = 0;
+    let mut n = 0usize;
+    while *i < chars.len() && n < max && chars[*i].is_ascii_digit() {
+        v = v * 10 + (chars[*i] as u8 - b'0') as i64;
+        *i += 1;
+        n += 1;
+    }
+    if *i == start { None } else { Some(v) }
+}
+
+/// Consume a month name from `chars` at `*i`, case-insensitively. When `abbrev`,
+/// match a 3-letter abbreviation (the first 3 chars of a `MONTH_NAMES` entry);
+/// otherwise match a full month name (longest match — the input must begin with the
+/// full name). Returns the 1-based month, or `None` if no name matches.
+fn consume_month_name(chars: &[char], i: &mut usize, abbrev: bool) -> Option<u32> {
+    for (idx, name) in MONTH_NAMES.iter().enumerate() {
+        let needle: Vec<char> = if abbrev {
+            name.chars().take(3).collect()
+        } else {
+            name.chars().collect()
+        };
+        if input_starts_with_ci(chars, *i, &needle) {
+            *i += needle.len();
+            return Some(idx as u32 + 1);
+        }
+    }
+    None
+}
+
+/// Skip a day-of-week NAME in the input (accepted but value-less). Matches a known
+/// day name (full or 3-letter abbrev) case-insensitively; if none matches, skips a
+/// run of up to `len` leading letters as a lenient fallback.
+fn consume_day_name(chars: &[char], i: &mut usize, len: usize) {
+    for name in DAY_NAMES.iter() {
+        let full: Vec<char> = name.chars().collect();
+        if input_starts_with_ci(chars, *i, &full) {
+            *i += full.len();
+            return;
+        }
+        let abbrev: Vec<char> = name.chars().take(3).collect();
+        if input_starts_with_ci(chars, *i, &abbrev) {
+            *i += abbrev.len();
+            return;
+        }
+    }
+    // Lenient fallback: skip up to `len` leading alphabetic chars.
+    let mut n = 0;
+    while *i < chars.len() && n < len && chars[*i].is_alphabetic() {
+        *i += 1;
+        n += 1;
+    }
+}
+
+/// Consume an `AM`/`PM` meridiem at `*i` (dotted `A.M.`/`P.M.` and either case
+/// accepted). Returns the half-of-day, or `None` if neither matches.
+fn consume_meridiem(chars: &[char], i: &mut usize) -> Option<Meridiem> {
+    // Dotted forms first (longest match), then plain.
+    for (needle, m) in [
+        ("a.m.", Meridiem::Am),
+        ("p.m.", Meridiem::Pm),
+        ("am", Meridiem::Am),
+        ("pm", Meridiem::Pm),
+    ] {
+        let nchars: Vec<char> = needle.chars().collect();
+        if input_starts_with_ci(chars, *i, &nchars) {
+            *i += nchars.len();
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Does `chars[i..]` begin with `needle` (already a `&[char]`), ASCII-case-insensitive?
+fn input_starts_with_ci(chars: &[char], i: usize, needle: &[char]) -> bool {
+    if i + needle.len() > chars.len() {
+        return false;
+    }
+    chars[i..i + needle.len()]
+        .iter()
+        .zip(needle)
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Advance `*i` over a run of leading non-alphanumeric (separator/whitespace/punct)
+/// input chars. PostgreSQL is lenient about separators between fields, so a literal
+/// template separator matches zero-or-more input separators.
+fn skip_separators(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && !chars[*i].is_alphanumeric() {
+        *i += 1;
+    }
+}
+
+/// Match a single literal template char `lit` against the input at `*i`. An
+/// alphanumeric literal consumes one matching input char (case-insensitive; a
+/// mismatch is tolerated — PG does not hard-fail a literal mismatch — leaving the
+/// cursor in place). A separator/punctuation literal matches leniently: it skips a
+/// run of leading separator chars in the input (PG largely ignores separators, so
+/// e.g. an input `-` matches a template `/`).
+fn match_literal(lit: char, chars: &[char], i: &mut usize) {
+    if lit.is_alphanumeric() {
+        if *i < chars.len() && chars[*i].eq_ignore_ascii_case(&lit) {
+            *i += 1;
+        }
+    } else {
+        skip_separators(chars, i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SP38: `make_*` constructors and `justify_*` normalization.
+//
+// PostgreSQL's `make_date`/`make_time`/`make_timestamp`/`make_interval` build a
+// value from positional numeric fields; an out-of-range field is a
+// `DatetimeFieldOverflow` (22008). The `interval_justify_{days,hours,interval}`
+// functions re-balance an interval's months/days/micros into PG's canonical
+// 30-day-month / 24-hour-day buckets, then sign-normalize so no field's sign
+// disagrees with the whole (`justify_interval`). Pure value helpers — the
+// executor wires them into `make_*`/`justify_*` SQL functions in a later task.
+// ---------------------------------------------------------------------------
+
+/// Map a jiff civil-constructor error (an out-of-range field) to a
+/// `DatetimeFieldOverflow` (22008), labelling the offending field set.
+fn field_overflow(value: impl Into<String>) -> TypeError {
+    TypeError::DatetimeFieldOverflow {
+        value: value.into(),
+    }
+}
+
+/// Split a fractional-seconds `f64` into whole seconds + nanoseconds at µs
+/// resolution (PG stores microseconds, so the nanos are always a multiple of
+/// 1000). Returns `None` when the whole-second part does not fit an `i8` (the
+/// jiff `Time`/`DateTime` second field), which a civil time would reject anyway.
+fn split_seconds(sec: f64) -> Option<(i8, i32)> {
+    if !sec.is_finite() {
+        return None;
+    }
+    let whole = sec.trunc();
+    if !(-128.0..=127.0).contains(&whole) {
+        return None;
+    }
+    let whole = whole as i8;
+    // Fractional part → microseconds (truncate to µs precision), then ×1000 for
+    // jiff's nanosecond field. `.round()` matches PG's `rint` on the µs value.
+    let micros = (sec.fract() * 1_000_000.0).round() as i32;
+    let nanos = micros * 1_000;
+    Some((whole, nanos))
+}
+
+/// `make_date(year, month, day)`. An out-of-range field (month 13, day 0, …) →
+/// 22008 (`DatetimeFieldOverflow`).
+pub fn make_date(year: i32, month: i32, day: i32) -> Result<Date, TypeError> {
+    let label = || format!("{year}-{month}-{day}");
+    let y = i16::try_from(year).map_err(|_| field_overflow(label()))?;
+    let mo = i8::try_from(month).map_err(|_| field_overflow(label()))?;
+    let d = i8::try_from(day).map_err(|_| field_overflow(label()))?;
+    Date::new(y, mo, d).map_err(|_| field_overflow(label()))
+}
+
+/// `make_time(hour, min, sec)`; the fractional part of `sec` becomes microseconds
+/// (PG resolution). An out-of-range field (hour 24, minute 60, …) → 22008.
+pub fn make_time(hour: i32, min: i32, sec: f64) -> Result<Time, TypeError> {
+    let label = || format!("{hour}:{min}:{sec}");
+    let h = i8::try_from(hour).map_err(|_| field_overflow(label()))?;
+    let mi = i8::try_from(min).map_err(|_| field_overflow(label()))?;
+    let (s, nanos) = split_seconds(sec).ok_or_else(|| field_overflow(label()))?;
+    Time::new(h, mi, s, nanos).map_err(|_| field_overflow(label()))
+}
+
+/// Civil-`DateTime` builder shared by `make_timestamp` / `make_timestamptz` (the
+/// executor wraps the time-zone step for the latter). An out-of-range field →
+/// 22008.
+pub fn make_timestamp_civil(
+    y: i32,
+    mo: i32,
+    d: i32,
+    h: i32,
+    mi: i32,
+    sec: f64,
+) -> Result<DateTime, TypeError> {
+    let date = make_date(y, mo, d)?;
+    let time = make_time(h, mi, sec)?;
+    Ok(date.to_datetime(time))
+}
+
+/// `make_interval(years, months, weeks, days, hours, mins, secs)`: weeks fold into
+/// days, years into months, and the clock fields (hours/mins/secs, fractional secs
+/// included) into microseconds. All arithmetic is checked; any field overflow →
+/// 22008.
+pub fn make_interval(
+    years: i32,
+    months: i32,
+    weeks: i32,
+    days: i32,
+    hours: i32,
+    mins: i32,
+    secs: f64,
+) -> Result<Interval, TypeError> {
+    let label = "make_interval";
+    // months = years*12 + months (checked, i32).
+    let months = years
+        .checked_mul(12)
+        .and_then(|m| m.checked_add(months))
+        .ok_or_else(|| field_overflow(label))?;
+    // days = weeks*7 + days (checked, i32).
+    let days = weeks
+        .checked_mul(7)
+        .and_then(|d| d.checked_add(days))
+        .ok_or_else(|| field_overflow(label))?;
+    // micros = (((hours*60 + mins)*60) * 1e6) + round(secs*1e6) (checked, i64).
+    if !secs.is_finite() {
+        return Err(field_overflow(label));
+    }
+    let sec_micros_f = (secs * 1_000_000.0).round();
+    if sec_micros_f.abs() >= 9_223_372_036_854_775_808.0_f64 {
+        return Err(field_overflow(label));
+    }
+    let sec_micros = sec_micros_f as i64;
+    let micros = (i64::from(hours) * 60 + i64::from(mins))
+        .checked_mul(60)
+        .and_then(|s| s.checked_mul(1_000_000))
+        .and_then(|us| us.checked_add(sec_micros))
+        .ok_or_else(|| field_overflow(label))?;
+    Ok(Interval {
+        months,
+        days,
+        micros,
+    })
+}
+
+/// PostgreSQL `interval_justify_days`: roll whole 30-day groups of `days` into
+/// `months`, leaving `days` in `(-30, 30)` (truncating division keeps the sign).
+/// The `months` sum is done in i64 and narrowed back, so a near-`i32::MAX` input
+/// raises 22008 (PG 15+ `ERROR: interval out of range`) rather than panicking
+/// (debug, overflow-checks on) or wrapping (release).
+pub fn justify_days(iv: Interval) -> Result<Interval, TypeError> {
+    let whole_months = i64::from(iv.days) / 30;
+    let months = i64::from(iv.months) + whole_months;
+    Ok(Interval {
+        months: i32::try_from(months).map_err(|_| field_overflow("justify_days"))?,
+        days: iv.days % 30,
+        micros: iv.micros,
+    })
+}
+
+/// PostgreSQL `interval_justify_hours`: roll whole 24-hour groups of `micros` into
+/// `days`, leaving `micros` in `(-1 day, 1 day)` (truncating division keeps the
+/// sign). The `days` sum is done in i64 and narrowed back, so a near-`i32::MAX`
+/// input raises 22008 (PG 15+ `ERROR: interval out of range`) rather than
+/// panicking (debug, overflow-checks on) or wrapping (release).
+pub fn justify_hours(iv: Interval) -> Result<Interval, TypeError> {
+    let whole_days = iv.micros / USECS_PER_DAY_I64;
+    let days = i64::from(iv.days) + whole_days;
+    Ok(Interval {
+        months: iv.months,
+        days: i32::try_from(days).map_err(|_| field_overflow("justify_hours"))?,
+        micros: iv.micros % USECS_PER_DAY_I64,
+    })
+}
+
+/// PostgreSQL `interval_justify_interval` (src/backend/utils/adt/timestamp.c):
+/// pre-justify micros→days (24h) and days→months (30d), then sign-normalize so no
+/// field's sign disagrees with a larger non-zero field. The result is PG's
+/// canonical form, e.g. `'1 mon -1 hour'` → `'29 days 23:00:00'`.
+pub fn justify_interval(iv: Interval) -> Result<Interval, TypeError> {
+    const DAYS_PER_MONTH: i32 = 30;
+    // Pre-justify on widened fields (the rolls can briefly push `days` past i32).
+    let mut months = i64::from(iv.months);
+    let mut days = i64::from(iv.days);
+    let mut micros = iv.micros;
+
+    // micros → days (24h), then days → months (30d).
+    days += micros / USECS_PER_DAY_I64;
+    micros %= USECS_PER_DAY_I64;
+    months += days / i64::from(DAYS_PER_MONTH);
+    days %= i64::from(DAYS_PER_MONTH);
+
+    // Sign-normalize months↔days: if months and days disagree (or days==0 and
+    // micros disagrees with months), borrow/carry a whole 30-day month.
+    if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+        days += i64::from(DAYS_PER_MONTH);
+        months -= 1;
+    } else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+        days -= i64::from(DAYS_PER_MONTH);
+        months += 1;
+    }
+    // Sign-normalize days↔micros: borrow/carry a whole 24-hour day.
+    if days > 0 && micros < 0 {
+        micros += USECS_PER_DAY_I64;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= USECS_PER_DAY_I64;
+        days += 1;
+    }
+
+    // Normalization keeps each field within a month/day of its pre-justify value,
+    // but `months` (and transiently `days`) can already exceed i32 after rolling
+    // the micros/days carries up — so the narrowing back to i32 is NOT lossless
+    // in general. Check it: an out-of-i32 result raises 22008 (PG 15+ `ERROR:
+    // interval out of range`) rather than silently wrapping.
+    Ok(Interval {
+        months: i32::try_from(months).map_err(|_| field_overflow("justify_interval"))?,
+        days: i32::try_from(days).map_err(|_| field_overflow("justify_interval"))?,
+        micros,
+    })
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::{DateTimeFields, format_datetime};
+
+    fn fields_monday() -> DateTimeFields {
+        // 2024-01-15 13:45:06.5, a Monday.
+        DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 13, 45, 6, 500_000_000),
+            None,
+        )
+    }
+
+    #[test]
+    fn format_datetime_core_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("YYYY-MM-DD HH24:MI:SS"), "2024-01-15 13:45:06");
+        assert_eq!(fmt("HH12:MI:SS PM"), "01:45:06 PM");
+        assert_eq!(fmt("HH12:MI am"), "01:45 pm");
+        assert_eq!(fmt("Mon Month"), "Jan January  "); // Month blank-padded to 9
+        assert_eq!(fmt("FMMonth DD, YYYY"), "January 15, 2024"); // FM suppresses padding
+        assert_eq!(fmt("Dy Day"), "Mon Monday   "); // Day padded to 9
+        assert_eq!(fmt("Q"), "1");
+        assert_eq!(fmt("MS US"), "500 500000");
+        assert_eq!(fmt(r#""year:" YYYY"#), "year: 2024"); // quoted literal
+        assert_eq!(fmt("DDth"), "15th"); // ordinal suffix
+        assert_eq!(fmt("FF3"), "500");
+    }
+
+    #[test]
+    fn format_datetime_timezone_patterns() {
+        // timestamptz rendered at -05:00 (offset present).
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            Some(-5 * 3600),
+        );
+        assert_eq!(format_datetime("OF", &f).expect("OF"), "-05");
+        assert_eq!(format_datetime("TZH:TZM", &f).expect("tz"), "-05:00");
+        // A plain timestamp (no offset) renders TZ patterns as empty (PG behavior).
+        let g = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("HH24OF", &g).expect("notz"), "12");
+    }
+
+    #[test]
+    fn format_datetime_year_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("YYYY"), "2024");
+        assert_eq!(fmt("YYY"), "024");
+        assert_eq!(fmt("YY"), "24");
+        assert_eq!(fmt("Y"), "4");
+        assert_eq!(fmt("Y,YYY"), "2,024");
+        assert_eq!(fmt("CC"), "21"); // 2024 → century 21
+        // ISO year: 2024-01-15 is in ISO year 2024.
+        assert_eq!(fmt("IYYY"), "2024");
+        assert_eq!(fmt("IYY"), "024");
+        assert_eq!(fmt("IY"), "24");
+        assert_eq!(fmt("I"), "4");
+    }
+
+    #[test]
+    fn format_datetime_era_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("AD"), "AD");
+        assert_eq!(fmt("BC"), "AD"); // both spellings render the era for the value
+        assert_eq!(fmt("ad"), "ad");
+        assert_eq!(fmt("A.D."), "A.D.");
+        assert_eq!(fmt("a.d."), "a.d.");
+    }
+
+    #[test]
+    fn format_datetime_month_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("MM"), "01");
+        assert_eq!(fmt("Mon"), "Jan");
+        assert_eq!(fmt("MON"), "JAN");
+        assert_eq!(fmt("mon"), "jan");
+        assert_eq!(fmt("Month"), "January  ");
+        assert_eq!(fmt("MONTH"), "JANUARY  ");
+        assert_eq!(fmt("month"), "january  ");
+        // PG LEFT-justifies the Roman numeral in a width-4 field ("VIII" is widest).
+        assert_eq!(fmt("RM"), "I   ");
+        assert_eq!(fmt("rm"), "i   ");
+        assert_eq!(fmt("FMRM"), "I"); // FM strips the left-justify padding
+        assert_eq!(fmt("FMMonth"), "January");
+        assert_eq!(fmt("FMMM"), "1");
+    }
+
+    #[test]
+    fn format_datetime_day_and_week_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("DD"), "15");
+        assert_eq!(fmt("DDD"), "015"); // day-of-year 15
+        assert_eq!(fmt("IDDD"), "015"); // ISO day-of-year 15 (week 3, dow 1: 2*7+1=15)
+        assert_eq!(fmt("D"), "2"); // Monday → Sun=1 scheme → 2
+        assert_eq!(fmt("ID"), "1"); // Monday → ISO dow 1
+        assert_eq!(fmt("Day"), "Monday   ");
+        assert_eq!(fmt("DAY"), "MONDAY   ");
+        assert_eq!(fmt("day"), "monday   ");
+        assert_eq!(fmt("Dy"), "Mon");
+        assert_eq!(fmt("DY"), "MON");
+        assert_eq!(fmt("dy"), "mon");
+        assert_eq!(fmt("W"), "3"); // (15-1)/7 + 1 = 3
+        assert_eq!(fmt("WW"), "03"); // (15-1)/7 + 1 = 3
+        assert_eq!(fmt("IW"), "03"); // ISO week 3
+        assert_eq!(fmt("FMDDD"), "15"); // FM drops the leading zero
+    }
+
+    #[test]
+    fn format_datetime_time_patterns() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("HH24"), "13");
+        assert_eq!(fmt("HH12"), "01");
+        assert_eq!(fmt("HH"), "01");
+        assert_eq!(fmt("MI"), "45");
+        assert_eq!(fmt("SS"), "06");
+        // seconds past midnight: 13*3600 + 45*60 + 6 = 49506.
+        assert_eq!(fmt("SSSS"), "49506");
+        assert_eq!(fmt("SSSSS"), "49506");
+        assert_eq!(fmt("MS"), "500");
+        assert_eq!(fmt("US"), "500000");
+        assert_eq!(fmt("FF1"), "5");
+        assert_eq!(fmt("FF2"), "50");
+        assert_eq!(fmt("FF3"), "500");
+        assert_eq!(fmt("FF6"), "500000");
+        assert_eq!(fmt("FMHH24"), "13");
+        assert_eq!(fmt("FMSS"), "6"); // FM drops leading zero
+    }
+
+    #[test]
+    fn format_datetime_meridiem_and_midnight() {
+        // 00:30 → AM, 12-hour 12.
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 0, 30, 0, 0),
+            None,
+        );
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("HH12 AM"), "12 AM");
+        assert_eq!(fmt("HH12 PM"), "12 AM"); // both spellings render the value's meridiem
+        assert_eq!(fmt("HH12 am"), "12 am");
+        assert_eq!(fmt("A.M."), "A.M.");
+        assert_eq!(fmt("p.m."), "a.m.");
+        // SSSS/SSSSS are NOT zero-padded (PG): 00:30:00 → 1800, not 1800/01800.
+        assert_eq!(fmt("SSSS"), "1800");
+        assert_eq!(fmt("SSSSS"), "1800");
+        // noon → PM, 12-hour 12.
+        let g = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("HH12 PM", &g).expect("noon"), "12 PM");
+    }
+
+    #[test]
+    fn format_datetime_ordinal_th_variants() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        assert_eq!(fmt("DDth"), "15th");
+        assert_eq!(fmt("DDTH"), "15TH");
+        // DD=15 → th. Use a day that ends in 1/2/3 for st/nd/rd.
+        let d1 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 1, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("DDth", &d1).expect("1"), "01st");
+        let d2 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 2, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("DDth", &d2).expect("2"), "02nd");
+        let d3 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 3, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("DDth", &d3).expect("3"), "03rd");
+        // 11/12/13 are all `th`.
+        let d11 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 11, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("DDth", &d11).expect("11"), "11th");
+        // FMDDth drops the leading zero AND keeps the suffix: "1st".
+        assert_eq!(format_datetime("FMDDth", &d1).expect("fm"), "1st");
+    }
+
+    #[test]
+    fn format_datetime_quoted_and_passthrough() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        // Quoted literal with an embedded pattern char (Y) emitted verbatim.
+        assert_eq!(fmt(r#""Year " YYYY"#), "Year  2024");
+        // Escaped quote inside a quoted run.
+        assert_eq!(fmt(r#""a\"b""#), "a\"b");
+        // A non-pattern char (e.g. `/`) passes through literally.
+        assert_eq!(fmt("YYYY/MM/DD"), "2024/01/15");
+        // A bare letter that begins no pattern is emitted literally.
+        assert_eq!(fmt("Q!"), "1!");
+    }
+
+    #[test]
+    fn format_datetime_offset_minutes() {
+        // +05:30 offset (e.g. India): OF shows the colon-minutes; TZH/TZM split.
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            Some(5 * 3600 + 30 * 60),
+        );
+        assert_eq!(format_datetime("OF", &f).expect("of"), "+05:30");
+        assert_eq!(format_datetime("TZH", &f).expect("tzh"), "+05");
+        assert_eq!(format_datetime("TZM", &f).expect("tzm"), "30");
+        assert_eq!(format_datetime("TZ", &f).expect("tz"), "+05");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation-killing tests (cargo-mutants on `datetime.rs`): each pins a
+    // boundary the broad pattern tests above leave ambiguous.
+    // -----------------------------------------------------------------------
+
+    /// `WW`/`W` use `(x - 1) / 7 + 1`; a day-of-year / day-of-month at a 7-boundary
+    /// (the 7th) is the value where `(x-1)/7` differs from `(x+1)/7` and `x/7`, so it
+    /// kills the `from_civil` week mutants (`- → +`, `- → /`).
+    #[test]
+    fn format_datetime_week_off_by_one_boundary() {
+        // 2024-01-07: day-of-month 7, day-of-year 7.
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 7, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("W", &f).expect("W"), "1"); // (7-1)/7+1 = 1
+        assert_eq!(format_datetime("WW", &f).expect("WW"), "01"); // (7-1)/7+1 = 1
+        // Day 8 would give week 2 only if the `-1` is correct (8th is the start of
+        // the 2nd 7-day group).
+        let g = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 8, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("W", &g).expect("W8"), "2"); // (8-1)/7+1 = 2
+    }
+
+    /// `pad_num`'s `value < 0` sign branch: a ZERO-valued numeric field must render
+    /// without a spurious sign (kills `< → <=` and `< → ==`, which would add `-` at
+    /// zero). A NEGATIVE year exercises the sign branch itself.
+    #[test]
+    fn format_datetime_zero_and_negative_numbers() {
+        // Midnight, minute/second zero → "00", never "-00".
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("HH24:MI:SS", &f).expect("zero"), "00:00:00");
+        // A BC-ish negative year renders with a leading sign, then zero-padded to
+        // the field width (`-{:04}` of 100 → "-0100") — the `value < 0` arm.
+        let bc = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(-100, 6, 15, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("YYYY", &bc).expect("neg"), "-0100");
+        // `CC` of year -100 exercises the `y < 1` (BC / year ≤ 0) century branch
+        // `(y - 99) / 100` → -1, killing the century arithmetic mutants
+        // (`- → +`, `- → /`, `/ → %`, `/ → *`).
+        assert_eq!(format_datetime("CC", &bc).expect("cc"), "-01");
+        // Year 1 is the `y < 1` boundary: it takes the AD branch `(1+99)/100 = 1`.
+        // If the test were `<=` / `==` it would wrongly take the BC branch
+        // `(1-99)/100 = 0`, so this pins the comparison.
+        let ad1 =
+            DateTimeFields::from_civil(jiff::civil::DateTime::constant(1, 6, 15, 0, 0, 0, 0), None);
+        assert_eq!(format_datetime("CC", &ad1).expect("cc1"), "01");
+        // Year 2024 stays in the AD branch (century 21) — covered above, repeated
+        // here so the `else` branch's `+ 99` / `/ 100` are exercised on a positive.
+        assert_eq!(
+            format_datetime("CC", &fields_monday()).expect("cc2024"),
+            "21"
+        );
+    }
+
+    /// `offset_hh`'s `secs < 0` sign: a ZERO offset must render `+00`, not `-00`
+    /// (kills `< → <=`).
+    #[test]
+    fn format_datetime_zero_offset_is_plus() {
+        let f = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            Some(0),
+        );
+        assert_eq!(format_datetime("TZH", &f).expect("z"), "+00");
+        assert_eq!(format_datetime("OF", &f).expect("of"), "+00");
+        assert_eq!(format_datetime("TZ", &f).expect("tz"), "+00");
+        // A NEGATIVE offset still renders the minus (the sign branch itself).
+        let n = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),
+            Some(-3 * 3600),
+        );
+        assert_eq!(format_datetime("TZH", &n).expect("neg"), "-03");
+    }
+
+    /// The quoted-literal loop boundaries: an UNTERMINATED quote must not over-read
+    /// (kills the `i < len` / `i + 1 < len` `< → <=` mutants, which would index past
+    /// the end and panic), and a trailing `\` inside an unterminated quote is emitted
+    /// literally (kills the escape-lookahead `+`/`<` mutants).
+    #[test]
+    fn format_datetime_unterminated_quote_does_not_overrun() {
+        let f = fields_monday();
+        let fmt = |t: &str| format_datetime(t, &f).expect(t);
+        // Unterminated quote: everything after the opening quote is emitted verbatim.
+        assert_eq!(fmt(r#""abc"#), "abc");
+        // A trailing backslash with no following char (the escape lookahead's false
+        // branch): the `\` is emitted literally.
+        assert_eq!(fmt(r#""x\"#), "x\\");
+        // A bare `FF` at end-of-string (no digit) must not over-read past the buffer
+        // and falls through to two literal `F`s.
+        assert_eq!(fmt("FF"), "FF");
+    }
+
+    /// The escape `i += 2` advance: an escaped quote NOT at index 2 (so `i*2 ≠ i+2`)
+    /// followed by more content proves the index advances by exactly 2 (kills
+    /// `+= → *=`).
+    #[test]
+    fn format_datetime_escaped_quote_advances_by_two() {
+        let f = fields_monday();
+        // `"ab\"c"`: the backslash is at index 3; after the escaped `"` the engine
+        // must land on `c` (i += 2 → 5), not skip it (i *= 2 → 6).
+        assert_eq!(format_datetime(r#""ab\"c""#, &f).expect("esc"), "ab\"c");
+    }
+
+    /// The `TH` `i += 2` advance: a `th` NOT at index 2 with trailing content proves
+    /// the suffix advances the cursor by exactly 2 (kills `+= → *=`). `MMDDthMM`:
+    /// after the `th` at index 4, the trailing `MM` must still render.
+    #[test]
+    fn format_datetime_th_advances_by_two() {
+        let f = fields_monday(); // month 01, day 15
+        // MM=01, DD=15, th (ordinal of 15) = "th", trailing MM=01.
+        assert_eq!(format_datetime("MMDDthMM", &f).expect("th"), "0115th01");
+    }
+
+    /// `Q` uses `(month - 1) / 3 + 1`; month 3 is the value where the correct quarter
+    /// (1) differs from every arithmetic mutant of that expression, killing the four
+    /// `match_pattern` 1399 mutants (`- → +`, `- → /`, `/ → %`, `/ → *`).
+    #[test]
+    fn format_datetime_quarter_boundary() {
+        let m3 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 3, 15, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("Q", &m3).expect("q1"), "1"); // (3-1)/3+1 = 1
+        let m7 = DateTimeFields::from_civil(
+            jiff::civil::DateTime::constant(2024, 7, 15, 0, 0, 0, 0),
+            None,
+        );
+        assert_eq!(format_datetime("Q", &m7).expect("q3"), "3"); // (7-1)/3+1 = 3
+    }
+
+    /// The `FF` bounds check `matches_at(.,"FF") && i + 2 < len && ...`: a non-`FF`
+    /// 3-char run ending in a digit must NOT be rendered as fractional seconds
+    /// (kills `&& → ||`), and an `FF` whose digit index is just past a `i * 2`
+    /// boundary must still render (kills `+ → *` in the bounds check).
+    #[test]
+    fn format_datetime_ff_bounds_check() {
+        let f = fields_monday(); // micros 500000
+        // `&& → ||`: with OR, `AB3` (no FF) would wrongly trigger the FF render. The
+        // `A`/`B`/`3` are literal passthrough.
+        assert_eq!(format_datetime("AB3", &f).expect("ab3"), "AB3");
+        // `+ → *`: place FF at index 4 (four literal dots), where `4 + 2 = 6 < 7` but
+        // `4 * 2 = 8 ≥ 7`, so the `*` mutant would skip the FF render.
+        assert_eq!(format_datetime("....FF3", &f).expect("ff"), "....500");
+    }
+
+    #[test]
+    fn format_interval_uses_stored_fields() {
+        use super::{Interval, format_interval};
+        let fmt = |iv: Interval, t: &str| format_interval(iv, t).expect(t);
+        // 36 hours: HH24 reads the micros component → 36 (not normalized to 1 day 12h).
+        let h36 = Interval {
+            months: 0,
+            days: 0,
+            micros: 36 * 3_600_000_000,
+        };
+        assert_eq!(fmt(h36, "HH24:MI:SS"), "36:00:00");
+        // 1 day 02:03:04 → DD=01, HH24=02 (days stay separate from the clock).
+        let d1 = Interval {
+            months: 0,
+            days: 1,
+            micros: (2 * 3600 + 3 * 60 + 4) * 1_000_000,
+        };
+        assert_eq!(fmt(d1, "DD HH24:MI:SS"), "01 02:03:04");
+    }
+
+    #[test]
+    fn format_interval_year_month_and_remainder() {
+        use super::{Interval, format_interval};
+        let fmt = |iv: Interval, t: &str| format_interval(iv, t).expect(t);
+        // 14 months → YYYY = months/12 = 1, MM = months%12 = 02 (NOT carried as a year).
+        let m14 = Interval {
+            months: 14,
+            days: 0,
+            micros: 0,
+        };
+        assert_eq!(fmt(m14, "YYYY-MM"), "0001-02");
+        // The full clock remainder past an over-24h hour: 25:30:45.123456.
+        let clock = Interval {
+            months: 0,
+            days: 0,
+            micros: 25 * 3_600_000_000 + 30 * 60_000_000 + 45 * 1_000_000 + 123_456,
+        };
+        assert_eq!(fmt(clock, "HH24:MI:SS.US"), "25:30:45.123456");
+        // Sub-second millis read from the micros remainder.
+        assert_eq!(fmt(clock, "MS"), "123");
+    }
+
+    #[test]
+    fn format_interval_negative_clock_decomposes_component_wise() {
+        use super::{Interval, format_interval};
+        // A wholly-negative clock interval (-02:03:04). PG `interval2tm` splits the
+        // signed `micros` component-wise (`tm_hour`/`tm_min`/`tm_sec` each negative),
+        // so each numeric clock field renders with its OWN sign — there is no single
+        // factored leading minus. HH24 = micros/3_600_000_000 = -2; MI = -3; SS = -4;
+        // `pad_num` keeps each sign and zero-pads the magnitude.
+        // NOTE: the exact per-component-sign rendering is flagged for Task 9's PG
+        // oracle pass; this pins the documented `interval2tm` decomposition contract.
+        let neg = Interval {
+            months: 0,
+            days: 0,
+            micros: -((2 * 3600 + 3 * 60 + 4) * 1_000_000),
+        };
+        assert_eq!(
+            format_interval(neg, "HH24:MI:SS").expect("neg"),
+            "-02:-03:-04"
+        );
+    }
+}
+
 #[cfg(test)]
 mod interval_tests {
     use super::*;
@@ -1629,5 +3426,325 @@ mod mutation_tests {
         );
         // A positive sub-second-only clock (the subsec multiply, line 869).
         assert_eq!(interval_to_text(iv(0, 0, 250_000)), "00:00:00.25");
+    }
+}
+
+#[cfg(test)]
+mod parse_template_tests {
+    #[test]
+    fn parse_by_template_extracts_fields() {
+        use super::parse_by_template;
+        let p = parse_by_template("YYYY-MM-DD HH24:MI:SS", "2024-01-15 13:45:06").expect("p");
+        assert_eq!((p.year, p.month, p.day), (2024, 1, 15));
+        assert_eq!((p.hour, p.minute, p.second), (13, 45, 6));
+        // month name + 12-hour + meridiem
+        let q = parse_by_template("Mon DD YYYY HH12:MI PM", "Jul 04 2024 01:30 PM").expect("q");
+        assert_eq!(
+            (q.year, q.month, q.day, q.hour, q.minute),
+            (2024, 7, 4, 13, 30)
+        );
+        // absent fields default (PG): year→1, month→1, day→1, time→0.
+        let d = parse_by_template("YYYY", "2030").expect("d");
+        assert_eq!((d.year, d.month, d.day, d.hour), (2030, 1, 1, 0));
+    }
+
+    #[test]
+    fn parse_by_template_errors() {
+        use super::parse_by_template;
+        // non-digit where a digit is required → 22007.
+        assert_eq!(
+            parse_by_template("YYYY-MM-DD", "abcd-01-01")
+                .expect_err("non-digit")
+                .sqlstate(),
+            "22007"
+        );
+        // out-of-range field → 22008.
+        assert_eq!(
+            parse_by_template("YYYY-MM-DD", "2024-13-01")
+                .expect_err("month 13")
+                .sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn parse_by_template_meridiem_conversions() {
+        use super::parse_by_template;
+        // 12 AM → 0 (midnight).
+        let mid = parse_by_template("HH12:MI AM", "12:00 AM").expect("mid");
+        assert_eq!((mid.hour, mid.minute), (0, 0));
+        // 12 PM → 12 (noon).
+        let noon = parse_by_template("HH12:MI PM", "12:00 PM").expect("noon");
+        assert_eq!(noon.hour, 12);
+        // 11 PM → 23.
+        let eve = parse_by_template("HH12 PM", "11 PM").expect("eve");
+        assert_eq!(eve.hour, 23);
+        // lowercase meridiem accepted.
+        let low = parse_by_template("HH12:MI am", "07:15 am").expect("am");
+        assert_eq!((low.hour, low.minute), (7, 15));
+        // dotted meridiem accepted.
+        let dot = parse_by_template("HH12 P.M.", "03 P.M.").expect("dot");
+        assert_eq!(dot.hour, 15);
+        // No meridiem: HH12 value used as-is (PG: 13 stays 13 in HH12 w/o AM/PM).
+        let raw = parse_by_template("HH12:MI:SS", "13:05:09").expect("raw");
+        assert_eq!((raw.hour, raw.minute, raw.second), (13, 5, 9));
+    }
+
+    #[test]
+    fn parse_by_template_full_month_name_and_us() {
+        use super::parse_by_template;
+        // Full month name (longest match, case-insensitive).
+        let m = parse_by_template("Month DD, YYYY", "September 09, 1999").expect("m");
+        assert_eq!((m.year, m.month, m.day), (1999, 9, 9));
+        let m2 = parse_by_template("MONTH", "DECEMBER").expect("m2");
+        assert_eq!(m2.month, 12);
+        // Microseconds.
+        let us = parse_by_template("HH24:MI:SS.US", "01:02:03.123456").expect("us");
+        assert_eq!(
+            (us.hour, us.minute, us.second, us.micros),
+            (1, 2, 3, 123456)
+        );
+    }
+
+    #[test]
+    fn parse_by_template_leniency() {
+        use super::parse_by_template;
+        // PG is lenient about separators: a slash template against dashes still parses.
+        let p = parse_by_template("YYYY/MM/DD", "2024-01-15").expect("p");
+        assert_eq!((p.year, p.month, p.day), (2024, 1, 15));
+        // Fewer digits than the field width are accepted when a non-digit follows.
+        let q = parse_by_template("YYYY-MM-DD", "2024-1-5").expect("q");
+        assert_eq!((q.month, q.day), (1, 5));
+        // A quoted literal run in the template is skipped over the matching input.
+        let r = parse_by_template("YYYY\"-the-\"MM", "2024-the-07").expect("r");
+        assert_eq!((r.year, r.month), (2024, 7));
+    }
+
+    #[test]
+    fn parse_by_template_range_errors() {
+        use super::parse_by_template;
+        // hour 24 (after no meridiem) is out of range → 22008.
+        assert_eq!(
+            parse_by_template("HH24:MI", "24:00")
+                .expect_err("hour 24")
+                .sqlstate(),
+            "22008"
+        );
+        // minute 60 → 22008.
+        assert_eq!(
+            parse_by_template("MI", "60")
+                .expect_err("minute 60")
+                .sqlstate(),
+            "22008"
+        );
+        // day 0 → 22008.
+        assert_eq!(
+            parse_by_template("DD", "00").expect_err("day 0").sqlstate(),
+            "22008"
+        );
+        // An unrecognized month name → 22007 (bad shape, no digits to consume).
+        assert_eq!(
+            parse_by_template("Mon", "Xyz")
+                .expect_err("bad month name")
+                .sqlstate(),
+            "22007"
+        );
+    }
+
+    #[test]
+    fn parse_by_template_milliseconds_scale_to_micros() {
+        use super::parse_by_template;
+        // The `MS` (milliseconds) pattern consumes up to 3 digits and scales them to
+        // microseconds (×1000): 123 ms → 123_000 µs.
+        let p = parse_by_template("HH24:MI:SS.MS", "01:02:03.123").expect("ms");
+        assert_eq!((p.hour, p.minute, p.second, p.micros), (1, 2, 3, 123_000));
+    }
+
+    #[test]
+    fn parse_by_template_day_name_is_skipped() {
+        use super::parse_by_template;
+        // A `Day`/`Dy` day-of-week NAME pattern is accepted and skipped without setting
+        // any field; the remaining month/day/year fields are still extracted correctly.
+        let p =
+            parse_by_template("Day, Month DD, YYYY", "Monday, July 04, 2024").expect("day name");
+        assert_eq!((p.year, p.month, p.day), (2024, 7, 4));
+        // Defaults for the unset time fields are unchanged (no field corruption).
+        assert_eq!((p.hour, p.minute, p.second, p.micros), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod make_justify_tests {
+    #[test]
+    fn make_constructors() {
+        use super::{Interval, make_date, make_interval, make_time, make_timestamp_civil};
+        assert_eq!(
+            make_date(2024, 7, 4).expect("d"),
+            jiff::civil::date(2024, 7, 4)
+        );
+        // make_time(hour, min, sec) — fractional seconds → micros.
+        assert_eq!(
+            make_time(13, 45, 6.5).expect("t"),
+            jiff::civil::time(13, 45, 6, 500_000_000)
+        );
+        assert_eq!(
+            make_timestamp_civil(2024, 7, 4, 13, 45, 6.0).expect("ts"),
+            jiff::civil::datetime(2024, 7, 4, 13, 45, 6, 0)
+        );
+        // make_interval positional: 1 year, 2 months, 0 weeks, 3 days.
+        assert_eq!(
+            make_interval(1, 2, 0, 3, 0, 0, 0.0).expect("iv"),
+            Interval {
+                months: 14,
+                days: 3,
+                micros: 0
+            }
+        );
+        // weeks fold into days; fractional secs into micros.
+        assert_eq!(
+            make_interval(0, 0, 2, 0, 0, 0, 1.5).expect("iv"),
+            Interval {
+                months: 0,
+                days: 14,
+                micros: 1_500_000
+            }
+        );
+        // out-of-range field → 22008.
+        assert_eq!(
+            make_date(2024, 13, 1).expect_err("month 13").sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn make_boundary_and_overflow() {
+        use super::{Interval, make_interval, make_time};
+        // make_time(24, 0, 0) is out of range → 22008.
+        assert_eq!(
+            make_time(24, 0, 0.0).expect_err("hour 24").sqlstate(),
+            "22008"
+        );
+        // A negative interval field is representable (PG allows negative make_interval).
+        assert_eq!(
+            make_interval(0, -1, 0, 0, -2, 0, 0.0).expect("neg"),
+            Interval {
+                months: -1,
+                days: 0,
+                micros: -2 * 3_600_000_000
+            }
+        );
+        // years*12 overflowing i32 → 22008.
+        assert_eq!(
+            make_interval(i32::MAX, 1, 0, 0, 0, 0, 0.0)
+                .expect_err("months overflow")
+                .sqlstate(),
+            "22008"
+        );
+    }
+
+    #[test]
+    fn justify_helpers() {
+        use super::{Interval, justify_days, justify_hours, justify_interval};
+        // 35 days → 1 month 5 days.
+        assert_eq!(
+            justify_days(Interval {
+                months: 0,
+                days: 35,
+                micros: 0
+            })
+            .expect("35 days justifies in range"),
+            Interval {
+                months: 1,
+                days: 5,
+                micros: 0
+            }
+        );
+        // 27 hours → 1 day 3 hours.
+        assert_eq!(
+            justify_hours(Interval {
+                months: 0,
+                days: 0,
+                micros: 27 * 3_600_000_000
+            })
+            .expect("27 hours justifies in range"),
+            Interval {
+                months: 0,
+                days: 1,
+                micros: 3 * 3_600_000_000
+            }
+        );
+        // PG: justify_interval('1 mon -1 hour') = '29 days 23:00:00'.
+        assert_eq!(
+            justify_interval(Interval {
+                months: 1,
+                days: 0,
+                micros: -3_600_000_000
+            })
+            .expect("'1 mon -1 hour' justifies in range"),
+            Interval {
+                months: 0,
+                days: 29,
+                micros: 23 * 3_600_000_000
+            }
+        );
+        // The symmetric mixed-sign case: '-1 mon +1 hour' → '-29 days -23:00:00'.
+        assert_eq!(
+            justify_interval(Interval {
+                months: -1,
+                days: 0,
+                micros: 3_600_000_000
+            })
+            .expect("'-1 mon +1 hour' justifies in range"),
+            Interval {
+                months: 0,
+                days: -29,
+                micros: -23 * 3_600_000_000
+            }
+        );
+    }
+
+    // Each `justify_*` narrows an i64 month/day roll back to an i32 field; an
+    // input whose fields sit near i32::MAX overflows that narrowing (the old
+    // unchecked code panicked in debug / wrapped in release / silently truncated
+    // the i64→i32 cast). PG 15+ raises `ERROR: interval out of range` (22008).
+    #[test]
+    fn justify_days_overflow_is_22008() {
+        use super::{Interval, justify_days};
+        // months + days/30 ≈ i32::MAX + 71_582_788 overflows the i32 narrowing.
+        let err = justify_days(Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: 0,
+        })
+        .expect_err("near-i32::MAX months+days overflows justify_days");
+        assert_eq!(err.sqlstate(), "22008");
+    }
+
+    #[test]
+    fn justify_hours_overflow_is_22008() {
+        use super::{Interval, justify_hours};
+        // days + micros/USECS_PER_DAY ≈ i32::MAX + 106_751_991 overflows the i32
+        // narrowing.
+        let err = justify_hours(Interval {
+            months: 0,
+            days: i32::MAX,
+            micros: i64::MAX,
+        })
+        .expect_err("near-i32::MAX days plus a full i64 of micros overflows justify_hours");
+        assert_eq!(err.sqlstate(), "22008");
+    }
+
+    #[test]
+    fn justify_interval_overflow_is_22008() {
+        use super::{Interval, justify_interval};
+        // After rolling micros→days→months the month total exceeds i32::MAX; the
+        // old `months as i32` silently wrapped, the checked narrowing now errors.
+        let err = justify_interval(Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: i64::MAX,
+        })
+        .expect_err("rolled month total exceeds i32 in justify_interval");
+        assert_eq!(err.sqlstate(), "22008");
     }
 }
