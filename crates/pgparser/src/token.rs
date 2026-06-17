@@ -109,6 +109,10 @@ pub enum Keyword {
     Exists,
     Any,
     Some,
+    // SP38: set operations
+    Union,
+    Intersect,
+    Except,
 }
 
 impl Keyword {
@@ -187,6 +191,10 @@ impl Keyword {
             "exists" => Keyword::Exists,
             "any" => Keyword::Any,
             "some" => Keyword::Some,
+            // SP38: set operations
+            "union" => Keyword::Union,
+            "intersect" => Keyword::Intersect,
+            "except" => Keyword::Except,
             _ => return None,
         })
     }
@@ -258,6 +266,9 @@ mod tests {
             ("exists", Keyword::Exists),
             ("any", Keyword::Any),
             ("some", Keyword::Some),
+            ("union", Keyword::Union),
+            ("intersect", Keyword::Intersect),
+            ("except", Keyword::Except),
         ];
         for (word, kw) in pairs {
             assert_eq!(Keyword::from_word(word), Some(*kw), "from_word({word:?})");

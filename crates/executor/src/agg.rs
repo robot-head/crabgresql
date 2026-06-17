@@ -940,7 +940,7 @@ pub(crate) fn aggregate_rows(
         out.retain(|(_, proj)| seen.insert(proj.clone()));
     }
     if !s.order_by.is_empty() {
-        out.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, s));
+        out.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, &s.order_by));
     }
     // SP28: OFFSET then LIMIT.
     crate::exec::apply_offset_limit(&mut out, s.offset, s.limit);

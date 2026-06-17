@@ -110,6 +110,24 @@ async fn deeply_nested_subqueries_return_54001_and_server_survives() {
     assert_connection_alive(&client).await;
 }
 
+/// Mode 2 (set ops) — a flat `… UNION ALL …` chain builds a deep left-nested
+/// `SetExpr`; the `set_expr` loop cap rejects it (54001) before the over-deep tree
+/// is built, and the server survives.
+#[tokio::test]
+async fn long_union_chain_returns_54001_and_server_survives() {
+    let client = connect(spawn().await).await;
+
+    let n = 5000;
+    let sql = format!("SELECT 1{}", " UNION ALL SELECT 1".repeat(n));
+    let err = client
+        .simple_query(&sql)
+        .await
+        .expect_err("a 5000-long UNION chain must be rejected, not crash the server");
+    assert_eq!(sqlstate(err), "54001");
+
+    assert_connection_alive(&client).await;
+}
+
 /// A modest, realistic nesting depth still works — the guard does not reject
 /// ordinary queries.
 #[tokio::test]

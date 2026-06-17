@@ -40,6 +40,17 @@ pub enum ExecError {
     /// A subquery used as an expression / IN / quantified source returned more than
     /// one column (42601).
     SubqueryColumns,
+    /// SP38: the branches of a UNION/INTERSECT/EXCEPT have different column counts
+    /// (42601). `op` names the specific operator for the PG-exact message; `left`/
+    /// `right` are kept for internal use (the message does not print them).
+    SetOpColumnCount {
+        op: pgparser::ast::SetOp,
+        left: usize,
+        right: usize,
+    },
+    /// SP38: an `ORDER BY <n>` positional reference is 0 or past the number of
+    /// output columns (42P10 — invalid_column_reference).
+    InvalidColumnReference(String),
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -94,6 +105,20 @@ impl ExecError {
             ExecError::SubqueryColumns => {
                 PgError::error("42601", "subquery must return only one column")
             }
+            ExecError::SetOpColumnCount { op, .. } => {
+                // PG-exact: the message names the specific operator and has no count,
+                // e.g. "each UNION query must have the same number of columns".
+                let op_name = match op {
+                    pgparser::ast::SetOp::Union => "UNION",
+                    pgparser::ast::SetOp::Intersect => "INTERSECT",
+                    pgparser::ast::SetOp::Except => "EXCEPT",
+                };
+                PgError::error(
+                    "42601",
+                    format!("each {op_name} query must have the same number of columns"),
+                )
+            }
+            ExecError::InvalidColumnReference(m) => PgError::error("42P10", m),
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",
                 format!("missing FROM-clause entry for table \"{t}\""),
