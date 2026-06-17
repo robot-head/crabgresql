@@ -21,6 +21,10 @@ version = "0.1.0"
 edition = "2024"
 license = "PostgreSQL"
 
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

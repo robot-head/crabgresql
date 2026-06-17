@@ -13,6 +13,7 @@
 # exactly what we want here: the first failing test kills the mutant, so a caught
 # mutant stops early instead of running the whole suite.
 test_tool = "nextest"
+profile = "mutants"
 
 # A mutant only needs the tests of the package it was generated in. Running the
 # whole workspace per mutant would drag the slow, timing-sensitive distributed
