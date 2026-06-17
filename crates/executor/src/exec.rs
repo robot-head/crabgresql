@@ -1288,7 +1288,11 @@ pub(crate) fn describe(
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
     // Extended-protocol Describe targets a single statement.
-    let Some(Statement::Select(s)) = statements.first() else {
+    let stmt = statements.first();
+    if let Some(Statement::SetOperation(q)) = stmt {
+        return crate::setops::describe_set_query(catalog_kv, q);
+    }
+    let Some(Statement::Select(s)) = stmt else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let scope = if s.from.is_empty() {
@@ -1876,6 +1880,20 @@ mod tests {
             .await
             .expect("describe");
         assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn describe_set_op_returns_first_branch_fields() {
+        // Schema-only: a set-op query reports the first branch's column name(s) and
+        // the unified type, without executing.
+        let engine = SqlEngine::new();
+        let fields = engine
+            .connect()
+            .describe("SELECT 1 AS x UNION SELECT 2")
+            .await
+            .expect("describe");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x"); // name from the FIRST branch
     }
 
     #[tokio::test]

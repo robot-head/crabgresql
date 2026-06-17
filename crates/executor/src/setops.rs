@@ -19,6 +19,54 @@ use crate::error::ExecError;
 use crate::join::Relation;
 use crate::scope::{ColumnBinding, Scope};
 
+/// Schema-only RowDescription for a set-op query (extended-protocol Describe, no
+/// execution): field NAMES from the first leaf, TYPES unified across all leaves.
+pub(crate) fn describe_set_query(
+    catalog_kv: &dyn Kv,
+    q: &SetQuery,
+) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
+    let cols = set_expr_schema(catalog_kv, &q.body)?;
+    Ok(cols
+        .iter()
+        .map(|(name, ty)| crate::exec::field(name, *ty))
+        .collect())
+}
+
+/// (name, type) per output column for a set-op subtree, schema-only.
+fn set_expr_schema(
+    catalog_kv: &dyn Kv,
+    e: &SetExpr,
+) -> Result<Vec<(String, ColumnType)>, ExecError> {
+    match e {
+        SetExpr::Select(s) => {
+            let scope = if s.from.is_empty() {
+                Scope::empty()
+            } else {
+                crate::exec::build_from_schema(catalog_kv, &s.from)?.scope
+            };
+            let (fields, _exprs, tys) = crate::exec::resolve_projection(&s.projection, &scope)?;
+            Ok(fields.into_iter().map(|f| f.name).zip(tys).collect())
+        }
+        SetExpr::SetOp {
+            op, left, right, ..
+        } => {
+            let l = set_expr_schema(catalog_kv, left)?;
+            let r = set_expr_schema(catalog_kv, right)?;
+            if l.len() != r.len() {
+                return Err(ExecError::SetOpColumnCount {
+                    op: *op,
+                    left: l.len(),
+                    right: r.len(),
+                });
+            }
+            l.into_iter()
+                .zip(r)
+                .map(|((ln, lt), (_rn, rt))| Ok((ln, crate::eval::unify_types(lt, rt)?)))
+                .collect::<Result<Vec<_>, ExecError>>()
+        }
+    }
+}
+
 /// Evaluate a complete set-operation query to a wire result. Each leaf runs through
 /// the existing single-SELECT read path (`exec::select_to_relation`) under the
 /// statement's snapshot handles; the tree folds via `combine`; the query-level
