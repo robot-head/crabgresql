@@ -7,7 +7,7 @@
 //! reuses `Datum`'s grouping `Eq`/`Hash` (NULL = NULL), which is exactly PG's
 //! "not distinct" rule for set operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pgparser::ast::SetOp;
 use pgtypes::{ColumnType, Datum};
@@ -93,7 +93,7 @@ fn coerce_rows(
 
 /// Distinct, preserving first-seen order (UNION).
 fn dedup_keep_order<I: Iterator<Item = Vec<Datum>>>(it: I) -> Vec<Vec<Datum>> {
-    let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
+    let mut seen: HashSet<Vec<Datum>> = HashSet::new();
     let mut out = Vec::new();
     for row in it {
         if seen.insert(row.clone()) {
@@ -115,9 +115,9 @@ fn counts(rows: &[Vec<Datum>]) -> HashMap<Vec<Datum>, usize> {
 /// INTERSECT: rows in both. distinct → once per distinct row present in both;
 /// ALL → min(Lₙ, Rₙ). Distinct left rows are processed in first-seen order.
 fn intersect(lrows: Vec<Vec<Datum>>, rrows: Vec<Vec<Datum>>, all: bool) -> Vec<Vec<Datum>> {
-    let lc = counts(&lrows);
+    let lc = counts(&lrows); // read only on the ALL path (min multiplicity)
     let rc = counts(&rrows);
-    let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
+    let mut seen: HashSet<Vec<Datum>> = HashSet::new();
     let mut out = Vec::new();
     for row in &lrows {
         if !seen.insert(row.clone()) {
@@ -140,7 +140,7 @@ fn intersect(lrows: Vec<Vec<Datum>>, rrows: Vec<Vec<Datum>>, all: bool) -> Vec<V
 fn except(lrows: Vec<Vec<Datum>>, rrows: Vec<Vec<Datum>>, all: bool) -> Vec<Vec<Datum>> {
     let lc = counts(&lrows);
     let rc = counts(&rrows);
-    let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
+    let mut seen: HashSet<Vec<Datum>> = HashSet::new();
     let mut out = Vec::new();
     for row in &lrows {
         if !seen.insert(row.clone()) {
@@ -220,6 +220,19 @@ mod tests {
         assert_eq!(
             combine(SetOp::Except, true, l, r, &ctx).expect("ea").rows,
             vec![i4(1), i4(2)]
+        );
+    }
+
+    #[test]
+    fn except_all_underflows_to_empty() {
+        // When the right side has MORE copies than the left, EXCEPT ALL clamps the
+        // multiplicity at 0 (max(0, Lₙ − Rₙ)) — it never wraps. Pins `saturating_sub`.
+        let ctx = EvalCtx::test_default();
+        let l = rel("a", ColumnType::Int4, vec![i4(1)]);
+        let r = rel("a", ColumnType::Int4, vec![i4(1), i4(1)]);
+        assert_eq!(
+            combine(SetOp::Except, true, l, r, &ctx).expect("ea").rows,
+            Vec::<Vec<Datum>>::new()
         );
     }
 
