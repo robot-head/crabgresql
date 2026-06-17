@@ -35,6 +35,11 @@ pub enum ExecError {
     /// An object was used in a way its kind does not allow (42809) — e.g.
     /// `DISTINCT`/`ALL` applied to a scalar (non-aggregate) function.
     WrongObjectType(String),
+    /// A scalar subquery returned more than one row (21000).
+    CardinalityViolation,
+    /// A subquery used as an expression / IN / quantified source returned more than
+    /// one column (42601).
+    SubqueryColumns,
     /// A statement was issued in an aborted transaction block (25P02): every
     /// command after an error (until COMMIT/ROLLBACK) is rejected.
     InFailedTransaction,
@@ -69,6 +74,13 @@ impl ExecError {
             }
             ExecError::AmbiguousColumn(c) => {
                 PgError::error("42702", format!("column reference \"{c}\" is ambiguous"))
+            }
+            ExecError::CardinalityViolation => PgError::error(
+                "21000",
+                "more than one row returned by a subquery used as an expression",
+            ),
+            ExecError::SubqueryColumns => {
+                PgError::error("42601", "subquery must return only one column")
             }
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",

@@ -105,6 +105,10 @@ pub enum Keyword {
     On,
     Using,
     Natural,
+    // SP34: subqueries
+    Exists,
+    Any,
+    Some,
 }
 
 impl Keyword {
@@ -179,6 +183,10 @@ impl Keyword {
             "on" => Keyword::On,
             "using" => Keyword::Using,
             "natural" => Keyword::Natural,
+            // SP34: subqueries
+            "exists" => Keyword::Exists,
+            "any" => Keyword::Any,
+            "some" => Keyword::Some,
             _ => return None,
         })
     }
@@ -247,6 +255,9 @@ mod tests {
             ("on", Keyword::On),
             ("using", Keyword::Using),
             ("natural", Keyword::Natural),
+            ("exists", Keyword::Exists),
+            ("any", Keyword::Any),
+            ("some", Keyword::Some),
         ];
         for (word, kw) in pairs {
             assert_eq!(Keyword::from_word(word), Some(*kw), "from_word({word:?})");

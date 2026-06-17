@@ -1,6 +1,6 @@
 //! The crabgresql AST for the SP2 slice.
 
-use pgtypes::ColumnType;
+use pgtypes::{ColumnType, Datum};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -197,6 +197,33 @@ pub enum Expr {
     /// parse error); the executor performs the value conversion.
     Cast {
         expr: Box<Expr>,
+        ty: ColumnType,
+    },
+    /// SP34: a scalar subquery `(SELECT …)` — one row, one column, usable as an
+    /// expression. Resolved (uncorrelated) to `Const` by the executor pre-pass.
+    ScalarSubquery(Box<SelectStmt>),
+    /// SP34: `EXISTS (SELECT …)` — true iff the subquery returns ≥1 row. `NOT
+    /// EXISTS` is the prefix `NOT` wrapping this.
+    Exists(Box<SelectStmt>),
+    /// SP34: `expr [NOT] IN (SELECT …)` — subquery membership (single-column subquery).
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<SelectStmt>,
+        negated: bool,
+    },
+    /// SP34: `expr op ANY|SOME|ALL (SELECT …)`. `all` is the `ALL` form; `ANY`/`SOME`
+    /// are `all == false`. The subquery is single-column.
+    Quantified {
+        expr: Box<Expr>,
+        op: BinaryOp,
+        all: bool,
+        subquery: Box<SelectStmt>,
+    },
+    /// SP34: an executor-produced literal — a resolved subquery folded to a value
+    /// carrying its static type. The parser NEVER emits this; `ty` matters because a
+    /// zero-row scalar subquery is a typed NULL.
+    Const {
+        value: Datum,
         ty: ColumnType,
     },
 }

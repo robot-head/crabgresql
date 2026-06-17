@@ -294,14 +294,14 @@ impl RangeRouter {
             | Statement::Delete { table, .. } => self.range_of(table).map(Some),
             Statement::Select(s) => {
                 let mut ranges = std::collections::BTreeSet::new();
-                collect_select_ranges(self, &s.from, &mut ranges)?;
+                collect_select_ranges(self, s, &mut ranges)?;
                 match ranges.len() {
                     0 => Ok(None), // FROM-less -> range 0, unpinned
                     1 => Ok(Some(
                         *ranges.iter().next().expect("len()==1 has one element"),
                     )),
                     _ => Err(ExecError::Unsupported(
-                        "cross-range joins are not supported".into(),
+                        "cross-range joins or subqueries are not supported".into(),
                     )),
                 }
             }
@@ -612,16 +612,37 @@ impl RangeRouter {
     }
 }
 
-/// Collect every base-table range a SELECT's FROM clause references into `out`.
-/// Free function (not a method) so it borrows the router immutably while walking a
-/// borrowed `&[TableExpr]` from the same statement — no borrow friction.
+/// Collect every base-table range a SELECT references into `out` — its FROM clause
+/// (base tables / joins / derived tables, SP33) AND every uncorrelated subquery
+/// nested in its expression clauses (projection / WHERE / HAVING / GROUP BY /
+/// ORDER BY, SP34). The router enforces that all of them live on one range (else
+/// 0A000). Free function so it borrows the router immutably while walking the
+/// borrowed `&SelectStmt` — no borrow friction.
 fn collect_select_ranges(
     router: &RangeRouter,
-    from: &[pgparser::ast::TableExpr],
+    s: &pgparser::ast::SelectStmt,
     out: &mut std::collections::BTreeSet<RangeId>,
 ) -> Result<(), ExecError> {
-    for te in from {
+    use pgparser::ast::SelectItem;
+    for te in &s.from {
         collect_table_expr_ranges(router, te, out)?;
+    }
+    for item in &s.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_expr_ranges(router, expr, out)?;
+        }
+    }
+    if let Some(f) = &s.filter {
+        collect_expr_ranges(router, f, out)?;
+    }
+    if let Some(h) = &s.having {
+        collect_expr_ranges(router, h, out)?;
+    }
+    for g in &s.group_by {
+        collect_expr_ranges(router, g, out)?;
+    }
+    for o in &s.order_by {
+        collect_expr_ranges(router, &o.expr, out)?;
     }
     Ok(())
 }
@@ -637,12 +658,86 @@ fn collect_table_expr_ranges(
             out.insert(router.range_of(name)?);
         }
         TableExpr::Derived { subquery, .. } => {
-            collect_select_ranges(router, &subquery.from, out)?;
+            collect_select_ranges(router, subquery, out)?;
         }
         TableExpr::Join { left, right, .. } => {
             collect_table_expr_ranges(router, left, out)?;
             collect_table_expr_ranges(router, right, out)?;
         }
+    }
+    Ok(())
+}
+
+/// SP34: collect ranges referenced by subqueries nested in an expression. Recurses
+/// through every `Expr` variant that can hold a subquery or a sub-expression; a
+/// subquery node recurses into its full SELECT via `collect_select_ranges`.
+fn collect_expr_ranges(
+    router: &RangeRouter,
+    e: &pgparser::ast::Expr,
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    use pgparser::ast::{Expr, FuncArgs};
+    match e {
+        Expr::ScalarSubquery(s) | Expr::Exists(s) => collect_select_ranges(router, s, out)?,
+        Expr::InSubquery { expr, subquery, .. } | Expr::Quantified { expr, subquery, .. } => {
+            collect_expr_ranges(router, expr, out)?;
+            collect_select_ranges(router, subquery, out)?;
+        }
+        Expr::Unary { expr, .. } => collect_expr_ranges(router, expr, out)?,
+        Expr::Binary { left, right, .. } => {
+            collect_expr_ranges(router, left, out)?;
+            collect_expr_ranges(router, right, out)?;
+        }
+        Expr::Func(fc) => {
+            if let FuncArgs::Exprs(args) = &fc.args {
+                for a in args {
+                    collect_expr_ranges(router, a, out)?;
+                }
+            }
+        }
+        Expr::IsNull { expr, .. } => collect_expr_ranges(router, expr, out)?,
+        Expr::InList { expr, list, .. } => {
+            collect_expr_ranges(router, expr, out)?;
+            for x in list {
+                collect_expr_ranges(router, x, out)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_ranges(router, expr, out)?;
+            collect_expr_ranges(router, low, out)?;
+            collect_expr_ranges(router, high, out)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_ranges(router, expr, out)?;
+            collect_expr_ranges(router, pattern, out)?;
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_ranges(router, o, out)?;
+            }
+            for (c, r) in whens {
+                collect_expr_ranges(router, c, out)?;
+                collect_expr_ranges(router, r, out)?;
+            }
+            if let Some(el) = else_result {
+                collect_expr_ranges(router, el, out)?;
+            }
+        }
+        Expr::Cast { expr, .. } => collect_expr_ranges(router, expr, out)?,
+        Expr::IntLiteral(_)
+        | Expr::NumericLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BoolLiteral(_)
+        | Expr::NullLiteral
+        | Expr::Column { .. }
+        | Expr::Param(_)
+        | Expr::Const { .. } => {}
     }
     Ok(())
 }
@@ -792,6 +887,45 @@ mod tests {
         // A single-table SELECT on its data range still routes and reads back — the
         // multi-table FROM walk did not regress ordinary single-table routing.
         assert_eq!(router.scan_one_i32("SELECT id FROM b").await, vec![20]);
+    }
+
+    /// SP34: a single SELECT whose SUBQUERY references a table on another range is
+    /// rejected `0A000` by the router (`pinning_range` now walks subquery expressions
+    /// too), while a co-located subquery routes and reads back fine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_range_subquery_is_rejected_while_colocated_runs() {
+        // boundary at table 2: a (id 1) -> range 0, b (id 2) -> range 1.
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        router.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("seed a");
+        router
+            .simple("INSERT INTO b VALUES (1)")
+            .await
+            .expect("seed b");
+
+        // a (range 0) referencing b (range 1) in a subquery -> rejected 0A000.
+        let err = router
+            .simple("SELECT id FROM a WHERE id IN (SELECT id FROM b)")
+            .await
+            .expect_err("cross-range subquery rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(err.message.contains("cross-range"), "got {err:?}");
+
+        // A co-located subquery (both on range 0) routes and reads back.
+        assert_eq!(
+            router
+                .scan_one_i32("SELECT id FROM a WHERE id IN (SELECT id FROM a)")
+                .await,
+            vec![1]
+        );
     }
 
     /// A cross-range transaction now escalates to two-phase commit instead of being

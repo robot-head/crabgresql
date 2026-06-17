@@ -19,6 +19,7 @@ mod read_gate;
 mod scope;
 mod seq;
 mod session;
+mod subquery;
 
 use std::path::Path;
 use std::sync::Arc;
