@@ -24,6 +24,14 @@ pub enum TypeError {
         from: &'static str,
         to: &'static str,
     },
+    /// SP33: a math/string domain error carrying its own PostgreSQL SQLSTATE —
+    /// e.g. `ln(0)` (2201E), `sqrt(-1)` (2201F), `chr(0)` (54000). One
+    /// code-carrying variant rather than one per domain.
+    #[error("{message}")]
+    Domain {
+        sqlstate: &'static str,
+        message: &'static str,
+    },
 }
 
 impl TypeError {
@@ -36,6 +44,7 @@ impl TypeError {
             TypeError::TypeMismatch { .. } => "42804",
             TypeError::InvalidEscape => "22025",
             TypeError::CannotCast { .. } => "42846",
+            TypeError::Domain { sqlstate, .. } => sqlstate,
         }
     }
 }
@@ -71,6 +80,14 @@ mod tests {
             }
             .sqlstate(),
             "42846"
+        );
+        assert_eq!(
+            TypeError::Domain {
+                sqlstate: "2201E",
+                message: "cannot take logarithm of a negative number",
+            }
+            .sqlstate(),
+            "2201E"
         );
     }
 }

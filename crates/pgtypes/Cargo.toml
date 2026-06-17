@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 bigdecimal.workspace = true
+dashu-float.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

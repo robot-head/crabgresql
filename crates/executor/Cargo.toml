@@ -19,6 +19,7 @@ bytes.workspace = true
 tokio.workspace = true
 async-trait = { workspace = true }
 zerocopy.workspace = true
+bigdecimal.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
