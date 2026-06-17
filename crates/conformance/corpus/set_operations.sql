@@ -38,9 +38,12 @@ SELECT id FROM a UNION SELECT id FROM b ORDER BY 1;
 
 -- error surface (SQLSTATE matched by the oracle)
 SELECT 1 UNION SELECT 1, 2;
--- NOTE: SELECT 1 UNION SELECT 'x' is intentionally excluded from the corpus.
--- PostgreSQL 18 returns 22P02 (invalid input syntax for integer: 'x') because
--- it resolves the branch types to int4, then attempts a runtime text→int4 coercion
--- that fails mid-cast.  crabgresql returns 42804 (datatype mismatch) at plan time
--- because type unification is strict and raises 42804 without attempting the coerce.
--- This is a documented deviation (same pattern as coalesce(1,'x') in scalar_functions).
+-- genuinely incompatible branch types (int4 vs explicit text) → 42804 in both
+SELECT 1 UNION SELECT 'x'::text;
+-- NOTE: SELECT 1 UNION SELECT 'x' (a BARE string literal) is intentionally excluded.
+-- PostgreSQL 18 returns 22P02 (invalid input syntax for integer: 'x') because it
+-- types the unknown literal as int4 to match the other branch, then fails the runtime
+-- text→int4 coercion mid-cast.  crabgresql types the bare literal as text and returns
+-- 42804 (datatype mismatch) at plan-time strict unification.  This is a documented
+-- deviation in the unknown-type-literal family (same pattern as coalesce(1,'x') in
+-- scalar_functions.sql); the explicit-text case above is PG-faithful and IS diffed.

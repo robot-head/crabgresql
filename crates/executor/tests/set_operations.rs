@@ -159,8 +159,14 @@ async fn set_op_error_surface() {
     let c = connect(port).await;
     // column-count mismatch => 42601
     assert_eq!(err_code(&c, "SELECT 1 UNION SELECT 1, 2").await, "42601");
-    // incompatible types => 42804
-    assert_eq!(err_code(&c, "SELECT 1 UNION SELECT 'x'").await, "42804");
+    // genuinely incompatible branch types (int4 vs explicit text) => 42804.
+    // (A BARE 'x' literal is unknown-typed: PG resolves it to int4 then fails the
+    // runtime cast with 22P02 — a documented unknown-literal deviation — so the
+    // PG-faithful incompatible-types case uses an explicit ::text.)
+    assert_eq!(
+        err_code(&c, "SELECT 1 UNION SELECT 'x'::text").await,
+        "42804"
+    );
     // out-of-range positional ORDER BY => 42P10
     assert_eq!(
         err_code(&c, "SELECT 1 UNION SELECT 2 ORDER BY 5").await,
