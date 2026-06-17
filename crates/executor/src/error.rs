@@ -41,8 +41,10 @@ pub enum ExecError {
     /// one column (42601).
     SubqueryColumns,
     /// SP38: the branches of a UNION/INTERSECT/EXCEPT have different column counts
-    /// (42601).
+    /// (42601). `op` names the specific operator for the PG-exact message; `left`/
+    /// `right` are kept for internal use (the message does not print them).
     SetOpColumnCount {
+        op: pgparser::ast::SetOp,
         left: usize,
         right: usize,
     },
@@ -94,13 +96,19 @@ impl ExecError {
             ExecError::SubqueryColumns => {
                 PgError::error("42601", "subquery must return only one column")
             }
-            ExecError::SetOpColumnCount { left, right } => PgError::error(
-                "42601",
-                format!(
-                    "each UNION/INTERSECT/EXCEPT query must have the same number of columns \
-                     (got {left} and {right})"
-                ),
-            ),
+            ExecError::SetOpColumnCount { op, .. } => {
+                // PG-exact: the message names the specific operator and has no count,
+                // e.g. "each UNION query must have the same number of columns".
+                let op_name = match op {
+                    pgparser::ast::SetOp::Union => "UNION",
+                    pgparser::ast::SetOp::Intersect => "INTERSECT",
+                    pgparser::ast::SetOp::Except => "EXCEPT",
+                };
+                PgError::error(
+                    "42601",
+                    format!("each {op_name} query must have the same number of columns"),
+                )
+            }
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",
                 format!("missing FROM-clause entry for table \"{t}\""),

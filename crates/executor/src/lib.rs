@@ -21,6 +21,7 @@ mod read_gate;
 mod scope;
 mod seq;
 mod session;
+mod setops;
 mod subquery;
 
 use std::path::Path;
