@@ -1,18 +1,87 @@
 //! Recursive-descent statement parser with Pratt expression parsing.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::ast::{BinaryOp, Expr, UnaryOp};
 use crate::error::ParseError;
 use crate::lexer::lex;
 use crate::token::{Keyword, Token};
 
+/// Maximum nesting depth the parser will build before returning `54001`
+/// (statement_too_complex). This bounds BOTH crash modes:
+///   * mode 1 — deep parse recursion (nested parens / subqueries / CASE / NOT /
+///     unary minus, all of which funnel through `expr`/`select_inner`), and
+///   * mode 2 — a flat left-associative chain (`1+1+1+…`) whose Pratt loop is
+///     iterative but builds an N-deep left-nested AST that would overflow later
+///     in eval AND on recursive `Box` `Drop`; capping the loop iteration count
+///     stops the over-deep tree from ever being built.
+///
+/// Chosen empirically (see the `at_limit_*` crash-safety tests): the server runs
+/// on tokio's default ~2 MiB worker stack, and a query nested at `MAX_DEPTH` must
+/// parse AND evaluate without overflowing while a deeper one returns a clean
+/// error. Measured on that 2 MiB stack (both plain-debug AND llvm-cov-
+/// instrumented builds, since CI runs `cargo llvm-cov nextest`), a deeply-nested
+/// `(((…)))` paren parse — the heaviest recursion, an `expr`→`prefix`→`expr`
+/// round-trip per level — overflows the stack at a nesting depth of ~133. `50`
+/// leaves ~2.6x headroom below that ceiling; the executor's eval recursion
+/// (ceiling >12 000 on the same stack) and the AST's recursive `Box` `Drop` are
+/// nowhere near it. Real queries nest well under ~50 levels. This cap is
+/// deliberately MUCH more conservative than PostgreSQL's own (far higher)
+/// `max_stack_depth` — both return `54001` for sufficiently deep input, which is
+/// what matters for closing the DoS.
+pub(crate) const MAX_DEPTH: usize = 50;
+
 pub(crate) struct Parser {
     toks: Vec<(Token, usize)>,
     pos: usize,
+    /// Current recursion depth of the recursive productions (`expr`,
+    /// `select_inner`). Held behind an `Rc<Cell<…>>` so the RAII [`DepthGuard`]
+    /// can hold an OWNED clone of the handle rather than a borrow of `self` —
+    /// that lets the guarded method keep calling `&mut self` methods freely while
+    /// the guard is alive (a `&self.depth` borrow would conflict with `&mut self`
+    /// for the guard's whole lifetime). The guard's `Drop` decrements on EVERY
+    /// exit path, including a `?` early-return, so the depth is always restored.
+    depth: Rc<Cell<usize>>,
+}
+
+/// RAII depth counter: increments the shared depth `Cell` on construction and
+/// decrements it on `Drop` (so a `?` early-return still restores the count).
+/// Holds an owned `Rc` clone, so it does not borrow the `Parser` and never fights
+/// the borrow checker with the `&mut self` method calls in the guarded body.
+struct DepthGuard {
+    depth: Rc<Cell<usize>>,
+}
+
+impl DepthGuard {
+    /// Enter one recursion level, erroring with `54001` if it would exceed
+    /// `MAX_DEPTH`. On error the guard is NOT created (the count is not bumped for
+    /// a frame that never ran); the caller returns the error immediately.
+    fn enter(depth: &Rc<Cell<usize>>, position: usize) -> Result<Self, ParseError> {
+        let next = depth.get() + 1;
+        if next > MAX_DEPTH {
+            return Err(ParseError::too_deep(position));
+        }
+        depth.set(next);
+        Ok(Self {
+            depth: Rc::clone(depth),
+        })
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get() - 1);
+    }
 }
 
 impl Parser {
     pub(crate) fn new(toks: Vec<(Token, usize)>) -> Self {
-        Self { toks, pos: 0 }
+        Self {
+            toks,
+            pos: 0,
+            depth: Rc::new(Cell::new(0)),
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -171,8 +240,22 @@ impl Parser {
 
     /// Pratt expression parser. `min_bp` is the minimum left binding power.
     pub(crate) fn expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        // Mode-1 guard: every recursive expression production (parens, NOT, unary
+        // minus, CASE, CAST, IN-list, BETWEEN, LIKE, function args, subqueries)
+        // funnels back through `expr`, so bounding the recursion depth here caps
+        // all of them. The RAII guard decrements on every exit path, `?` included.
+        let _guard = DepthGuard::enter(&self.depth, self.peek_pos())?;
         let mut lhs = self.prefix()?;
+        // Mode-2 guard: the Pratt loop is iterative, but each iteration adds one
+        // level of left-nesting to the result tree (`1+1+1+…`). Capping the
+        // iteration count caps the built tree's depth, so it can never grow deep
+        // enough to overflow eval/fold/router-walk or recursive `Box` `Drop`.
+        let mut iterations: usize = 0;
         loop {
+            iterations += 1;
+            if iterations > MAX_DEPTH {
+                return Err(ParseError::too_deep(self.peek_pos()));
+            }
             // SP31: `::` is the tightest-binding operator (tighter than unary
             // minus and every arithmetic/comparison operator), so it is consumed
             // unconditionally here — no `min_bp` gate — and left-associatively
@@ -1048,6 +1131,12 @@ impl Parser {
     /// FROM-clause derived-table path (`( SELECT … ) alias`) can recurse into it.
     fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
         use crate::ast::{OrderItem, SelectItem, SelectStmt};
+        // Mode-1 guard: a derived-table chain `( SELECT … FROM ( SELECT … ) )`
+        // recurses `select_inner → table_factor → select_inner` without passing
+        // through `expr` at each level, so `select_inner` needs its own depth
+        // guard (scalar/IN/EXISTS subqueries also reach here, but those funnel
+        // through `expr` first — guarding both is belt-and-braces).
+        let _guard = DepthGuard::enter(&self.depth, self.peek_pos())?;
         self.expect(&Token::Keyword(Keyword::Select))?;
         // SP28: SELECT DISTINCT (ALL is the default modifier — accept and ignore).
         let distinct = self.eat_keyword(Keyword::Distinct);
@@ -2720,5 +2809,97 @@ mod tests {
             } => assert!(!all),
             other => panic!("expected SOME(=ANY), got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Recursion-depth guard (54001 / statement_too_complex).
+    //
+    // Two distinct DoS crash modes, both must return a clean 54001 — never a
+    // stack overflow that aborts the whole server process:
+    //   mode 1  deep PARSE recursion: nested parens/CASE/NOT/unary minus all
+    //           funnel through `expr`, so a guard there bounds them.
+    //   mode 2  deep AST TREE from a flat left-assoc chain (`1+1+1+…`): the
+    //           Pratt loop parses iteratively but builds an N-deep left-nested
+    //           tree that then overflows in eval AND on recursive Box `Drop`.
+    //           Capping the loop iterations prevents the over-deep tree.
+    // ------------------------------------------------------------------
+
+    /// Mode 1: `(((…1…)))` nested far beyond `MAX_DEPTH` → clean 54001, no crash.
+    #[test]
+    fn deeply_nested_parens_return_54001_not_a_crash() {
+        let n = MAX_DEPTH * 4;
+        let sql = format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n));
+        let err = parse(&sql).expect_err("too-deep parens must error, not crash");
+        assert_eq!(err.sqlstate(), "54001", "got {err:?}");
+        assert_eq!(err.message, "stack depth limit exceeded");
+    }
+
+    /// Mode 1: deep prefix `NOT` chain funnels through `expr` → 54001.
+    #[test]
+    fn deeply_nested_not_returns_54001() {
+        let n = MAX_DEPTH * 4;
+        let sql = format!("SELECT {}true", "NOT ".repeat(n));
+        let err = parse(&sql).expect_err("too-deep NOT must error");
+        assert_eq!(err.sqlstate(), "54001", "got {err:?}");
+    }
+
+    /// Mode 1: deeply nested scalar subqueries `(SELECT (SELECT …))` → 54001.
+    #[test]
+    fn deeply_nested_subqueries_return_54001() {
+        let n = MAX_DEPTH * 2;
+        let sql = format!("SELECT {}1{}", "(SELECT ".repeat(n), ")".repeat(n));
+        let err = parse(&sql).expect_err("too-deep subqueries must error");
+        assert_eq!(err.sqlstate(), "54001", "got {err:?}");
+    }
+
+    /// Mode 2: a long flat `1+1+1+…` chain is parsed iteratively but builds an
+    /// N-deep left-nested tree; capping the Pratt loop returns 54001 so the
+    /// tree (and its later eval/Drop) never over-deepens.
+    #[test]
+    fn long_left_assoc_chain_returns_54001() {
+        let n = MAX_DEPTH * 4;
+        let sql = format!("SELECT {}1", "1+".repeat(n));
+        let err = parse(&sql).expect_err("too-long additive chain must error");
+        assert_eq!(err.sqlstate(), "54001", "got {err:?}");
+    }
+
+    /// Crash-safety floor: a query nested right up to the limit must PARSE OK
+    /// (no stack overflow). If this test ABORTS the process (stack overflow rather
+    /// than a clean pass), `MAX_DEPTH` is too high for the runner's ~2 MiB stack
+    /// and must be lowered. Each `(` adds one `expr` frame (one `DepthGuard`
+    /// level); `select_inner` + the outermost projection `expr` add a small
+    /// constant on top, so `MAX_DEPTH - 3` parens lands the deepest frame just
+    /// under the limit — the most deeply-nested paren query the parser admits.
+    #[test]
+    fn at_limit_parens_parse_ok() {
+        let n = MAX_DEPTH - 3;
+        let sql = format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n));
+        parse(&sql).expect("a query nested at the limit must parse, not crash");
+    }
+
+    /// The guard actually fires near the limit (not merely far away): a paren
+    /// nest a few levels OVER `MAX_DEPTH` returns 54001, while the `at_limit`
+    /// test above proves a nest just UNDER it still parses — so the boundary is
+    /// where it is intended to be.
+    #[test]
+    fn parens_just_over_limit_returns_54001() {
+        let n = MAX_DEPTH + 2;
+        let sql = format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n));
+        assert_eq!(
+            parse(&sql)
+                .expect_err("just over the limit must error")
+                .sqlstate(),
+            "54001",
+        );
+    }
+
+    /// A modest real-world nesting depth (well under the limit) parses fine —
+    /// the guard does not reject ordinary queries.
+    #[test]
+    fn modest_nesting_parses_fine() {
+        let sql = format!("SELECT {}1{}", "(".repeat(20), ")".repeat(20));
+        parse(&sql).expect("modest nesting must parse");
+        // A flat chain of 20 additions is fine too.
+        parse(&format!("SELECT {}1", "1+".repeat(20))).expect("modest chain must parse");
     }
 }
