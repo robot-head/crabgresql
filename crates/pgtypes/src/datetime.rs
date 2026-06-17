@@ -1533,7 +1533,7 @@ fn match_pattern(
             return Ok(Some((3, name, None)));
         }
     }
-    // `RM`/`rm`: PostgreSQL right-justifies the Roman month numeral in a width-4
+    // `RM`/`rm`: PostgreSQL left-justifies the Roman month numeral in a width-4
     // field (the widest is "VIII"); `FM` strips that padding.
     if matches_at(chars, i, "RM") {
         return Ok(Some((
