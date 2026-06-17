@@ -250,6 +250,27 @@ mod tests {
     }
 
     #[test]
+    fn adversarial_datetime_values_error_not_panic() {
+        // Regression (decode_row fuzz crash): a date/time field whose fixed-width
+        // payload is an out-of-range integer (e.g. a TIMESTAMPTZ at i64::MAX) must
+        // be rejected as corrupt, NOT panic — earlier the decoders used jiff's
+        // panicking `ToSpan`/an unchecked epoch `+`. Tags: DATE=7, TIME=8,
+        // TIMESTAMP=9, TIMESTAMPTZ=10, INTERVAL=11.
+        for (tag, width) in [(7u8, 4usize), (8, 8), (9, 8), (10, 8), (11, 16)] {
+            for fill in [0xFFu8, 0x7F, 0x80, 0x00] {
+                let mut bytes = vec![ROW_VERSION, tag];
+                bytes.extend(vec![fill; width]);
+                // Must return Ok or Err — never panic / never hang.
+                let _ = decode_row(&bytes);
+            }
+        }
+        // The specific i64::MAX TIMESTAMPTZ boundary that crashed must be a clean Err.
+        let mut tstz_max = vec![ROW_VERSION, 10];
+        tstz_max.extend_from_slice(&i64::MAX.to_be_bytes());
+        assert!(decode_row(&tstz_max).is_err());
+    }
+
+    #[test]
     fn unknown_version_errors() {
         assert!(decode_row(&[99, 1, 1]).is_err());
     }

@@ -306,6 +306,9 @@ fn pg_epoch_datetime() -> DateTime {
     DateTime::constant(2000, 1, 1, 0, 0, 0, 0)
 }
 
+/// Seconds from the Unix epoch (1970-01-01) to the PostgreSQL epoch (2000-01-01).
+const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+
 /// Microseconds in one calendar day (24h estimate — civil days are always 24h).
 const USECS_PER_DAY_I64: i64 = 86_400_000_000;
 
@@ -383,9 +386,14 @@ pub fn date_from_binary(b: &[u8]) -> Result<Date, TypeError> {
         type_name: "date",
         value: format!("{b:?}"),
     })?;
-    let days = i32::from_be_bytes(arr);
-    pg_epoch_date()
-        .checked_add(days.days())
+    let days = i64::from(i32::from_be_bytes(arr));
+    // Route through a non-panicking `Timestamp` — `ToSpan::days()` PANICS when the
+    // value is outside jiff's Span range, and these bytes are arbitrary (storage /
+    // fuzz). An i32 day count · 86_400 + the epoch offset always fits i64, so the
+    // only failure is an out-of-range instant, reported as 22008.
+    let unix_secs = days * 86_400 + PG_EPOCH_UNIX_SECS;
+    Timestamp::from_second(unix_secs)
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::UTC).date())
         .map_err(|_| TypeError::DatetimeFieldOverflow {
             value: days.to_string(),
         })
@@ -512,11 +520,20 @@ pub fn timestamp_from_binary(b: &[u8]) -> Result<DateTime, TypeError> {
         type_name: "timestamp without time zone",
         value: format!("{b:?}"),
     })?;
-    let micros = i64::from_be_bytes(arr);
-    pg_epoch_datetime()
-        .checked_add(micros.microseconds())
+    let pg_micros = i64::from_be_bytes(arr);
+    // Route through a non-panicking UTC `Timestamp` — `ToSpan::microseconds()`
+    // PANICS outside jiff's Span range and these bytes are arbitrary. The civil
+    // timestamp is µs since 2000-01-01 read as UTC, so the round trip is exact
+    // (UTC has no DST). Overflow on either step → 22008.
+    let unix_micros = pg_micros
+        .checked_add(PG_EPOCH_UNIX_SECS * 1_000_000)
+        .ok_or_else(|| TypeError::DatetimeFieldOverflow {
+            value: pg_micros.to_string(),
+        })?;
+    Timestamp::from_microsecond(unix_micros)
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::UTC).datetime())
         .map_err(|_| TypeError::DatetimeFieldOverflow {
-            value: micros.to_string(),
+            value: pg_micros.to_string(),
         })
 }
 
@@ -644,7 +661,6 @@ fn push_offset(out: &mut String, off: Offset) {
 pub fn timestamptz_to_binary(ts: Timestamp) -> [u8; 8] {
     // Unix-epoch µs, then rebase to the PG epoch (2000-01-01 is 946684800s after
     // the Unix epoch).
-    const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let unix_micros = ts.as_microsecond();
     let micros = unix_micros - PG_EPOCH_UNIX_SECS * 1_000_000;
     micros.to_be_bytes()
@@ -652,13 +668,19 @@ pub fn timestamptz_to_binary(ts: Timestamp) -> [u8; 8] {
 
 /// `timestamptz_recv`: i64 big-endian microseconds since the PG epoch (UTC).
 pub fn timestamptz_from_binary(b: &[u8]) -> Result<Timestamp, TypeError> {
-    const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let arr: [u8; 8] = b.try_into().map_err(|_| TypeError::InvalidDatetimeFormat {
         type_name: "timestamp with time zone",
         value: format!("{b:?}"),
     })?;
     let pg_micros = i64::from_be_bytes(arr);
-    let unix_micros = pg_micros + PG_EPOCH_UNIX_SECS * 1_000_000;
+    // Rebase to the Unix epoch with a CHECKED add: `pg_micros` comes from
+    // arbitrary bytes (storage/fuzz), so an unchecked `+` overflows i64 near the
+    // boundary and panics under overflow-checks. Overflow → out of range (22008).
+    let unix_micros = pg_micros
+        .checked_add(PG_EPOCH_UNIX_SECS * 1_000_000)
+        .ok_or_else(|| TypeError::DatetimeFieldOverflow {
+            value: pg_micros.to_string(),
+        })?;
     Timestamp::from_microsecond(unix_micros).map_err(|_| TypeError::DatetimeFieldOverflow {
         value: pg_micros.to_string(),
     })
@@ -1076,6 +1098,36 @@ mod io_tests {
             interval_from_binary(&interval_to_binary(i)).expect("round-trip"),
             i
         );
+    }
+
+    /// Fuzz regression: every `*_from_binary` takes ARBITRARY bytes (from storage
+    /// or a fuzzer) and must return `Ok`/`Err`, NEVER panic. The bug: a previous
+    /// `timestamptz_from_binary` added the PG-epoch offset to `pg_micros` with an
+    /// unchecked `+`, which overflowed i64 (panicking under overflow-checks) for
+    /// boundary inputs like `i64::MAX`.
+    #[test]
+    fn from_binary_never_panics_on_adversarial_bytes() {
+        let eights: [[u8; 8]; 5] = [
+            [0xFF; 8],
+            i64::MAX.to_be_bytes(),
+            i64::MIN.to_be_bytes(),
+            [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0; 8],
+        ];
+        for b in &eights {
+            let _ = time_from_binary(b);
+            let _ = timestamp_from_binary(b);
+            let _ = timestamptz_from_binary(b);
+        }
+        for b in &[[0xFF; 4], [0x7F, 0xFF, 0xFF, 0xFF], [0x80, 0, 0, 0], [0; 4]] {
+            let _ = date_from_binary(b);
+        }
+        for b in &[[0xFF; 16], [0; 16]] {
+            let _ = interval_from_binary(b);
+        }
+        // The specific overflow boundary must be a clean Err, not a panic.
+        assert!(timestamptz_from_binary(&i64::MAX.to_be_bytes()).is_err());
+        assert!(timestamptz_from_binary(&i64::MIN.to_be_bytes()).is_err());
     }
 }
 
