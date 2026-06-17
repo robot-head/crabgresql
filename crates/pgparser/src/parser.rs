@@ -2867,9 +2867,9 @@ mod tests {
     /// (no stack overflow). If this test ABORTS the process (stack overflow rather
     /// than a clean pass), `MAX_DEPTH` is too high for the runner's ~2 MiB stack
     /// and must be lowered. Each `(` adds one `expr` frame (one `DepthGuard`
-    /// level); `select_inner` + the outermost projection `expr` add a small
-    /// constant on top, so `MAX_DEPTH - 3` parens lands the deepest frame just
-    /// under the limit — the most deeply-nested paren query the parser admits.
+    /// level); `select_inner` + the outermost projection `expr` add 2 guard
+    /// levels on top, so `MAX_DEPTH - 2` is the deepest paren query the parser
+    /// admits — this test uses `MAX_DEPTH - 3` for one extra level of headroom.
     #[test]
     fn at_limit_parens_parse_ok() {
         let n = MAX_DEPTH - 3;
