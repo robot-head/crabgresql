@@ -983,6 +983,183 @@ impl DateTimeFields {
     }
 }
 
+/// The field source the `to_char` renderer reads. Both `DateTimeFields` (a
+/// civil date/time, fields already normalized to `0..=23` hours etc.) and an
+/// interval field-set (PG `interval2tm`: hours may be `≥ 24` or negative, no
+/// meaningful dow/doy/ISO fields) implement it, so `format_datetime` and
+/// `format_interval` share ONE tokenizer/renderer (`match_pattern` + the
+/// `render_tokens` body).
+///
+/// Every numeric getter returns `i64` so an interval's un-normalized hour count
+/// (e.g. `36`, or a negative offset) is representable; `DateTimeFields` widens
+/// its narrow civil fields losslessly.
+trait FieldSource {
+    fn year(&self) -> i64;
+    fn month(&self) -> i64; // 1..=12 for a datetime; 0..=11 (months % 12) for an interval
+    fn day(&self) -> i64;
+    fn hour(&self) -> i64; // 0..=23 for a datetime; may be ≥ 24 / negative for an interval
+    fn minute(&self) -> i64;
+    fn second(&self) -> i64;
+    fn micros(&self) -> i64; // 0..=999_999 sub-second microseconds
+    fn iso_dow(&self) -> i64;
+    fn dow(&self) -> i64;
+    fn doy(&self) -> i64;
+    fn iso_week(&self) -> i64;
+    fn iso_year(&self) -> i64;
+    fn week_of_year(&self) -> i64;
+    fn week_of_month(&self) -> i64;
+    fn tz_offset_secs(&self) -> Option<i32>;
+
+    /// Index into the 12-entry month-name/Roman tables. A datetime's `month` is
+    /// always `1..=12`; an interval's `months % 12` can be `0..=11` (or negative),
+    /// so this maps the raw value into `0..=11` rather than panicking on an
+    /// out-of-range subscript. (Month NAMES on an interval are not a corpus case;
+    /// this just keeps the shared renderer total — see Task 9.)
+    fn month_name_index(&self) -> usize {
+        (self.month().rem_euclid(12)) as usize
+    }
+
+    /// Index into the 7-entry day-name table (`DAY_NAMES`, 0 = Sunday). A datetime's
+    /// `dow` is `1..=7`; an interval has no day-of-week, so this clamps into range
+    /// to keep the renderer total (day NAMES on an interval are not a corpus case).
+    fn day_name_index(&self) -> usize {
+        ((self.dow() - 1).rem_euclid(7)) as usize
+    }
+}
+
+impl FieldSource for DateTimeFields {
+    fn year(&self) -> i64 {
+        i64::from(self.year)
+    }
+    fn month(&self) -> i64 {
+        i64::from(self.month)
+    }
+    fn day(&self) -> i64 {
+        i64::from(self.day)
+    }
+    fn hour(&self) -> i64 {
+        i64::from(self.hour)
+    }
+    fn minute(&self) -> i64 {
+        i64::from(self.minute)
+    }
+    fn second(&self) -> i64 {
+        i64::from(self.second)
+    }
+    fn micros(&self) -> i64 {
+        i64::from(self.micros)
+    }
+    fn iso_dow(&self) -> i64 {
+        i64::from(self.iso_dow)
+    }
+    fn dow(&self) -> i64 {
+        i64::from(self.dow)
+    }
+    fn doy(&self) -> i64 {
+        i64::from(self.doy)
+    }
+    fn iso_week(&self) -> i64 {
+        i64::from(self.iso_week)
+    }
+    fn iso_year(&self) -> i64 {
+        i64::from(self.iso_year)
+    }
+    fn week_of_year(&self) -> i64 {
+        i64::from(self.week_of_year)
+    }
+    fn week_of_month(&self) -> i64 {
+        i64::from(self.week_of_month)
+    }
+    fn tz_offset_secs(&self) -> Option<i32> {
+        self.tz_offset_secs
+    }
+    // For a datetime, `month`/`dow` are in range, so the default index maps are
+    // exact (`month - 1 == month.rem_euclid(12)` for 1..=12, etc.); we override
+    // to make that obvious and avoid relying on the wrap path.
+    fn month_name_index(&self) -> usize {
+        (self.month - 1) as usize
+    }
+    fn day_name_index(&self) -> usize {
+        (self.dow - 1) as usize
+    }
+}
+
+/// The interval field-set for the `to_char(interval, fmt)` renderer, mirroring
+/// PostgreSQL `interval2tm`: the stored `months`/`days`/`micros` are read
+/// component-wise WITHOUT normalizing across the day/month boundary —
+/// `year = months / 12`, `month = months % 12`, `day = days`, and from `micros`
+/// `hour = micros / 3_600_000_000` (which may be `≥ 24` or negative), then
+/// minute/second/sub-second from the remainder.
+struct IntervalFields {
+    months: i64,
+    days: i64,
+    micros: i64,
+}
+
+impl IntervalFields {
+    fn new(iv: Interval) -> Self {
+        IntervalFields {
+            months: i64::from(iv.months),
+            days: i64::from(iv.days),
+            micros: iv.micros,
+        }
+    }
+}
+
+impl FieldSource for IntervalFields {
+    fn year(&self) -> i64 {
+        self.months / 12
+    }
+    fn month(&self) -> i64 {
+        self.months % 12
+    }
+    fn day(&self) -> i64 {
+        self.days
+    }
+    fn hour(&self) -> i64 {
+        // PG `interval2tm`: hours are NOT folded into days — `36 h` stays `36`.
+        self.micros / 3_600_000_000
+    }
+    fn minute(&self) -> i64 {
+        (self.micros / 60_000_000) % 60
+    }
+    fn second(&self) -> i64 {
+        (self.micros / 1_000_000) % 60
+    }
+    fn micros(&self) -> i64 {
+        // Sub-second microseconds; the sign rides along on negative intervals.
+        self.micros % 1_000_000
+    }
+    // An interval has no calendar day-of-week / day-of-year / ISO week fields.
+    // PG's `to_char(interval, …)` leaves these as the raw `tm` defaults (0); we
+    // return 0 so a numeric ISO/dow/doy pattern renders its zero rather than
+    // panicking — these patterns are not part of the interval corpus (Task 9).
+    fn iso_dow(&self) -> i64 {
+        0
+    }
+    fn dow(&self) -> i64 {
+        0
+    }
+    fn doy(&self) -> i64 {
+        0
+    }
+    fn iso_week(&self) -> i64 {
+        0
+    }
+    fn iso_year(&self) -> i64 {
+        0
+    }
+    fn week_of_year(&self) -> i64 {
+        0
+    }
+    fn week_of_month(&self) -> i64 {
+        0
+    }
+    fn tz_offset_secs(&self) -> Option<i32> {
+        None
+    }
+}
+
 /// The Roman-numeral month table (1-indexed: `ROMAN_MONTHS[m-1]`).
 const ROMAN_MONTHS: [&str; 12] = [
     "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
@@ -1021,6 +1198,23 @@ const DAY_NAMES: [&str; 7] = [
 /// unrecognized character is emitted literally (PostgreSQL behavior), never an
 /// error.
 pub fn format_datetime(template: &str, fields: &DateTimeFields) -> Result<String, TypeError> {
+    render_tokens(template, fields)
+}
+
+/// The `to_char(interval, fmt)` engine: render `template` from an interval's
+/// STORED `months`/`days`/`micros` (PG `interval2tm` — clock fields are NOT
+/// normalized across the day/month boundary, so e.g. `HH24` of a `36 hour`
+/// interval is `36`). Shares the exact tokenizer/renderer as `format_datetime`
+/// via the `FieldSource` indirection.
+pub fn format_interval(iv: Interval, template: &str) -> Result<String, TypeError> {
+    render_tokens(template, &IntervalFields::new(iv))
+}
+
+/// The shared `to_char` tokenizer/renderer: walk `template` left-to-right,
+/// longest-pattern-match at each point, honoring quoted runs, `FM`, and `TH`/`th`.
+/// The field VALUES come from `src` (a civil datetime or an interval), so the same
+/// engine serves `to_char(timestamp, …)` and `to_char(interval, …)`.
+fn render_tokens(template: &str, src: &dyn FieldSource) -> Result<String, TypeError> {
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -1072,7 +1266,7 @@ pub fn format_datetime(template: &str, fields: &DateTimeFields) -> Result<String
         }
 
         // Try the longest matching pattern keyword.
-        if let Some((kw, rendered, number)) = match_pattern(&chars, i, fields, fill_mode)? {
+        if let Some((kw, rendered, number)) = match_pattern(&chars, i, src, fill_mode)? {
             out.push_str(&rendered);
             last_number = number;
             fill_mode = false;
@@ -1142,8 +1336,10 @@ fn pad_name(name: &str, width: usize, fm: bool) -> String {
 }
 
 /// Render the meridiem string variants. `lower` lowercases; `dotted` inserts the
-/// dots (`A.M.`/`P.M.`).
-fn meridiem(hour: u32, lower: bool, dotted: bool) -> String {
+/// dots (`A.M.`/`P.M.`). `hour` is `i64` so the shared renderer also serves an
+/// interval source (where AM/PM has no clock meaning — not a corpus case); for a
+/// civil `0..=23` hour the `>= 12` test is unchanged.
+fn meridiem(hour: i64, lower: bool, dotted: bool) -> String {
     let pm = hour >= 12;
     let s = match (pm, dotted) {
         (false, false) => "AM",
@@ -1193,8 +1389,11 @@ fn cased(name: &str, case: NameCase) -> String {
 }
 
 /// 12-hour clock hour for `HH`/`HH12`: `((h + 11) % 12) + 1` (so 0→12, 13→1).
-fn hour12(hour: u32) -> i64 {
-    i64::from((hour + 11) % 12 + 1)
+/// `hour` is `i64` so the shared renderer also serves an interval source (where
+/// `HH`/`HH12` has no clock meaning — not a corpus case); `rem_euclid` keeps the
+/// result in `1..=12` for any input, matching the civil `0..=23` mapping exactly.
+fn hour12(hour: i64) -> i64 {
+    (hour + 11).rem_euclid(12) + 1
 }
 
 /// Render the `±HH` / `±HH:MM` etc. timezone forms from an offset in seconds.
@@ -1211,70 +1410,58 @@ fn offset_hh(secs: i32) -> String {
 fn match_pattern(
     chars: &[char],
     i: usize,
-    f: &DateTimeFields,
+    f: &dyn FieldSource,
     fm: bool,
 ) -> Result<Option<(usize, String, Option<i64>)>, TypeError> {
     // -- year (longest first) --
     if matches_at(chars, i, "YYYY") {
-        return Ok(Some((
-            4,
-            pad_num(i64::from(f.year), 4, fm),
-            Some(i64::from(f.year)),
-        )));
+        return Ok(Some((4, pad_num(f.year(), 4, fm), Some(f.year()))));
     }
     if matches_at(chars, i, "YYY") {
-        let v = i64::from(f.year).rem_euclid(1000);
+        let v = f.year().rem_euclid(1000);
         return Ok(Some((3, pad_num(v, 3, fm), Some(v))));
     }
     // `Y,YYY`: comma-grouped 4-digit year (the comma grouping is kept even under
     // FM; PG's FM only suppresses leading zeros, not the group separator).
     if matches_at(chars, i, "Y,YYY") {
-        let y = i64::from(f.year);
+        let y = f.year();
         let s = format!("{},{:03}", y / 1000, (y % 1000).abs());
         return Ok(Some((5, s, Some(y))));
     }
     if matches_at(chars, i, "YY") {
-        let v = i64::from(f.year).rem_euclid(100);
+        let v = f.year().rem_euclid(100);
         return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
     }
     if matches_at(chars, i, "Y") {
-        let v = i64::from(f.year).rem_euclid(10);
+        let v = f.year().rem_euclid(10);
         return Ok(Some((1, pad_num(v, 1, fm), Some(v))));
     }
     // -- ISO patterns (longest first so `IDDD`/`IYYY` win over `IY`/`IW`/`ID`/`I`) --
     if matches_at(chars, i, "IDDD") {
         // ISO day-of-year: (iso_week - 1) * 7 + iso_dow.
-        let v = i64::from((f.iso_week - 1) * 7 + f.iso_dow);
+        let v = (f.iso_week() - 1) * 7 + f.iso_dow();
         return Ok(Some((4, pad_num(v, 3, fm), Some(v))));
     }
     if matches_at(chars, i, "IYYY") {
-        return Ok(Some((
-            4,
-            pad_num(i64::from(f.iso_year), 4, fm),
-            Some(i64::from(f.iso_year)),
-        )));
+        return Ok(Some((4, pad_num(f.iso_year(), 4, fm), Some(f.iso_year()))));
     }
     if matches_at(chars, i, "IYY") {
-        let v = i64::from(f.iso_year).rem_euclid(1000);
+        let v = f.iso_year().rem_euclid(1000);
         return Ok(Some((3, pad_num(v, 3, fm), Some(v))));
     }
     if matches_at(chars, i, "IW") {
-        return Ok(Some((
-            2,
-            pad_num(i64::from(f.iso_week), 2, fm),
-            Some(i64::from(f.iso_week)),
-        )));
+        return Ok(Some((2, pad_num(f.iso_week(), 2, fm), Some(f.iso_week()))));
     }
     if matches_at(chars, i, "IY") {
-        let v = i64::from(f.iso_year).rem_euclid(100);
+        let v = f.iso_year().rem_euclid(100);
         return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
     }
     if matches_at(chars, i, "ID") {
-        let v = i64::from(f.iso_dow);
+        let v = f.iso_dow();
         return Ok(Some((2, v.to_string(), Some(v))));
     }
     if matches_at(chars, i, "I") {
-        let v = i64::from(f.iso_year).rem_euclid(10);
+        let v = f.iso_year().rem_euclid(10);
         return Ok(Some((1, pad_num(v, 1, fm), Some(v))));
     }
     // -- century --
@@ -1284,7 +1471,7 @@ fn match_pattern(
         // test is written `y < 1` (not `y > 0`) so the boundary year 1 — which the
         // two branches map to 1 vs 0 — makes the comparison observable (a year-1
         // unit test pins it).
-        let y = i64::from(f.year);
+        let y = f.year();
         let c = if y < 1 {
             (y - 99) / 100
         } else {
@@ -1304,16 +1491,16 @@ fn match_pattern(
         ("bc", true, false),
     ] {
         if matches_at(chars, i, kw) {
-            return Ok(Some((kw.chars().count(), era(f.year, lower, dotted), None)));
+            return Ok(Some((
+                kw.chars().count(),
+                era(f.year() as i32, lower, dotted),
+                None,
+            )));
         }
     }
     // -- month --
     if matches_at(chars, i, "MM") {
-        return Ok(Some((
-            2,
-            pad_num(i64::from(f.month), 2, fm),
-            Some(i64::from(f.month)),
-        )));
+        return Ok(Some((2, pad_num(f.month(), 2, fm), Some(f.month()))));
     }
     for (kw, case) in [
         ("Month", NameCase::Title),
@@ -1321,7 +1508,7 @@ fn match_pattern(
         ("month", NameCase::Lower),
     ] {
         if matches_at(chars, i, kw) {
-            let name = cased(MONTH_NAMES[(f.month - 1) as usize], case);
+            let name = cased(MONTH_NAMES[f.month_name_index()], case);
             return Ok(Some((5, pad_name(&name, 9, fm), None)));
         }
     }
@@ -1331,38 +1518,30 @@ fn match_pattern(
         ("mon", NameCase::Lower),
     ] {
         if matches_at(chars, i, kw) {
-            let name = cased(&MONTH_NAMES[(f.month - 1) as usize][..3], case);
+            let name = cased(&MONTH_NAMES[f.month_name_index()][..3], case);
             return Ok(Some((3, name, None)));
         }
     }
     if matches_at(chars, i, "RM") {
         return Ok(Some((
             2,
-            ROMAN_MONTHS[(f.month - 1) as usize].to_string(),
+            ROMAN_MONTHS[f.month_name_index()].to_string(),
             None,
         )));
     }
     if matches_at(chars, i, "rm") {
         return Ok(Some((
             2,
-            ROMAN_MONTHS[(f.month - 1) as usize].to_ascii_lowercase(),
+            ROMAN_MONTHS[f.month_name_index()].to_ascii_lowercase(),
             None,
         )));
     }
     // -- day (DDD before DD before D; the ISO `IDDD`/`ID` are handled above) --
     if matches_at(chars, i, "DDD") {
-        return Ok(Some((
-            3,
-            pad_num(i64::from(f.doy), 3, fm),
-            Some(i64::from(f.doy)),
-        )));
+        return Ok(Some((3, pad_num(f.doy(), 3, fm), Some(f.doy()))));
     }
     if matches_at(chars, i, "DD") {
-        return Ok(Some((
-            2,
-            pad_num(i64::from(f.day), 2, fm),
-            Some(i64::from(f.day)),
-        )));
+        return Ok(Some((2, pad_num(f.day(), 2, fm), Some(f.day()))));
     }
     for (kw, case) in [
         ("Day", NameCase::Title),
@@ -1370,7 +1549,7 @@ fn match_pattern(
         ("day", NameCase::Lower),
     ] {
         if matches_at(chars, i, kw) {
-            let name = cased(DAY_NAMES[(f.dow - 1) as usize], case);
+            let name = cased(DAY_NAMES[f.day_name_index()], case);
             return Ok(Some((3, pad_name(&name, 9, fm), None)));
         }
     }
@@ -1380,75 +1559,63 @@ fn match_pattern(
         ("dy", NameCase::Lower),
     ] {
         if matches_at(chars, i, kw) {
-            let name = cased(&DAY_NAMES[(f.dow - 1) as usize][..3], case);
+            let name = cased(&DAY_NAMES[f.day_name_index()][..3], case);
             return Ok(Some((2, name, None)));
         }
     }
     if matches_at(chars, i, "D") {
-        let v = i64::from(f.dow);
+        let v = f.dow();
         return Ok(Some((1, v.to_string(), Some(v))));
     }
     // -- week / quarter (the ISO `IW` is handled in the ISO group above) --
     if matches_at(chars, i, "WW") {
         return Ok(Some((
             2,
-            pad_num(i64::from(f.week_of_year), 2, fm),
-            Some(i64::from(f.week_of_year)),
+            pad_num(f.week_of_year(), 2, fm),
+            Some(f.week_of_year()),
         )));
     }
     if matches_at(chars, i, "W") {
-        let v = i64::from(f.week_of_month);
+        let v = f.week_of_month();
         return Ok(Some((1, v.to_string(), Some(v))));
     }
     if matches_at(chars, i, "Q") {
-        let v = i64::from((f.month - 1) / 3 + 1);
+        let v = (f.month() - 1) / 3 + 1;
         return Ok(Some((1, v.to_string(), Some(v))));
     }
     // -- time (HH24 before HH12/HH; SSSSS before SSSS before SS) --
     if matches_at(chars, i, "HH24") {
-        return Ok(Some((
-            4,
-            pad_num(i64::from(f.hour), 2, fm),
-            Some(i64::from(f.hour)),
-        )));
+        return Ok(Some((4, pad_num(f.hour(), 2, fm), Some(f.hour()))));
     }
     if matches_at(chars, i, "HH12") {
-        let v = hour12(f.hour);
+        let v = hour12(f.hour());
         return Ok(Some((4, pad_num(v, 2, fm), Some(v))));
     }
     if matches_at(chars, i, "HH") {
-        let v = hour12(f.hour);
+        let v = hour12(f.hour());
         return Ok(Some((2, pad_num(v, 2, fm), Some(v))));
     }
     if matches_at(chars, i, "MI") {
-        return Ok(Some((
-            2,
-            pad_num(i64::from(f.minute), 2, fm),
-            Some(i64::from(f.minute)),
-        )));
+        return Ok(Some((2, pad_num(f.minute(), 2, fm), Some(f.minute()))));
     }
     if matches_at(chars, i, "SSSSS") {
-        let v = i64::from(f.hour) * 3600 + i64::from(f.minute) * 60 + i64::from(f.second);
+        let v = f.hour() * 3600 + f.minute() * 60 + f.second();
         return Ok(Some((5, pad_num(v, 5, fm), Some(v))));
     }
     if matches_at(chars, i, "SSSS") {
-        let v = i64::from(f.hour) * 3600 + i64::from(f.minute) * 60 + i64::from(f.second);
+        let v = f.hour() * 3600 + f.minute() * 60 + f.second();
         return Ok(Some((4, pad_num(v, 4, fm), Some(v))));
     }
     if matches_at(chars, i, "SS") {
-        return Ok(Some((
-            2,
-            pad_num(i64::from(f.second), 2, fm),
-            Some(i64::from(f.second)),
-        )));
+        return Ok(Some((2, pad_num(f.second(), 2, fm), Some(f.second()))));
     }
     if matches_at(chars, i, "MS") {
         // Milliseconds: micros / 1000, 3 digits.
-        let v = i64::from(f.micros / 1000);
+        let v = f.micros() / 1000;
         return Ok(Some((2, pad_num(v, 3, fm), Some(v))));
     }
     if matches_at(chars, i, "US") {
-        let v = i64::from(f.micros);
+        let v = f.micros();
         return Ok(Some((2, pad_num(v, 6, fm), Some(v))));
     }
     // FF1..FF6: fractional seconds to N digits.
@@ -1456,7 +1623,7 @@ fn match_pattern(
         let n = (chars[i + 2] as u8 - b'0') as usize;
         if (1..=6).contains(&n) {
             // Six-digit micros, take the first `n` digits.
-            let full = format!("{:06}", f.micros);
+            let full = format!("{:06}", f.micros());
             return Ok(Some((3, full[..n].to_string(), None)));
         }
     }
@@ -1474,28 +1641,28 @@ fn match_pattern(
         if matches_at(chars, i, kw) {
             return Ok(Some((
                 kw.chars().count(),
-                meridiem(f.hour, lower, dotted),
+                meridiem(f.hour(), lower, dotted),
                 None,
             )));
         }
     }
     // -- timezone (only with an offset present; else empty) --
     if matches_at(chars, i, "TZH") {
-        let s = match f.tz_offset_secs {
+        let s = match f.tz_offset_secs() {
             Some(secs) => offset_hh(secs),
             None => String::new(),
         };
         return Ok(Some((3, s, None)));
     }
     if matches_at(chars, i, "TZM") {
-        let s = match f.tz_offset_secs {
+        let s = match f.tz_offset_secs() {
             Some(secs) => format!("{:02}", (secs.unsigned_abs() % 3600) / 60),
             None => String::new(),
         };
         return Ok(Some((3, s, None)));
     }
     if matches_at(chars, i, "OF") {
-        let s = match f.tz_offset_secs {
+        let s = match f.tz_offset_secs() {
             Some(secs) => {
                 let mins = (secs.unsigned_abs() % 3600) / 60;
                 if mins == 0 {
@@ -1509,7 +1676,7 @@ fn match_pattern(
         return Ok(Some((2, s, None)));
     }
     if matches_at(chars, i, "TZ") || matches_at(chars, i, "tz") {
-        let s = match f.tz_offset_secs {
+        let s = match f.tz_offset_secs() {
             Some(secs) => offset_hh(secs),
             None => String::new(),
         };
@@ -1882,6 +2049,69 @@ mod format_tests {
         // `+ → *`: place FF at index 4 (four literal dots), where `4 + 2 = 6 < 7` but
         // `4 * 2 = 8 ≥ 7`, so the `*` mutant would skip the FF render.
         assert_eq!(format_datetime("....FF3", &f).expect("ff"), "....500");
+    }
+
+    #[test]
+    fn format_interval_uses_stored_fields() {
+        use super::{Interval, format_interval};
+        let fmt = |iv: Interval, t: &str| format_interval(iv, t).expect(t);
+        // 36 hours: HH24 reads the micros component → 36 (not normalized to 1 day 12h).
+        let h36 = Interval {
+            months: 0,
+            days: 0,
+            micros: 36 * 3_600_000_000,
+        };
+        assert_eq!(fmt(h36, "HH24:MI:SS"), "36:00:00");
+        // 1 day 02:03:04 → DD=01, HH24=02 (days stay separate from the clock).
+        let d1 = Interval {
+            months: 0,
+            days: 1,
+            micros: (2 * 3600 + 3 * 60 + 4) * 1_000_000,
+        };
+        assert_eq!(fmt(d1, "DD HH24:MI:SS"), "01 02:03:04");
+    }
+
+    #[test]
+    fn format_interval_year_month_and_remainder() {
+        use super::{Interval, format_interval};
+        let fmt = |iv: Interval, t: &str| format_interval(iv, t).expect(t);
+        // 14 months → YYYY = months/12 = 1, MM = months%12 = 02 (NOT carried as a year).
+        let m14 = Interval {
+            months: 14,
+            days: 0,
+            micros: 0,
+        };
+        assert_eq!(fmt(m14, "YYYY-MM"), "0001-02");
+        // The full clock remainder past an over-24h hour: 25:30:45.123456.
+        let clock = Interval {
+            months: 0,
+            days: 0,
+            micros: 25 * 3_600_000_000 + 30 * 60_000_000 + 45 * 1_000_000 + 123_456,
+        };
+        assert_eq!(fmt(clock, "HH24:MI:SS.US"), "25:30:45.123456");
+        // Sub-second millis read from the micros remainder.
+        assert_eq!(fmt(clock, "MS"), "123");
+    }
+
+    #[test]
+    fn format_interval_negative_clock_decomposes_component_wise() {
+        use super::{Interval, format_interval};
+        // A wholly-negative clock interval (-02:03:04). PG `interval2tm` splits the
+        // signed `micros` component-wise (`tm_hour`/`tm_min`/`tm_sec` each negative),
+        // so each numeric clock field renders with its OWN sign — there is no single
+        // factored leading minus. HH24 = micros/3_600_000_000 = -2; MI = -3; SS = -4;
+        // `pad_num` keeps each sign and zero-pads the magnitude.
+        // NOTE: the exact per-component-sign rendering is flagged for Task 9's PG
+        // oracle pass; this pins the documented `interval2tm` decomposition contract.
+        let neg = Interval {
+            months: 0,
+            days: 0,
+            micros: -((2 * 3600 + 3 * 60 + 4) * 1_000_000),
+        };
+        assert_eq!(
+            format_interval(neg, "HH24:MI:SS").expect("neg"),
+            "-02:-03:-04"
+        );
     }
 }
 
