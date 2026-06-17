@@ -310,6 +310,9 @@ impl RangeRouter {
             // there; if they span ranges, reject 0A000.
             Statement::SetOperation(q) => {
                 let mut ranges = std::collections::BTreeSet::new();
+                // Only `q.body` is walked: the query-level ORDER BY references the
+                // combined OUTPUT columns (positions / output names), never a
+                // FROM-table, so it cannot introduce a new range.
                 collect_set_expr_ranges(self, &q.body, &mut ranges)?;
                 match ranges.len() {
                     0 => Ok(None),
