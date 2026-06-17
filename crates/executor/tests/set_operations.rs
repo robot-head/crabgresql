@@ -159,17 +159,51 @@ async fn set_op_error_surface() {
     let c = connect(port).await;
     // column-count mismatch => 42601
     assert_eq!(err_code(&c, "SELECT 1 UNION SELECT 1, 2").await, "42601");
-    // genuinely incompatible branch types (int4 vs explicit text) => 42804.
-    // (A BARE 'x' literal is unknown-typed: PG resolves it to int4 then fails the
-    // runtime cast with 22P02 — a documented unknown-literal deviation — so the
-    // PG-faithful incompatible-types case uses an explicit ::text.)
+    // two CONCRETE incompatible types => 42804. An explicit `::text` makes the
+    // literal a real text value (not the `unknown` pseudo-type), so it clashes with
+    // int4 at type-resolution time — exactly PG's `select_common_type` 42804.
     assert_eq!(
         err_code(&c, "SELECT 1 UNION SELECT 'x'::text").await,
         "42804"
     );
+    // a BARE 'x' literal is `unknown`: it resolves to the other branch's int4, then
+    // the value fails the text→int4 parse => 22P02 (PG-faithful, see the
+    // unknown-literal test below).
+    assert_eq!(err_code(&c, "SELECT 1 UNION SELECT 'x'").await, "22P02");
     // out-of-range positional ORDER BY => 42P10
     assert_eq!(
         err_code(&c, "SELECT 1 UNION SELECT 2 ORDER BY 5").await,
         "42P10"
+    );
+}
+
+/// PostgreSQL `unknown`-literal resolution across set-op branches: a bare `NULL` or
+/// string literal takes the other branch's type and is coerced via the cast matrix
+/// (a well-formed value parses; a bad one raises 22P02). All confirmed against a live
+/// PostgreSQL 18 oracle.
+#[tokio::test]
+async fn unknown_literal_branches_resolve_like_pg() {
+    let port = spawn().await;
+    let c = connect(port).await;
+
+    // bare NULL unifies to int4 and yields the NULL row (NOT a 42804 type clash).
+    assert_eq!(
+        col0(&c, "SELECT NULL UNION SELECT 2 ORDER BY 1").await,
+        vec![Some("2".into()), None]
+    );
+    // a well-formed string literal resolves to int4 and parses.
+    assert_eq!(
+        col0(&c, "SELECT 1 UNION SELECT '5' ORDER BY 1").await,
+        vec![Some("1".into()), Some("5".into())]
+    );
+    // both branches unknown → text (PG's final unknown→text rule).
+    assert_eq!(
+        col0(&c, "SELECT 'a' UNION SELECT 'b' ORDER BY 1").await,
+        vec![Some("a".into()), Some("b".into())]
+    );
+    // a string literal resolves to a non-text type and parses (numeric here).
+    assert_eq!(
+        col0(&c, "SELECT 1.5 UNION SELECT '2' ORDER BY 1").await,
+        vec![Some("1.5".into()), Some("2".into())]
     );
 }

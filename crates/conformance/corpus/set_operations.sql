@@ -36,14 +36,17 @@ SELECT id FROM a UNION SELECT 9999999999 ORDER BY id;
 -- ORDER BY by 1-based position
 SELECT id FROM a UNION SELECT id FROM b ORDER BY 1;
 
+-- unknown-literal resolution: a bare NULL / string literal is PG's `unknown`
+-- pseudo-type — it takes the other branch's type and is coerced via the cast matrix.
+SELECT NULL UNION SELECT 2 ORDER BY 1;
+SELECT 1 UNION SELECT '5' ORDER BY 1;
+SELECT 'a' UNION SELECT 'b' ORDER BY 1;
+SELECT 1.5 UNION SELECT '2' ORDER BY 1;
+
 -- error surface (SQLSTATE matched by the oracle)
 SELECT 1 UNION SELECT 1, 2;
--- genuinely incompatible branch types (int4 vs explicit text) → 42804 in both
+-- an explicit ::text is a CONCRETE type (not `unknown`), so int4 vs text → 42804
 SELECT 1 UNION SELECT 'x'::text;
--- NOTE: SELECT 1 UNION SELECT 'x' (a BARE string literal) is intentionally excluded.
--- PostgreSQL 18 returns 22P02 (invalid input syntax for integer: 'x') because it
--- types the unknown literal as int4 to match the other branch, then fails the runtime
--- text→int4 coercion mid-cast.  crabgresql types the bare literal as text and returns
--- 42804 (datatype mismatch) at plan-time strict unification.  This is a documented
--- deviation in the unknown-type-literal family (same pattern as coalesce(1,'x') in
--- scalar_functions.sql); the explicit-text case above is PG-faithful and IS diffed.
+-- a bare 'x' is `unknown` → resolves to int4 → the value fails the text→int4 parse,
+-- so PG and crabgresql both raise 22P02 (invalid input syntax for type integer)
+SELECT 1 UNION SELECT 'x';

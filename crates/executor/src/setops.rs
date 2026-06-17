@@ -1,11 +1,11 @@
 //! SP38: set operations — UNION / INTERSECT / EXCEPT [ALL].
 //!
 //! A set operation folds the outputs of two or more SELECT branches. Each leaf is
-//! evaluated to a `Relation` via the existing `exec::select_to_relation` (Task 6);
-//! this module supplies the pure combine: column-count check, cross-branch type
-//! unification + value coercion, and the duplicate semantics. Duplicate matching
-//! reuses `Datum`'s grouping `Eq`/`Hash` (NULL = NULL), which is exactly PG's
-//! "not distinct" rule for set operations.
+//! evaluated to a `Relation` via the existing `exec::select_to_relation`; this module
+//! resolves the combined output columns (PostgreSQL `select_common_type` semantics,
+//! incl. `unknown`-literal resolution), coerces every branch's rows to those common
+//! types, and applies the duplicate semantics. Duplicate matching reuses `Datum`'s
+//! grouping `Eq`/`Hash` (NULL = NULL), which is exactly PG's "not distinct" rule.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,27 +16,56 @@ use pgtypes::{ColumnType, Datum};
 
 use crate::clock::EvalCtx;
 use crate::error::ExecError;
-use crate::join::Relation;
 use crate::scope::{ColumnBinding, Scope};
 
-/// Schema-only RowDescription for a set-op query (extended-protocol Describe, no
-/// execution): field NAMES from the first leaf, TYPES unified across all leaves.
-pub(crate) fn describe_set_query(
-    catalog_kv: &dyn Kv,
-    q: &SetQuery,
-) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let cols = set_expr_schema(catalog_kv, &q.body)?;
-    Ok(cols
-        .iter()
-        .map(|(name, ty)| crate::exec::field(name, *ty))
-        .collect())
+/// One resolved output column of a set-op query: its `name` (from the leftmost
+/// branch), its resolved `ty`, and whether it is still `unknown` — i.e. every
+/// contributing branch column was a bare untyped literal (`NULL` or a string
+/// literal), which PostgreSQL leaves as the `unknown` pseudo-type. An unknown column
+/// takes whatever a typed branch resolves to; if it stays unknown across every branch
+/// it becomes `text` (PG's final unknown→text rule).
+struct ResolvedCol {
+    name: String,
+    ty: ColumnType,
+    unknown: bool,
 }
 
-/// (name, type) per output column for a set-op subtree, schema-only.
-fn set_expr_schema(
-    catalog_kv: &dyn Kv,
-    e: &SetExpr,
-) -> Result<Vec<(String, ColumnType)>, ExecError> {
+/// A bare untyped literal — `NULL` or a string literal — is PostgreSQL's `unknown`
+/// pseudo-type in set-operation type resolution: it takes the type of the other
+/// branch rather than forcing a clash. An explicit cast (`'x'::text`), a column
+/// reference, or any function/expression result is a CONCRETE type and is NOT
+/// unknown (so `1 UNION 'x'::text` is still a 42804 mismatch, like PG).
+fn is_unknown_literal(e: &Expr) -> bool {
+    matches!(e, Expr::NullLiteral | Expr::StringLiteral(_))
+}
+
+/// Unknown-aware pairwise column unification (PG `select_common_type`): an `unknown`
+/// operand yields the other operand's type; two `unknown`s stay `unknown`; two
+/// concrete types fold through `eval::unify_types` (numeric tower / identical, else
+/// 42804). `unify_types` is the LUB, so folding pairwise across a branch list equals
+/// resolving the whole list at once.
+fn unify_col(
+    lt: ColumnType,
+    lunk: bool,
+    rt: ColumnType,
+    runk: bool,
+) -> Result<(ColumnType, bool), ExecError> {
+    Ok(match (lunk, runk) {
+        // both unknown -> stay unknown (`lt` is the text placeholder from infer_type)
+        (true, true) => (lt, true),
+        // unknown ∪ concrete -> the concrete type
+        (true, false) => (rt, false),
+        (false, true) => (lt, false),
+        (false, false) => (crate::eval::unify_types(lt, rt)?, false),
+    })
+}
+
+/// Resolve a set-op subtree's output columns (name + type + unknown-ness),
+/// schema-only (no rows). Names come from the LEFT branch; types are the
+/// unknown-aware unification across branches; a column-count mismatch raises 42601
+/// with the offending operator. Shared by `describe_set_query` (extended-protocol
+/// Describe) and `execute_set_operation` (to precompute the coercion target types).
+fn resolve_set_columns(catalog_kv: &dyn Kv, e: &SetExpr) -> Result<Vec<ResolvedCol>, ExecError> {
     match e {
         SetExpr::Select(s) => {
             let scope = if s.from.is_empty() {
@@ -44,19 +73,27 @@ fn set_expr_schema(
             } else {
                 crate::exec::build_from_schema(catalog_kv, &s.from)?.scope
             };
-            // Match the plain-Select describe path: substitute scalar subqueries in
-            // the projection with typed-NULL consts so their OIDs are known without
-            // executing (SP34 type pass), then resolve.
+            // Run the SP34 scalar-subquery type pass (so a subquery column's OID is
+            // known without executing), then resolve names + types + unknown-ness.
             let projection =
                 crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
-            let (fields, _exprs, tys) = crate::exec::resolve_projection(&projection, &scope)?;
-            Ok(fields.into_iter().map(|f| f.name).zip(tys).collect())
+            let (fields, exprs, tys) = crate::exec::resolve_projection(&projection, &scope)?;
+            Ok(fields
+                .into_iter()
+                .zip(tys)
+                .zip(exprs)
+                .map(|((f, ty), e)| ResolvedCol {
+                    name: f.name,
+                    ty,
+                    unknown: is_unknown_literal(&e),
+                })
+                .collect())
         }
         SetExpr::SetOp {
             op, left, right, ..
         } => {
-            let l = set_expr_schema(catalog_kv, left)?;
-            let r = set_expr_schema(catalog_kv, right)?;
+            let l = resolve_set_columns(catalog_kv, left)?;
+            let r = resolve_set_columns(catalog_kv, right)?;
             if l.len() != r.len() {
                 return Err(ExecError::SetOpColumnCount {
                     op: *op,
@@ -66,15 +103,43 @@ fn set_expr_schema(
             }
             l.into_iter()
                 .zip(r)
-                .map(|((ln, lt), (_rn, rt))| Ok((ln, crate::eval::unify_types(lt, rt)?)))
-                .collect::<Result<Vec<_>, ExecError>>()
+                .map(|(lc, rc)| {
+                    let (ty, unknown) = unify_col(lc.ty, lc.unknown, rc.ty, rc.unknown)?;
+                    Ok(ResolvedCol {
+                        name: lc.name,
+                        ty,
+                        unknown,
+                    })
+                })
+                .collect()
         }
     }
 }
 
-/// Evaluate a complete set-operation query to a wire result. Each leaf runs through
-/// the existing single-SELECT read path (`exec::select_to_relation`) under the
-/// statement's snapshot handles; the tree folds via `combine`; the query-level
+/// The final wire type of an output column: an unresolved `unknown` column becomes
+/// `text` (PG's final unknown→text rule).
+fn output_type(c: &ResolvedCol) -> ColumnType {
+    if c.unknown { ColumnType::Text } else { c.ty }
+}
+
+/// Schema-only RowDescription for a set-op query (extended-protocol Describe, no
+/// execution): field NAMES from the first leaf, TYPES unified across all leaves.
+pub(crate) fn describe_set_query(
+    catalog_kv: &dyn Kv,
+    q: &SetQuery,
+) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
+    let cols = resolve_set_columns(catalog_kv, &q.body)?;
+    Ok(cols
+        .iter()
+        .map(|c| crate::exec::field(&c.name, output_type(c)))
+        .collect())
+}
+
+/// Evaluate a complete set-operation query to a wire result. The output columns are
+/// resolved once (names + the common coercion type per column, unknown-aware); each
+/// leaf runs through the existing single-SELECT read path (`exec::select_to_relation`)
+/// under the statement's snapshot handles and has its rows coerced to those common
+/// types; the tree folds via the per-operator multiset combine; the query-level
 /// ORDER BY / OFFSET / LIMIT then apply to the combined output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_set_operation(
@@ -87,17 +152,35 @@ pub(crate) fn execute_set_operation(
     q: &SetQuery,
     ctx: &EvalCtx,
 ) -> Result<pgwire::engine::QueryResult, ExecError> {
-    let rel = fold(catalog_kv, kv, global, gsnap, snapshot, own, &q.body, ctx)?;
-    let mut rows = rel.rows;
+    // Resolve the output columns once: names + the common type per column. Coercing
+    // every branch to ONE common type per column is exactly PG's model
+    // (`select_common_type` over the whole set-op tree), so the leaves coerce to
+    // these types regardless of where they sit in the tree.
+    let cols = resolve_set_columns(catalog_kv, &q.body)?;
+    let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
+
+    let mut rows = fold(
+        catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &out_tys, ctx,
+    )?;
 
     // Query-level ORDER BY over the OUTPUT columns: a bare integer is a 1-based
     // position; anything else is evaluated against the output scope.
     if !q.order_by.is_empty() {
+        let out_scope = Scope {
+            columns: cols
+                .iter()
+                .map(|c| ColumnBinding {
+                    qualifier: None,
+                    name: c.name.clone(),
+                    ty: output_type(c),
+                })
+                .collect(),
+        };
         let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(rows.len());
         for row in rows {
             let mut keys = Vec::with_capacity(q.order_by.len());
             for item in &q.order_by {
-                keys.push(order_key(&item.expr, &rel.scope, &row, ctx)?);
+                keys.push(order_key(&item.expr, &out_scope, &row, ctx)?);
             }
             keyed.push((keys, row));
         }
@@ -106,11 +189,9 @@ pub(crate) fn execute_set_operation(
     }
     crate::exec::apply_offset_limit(&mut rows, q.offset, q.limit);
 
-    let fields = rel
-        .scope
-        .columns
+    let fields = cols
         .iter()
-        .map(|c| crate::exec::field(&c.name, c.ty))
+        .map(|c| crate::exec::field(&c.name, output_type(c)))
         .collect();
     Ok(crate::exec::rows_result(fields, &rows, &ctx.time_zone))
 }
@@ -136,6 +217,10 @@ fn order_key(expr: &Expr, scope: &Scope, row: &[Datum], ctx: &EvalCtx) -> Result
     crate::eval::eval(expr, scope, row, ctx)
 }
 
+/// Fold a set-op subtree to combined rows, coercing each leaf's rows to the common
+/// per-column output types `out_tys` (resolved once by `resolve_set_columns`). Both
+/// sides of a `SetOp` node therefore carry identical types, so the multiset combine
+/// compares like-typed `Datum`s.
 #[allow(clippy::too_many_arguments)]
 fn fold(
     catalog_kv: &dyn Kv,
@@ -145,11 +230,15 @@ fn fold(
     snapshot: &Snapshot,
     own: Option<u64>,
     e: &SetExpr,
+    out_tys: &[ColumnType],
     ctx: &EvalCtx,
-) -> Result<Relation, ExecError> {
+) -> Result<Vec<Vec<Datum>>, ExecError> {
     match e {
         SetExpr::Select(s) => {
-            crate::exec::select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, s, ctx)
+            let rel = crate::exec::select_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, s, ctx,
+            )?;
+            coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::SetOp {
             op,
@@ -157,47 +246,25 @@ fn fold(
             left,
             right,
         } => {
-            let l = fold(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
-            let r = fold(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
-            combine(*op, *all, l, r, ctx)
+            let lrows = fold(
+                catalog_kv, kv, global, gsnap, snapshot, own, left, out_tys, ctx,
+            )?;
+            let rrows = fold(
+                catalog_kv, kv, global, gsnap, snapshot, own, right, out_tys, ctx,
+            )?;
+            Ok(combine_rows(*op, *all, lrows, rrows))
         }
     }
 }
 
-/// Combine two child relations under one set operator into a single relation.
-/// Output column NAMES come from the left child; TYPES are the per-column
-/// unification of both children (numeric tower + identical types; incompatible →
-/// 42804). Rows of both sides are coerced to the unified types before combining.
-pub(crate) fn combine(
+/// Multiset combine of two already-same-typed row sets under one set operator.
+fn combine_rows(
     op: SetOp,
     all: bool,
-    left: Relation,
-    right: Relation,
-    ctx: &EvalCtx,
-) -> Result<Relation, ExecError> {
-    let (lw, rw) = (left.scope.width(), right.scope.width());
-    if lw != rw {
-        return Err(ExecError::SetOpColumnCount {
-            op,
-            left: lw,
-            right: rw,
-        });
-    }
-    let mut out_cols = Vec::with_capacity(lw);
-    let mut tys = Vec::with_capacity(lw);
-    for i in 0..lw {
-        let ty = crate::eval::unify_types(left.scope.ty_at(i), right.scope.ty_at(i))?;
-        tys.push(ty);
-        out_cols.push(ColumnBinding {
-            qualifier: None,
-            name: left.scope.columns[i].name.clone(),
-            ty,
-        });
-    }
-    let lrows = coerce_rows(left.rows, &left.scope, &tys, ctx)?;
-    let rrows = coerce_rows(right.rows, &right.scope, &tys, ctx)?;
-
-    let rows = match op {
+    lrows: Vec<Vec<Datum>>,
+    rrows: Vec<Vec<Datum>>,
+) -> Vec<Vec<Datum>> {
+    match op {
         SetOp::Union if all => {
             let mut v = lrows;
             v.extend(rrows);
@@ -206,14 +273,13 @@ pub(crate) fn combine(
         SetOp::Union => dedup_keep_order(lrows.into_iter().chain(rrows)),
         SetOp::Intersect => intersect(lrows, rrows, all),
         SetOp::Except => except(lrows, rrows, all),
-    };
-    Ok(Relation {
-        scope: Scope { columns: out_cols },
-        rows,
-    })
+    }
 }
 
-/// Coerce each row's cells from the child's column types to the unified `tys`.
+/// Coerce each row's cells from the child's column types to the common `tys`. A NULL
+/// cell passes through unchanged (NULL of any type is NULL); a same-type cell is
+/// untouched; anything else is cast (e.g. an `unknown` string literal resolved to
+/// `int4` parses via `text→int4`, raising 22P02 on a bad value exactly like PG).
 fn coerce_rows(
     rows: Vec<Vec<Datum>>,
     scope: &Scope,
@@ -308,140 +374,108 @@ fn except(lrows: Vec<Vec<Datum>>, rrows: Vec<Vec<Datum>>, all: bool) -> Vec<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scope::ColumnBinding;
 
-    fn rel(name: &str, ty: ColumnType, rows: Vec<Vec<Datum>>) -> Relation {
-        Relation {
-            scope: Scope {
-                columns: vec![ColumnBinding {
-                    qualifier: None,
-                    name: name.into(),
-                    ty,
-                }],
-            },
-            rows,
-        }
-    }
     fn i4(n: i32) -> Vec<Datum> {
         vec![Datum::Int4(n)]
     }
 
     #[test]
     fn union_dedups_union_all_keeps() {
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1), i4(2)]);
-        let r = rel("a", ColumnType::Int4, vec![i4(2), i4(3)]);
-        let u = combine(SetOp::Union, false, l.clone(), r.clone(), &ctx).expect("union");
-        assert_eq!(u.rows, vec![i4(1), i4(2), i4(3)]);
-        let ua = combine(SetOp::Union, true, l, r, &ctx).expect("union all");
-        assert_eq!(ua.rows, vec![i4(1), i4(2), i4(2), i4(3)]);
+        let l = vec![i4(1), i4(2)];
+        let r = vec![i4(2), i4(3)];
+        assert_eq!(
+            combine_rows(SetOp::Union, false, l.clone(), r.clone()),
+            vec![i4(1), i4(2), i4(3)]
+        );
+        assert_eq!(
+            combine_rows(SetOp::Union, true, l, r),
+            vec![i4(1), i4(2), i4(2), i4(3)]
+        );
     }
 
     #[test]
     fn intersect_and_except_multiplicity() {
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1), i4(1), i4(2)]);
-        let r = rel("a", ColumnType::Int4, vec![i4(1), i4(3)]);
+        let l = vec![i4(1), i4(1), i4(2)];
+        let r = vec![i4(1), i4(3)];
         assert_eq!(
-            combine(SetOp::Intersect, false, l.clone(), r.clone(), &ctx)
-                .expect("i")
-                .rows,
+            combine_rows(SetOp::Intersect, false, l.clone(), r.clone()),
             vec![i4(1)]
         );
         assert_eq!(
-            combine(SetOp::Intersect, true, l.clone(), r.clone(), &ctx)
-                .expect("ia")
-                .rows,
+            combine_rows(SetOp::Intersect, true, l.clone(), r.clone()),
             vec![i4(1)]
         );
         // EXCEPT distinct: {2}; EXCEPT ALL: two 1s minus one 1 = one 1, plus 2 => [1,2]
         assert_eq!(
-            combine(SetOp::Except, false, l.clone(), r.clone(), &ctx)
-                .expect("e")
-                .rows,
+            combine_rows(SetOp::Except, false, l.clone(), r.clone()),
             vec![i4(2)]
         );
-        assert_eq!(
-            combine(SetOp::Except, true, l, r, &ctx).expect("ea").rows,
-            vec![i4(1), i4(2)]
-        );
+        assert_eq!(combine_rows(SetOp::Except, true, l, r), vec![i4(1), i4(2)]);
     }
 
     #[test]
     fn except_all_underflows_to_empty() {
         // When the right side has MORE copies than the left, EXCEPT ALL clamps the
         // multiplicity at 0 (max(0, Lₙ − Rₙ)) — it never wraps. Pins `saturating_sub`.
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1)]);
-        let r = rel("a", ColumnType::Int4, vec![i4(1), i4(1)]);
         assert_eq!(
-            combine(SetOp::Except, true, l, r, &ctx).expect("ea").rows,
+            combine_rows(SetOp::Except, true, vec![i4(1)], vec![i4(1), i4(1)]),
             Vec::<Vec<Datum>>::new()
         );
     }
 
     #[test]
     fn null_equals_null_in_dedup() {
-        let ctx = EvalCtx::test_default();
         let n = || vec![Datum::Null];
-        let l = rel("a", ColumnType::Int4, vec![n(), n()]);
-        let r = rel("a", ColumnType::Int4, vec![n()]);
         assert_eq!(
-            combine(SetOp::Union, false, l, r, &ctx).expect("u").rows,
+            combine_rows(SetOp::Union, false, vec![n(), n()], vec![n()]),
             vec![n()]
         );
     }
 
     #[test]
-    fn unifies_int4_and_int8_to_int8() {
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1)]);
-        let r = rel("a", ColumnType::Int8, vec![vec![Datum::Int8(2)]]);
-        let u = combine(SetOp::Union, true, l, r, &ctx).expect("u");
-        assert_eq!(u.scope.ty_at(0), ColumnType::Int8);
-        assert_eq!(u.rows, vec![vec![Datum::Int8(1)], vec![Datum::Int8(2)]]);
+    fn unify_col_numeric_tower_and_incompatible() {
+        // int4 ∪ int8 → int8
+        assert_eq!(
+            unify_col(ColumnType::Int4, false, ColumnType::Int8, false).expect("ok"),
+            (ColumnType::Int8, false)
+        );
+        // two CONCRETE incompatible types → 42804
+        assert!(matches!(
+            unify_col(ColumnType::Int4, false, ColumnType::Text, false),
+            Err(ExecError::TypeMismatch(_))
+        ));
     }
 
     #[test]
-    fn column_count_mismatch_errors() {
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1)]);
-        let r = Relation {
-            scope: Scope {
-                columns: vec![
-                    ColumnBinding {
-                        qualifier: None,
-                        name: "a".into(),
-                        ty: ColumnType::Int4,
-                    },
-                    ColumnBinding {
-                        qualifier: None,
-                        name: "b".into(),
-                        ty: ColumnType::Int4,
-                    },
-                ],
-            },
-            rows: vec![vec![Datum::Int4(1), Datum::Int4(2)]],
-        };
+    fn unify_col_unknown_takes_the_other_branch_type() {
+        // An `unknown` (bare NULL / string literal) column unifies to the concrete
+        // side — the fix that lets `SELECT NULL UNION SELECT 1` and
+        // `SELECT 1 UNION SELECT '5'` resolve to int4 (matching PG) instead of 42804.
         assert_eq!(
-            combine(SetOp::Union, false, l, r, &ctx).expect_err("count mismatch"),
-            ExecError::SetOpColumnCount {
-                op: SetOp::Union,
-                left: 1,
-                right: 2
-            }
+            unify_col(ColumnType::Text, true, ColumnType::Int4, false).expect("ok"),
+            (ColumnType::Int4, false)
+        );
+        assert_eq!(
+            unify_col(ColumnType::Int4, false, ColumnType::Text, true).expect("ok"),
+            (ColumnType::Int4, false)
+        );
+        // both unknown stays unknown (→ text at output, PG's final unknown→text rule)
+        assert_eq!(
+            unify_col(ColumnType::Text, true, ColumnType::Text, true).expect("ok"),
+            (ColumnType::Text, true)
         );
     }
 
     #[test]
-    fn incompatible_types_error_42804() {
-        let ctx = EvalCtx::test_default();
-        let l = rel("a", ColumnType::Int4, vec![i4(1)]);
-        let r = rel("a", ColumnType::Text, vec![vec![Datum::Text("x".into())]]);
-        assert!(matches!(
-            combine(SetOp::Union, false, l, r, &ctx).expect_err("incompatible"),
-            ExecError::TypeMismatch(_)
-        ));
+    fn is_unknown_literal_only_bare_null_and_string() {
+        assert!(is_unknown_literal(&Expr::NullLiteral));
+        assert!(is_unknown_literal(&Expr::StringLiteral("x".into())));
+        // an integer literal / column ref / explicit value is concrete, not unknown
+        assert!(!is_unknown_literal(&Expr::IntLiteral("1".into())));
+        assert!(!is_unknown_literal(&Expr::Column {
+            table: None,
+            name: "c".into()
+        }));
     }
 
     /// End-to-end: UNION deduplicates across two tables and ORDER BY positions
