@@ -45,6 +45,10 @@ pub enum Statement {
     Reset {
         name: String,
     },
+    /// SP38: a set-operation query — `<select> UNION|INTERSECT|EXCEPT [ALL] <select> …`
+    /// with a result-level ORDER BY / LIMIT / OFFSET. A plain single SELECT stays
+    /// `Statement::Select`; only a query containing a set-op keyword lands here.
+    SetOperation(SetQuery),
 }
 
 /// SP37: the right-hand side of a `SET` (or the value form of `SET TIME ZONE`).
@@ -94,6 +98,40 @@ pub struct SelectStmt {
     /// SP28: `OFFSET <n>` — skip the first `n` output rows (before LIMIT).
     pub offset: Option<i64>,
     pub locking: Option<RowLockStrength>,
+}
+
+/// SP38: a complete set-operation query expression. `body` is the operator tree
+/// (leaves are `SelectStmt`); `order_by` / `limit` / `offset` apply to the COMBINED
+/// result (PostgreSQL allows them only at the top of the query, or inside parens).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetQuery {
+    pub body: SetExpr,
+    pub order_by: Vec<OrderItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// SP38: a node in the set-operation tree. A `Select` leaf is one query block; a
+/// `SetOp` combines two sub-trees. INTERSECT binds tighter than UNION/EXCEPT;
+/// UNION/EXCEPT are left-associative (the parser encodes this in the tree shape).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetExpr {
+    Select(Box<SelectStmt>),
+    SetOp {
+        op: SetOp,
+        /// `true` for `… ALL …` (keep duplicates); `false` for the default
+        /// (duplicate-eliminating) form.
+        all: bool,
+        left: Box<SetExpr>,
+        right: Box<SetExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]

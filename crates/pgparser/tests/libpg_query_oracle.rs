@@ -85,6 +85,14 @@ const ACCEPTED: &[&str] = &[
     "SELECT now()",
     "SELECT date_part('hour', a) FROM t",
     "SELECT date_trunc('month', a) FROM t",
+    // SP38: set operations — UNION / INTERSECT / EXCEPT
+    "SELECT 1 UNION SELECT 2",
+    "SELECT 1 UNION ALL SELECT 2",
+    "SELECT a FROM t UNION SELECT a FROM u ORDER BY a",
+    "SELECT 1 INTERSECT SELECT 2",
+    "SELECT 1 EXCEPT ALL SELECT 2",
+    "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3",
+    "(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2",
     // SP37: SET / SHOW / RESET GUC
     "SET timezone = 'America/New_York'",
     "SET timezone TO 'UTC'",

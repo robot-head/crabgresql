@@ -1026,7 +1026,7 @@ fn project_rows_ordered(
                     (keys, r)
                 })
                 .collect();
-            keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+            keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, &s.order_by));
             projected = keyed.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_limit(&mut projected, s.offset, s.limit);
@@ -1042,7 +1042,7 @@ fn project_rows_ordered(
             }
             keyed.push((keys, row));
         }
-        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, s));
+        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, &s.order_by));
         kept = keyed.into_iter().map(|(_, row)| row).collect();
     }
     apply_offset_limit(&mut kept, s.offset, s.limit);
@@ -1208,7 +1208,7 @@ fn derived_name(expr: &Expr) -> String {
     }
 }
 
-fn field(name: &str, ty: ColumnType) -> FieldDescription {
+pub(crate) fn field(name: &str, ty: ColumnType) -> FieldDescription {
     FieldDescription {
         name: name.to_string(),
         table_oid: 0,
@@ -1232,9 +1232,13 @@ pub(crate) fn datum_to_cell(d: &Datum, tz: &jiff::tz::TimeZone) -> Option<Cell> 
 
 /// Compare two order-key vectors per the SELECT's ASC/DESC flags, with PG's
 /// default null placement (NULLS LAST for ASC, NULLS FIRST for DESC).
-pub(crate) fn order_cmp(a: &[Datum], b: &[Datum], s: &SelectStmt) -> std::cmp::Ordering {
+pub(crate) fn order_cmp(
+    a: &[Datum],
+    b: &[Datum],
+    order_by: &[pgparser::ast::OrderItem],
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    for (i, item) in s.order_by.iter().enumerate() {
+    for (i, item) in order_by.iter().enumerate() {
         let (x, y) = (&a[i], &b[i]);
         let ord = match (x.is_null(), y.is_null()) {
             (true, true) => Ordering::Equal,
@@ -1284,7 +1288,11 @@ pub(crate) fn describe(
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
     // Extended-protocol Describe targets a single statement.
-    let Some(Statement::Select(s)) = statements.first() else {
+    let stmt = statements.first();
+    if let Some(Statement::SetOperation(q)) = stmt {
+        return crate::setops::describe_set_query(catalog_kv, q);
+    }
+    let Some(Statement::Select(s)) = stmt else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
     let scope = if s.from.is_empty() {
@@ -1872,6 +1880,34 @@ mod tests {
             .await
             .expect("describe");
         assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn describe_set_op_returns_first_branch_fields() {
+        // Schema-only: a set-op query reports the first branch's column name(s) and
+        // the unified type, without executing.
+        let engine = SqlEngine::new();
+        let fields = engine
+            .connect()
+            .describe("SELECT 1 AS x UNION SELECT 2")
+            .await
+            .expect("describe");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x"); // name from the FIRST branch
+    }
+
+    #[tokio::test]
+    async fn describe_set_op_unifies_branch_types() {
+        // The Describe path must run cross-branch type unification: int4 ∪ int8 → int8.
+        let engine = SqlEngine::new();
+        let fields = engine
+            .connect()
+            .describe("SELECT 1 AS x UNION SELECT 2::int8")
+            .await
+            .expect("describe");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].type_oid, pgtypes::ColumnType::Int8.oid());
     }
 
     #[tokio::test]

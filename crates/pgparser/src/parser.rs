@@ -736,7 +736,7 @@ impl Parser {
             Token::Keyword(Keyword::Create) => self.create_table(),
             Token::Keyword(Keyword::Drop) => self.drop_table(),
             Token::Keyword(Keyword::Insert) => self.insert(),
-            Token::Keyword(Keyword::Select) => self.select(),
+            Token::Keyword(Keyword::Select) | Token::LParen => self.query_stmt(),
             // SP4: transaction control
             Token::Keyword(Keyword::Begin) | Token::Keyword(Keyword::Start) => self.begin(),
             Token::Keyword(Keyword::Commit) | Token::Keyword(Keyword::End) => {
@@ -1040,14 +1040,25 @@ impl Parser {
         })
     }
 
-    fn select(&mut self) -> Result<crate::ast::Statement, ParseError> {
-        Ok(crate::ast::Statement::Select(self.select_inner()?))
+    /// Parse a single SELECT body INCLUDING its trailing ORDER BY / LIMIT / OFFSET /
+    /// locking. The refactor that split this into `select_core` + `parse_set_tail` +
+    /// `parse_locking` leaves the recursive callers (derived tables, subquery
+    /// expressions) unaffected: they still get a fully-parsed `SelectStmt` with any
+    /// trailing ORDER BY / LIMIT / OFFSET / locking, exactly as before.
+    fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
+        let mut s = self.select_core()?;
+        let (order_by, limit, offset) = self.parse_set_tail()?;
+        s.order_by = order_by;
+        s.limit = limit;
+        s.offset = offset;
+        s.locking = self.parse_locking()?;
+        Ok(s)
     }
 
-    /// Parse a SELECT body into a [`SelectStmt`]. Factored out of `select` so the
-    /// FROM-clause derived-table path (`( SELECT … ) alias`) can recurse into it.
-    fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
-        use crate::ast::{OrderItem, SelectItem, SelectStmt};
+    /// Parse projection → HAVING. Leaves order_by / limit / offset / locking empty;
+    /// the caller (single SELECT or set-op query) owns the tail.
+    fn select_core(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
+        use crate::ast::{SelectItem, SelectStmt};
         self.expect(&Token::Keyword(Keyword::Select))?;
         // SP28: SELECT DISTINCT (ALL is the default modifier — accept and ignore).
         let distinct = self.eat_keyword(Keyword::Distinct);
@@ -1118,6 +1129,28 @@ impl Parser {
         } else {
             None
         };
+        Ok(SelectStmt {
+            projection,
+            from,
+            filter,
+            distinct,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            locking: None,
+        })
+    }
+
+    /// Parse an optional `ORDER BY …`, then `LIMIT`/`OFFSET` in either order.
+    /// The tuple is the three result-level tail components (order_by, limit, offset);
+    /// a named struct would not read more clearly than the positional triple.
+    #[allow(clippy::type_complexity)]
+    fn parse_set_tail(
+        &mut self,
+    ) -> Result<(Vec<crate::ast::OrderItem>, Option<i64>, Option<i64>), ParseError> {
+        use crate::ast::OrderItem;
         let mut order_by = Vec::new();
         if self.eat_keyword(Keyword::Order) {
             self.expect(&Token::Keyword(Keyword::By))?;
@@ -1148,32 +1181,136 @@ impl Parser {
                 break;
             }
         }
-        let locking = if self.eat_keyword(Keyword::For) {
+        Ok((order_by, limit, offset))
+    }
+
+    /// Parse an optional `FOR UPDATE` / `FOR SHARE` row-locking clause.
+    fn parse_locking(&mut self) -> Result<Option<crate::ast::RowLockStrength>, ParseError> {
+        if self.eat_keyword(Keyword::For) {
             if self.eat_keyword(Keyword::Update) {
-                Some(crate::ast::RowLockStrength::ForUpdate)
+                Ok(Some(crate::ast::RowLockStrength::ForUpdate))
             } else if self.eat_keyword(Keyword::Share) {
-                Some(crate::ast::RowLockStrength::ForShare)
+                Ok(Some(crate::ast::RowLockStrength::ForShare))
             } else {
-                return Err(ParseError::new(
+                Err(ParseError::new(
                     "expected UPDATE or SHARE after FOR",
                     self.peek_pos(),
-                ));
+                ))
             }
         } else {
-            None
-        };
-        Ok(SelectStmt {
-            projection,
-            from,
-            filter,
-            distinct,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            locking,
-        })
+            Ok(None)
+        }
+    }
+
+    /// SP38: parse a full set-operation query (the statement entry for SELECT / `(`).
+    /// `set_expr(0)` builds the operator tree; the trailing tail binds to the whole
+    /// query. A lone Select (no set-op) collapses back to `Statement::Select` so the
+    /// single-SELECT shape — including FOR UPDATE — is byte-for-byte unchanged.
+    fn query_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{SetExpr, SetQuery, Statement};
+        let body = self.set_expr(0)?;
+        let (order_by, limit, offset) = self.parse_set_tail()?;
+        match body {
+            SetExpr::Select(mut s) => {
+                s.order_by = order_by;
+                s.limit = limit;
+                s.offset = offset;
+                s.locking = self.parse_locking()?;
+                Ok(Statement::Select(*s))
+            }
+            body => {
+                if matches!(self.peek(), Token::Keyword(Keyword::For)) {
+                    return Err(ParseError::new(
+                        "FOR UPDATE/SHARE is not allowed with UNION/INTERSECT/EXCEPT",
+                        self.peek_pos(),
+                    ));
+                }
+                Ok(Statement::SetOperation(SetQuery {
+                    body,
+                    order_by,
+                    limit,
+                    offset,
+                }))
+            }
+        }
+    }
+
+    /// Precedence-climbing set-op tree. INTERSECT = 2, UNION/EXCEPT = 1; all
+    /// left-associative (recurse for the RHS at `prec + 1`).
+    fn set_expr(&mut self, min_prec: u8) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::{SetExpr, SetOp};
+        let mut left = self.set_primary()?;
+        loop {
+            let (op, prec) = match self.peek() {
+                Token::Keyword(Keyword::Union) => (SetOp::Union, 1u8),
+                Token::Keyword(Keyword::Except) => (SetOp::Except, 1u8),
+                Token::Keyword(Keyword::Intersect) => (SetOp::Intersect, 2u8),
+                _ => break,
+            };
+            if prec < min_prec {
+                break;
+            }
+            self.bump(); // the operator keyword
+            let all = self.eat_keyword(Keyword::All);
+            if !all {
+                self.eat_keyword(Keyword::Distinct); // explicit default modifier
+            }
+            let right = self.set_expr(prec + 1)?;
+            left = SetExpr::SetOp {
+                op,
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// A set-op primary: a parenthesized sub-query (precedence grouping, or a
+    /// parenthesized single SELECT that keeps its own ORDER BY / LIMIT), or a bare
+    /// SELECT branch (`select_core`, no tail — the query owns the tail).
+    fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::SetExpr;
+        if *self.peek() == Token::LParen {
+            self.bump(); // (
+            let inner = self.set_expr(0)?;
+            let inner = self.attach_paren_tail(inner)?;
+            self.expect(&Token::RParen)?;
+            Ok(inner)
+        } else {
+            Ok(SetExpr::Select(Box::new(self.select_core()?)))
+        }
+    }
+
+    /// If an ORDER BY / LIMIT / OFFSET follows inside parentheses, attach it to a
+    /// lone-SELECT inner; reject it on a multi-branch subtree (deferred).
+    fn attach_paren_tail(
+        &mut self,
+        inner: crate::ast::SetExpr,
+    ) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::SetExpr;
+        let has_tail = matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Order)
+                | Token::Keyword(Keyword::Limit)
+                | Token::Keyword(Keyword::Offset)
+        );
+        if !has_tail {
+            return Ok(inner);
+        }
+        match inner {
+            SetExpr::Select(mut s) => {
+                let (order_by, limit, offset) = self.parse_set_tail()?;
+                s.order_by = order_by;
+                s.limit = limit;
+                s.offset = offset;
+                Ok(SetExpr::Select(s))
+            }
+            _ => Err(ParseError::new(
+                "ORDER BY/LIMIT on a parenthesized set-operation subtree is not supported",
+                self.peek_pos(),
+            )),
+        }
     }
 
     /// Parse the FROM clause: a comma-separated list of join trees.
@@ -2720,5 +2857,111 @@ mod tests {
             } => assert!(!all),
             other => panic!("expected SOME(=ANY), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_union_all_and_precedence() {
+        use crate::ast::{SetExpr, SetOp, Statement};
+        // INTERSECT binds tighter than UNION: A UNION B INTERSECT C => A UNION (B INTERSECT C)
+        let s = crate::parse("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op, got {:?}", s[0])
+        };
+        let SetExpr::SetOp { op, all, right, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        assert_eq!(*op, SetOp::Union);
+        assert!(!*all);
+        assert!(matches!(
+            &**right,
+            SetExpr::SetOp {
+                op: SetOp::Intersect,
+                ..
+            }
+        ));
+
+        // UNION ALL sets `all`; left-associativity: A UNION B UNION C => (A UNION B) UNION C
+        let s = crate::parse("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op")
+        };
+        let SetExpr::SetOp { all, left, .. } = &q.body else {
+            panic!()
+        };
+        assert!(*all);
+        assert!(matches!(
+            &**left,
+            SetExpr::SetOp {
+                op: SetOp::Union,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn union_order_by_limit_bind_to_whole_query() {
+        use crate::ast::Statement;
+        let s = crate::parse("SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 5 OFFSET 1").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op")
+        };
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.offset, Some(1));
+    }
+
+    #[test]
+    fn parenthesized_branch_keeps_its_own_order_limit() {
+        use crate::ast::{SetExpr, Statement};
+        let s = crate::parse("(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op")
+        };
+        let SetExpr::SetOp { left, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        let SetExpr::Select(b) = &**left else {
+            panic!("left branch is a SELECT leaf")
+        };
+        assert_eq!(b.limit, Some(1));
+        assert_eq!(b.order_by.len(), 1);
+    }
+
+    #[test]
+    fn plain_select_is_unchanged() {
+        use crate::ast::Statement;
+        // No set-op keyword => still Statement::Select, tail on the struct.
+        let s = crate::parse("SELECT a FROM t ORDER BY a LIMIT 3").expect("parse");
+        let Statement::Select(sel) = &s[0] else {
+            panic!("plain select must stay Statement::Select")
+        };
+        assert_eq!(sel.limit, Some(3));
+        assert_eq!(sel.order_by.len(), 1);
+    }
+
+    #[test]
+    fn for_update_with_set_op_is_rejected() {
+        assert!(crate::parse("SELECT 1 UNION SELECT 2 FOR UPDATE").is_err());
+    }
+
+    #[test]
+    fn order_by_on_parenthesized_set_op_subtree_is_rejected() {
+        // Deferred non-goal: a tail on a parenthesized MULTI-branch subtree.
+        assert!(crate::parse("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3").is_err());
+    }
+
+    #[test]
+    fn union_distinct_is_the_default_form() {
+        use crate::ast::{SetExpr, Statement};
+        // `UNION DISTINCT` is the explicit spelling of the default (dedup) form:
+        // it parses to the same tree as a bare `UNION` (all == false).
+        let s = crate::parse("SELECT 1 UNION DISTINCT SELECT 2").expect("parse");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op, got {:?}", s[0])
+        };
+        let SetExpr::SetOp { all, .. } = &q.body else {
+            panic!("expected SetOp")
+        };
+        assert!(!*all, "UNION DISTINCT is the dedup (all == false) form");
     }
 }
