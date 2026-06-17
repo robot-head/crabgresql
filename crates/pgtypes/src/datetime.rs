@@ -1335,6 +1335,17 @@ fn pad_name(name: &str, width: usize, fm: bool) -> String {
     }
 }
 
+/// Blank-pad a Roman-numeral month on the RIGHT to width 4 (PG LEFT-justifies
+/// `RM`/`rm` in a field as wide as the widest numeral, "VIII" — oracle-confirmed,
+/// PG 18: `RM` for January → `'I   '`, for March → `'III '`); `fm` strips it.
+fn pad_roman(numeral: &str, fm: bool) -> String {
+    if fm {
+        numeral.to_string()
+    } else {
+        format!("{numeral:<4}")
+    }
+}
+
 /// Render the meridiem string variants. `lower` lowercases; `dotted` inserts the
 /// dots (`A.M.`/`P.M.`). `hour` is `i64` so the shared renderer also serves an
 /// interval source (where AM/PM has no clock meaning — not a corpus case); for a
@@ -1522,19 +1533,18 @@ fn match_pattern(
             return Ok(Some((3, name, None)));
         }
     }
+    // `RM`/`rm`: PostgreSQL right-justifies the Roman month numeral in a width-4
+    // field (the widest is "VIII"); `FM` strips that padding.
     if matches_at(chars, i, "RM") {
         return Ok(Some((
             2,
-            ROMAN_MONTHS[f.month_name_index()].to_string(),
+            pad_roman(ROMAN_MONTHS[f.month_name_index()], fm),
             None,
         )));
     }
     if matches_at(chars, i, "rm") {
-        return Ok(Some((
-            2,
-            ROMAN_MONTHS[f.month_name_index()].to_ascii_lowercase(),
-            None,
-        )));
+        let lower = ROMAN_MONTHS[f.month_name_index()].to_ascii_lowercase();
+        return Ok(Some((2, pad_roman(&lower, fm), None)));
     }
     // -- day (DDD before DD before D; the ISO `IDDD`/`ID` are handled above) --
     if matches_at(chars, i, "DDD") {
@@ -1598,13 +1608,15 @@ fn match_pattern(
     if matches_at(chars, i, "MI") {
         return Ok(Some((2, pad_num(f.minute(), 2, fm), Some(f.minute()))));
     }
+    // `SSSS`/`SSSSS` (seconds past midnight): PostgreSQL does NOT zero-pad these
+    // (e.g. `00:00:05` → `5`, not `0005`); they render as a bare decimal.
     if matches_at(chars, i, "SSSSS") {
         let v = f.hour() * 3600 + f.minute() * 60 + f.second();
-        return Ok(Some((5, pad_num(v, 5, fm), Some(v))));
+        return Ok(Some((5, v.to_string(), Some(v))));
     }
     if matches_at(chars, i, "SSSS") {
         let v = f.hour() * 3600 + f.minute() * 60 + f.second();
-        return Ok(Some((4, pad_num(v, 4, fm), Some(v))));
+        return Ok(Some((4, v.to_string(), Some(v))));
     }
     if matches_at(chars, i, "SS") {
         return Ok(Some((2, pad_num(f.second(), 2, fm), Some(f.second()))));
@@ -2352,8 +2364,10 @@ mod format_tests {
         assert_eq!(fmt("Month"), "January  ");
         assert_eq!(fmt("MONTH"), "JANUARY  ");
         assert_eq!(fmt("month"), "january  ");
-        assert_eq!(fmt("RM"), "I");
-        assert_eq!(fmt("rm"), "i");
+        // PG LEFT-justifies the Roman numeral in a width-4 field ("VIII" is widest).
+        assert_eq!(fmt("RM"), "I   ");
+        assert_eq!(fmt("rm"), "i   ");
+        assert_eq!(fmt("FMRM"), "I"); // FM strips the left-justify padding
         assert_eq!(fmt("FMMonth"), "January");
         assert_eq!(fmt("FMMM"), "1");
     }
@@ -2414,6 +2428,9 @@ mod format_tests {
         assert_eq!(fmt("HH12 am"), "12 am");
         assert_eq!(fmt("A.M."), "A.M.");
         assert_eq!(fmt("p.m."), "a.m.");
+        // SSSS/SSSSS are NOT zero-padded (PG): 00:30:00 → 1800, not 1800/01800.
+        assert_eq!(fmt("SSSS"), "1800");
+        assert_eq!(fmt("SSSSS"), "1800");
         // noon → PM, 12-hour 12.
         let g = DateTimeFields::from_civil(
             jiff::civil::DateTime::constant(2024, 1, 15, 12, 0, 0, 0),

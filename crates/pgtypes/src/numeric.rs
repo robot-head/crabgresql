@@ -415,13 +415,14 @@ pub fn apply_typmod(bd: &BigDecimal, tm: Typmod) -> Result<BigDecimal, TypeError
 //   4. Lay the integer digits right-to-left into the integer positions, then the
 //      fractional digits left-to-right; place group separators; place the point.
 //   5. Render the sign / currency / brackets per the mode at their anchors.
-//   6. Integer-part overflow → fill the whole field with `#`.
-//   7. `FM` strips padding; `TH`/`th` appends an ordinal; `B` blanks a zero value.
+//   6. Integer-part overflow → `#`-fill the digit positions (the sign/currency
+//      decoration still renders normally).
+//   7. `FM` strips padding; `TH`/`th` appends an ordinal; `B` is a no-op in PG 18.
 //
-// MANY exact spacings (currency glyph in C locale, `#` overflow width, `S`/`PR`/
-// `SG` placement) are documented but easy to get subtly wrong without a live PG.
-// Every such rule carries a `// TODO(T9 oracle):` marker so the corpus author
-// (Task 9, diffed against real PostgreSQL) can pin it.
+// Every exact spacing (the C-locale currency glyph, the `#`-overflow composition,
+// the default/`S`/`MI`/`PL`/`SG`/`PR` sign placement, and the `B` no-op) was
+// VALIDATED against a live PostgreSQL 18 oracle in SP38 Task 9; the relevant rule
+// comments cite the oracle-confirmed `to_char(...)` example.
 // ---------------------------------------------------------------------------
 
 /// Where a sign / currency marker is anchored relative to the number.
@@ -487,8 +488,6 @@ struct NumDesc {
     fill_mode: bool,
     /// `TH`/`th` ordinal suffix; `Some(true)` = upper (`TH`), `Some(false)` = lower.
     ordinal: Option<bool>,
-    /// `B`: blank the whole result if the value is zero.
-    blank_zero: bool,
 }
 
 /// Parse a numeric `to_char` template into a [`NumDesc`]. Patterns are matched
@@ -506,7 +505,6 @@ fn parse_num_template(template: &str) -> NumDesc {
     let mut v_shift: Option<u32> = None;
     let mut fill_mode = false;
     let mut ordinal: Option<bool> = None;
-    let mut blank_zero = false;
     let mut seen_digit = false; // have we passed any 9/0 yet? (anchors sign/currency)
 
     let mut i = 0;
@@ -594,8 +592,11 @@ fn parse_num_template(template: &str) -> NumDesc {
                 currency = Some(anchor_of(seen_digit));
                 i += 1;
             }
+            // `B` (blank-on-zero) is a documented PG pattern, but PostgreSQL 18's
+            // `NUM_processor` effectively never blanks the result for the in-scope
+            // templates (oracle-confirmed: `to_char(0,'B9999')` → `'    0'`). So `B`
+            // is consumed as a no-op (it is NOT emitted as a literal).
             'B' | 'b' => {
-                blank_zero = true;
                 i += 1;
             }
             // Any other character is a literal handled at render time.
@@ -616,7 +617,6 @@ fn parse_num_template(template: &str) -> NumDesc {
         v_shift,
         fill_mode,
         ordinal,
-        blank_zero,
     }
 }
 
@@ -661,12 +661,6 @@ fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {
 pub fn format_numeric(template: &str, value: &BigDecimal) -> Result<String, TypeError> {
     let desc = parse_num_template(template);
 
-    // (B) blank-on-zero short-circuit (PG checks the ROUNDED value, but a zero is
-    // zero at any scale; we test the raw value which is equivalent for `0`).
-    if desc.blank_zero && is_zero(value) {
-        return Ok(String::new());
-    }
-
     // (1) Apply the `V` shift: multiply by 10^shift. The shift digits were already
     // folded into `desc.pre` (integer positions) by the template parser. Build the
     // multiplier from text ("1" + n zeros) so a large `n` never overflows a `u64`.
@@ -687,9 +681,20 @@ pub fn format_numeric(template: &str, value: &BigDecimal) -> Result<String, Type
     let (int_digits, frac_digits) = split_decimal(&rounded, desc.post);
 
     // (4) Integer-part overflow: more significant integer digits than positions.
+    // PG `#`-fills every DIGIT/separator/point position but still renders the sign
+    // and currency decoration normally (oracle-confirmed, PG 18: `to_char(123456,
+    // '999')` → `' ###'`, `to_char(-123456,'99.99')` → `'-##.##'`), so the overflow
+    // core is routed through the SAME `decorate` path as a normal value.
+    // A template with NO integer digit positions (e.g. `.99`) cannot represent any
+    // value's integer part — not even the implicit leading `0` — so PG `#`-overflows
+    // it for every value (oracle-confirmed, PG 18: `to_char(0,'.99')` → `' .##'`).
     let int_significant = int_digits.trim_start_matches('0');
-    if int_significant.len() > desc.pre {
-        return Ok(overflow_fill(&desc));
+    if int_significant.len() > desc.pre || desc.pre == 0 {
+        let core = overflow_core(&desc);
+        // The `TH` ordinal is suppressed on overflow (no integer value to ordinalize).
+        let mut d = desc.clone();
+        d.ordinal = None;
+        return Ok(decorate(&d, core, negative, &rounded));
     }
 
     // (5) Lay out the digit grid.
@@ -699,25 +704,29 @@ pub fn format_numeric(template: &str, value: &BigDecimal) -> Result<String, Type
     Ok(decorate(&desc, core, negative, &rounded))
 }
 
-/// The `#`-filled overflow field. PG fills EVERY printable position (the digit
-/// grid + decimal point + separators) with `#`, and still honors the leading sign
-/// column / currency width.
-// TODO(T9 oracle): confirm the EXACT `#`-overflow width vs PG — whether the sign
-// column, currency glyph, and group separators are each counted as one `#`. We
-// model: one `#` per integer digit position, one per separator, one for the point
-// (if present), one per fractional position, plus the leading sign column unless
-// `FM`. Real PG may differ on separator/point counting.
-fn overflow_fill(desc: &NumDesc) -> String {
-    let mut width = desc.pre + desc.post + desc.group_before.len();
-    if desc.has_point || desc.post > 0 {
-        width += 1; // the decimal point
+/// The `#`-filled overflow CORE — the digit grid only. PG `#`-fills every digit
+/// position (a `9` and a `0` alike), renders each group separator as its literal
+/// char (there is always a `#` to its left), and places the decimal point; the
+/// sign / currency decoration is applied by `decorate`, NOT `#`-filled (oracle-
+/// confirmed, PG 18: `to_char(123456,'999')` → `' ###'`, `to_char(123456,'9,99')`
+/// → `' #,##'`, `to_char(123456,'L99')` → `'$ ##'`). FM trimming does not apply.
+fn overflow_core(desc: &NumDesc) -> String {
+    let mut int_out = String::new();
+    for idx in 0..desc.pre {
+        // A separator sits BEFORE digit slot `idx` when `group_before` records it.
+        for &g in &desc.group_before {
+            if g == idx && g != 0 {
+                int_out.push(',');
+            }
+        }
+        int_out.push('#');
     }
-    let mut s = String::new();
-    if matches!(desc.sign, SignMode::Default) && !desc.fill_mode {
-        s.push('#'); // the reserved sign column also fills with '#'
+    let mut core = int_out;
+    if desc.has_point {
+        core.push('.');
+        core.push_str(&"#".repeat(desc.post));
     }
-    s.push_str(&"#".repeat(width));
-    s
+    core
 }
 
 /// Split a rounded value into (integer-digit-string, fractional-digit-string),
@@ -771,20 +780,24 @@ fn lay_out_digits(desc: &NumDesc, int_digits: &str, frac_digits: &str) -> String
             *slot = '0';
         }
     }
-    // PG ALWAYS renders the ones place (the last integer position): a `9` there is
-    // `0` for a zero / sub-1 value, not blanked — PG: `to_char(0.1,'9.9')` → ` 0.1`,
-    // `to_char(0,'9999')` → `    0`. Only the leading zeros to its LEFT are blanked.
+    // The ones place (the last integer position) for a value with NO significant
+    // integer digit (a whole zero or a sub-1 value): PostgreSQL renders a `0` ONLY
+    // when the ones-place pattern is a `0`, OR when the template has NO fractional
+    // positions; a `9` ones place over a fraction-bearing template BLANKS instead
+    // (oracle-confirmed, PG 18: `to_char(0,'9999')` → `'    0'` but
+    // `to_char(0.5,'9.9')` → `'  .5'`, `to_char(0.5,'0.9')` → `' 0.5'`).
     if desc.pre > 0 && n == 0 {
-        // No significant integer digit at all: force the ones place to `0`.
-        slots[desc.pre - 1] = '0';
+        let ones_is_zero_pattern = desc.int_zero.get(desc.pre - 1).copied().unwrap_or(false);
+        if ones_is_zero_pattern || desc.post == 0 {
+            slots[desc.pre - 1] = '0';
+        }
     }
 
     // Insert group separators. `group_before[k]` = number of integer digit slots
     // to the LEFT of separator k. PG renders the separator as its literal char if
-    // there is a printable (non-blank) digit to its left, else blank.
-    // TODO(T9 oracle): confirm separator-adjacent-to-blank rendering vs PG (we
-    // blank a separator whose entire left side is blank; PG's NUM_processor checks
-    // the immediate left digit).
+    // there is a printable (non-blank) digit to its left, else blank (oracle-
+    // confirmed, PG 18: `to_char(123,'9,999')` → `'   123'` — the comma is blanked
+    // because every slot to its left is a suppressed leading zero).
     let mut int_out = String::new();
     for (idx, &slot) in slots.iter().enumerate() {
         // Emit any separators whose position equals `idx` (i.e. they sit BEFORE
@@ -844,10 +857,13 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
 
     match desc.sign {
         SignMode::Default => {
-            // Reserve ONE leading column: blank for non-negative, `-` for negative.
-            // FM strips the non-negative blank.
+            // PG's DEFAULT sign is ANCHORED: a negative `-` hugs the first significant
+            // digit, keeping the grid's leading blanks to its left (oracle-confirmed,
+            // PG 18: `to_char(-1,'999')` → `'  -1'`, `to_char(-12,'9999')` → `'  -12'`).
+            // A non-negative value reserves ONE leading blank column (FM strips it).
             if negative {
-                lead.push('-');
+                body = anchor_sign(&core_for_anchor, '-', Anchor::Leading);
+                anchored = true;
             } else if !desc.fill_mode {
                 lead.push(' ');
             }
@@ -859,9 +875,9 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
             anchored = true;
         }
         SignMode::Mi(anchor) => {
-            // FIXED minus column: `-` if negative, else a blank (FM drops the blank).
-            // TODO(T9 oracle): confirm MI's non-negative blank (and FM suppression)
-            // and its fixed (non-anchored) far-edge placement vs PG.
+            // FIXED minus column REPLACING the default sign: `-` if negative, else a
+            // blank (FM drops the blank). Oracle-confirmed, PG 18: `to_char(-12,
+            // 'MI9999')` → `'-  12'`, `to_char(12,'MI9999')` → `'   12'`.
             let ch = if negative {
                 Some('-')
             } else if desc.fill_mode {
@@ -872,34 +888,44 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
             push_fixed(&mut lead, &mut trail, ch, anchor);
         }
         SignMode::Pl(anchor) => {
-            // FIXED plus column: `+` if number > 0 (PG: "plus sign … if number > 0"),
-            // else a blank (FM drops it).
-            // TODO(T9 oracle): confirm PL emits `+` only for strictly-positive and a
-            // blank otherwise, at a fixed (non-anchored) column.
-            let positive = !negative && !is_zero(rounded);
-            let ch = if positive {
+            // `PL` is ADDITIVE to PG's default sign behavior (oracle-confirmed, PG 18):
+            // `to_char(12,'PL99')` → `'+ 12'` (PL's `+`, then the default reserved
+            // blank), `to_char(-12,'PL999')` → `'  -12'` (PL's leading blank, then the
+            // default `-` ANCHORED to the digit). PL emits `+` for non-negative
+            // (including zero) / a blank for negative at its own fixed column.
+            let pl_ch = if !negative {
                 Some('+')
             } else if desc.fill_mode {
                 None
             } else {
                 Some(' ')
             };
-            push_fixed(&mut lead, &mut trail, ch, anchor);
+            push_fixed(&mut lead, &mut trail, pl_ch, anchor);
+            // The default sign: an ANCHORED `-` for negative, else a reserved leading
+            // blank (FM strips the blank).
+            if negative {
+                body = anchor_sign(&core_for_anchor, '-', Anchor::Leading);
+                anchored = true;
+            } else if !desc.fill_mode {
+                lead.push(' ');
+            }
         }
         SignMode::Sg(anchor) => {
-            // FIXED sign column: always `+` or `-`.
-            // TODO(T9 oracle): confirm SG's fixed (non-anchored) placement vs PG.
+            // FIXED sign column REPLACING the default sign: always `+` or `-`.
+            // Oracle-confirmed, PG 18: `to_char(12,'SG99')` → `'+12'`.
             let sgn = if negative { '-' } else { '+' };
             push_fixed(&mut lead, &mut trail, Some(sgn), anchor);
         }
         SignMode::Pr => {
-            // Negative → `<core>`; non-negative → ` core ` (a leading + trailing
-            // blank). FM does NOT strip PR's blanks (they are part of the format).
-            // TODO(T9 oracle): confirm PR's non-negative spacing (leading AND
-            // trailing blank) vs PG, and interaction with FM.
+            // `PR` brackets HUG the number, preserving the grid's leading blanks
+            // (oracle-confirmed, PG 18): `to_char(-12,'9999PR')` → `'  <12>'` (the two
+            // leading blanks of `'  12'` stay, the `<` is glued before the first digit,
+            // the `>` is appended). A non-negative value gets a leading + trailing blank
+            // in the bracket positions instead.
             if negative {
-                lead.push('<');
+                body = anchor_sign(&core_for_anchor, '<', Anchor::Leading);
                 trail.push('>');
+                anchored = true;
             } else {
                 lead.push(' ');
                 trail.push(' ');
@@ -907,18 +933,14 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
         }
     }
 
-    // Currency marker. PG `L` uses `lc_monetary`; in the C locale the EXACT glyph is
-    // locale-defined (the docs' `to_char(485,'L999')` → `'DM 485'` is a German-locale
-    // example, NOT C). `$` is NOT a documented numeric pattern in PG — PG treats it
-    // as a literal. We render `$` at the anchor for BOTH as a placeholder; the corpus
-    // (T9) pins the real C-locale output.
-    // TODO(T9 oracle): confirm (1) the C-locale `L` glyph (likely empty in lc_monetary=C)
-    // and (2) whether `$` is a literal `$` at its position rather than a currency
-    // anchor. Both are currently rendered as a `$` at the anchor.
+    // Currency marker. Oracle-confirmed against PostgreSQL 18's default (C) locale:
+    // both `L` (the `lc_monetary` currency symbol) and `$` render a literal `$` at
+    // their anchor (`to_char(485,'L999')` → `'$ 485'`, `to_char(485,'999$')` →
+    // `' 485$'`). Currency sits OUTSIDE (left of / right of) the sign column.
     if let Some(anchor) = desc.currency {
         match anchor {
             // Currency is the OUTERMOST leading element (before the sign column), so
-            // `L999`(485) → `$` + ` 485` = `$ 485` (cf. PG `DM 485`).
+            // `L999`(485) → `$` + ` 485` = `$ 485`.
             Anchor::Leading => lead.insert(0, '$'),
             Anchor::Trailing => trail.push('$'),
         }
@@ -934,11 +956,12 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
 
     let mut s = format!("{lead}{body}{trail}");
 
-    // `TH`/`th`: append the ordinal of the INTEGER value (PG keys it off the
-    // integer part of the value). PG does NOT apply TH to negative or fractional
-    // values — but we still append for the integer part here; T9 pins the edge.
-    // TODO(T9 oracle): confirm TH is suppressed for negative / fractional values.
-    if let Some(upper) = desc.ordinal {
+    // `TH`/`th`: append the ordinal suffix of the integer value. PostgreSQL
+    // SUPPRESSES the suffix for a NEGATIVE value (oracle-confirmed, PG 18:
+    // `to_char(-12,'FM999TH')` → `'-12'`, `to_char(-1,'999TH')` → `'  -1'`).
+    if let Some(upper) = desc.ordinal
+        && !negative
+    {
         let int_val = rounded.with_scale_round(0, RoundingMode::Down);
         let n = int_val.to_i64().unwrap_or(0);
         s.push_str(&num_ordinal_suffix(n, upper));
@@ -951,24 +974,38 @@ fn decorate(desc: &NumDesc, core: String, negative: bool, rounded: &BigDecimal) 
 /// now-bare decimal point, and (when a fraction survives) drop a sub-1 value's
 /// sole leading integer `0`. `core` is the laid-out body (it may carry leading
 /// blanks from suppressed leading zeros, which the caller trims separately).
-/// PG: `to_char(148.5,'FM999.999')` → `148.5`; `to_char(-0.1,'FM9.99')` → `-.1`
-/// (the leading `0` is dropped BECAUSE a fraction remains); but a whole zero with
-/// no fraction keeps its digit: `to_char(0,'FM9')` → `0`.
-/// TODO(T9 oracle): confirm FM drops the sub-1 leading `0` only when a fraction
-/// survives (and never the `0`-pattern forced zero) vs PG.
+/// Oracle-confirmed, PG 18: `to_char(148.5,'FM999.999')` → `148.5`;
+/// `to_char(-0.1,'FM9.99')` → `-.1` (the sub-1 leading `0` is dropped BECAUSE a
+/// fraction remains); `to_char(0.5,'FM9.9')` → `.5` but `to_char(0.5,'FM0.9')` →
+/// `0.5` (a `0`-pattern ones place is forced, never dropped). When the template has
+/// fractional positions, FM strips the trailing fraction ZEROS but KEEPS the decimal
+/// point: `to_char(5,'FM9.99')` → `5.`, `to_char(100,'FM999.99')` → `100.`,
+/// `to_char(0,'FM9.99')` → `0.`. (A template with no point keeps no digit beyond the
+/// integer: `to_char(0,'FM9')` → `0`.)
 fn fm_trim_fraction(core: &str, ones_is_zero_pattern: bool) -> String {
     match core.split_once('.') {
         Some((int_part, frac)) => {
             let trimmed = frac.trim_end_matches('0');
-            if trimmed.is_empty() {
-                int_part.to_string()
-            } else if int_part.trim() == "0" && !ones_is_zero_pattern {
-                // sub-1 value whose ones place is a `9` (a leading zero): drop it
-                // (PG `FM`). A `0`-pattern ones place is kept (it is forced).
-                format!(".{trimmed}")
+            // The integer part is "effectively zero" if it has no significant digit
+            // (blank — a sub-1 / zero `9` ones place — or a forced `0`).
+            let int_is_zero = int_part.trim().is_empty() || int_part.trim() == "0";
+            let int_render = if int_is_zero && !ones_is_zero_pattern {
+                if trimmed.is_empty() {
+                    // A WHOLE zero (no fraction survives): PG shows the `0` (→ `0.`).
+                    "0".to_string()
+                } else {
+                    // A SUB-1 value whose `9` ones place is a leading zero AND a
+                    // fraction survives: PG drops the integer `0` (→ `.5`).
+                    String::new()
+                }
+            } else if int_is_zero {
+                // A `0`-pattern ones place is forced — always shown as `0`.
+                "0".to_string()
             } else {
-                format!("{int_part}.{trimmed}")
-            }
+                int_part.to_string()
+            };
+            // PG keeps the decimal point even when every fraction digit is stripped.
+            format!("{int_render}.{trimmed}")
         }
         None => core.to_string(),
     }
@@ -1705,8 +1742,8 @@ mod tests {
         assert_eq!(fmt("1234567", "9,999,999"), " 1,234,567");
         // `G` is the same as `,`.
         assert_eq!(fmt("1234567", "9G999G999"), " 1,234,567");
-        // A separator whose entire left side is blank renders blank (PG behavior).
-        // TODO(T9 oracle): confirm the leading separator-on-blank rendering vs PG.
+        // A separator whose entire left side is blank renders blank (oracle-confirmed,
+        // PG 18: `to_char(12,'9,999')` → `'    12'`).
         assert_eq!(fmt("12", "9,999"), "    12");
         assert_eq!(fmt("1234", "9,999"), " 1,234");
     }
@@ -1725,12 +1762,16 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // PG doc: to_char(148.5,'FM999.999') → '148.5' (trailing fraction zeros gone).
+        // PG: to_char(148.5,'FM999.999') → '148.5' (trailing fraction zeros gone).
         assert_eq!(fmt("148.5", "FM999.999"), "148.5");
-        // PG doc: to_char(-0.1,'FM9.99') → '-.1'.
+        // PG: to_char(-0.1,'FM9.99') → '-.1'.
         assert_eq!(fmt("-0.1", "FM9.99"), "-.1");
-        // A whole-number value under FM drops the bare decimal point entirely.
-        assert_eq!(fmt("5", "FM9.99"), "5");
+        // FM strips the trailing fraction ZEROS but KEEPS the decimal point when the
+        // template has fractional positions (oracle-confirmed, PG 18: 'FM9.99' over 5
+        // → '5.', over 100 → '100.', over 0 → '0.').
+        assert_eq!(fmt("5", "FM9.99"), "5.");
+        assert_eq!(fmt("100", "FM999.99"), "100.");
+        assert_eq!(fmt("0", "FM9.99"), "0.");
         // Without FM the trailing zeros are kept (and padding blank).
         assert_eq!(fmt("148.5", "999.999"), " 148.500");
         // A `0`-pattern ones place is KEPT under FM (it is forced), unlike a `9`.
@@ -1756,24 +1797,25 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // S — leading sign glued to the number (always shows + or -).
-        // TODO(T9 oracle): confirm S leading placement + the `+` for non-negative.
+        // S — leading sign glued to the number (always shows + or -). Oracle-pinned.
         assert_eq!(fmt("485", "S999"), "+485");
         assert_eq!(fmt("-485", "S999"), "-485");
         // S — trailing.
         assert_eq!(fmt("485", "999S"), "485+");
         assert_eq!(fmt("-485", "999S"), "485-");
         // MI — trailing minus, blank if non-negative.
-        // TODO(T9 oracle): confirm MI's non-negative blank placement vs PG.
         assert_eq!(fmt("485", "999MI"), "485 ");
         assert_eq!(fmt("-485", "999MI"), "485-");
         assert_eq!(fmt("485", "FM999MI"), "485"); // FM drops the blank
-        // PL — plus sign at a FIXED leading column (only when number > 0).
-        // PG doc: to_char(485,'PL999') → '+485'.
-        // TODO(T9 oracle): confirm PL renders only `+` (never `-`) vs PG.
-        assert_eq!(fmt("485", "PL999"), "+485");
-        // SG — plus or minus at a FIXED leading column.
-        // PG doc: to_char(-485,'SG999') → '-485'.
+        // PL is ADDITIVE to the default sign (PG 18): `+` then the reserved blank for
+        // non-negative; a leading blank then the default `-` ANCHORED to the digit for
+        // negative (`to_char(-12,'PL999')` → `'  -12'`).
+        assert_eq!(fmt("485", "PL999"), "+ 485");
+        assert_eq!(fmt("-485", "PL999"), " -485");
+        assert_eq!(fmt("-12", "PL999"), "  -12");
+        assert_eq!(fmt("485", "999PL"), " 485+");
+        assert_eq!(fmt("-1", "999PL"), "  -1 ");
+        // SG — plus or minus REPLACING the default sign column.
         assert_eq!(fmt("485", "SG999"), "+485");
         assert_eq!(fmt("-485", "SG999"), "-485");
     }
@@ -1783,10 +1825,12 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // PR — negative wrapped in <…>; non-negative gets leading + trailing space.
-        // TODO(T9 oracle): confirm PR's exact spacing for non-negative vs PG.
+        // PR — negative wrapped in <…> (brackets HUG the number, leading grid blanks
+        // preserved); non-negative gets a leading + trailing space. Oracle-pinned.
         assert_eq!(fmt("-485", "999PR"), "<485>");
         assert_eq!(fmt("485", "999PR"), " 485 ");
+        // The bracket hugs the digit when the grid is wider than the number.
+        assert_eq!(fmt("-12", "9999PR"), "  <12>");
     }
 
     #[test]
@@ -1794,10 +1838,9 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // Currency `L`/`$`: we render a literal `$` at the anchor. The EXACT glyph
-        // PG emits in the C locale must be confirmed by the corpus.
-        // TODO(T9 oracle): confirm the C-locale `L` glyph (PG: empty in C locale)
-        // and the `$` glyph + placement relative to the sign column.
+        // Currency `L`/`$`: PostgreSQL 18's C/default locale emits a literal `$`
+        // (oracle-confirmed: `to_char(485,'L999')` → `'$ 485'`). `$` is also a
+        // currency anchor. Both render `$` at the anchor, outside the sign column.
         assert_eq!(fmt("485", "L999"), "$ 485");
         assert_eq!(fmt("485", "$999"), "$ 485");
         assert_eq!(fmt("485", "999L"), " 485$");
@@ -1809,8 +1852,7 @@ mod tests {
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
         // V shifts left by the number of 9/0 digits FOLLOWING it (multiply by 10^n).
-        // `to_char(12.4, '99V999')` → 12.4 * 1000 = 12400 → "12400".
-        // TODO(T9 oracle): confirm V + fractional-template interaction vs PG.
+        // `to_char(12.4, '99V999')` → 12.4 * 1000 = 12400 → "12400". Oracle-pinned.
         assert_eq!(fmt("12.4", "99V999"), " 12400");
         assert_eq!(fmt("1", "9V9"), " 10");
     }
@@ -1820,22 +1862,25 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // TH/th append the ordinal suffix of the integer value.
-        // TODO(T9 oracle): confirm TH placement + casing vs PG.
+        // TH/th append the ordinal suffix of the integer value. Oracle-pinned.
         assert_eq!(fmt("1", "FM9TH"), "1ST");
         assert_eq!(fmt("2", "FM9th"), "2nd");
         assert_eq!(fmt("11", "FM99TH"), "11TH");
         assert_eq!(fmt("23", "FM99TH"), "23RD");
+        // PG SUPPRESSES the ordinal for a NEGATIVE value.
+        assert_eq!(fmt("-12", "FM999TH"), "-12");
+        assert_eq!(fmt("-1", "999TH"), "  -1");
     }
 
     #[test]
-    fn format_numeric_blank_zero() {
+    fn format_numeric_blank_zero_is_noop() {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // B blanks the WHOLE result when the value is zero.
-        assert_eq!(fmt("0", "B9999"), "");
-        assert_eq!(fmt("0", "B0000"), "");
+        // `B` (blank-on-zero) is a NO-OP in PostgreSQL 18 — a zero renders normally
+        // (oracle-confirmed: `to_char(0,'B9999')` → `'    0'`, NOT blank).
+        assert_eq!(fmt("0", "B9999"), "    0");
+        assert_eq!(fmt("0", "B0000"), " 0000");
         assert_eq!(fmt("12", "B9999"), "   12"); // non-zero unaffected
     }
 
@@ -1844,13 +1889,17 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // Integer part wider than the template → fill the field with `#`.
-        // Width = sign col (1) + 3 digit positions = 4 → "####".
-        // TODO(T9 oracle): confirm the EXACT `#`-overflow width vs PG (sign col,
-        // separators, and decimal point counting).
-        assert_eq!(fmt("1234", "999"), "####");
-        // With a fractional part: sign(1) + 3 int + point(1) + 2 frac = 7.
-        assert_eq!(fmt("1234.5", "999.99"), "#######");
+        // Integer part wider than the template → `#`-fill the DIGIT positions, but the
+        // sign column renders normally (oracle-confirmed, PG 18). Default non-negative
+        // reserves the leading blank: `to_char(1234,'999')` → `' ###'`.
+        assert_eq!(fmt("1234", "999"), " ###");
+        // With a fractional part: blank + 3 int `#` + point + 2 frac `#`.
+        assert_eq!(fmt("1234.5", "999.99"), " ###.##");
+        // A negative overflow keeps the anchored `-`; a separator stays literal.
+        assert_eq!(fmt("-1234", "999"), "-###");
+        assert_eq!(fmt("123456", "9,99"), " #,##");
+        // FM drops the leading sign blank.
+        assert_eq!(fmt("1234", "FM999"), "###");
     }
 
     #[test]
@@ -1858,12 +1907,13 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // -0 (rounds to zero) is NOT negative → leading blank, not `-`. The ones
-        // place always renders (PG): to_char(-0.001,'9.9') → ' 0.0'.
-        assert_eq!(fmt("-0.001", "9.9"), " 0.0");
-        // A value <1 shows the ones-place `0` with a `9` template (PG: ' 0.5').
-        assert_eq!(fmt("0.5", "9.9"), " 0.5");
-        // ... and a `0` template zero-fills the integer position too.
+        // -0 (rounds to zero) is NOT negative → no `-`. A sub-1 value over a `9`
+        // ones place + a fraction BLANKS the integer (PG 18): to_char(-0.001,'9.9')
+        // → '  .0'.
+        assert_eq!(fmt("-0.001", "9.9"), "  .0");
+        // A value <1 BLANKS the ones-place `9` when a fraction is present (PG: '  .5').
+        assert_eq!(fmt("0.5", "9.9"), "  .5");
+        // ... but a `0` ones place zero-fills the integer position (PG: ' 0.5').
         assert_eq!(fmt("0.5", "0.9"), " 0.5");
     }
 
@@ -1872,20 +1922,22 @@ mod tests {
         use super::{format_numeric, parse};
         let n = |s: &str| parse(s).expect(s);
         let fmt = |v: &str, t: &str| format_numeric(t, &n(v)).expect(t);
-        // Rounding carries into a new integer digit that no longer fits → overflow.
-        assert_eq!(fmt("99.6", "99"), "###"); // 99.6 → 100, 3 digits > 2 positions
-        // A negative value with a currency marker (default sign + leading currency).
+        // Rounding carries into a new integer digit that no longer fits → overflow
+        // (`#`-filled digits, leading sign blank): 99.6 → 100, 3 digits > 2 positions.
+        assert_eq!(fmt("99.6", "99"), " ##");
+        // A negative value with a currency marker (anchored `-` + leading currency).
         assert_eq!(fmt("-485", "L999"), "$-485");
         // Trailing currency on a negative.
         assert_eq!(fmt("-485", "999L"), "-485$");
         // A V-shift with a fractional input that rounds.
         // to_char(12.45, '99V9') → 12.45*10 = 124.5 → round to 0 frac → 125.
-        // TODO(T9 oracle): confirm V rounding interaction (PG doc shows '125').
         assert_eq!(fmt("12.45", "99V9"), " 125");
         // An ABSURD V-shift must not panic (bounded by the format-limit fallback).
         let _ = format_numeric("9V999999999", &n("1")); // just must not panic
-        // No integer positions at all (template `.99`).
-        assert_eq!(fmt("0.25", ".99"), " .25");
+        // No integer positions at all (template `.99`) → PG `#`-overflows for ANY
+        // value, since not even the implicit leading `0` fits (oracle-confirmed).
+        assert_eq!(fmt("0.25", ".99"), " .##");
+        assert_eq!(fmt("0", ".99"), " .##");
         // Group separator with a fully-blank left side renders blank, not ','.
         assert_eq!(fmt("5", "9,999"), "     5");
     }
