@@ -18,6 +18,12 @@ use crate::clock::EvalCtx;
 use crate::error::ExecError;
 use crate::scope::{ColumnBinding, Scope};
 
+/// Defense-in-depth recursion bound for the `SetExpr` tree walks (`fold` /
+/// `resolve_set_columns`), mirroring `eval`'s `MAX_EVAL_DEPTH`. The parser already
+/// caps a parsed set-op tree at `pgparser`'s `MAX_DEPTH` (well under this), so this
+/// only fires for a `SetExpr` built programmatically deeper than the parser allows.
+const MAX_SETOP_DEPTH: usize = 150;
+
 /// One resolved output column of a set-op query: its `name` (from the leftmost
 /// branch), its resolved `ty`, and whether it is still `unknown` — i.e. every
 /// contributing branch column was a bare untyped literal (`NULL` or a string
@@ -65,7 +71,17 @@ fn unify_col(
 /// unknown-aware unification across branches; a column-count mismatch raises 42601
 /// with the offending operator. Shared by `describe_set_query` (extended-protocol
 /// Describe) and `execute_set_operation` (to precompute the coercion target types).
-fn resolve_set_columns(catalog_kv: &dyn Kv, e: &SetExpr) -> Result<Vec<ResolvedCol>, ExecError> {
+fn resolve_set_columns(
+    catalog_kv: &dyn Kv,
+    e: &SetExpr,
+    depth: usize,
+) -> Result<Vec<ResolvedCol>, ExecError> {
+    // Defense-in-depth: the parser caps set-op tree depth at MAX_DEPTH (50), so this
+    // recursion is bounded for any parser-produced tree; the guard catches any
+    // programmatically-built `SetExpr` deeper than `MAX_SETOP_DEPTH`. Returns 54001.
+    if depth > MAX_SETOP_DEPTH {
+        return Err(ExecError::StackDepthExceeded);
+    }
     match e {
         SetExpr::Select(s) => {
             let scope = if s.from.is_empty() {
@@ -92,8 +108,8 @@ fn resolve_set_columns(catalog_kv: &dyn Kv, e: &SetExpr) -> Result<Vec<ResolvedC
         SetExpr::SetOp {
             op, left, right, ..
         } => {
-            let l = resolve_set_columns(catalog_kv, left)?;
-            let r = resolve_set_columns(catalog_kv, right)?;
+            let l = resolve_set_columns(catalog_kv, left, depth + 1)?;
+            let r = resolve_set_columns(catalog_kv, right, depth + 1)?;
             if l.len() != r.len() {
                 return Err(ExecError::SetOpColumnCount {
                     op: *op,
@@ -128,7 +144,7 @@ pub(crate) fn describe_set_query(
     catalog_kv: &dyn Kv,
     q: &SetQuery,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, &q.body)?;
+    let cols = resolve_set_columns(catalog_kv, &q.body, 0)?;
     Ok(cols
         .iter()
         .map(|c| crate::exec::field(&c.name, output_type(c)))
@@ -156,11 +172,11 @@ pub(crate) fn execute_set_operation(
     // every branch to ONE common type per column is exactly PG's model
     // (`select_common_type` over the whole set-op tree), so the leaves coerce to
     // these types regardless of where they sit in the tree.
-    let cols = resolve_set_columns(catalog_kv, &q.body)?;
+    let cols = resolve_set_columns(catalog_kv, &q.body, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
 
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &out_tys, ctx,
+        catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &out_tys, ctx, 0,
     )?;
 
     // Query-level ORDER BY over the OUTPUT columns: a bare integer is a 1-based
@@ -232,7 +248,12 @@ fn fold(
     e: &SetExpr,
     out_tys: &[ColumnType],
     ctx: &EvalCtx,
+    depth: usize,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
+    // Defense-in-depth (parser already caps the tree at MAX_DEPTH): 54001, not a crash.
+    if depth > MAX_SETOP_DEPTH {
+        return Err(ExecError::StackDepthExceeded);
+    }
     match e {
         SetExpr::Select(s) => {
             let rel = crate::exec::select_to_relation(
@@ -247,10 +268,28 @@ fn fold(
             right,
         } => {
             let lrows = fold(
-                catalog_kv, kv, global, gsnap, snapshot, own, left, out_tys, ctx,
+                catalog_kv,
+                kv,
+                global,
+                gsnap,
+                snapshot,
+                own,
+                left,
+                out_tys,
+                ctx,
+                depth + 1,
             )?;
             let rrows = fold(
-                catalog_kv, kv, global, gsnap, snapshot, own, right, out_tys, ctx,
+                catalog_kv,
+                kv,
+                global,
+                gsnap,
+                snapshot,
+                own,
+                right,
+                out_tys,
+                ctx,
+                depth + 1,
             )?;
             Ok(combine_rows(*op, *all, lrows, rrows))
         }
