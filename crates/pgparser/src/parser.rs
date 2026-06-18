@@ -819,7 +819,9 @@ impl Parser {
             Token::Keyword(Keyword::Create) => self.create_table(),
             Token::Keyword(Keyword::Drop) => self.drop_table(),
             Token::Keyword(Keyword::Insert) => self.insert(),
-            Token::Keyword(Keyword::Select) | Token::LParen => self.query_stmt(),
+            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values) | Token::LParen => {
+                self.query_stmt()
+            }
             // SP4: transaction control
             Token::Keyword(Keyword::Begin) | Token::Keyword(Keyword::Start) => self.begin(),
             Token::Keyword(Keyword::Commit) | Token::Keyword(Keyword::End) => {
@@ -1233,6 +1235,30 @@ impl Parser {
         })
     }
 
+    fn values_stmt(&mut self) -> Result<crate::ast::ValuesStmt, ParseError> {
+        self.expect(&Token::Keyword(Keyword::Values))?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&Token::LParen)?;
+            if *self.peek() == Token::RParen {
+                return Err(ParseError::new(
+                    "VALUES row must have at least one expression",
+                    self.peek_pos(),
+                ));
+            }
+            let mut row = vec![self.expr(0)?];
+            while self.eat_comma() {
+                row.push(self.expr(0)?);
+            }
+            self.expect(&Token::RParen)?;
+            rows.push(row);
+            if !self.eat_comma() {
+                break;
+            }
+        }
+        Ok(crate::ast::ValuesStmt { rows })
+    }
+
     /// Parse an optional `ORDER BY …`, then `LIMIT`/`OFFSET` in either order.
     /// The tuple is the three result-level tail components (order_by, limit, offset);
     /// a named struct would not read more clearly than the positional triple.
@@ -1297,17 +1323,23 @@ impl Parser {
     /// query. A lone Select (no set-op) collapses back to `Statement::Select` so the
     /// single-SELECT shape — including FOR UPDATE — is byte-for-byte unchanged.
     fn query_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
-        use crate::ast::{SetExpr, SetQuery, Statement};
+        use crate::ast::{QueryBody, SetExpr, SetQuery, Statement, ValuesQuery};
         let body = self.set_expr(0)?;
         let (order_by, limit, offset) = self.parse_set_tail()?;
         match body {
-            SetExpr::Select(mut s) => {
+            SetExpr::Query(QueryBody::Select(mut s)) => {
                 s.order_by = order_by;
                 s.limit = limit;
                 s.offset = offset;
                 s.locking = self.parse_locking()?;
                 Ok(Statement::Select(*s))
             }
+            SetExpr::Query(QueryBody::Values(v)) => Ok(Statement::Values(ValuesQuery {
+                body: v,
+                order_by,
+                limit,
+                offset,
+            })),
             body => {
                 if matches!(self.peek(), Token::Keyword(Keyword::For)) {
                     return Err(ParseError::new(
@@ -1373,15 +1405,19 @@ impl Parser {
     /// parenthesized single SELECT that keeps its own ORDER BY / LIMIT), or a bare
     /// SELECT branch (`select_core`, no tail — the query owns the tail).
     fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::SetExpr;
+        use crate::ast::{QueryBody, SetExpr};
         if *self.peek() == Token::LParen {
             self.bump(); // (
             let inner = self.set_expr(0)?;
             let inner = self.attach_paren_tail(inner)?;
             self.expect(&Token::RParen)?;
             Ok(inner)
+        } else if *self.peek() == Token::Keyword(Keyword::Values) {
+            Ok(SetExpr::Query(QueryBody::Values(self.values_stmt()?)))
         } else {
-            Ok(SetExpr::Select(Box::new(self.select_core()?)))
+            Ok(SetExpr::Query(QueryBody::Select(Box::new(
+                self.select_core()?,
+            ))))
         }
     }
 
@@ -1391,7 +1427,7 @@ impl Parser {
         &mut self,
         inner: crate::ast::SetExpr,
     ) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::SetExpr;
+        use crate::ast::{QueryBody, SetExpr};
         let has_tail = matches!(
             self.peek(),
             Token::Keyword(Keyword::Order)
@@ -1402,13 +1438,17 @@ impl Parser {
             return Ok(inner);
         }
         match inner {
-            SetExpr::Select(mut s) => {
+            SetExpr::Query(QueryBody::Select(mut s)) => {
                 let (order_by, limit, offset) = self.parse_set_tail()?;
                 s.order_by = order_by;
                 s.limit = limit;
                 s.offset = offset;
-                Ok(SetExpr::Select(s))
+                Ok(SetExpr::Query(QueryBody::Select(s)))
             }
+            SetExpr::Query(QueryBody::Values(_)) => Err(ParseError::new(
+                "ORDER BY/LIMIT on a parenthesized VALUES branch is not supported",
+                self.peek_pos(),
+            )),
             _ => Err(ParseError::new(
                 "ORDER BY/LIMIT on a parenthesized set-operation subtree is not supported",
                 self.peek_pos(),
@@ -1514,13 +1554,26 @@ impl Parser {
         use crate::ast::TableExpr;
         if *self.peek() == Token::LParen {
             self.bump();
-            if *self.peek() == Token::Keyword(Keyword::Select) {
-                let subquery = Box::new(self.select_inner()?);
+            if matches!(
+                self.peek(),
+                Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+            ) {
+                use crate::ast::QueryBody;
+                let subquery = if *self.peek() == Token::Keyword(Keyword::Select) {
+                    QueryBody::Select(Box::new(self.select_inner()?))
+                } else {
+                    QueryBody::Values(self.values_stmt()?)
+                };
                 self.expect(&Token::RParen)?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
                     ParseError::new("subquery in FROM must have an alias", self.peek_pos())
                 })?;
-                return Ok(TableExpr::Derived { subquery, alias });
+                let columns = self.opt_column_aliases()?;
+                return Ok(TableExpr::Derived {
+                    subquery,
+                    alias,
+                    columns,
+                });
             }
             let inner = self.join_tree()?;
             self.expect(&Token::RParen)?;
@@ -1541,6 +1594,19 @@ impl Parser {
             return Ok(Some(self.expect_ident()?));
         }
         Ok(None)
+    }
+
+    fn opt_column_aliases(&mut self) -> Result<Option<Vec<String>>, ParseError> {
+        if *self.peek() != Token::LParen {
+            return Ok(None);
+        }
+        self.bump();
+        let mut cols = vec![self.expect_ident()?];
+        while self.eat_comma() {
+            cols.push(self.expect_ident()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Some(cols))
     }
 
     /// Parse the integer count after a `LIMIT`/`OFFSET` keyword (`what` names it
@@ -3086,6 +3152,97 @@ mod tests {
     }
 
     #[test]
+    fn parses_standalone_values_query() {
+        use crate::ast::{Expr, Statement};
+        let s = crate::parse("VALUES (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 1 OFFSET 1")
+            .expect("parse standalone VALUES");
+        let Statement::Values(q) = &s[0] else {
+            panic!("expected VALUES, got {:?}", s[0])
+        };
+        assert_eq!(q.body.rows.len(), 2);
+        assert_eq!(q.body.rows[0].len(), 2);
+        assert!(matches!(q.body.rows[0][0], Expr::IntLiteral(_)));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+        assert_eq!(q.offset, Some(1));
+    }
+
+    #[test]
+    fn parses_values_as_set_operation_branch() {
+        use crate::ast::{QueryBody, SetExpr, SetOp, Statement};
+        let s = crate::parse("VALUES (1) UNION ALL SELECT 2").expect("parse values set op");
+        let Statement::SetOperation(q) = &s[0] else {
+            panic!("expected set op")
+        };
+        let SetExpr::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } = &q.body
+        else {
+            panic!("expected set op body")
+        };
+        assert_eq!(*op, SetOp::Union);
+        assert!(*all);
+        assert!(matches!(&**left, SetExpr::Query(QueryBody::Values(_))));
+        assert!(matches!(&**right, SetExpr::Query(QueryBody::Select(_))));
+    }
+
+    #[test]
+    fn parses_values_derived_table_with_column_aliases() {
+        use crate::ast::{QueryBody, Statement, TableExpr};
+        let s = crate::parse("SELECT id, name FROM (VALUES (1, 'a')) AS v(id, name)")
+            .expect("parse values derived table");
+        let Statement::Select(sel) = &s[0] else {
+            panic!("expected select")
+        };
+        let TableExpr::Derived {
+            subquery,
+            alias,
+            columns,
+        } = &sel.from[0]
+        else {
+            panic!("expected derived table")
+        };
+        assert!(matches!(subquery, QueryBody::Values(_)));
+        assert_eq!(alias, "v");
+        assert_eq!(
+            columns.as_ref().expect("column aliases"),
+            &vec!["id".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_select_derived_table_with_column_aliases() {
+        use crate::ast::{QueryBody, Statement, TableExpr};
+        let s = crate::parse("SELECT n FROM (SELECT a FROM t) AS d(n)")
+            .expect("parse derived SELECT column aliases");
+        let Statement::Select(sel) = &s[0] else {
+            panic!("expected select")
+        };
+        let TableExpr::Derived {
+            subquery,
+            alias,
+            columns,
+        } = &sel.from[0]
+        else {
+            panic!("expected derived table")
+        };
+        assert!(matches!(subquery, QueryBody::Select(_)));
+        assert_eq!(alias, "d");
+        assert_eq!(
+            columns.as_ref().expect("column aliases"),
+            &vec!["n".to_string()]
+        );
+    }
+
+    #[test]
+    fn values_rows_must_have_at_least_one_expr() {
+        assert!(crate::parse("VALUES ()").is_err());
+    }
+
+    #[test]
     fn parses_union_all_and_precedence() {
         use crate::ast::{SetExpr, SetOp, Statement};
         // INTERSECT binds tighter than UNION: A UNION B INTERSECT C => A UNION (B INTERSECT C)
@@ -3138,7 +3295,7 @@ mod tests {
 
     #[test]
     fn parenthesized_branch_keeps_its_own_order_limit() {
-        use crate::ast::{SetExpr, Statement};
+        use crate::ast::{QueryBody, SetExpr, Statement};
         let s = crate::parse("(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2").expect("parse");
         let Statement::SetOperation(q) = &s[0] else {
             panic!("expected set op")
@@ -3146,7 +3303,7 @@ mod tests {
         let SetExpr::SetOp { left, .. } = &q.body else {
             panic!("expected top SetOp")
         };
-        let SetExpr::Select(b) = &**left else {
+        let SetExpr::Query(QueryBody::Select(b)) = &**left else {
             panic!("left branch is a SELECT leaf")
         };
         assert_eq!(b.limit, Some(1));

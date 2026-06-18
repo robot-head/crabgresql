@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use kv::Kv;
 use mvcc::visibility::Snapshot;
-use pgparser::ast::{Expr, SetExpr, SetOp, SetQuery};
+use pgparser::ast::{Expr, QueryBody, SetExpr, SetOp, SetQuery};
 use pgtypes::{ColumnType, Datum};
 
 use crate::clock::EvalCtx;
@@ -83,7 +83,7 @@ fn resolve_set_columns(
         return Err(ExecError::StackDepthExceeded);
     }
     match e {
-        SetExpr::Select(s) => {
+        SetExpr::Query(QueryBody::Select(s)) => {
             let scope = if s.from.is_empty() {
                 Scope::empty()
             } else {
@@ -102,6 +102,19 @@ fn resolve_set_columns(
                     name: f.name,
                     ty,
                     unknown: is_unknown_literal(&e),
+                })
+                .collect())
+        }
+        SetExpr::Query(QueryBody::Values(v)) => {
+            let schema = crate::values::describe_values(v)?;
+            Ok(schema
+                .names
+                .into_iter()
+                .zip(schema.types)
+                .map(|(name, ty)| ResolvedCol {
+                    name,
+                    ty,
+                    unknown: false,
                 })
                 .collect())
         }
@@ -255,10 +268,14 @@ fn fold(
         return Err(ExecError::StackDepthExceeded);
     }
     match e {
-        SetExpr::Select(s) => {
+        SetExpr::Query(QueryBody::Select(s)) => {
             let rel = crate::exec::select_to_relation(
                 catalog_kv, kv, global, gsnap, snapshot, own, s, ctx,
             )?;
+            coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
+        }
+        SetExpr::Query(QueryBody::Values(v)) => {
+            let rel = crate::values::values_to_relation(v, ctx)?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::SetOp {

@@ -17,6 +17,8 @@ pub enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select(SelectStmt),
+    /// SP39: a standalone VALUES query expression with result-level ORDER BY/LIMIT/OFFSET.
+    Values(ValuesQuery),
     Begin {
         isolation: Option<IsolationLevel>,
     },
@@ -100,8 +102,32 @@ pub struct SelectStmt {
     pub locking: Option<RowLockStrength>,
 }
 
+/// SP39: a complete standalone VALUES query. Set-operation queries still use
+/// `SetQuery`; this variant is only for a lone VALUES statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesQuery {
+    pub body: ValuesStmt,
+    pub order_by: Vec<OrderItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// SP39: a VALUES row constructor list. Every row is non-empty; cross-row arity
+/// is checked during executor analysis so it gets PostgreSQL's analysis SQLSTATE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesStmt {
+    pub rows: Vec<Vec<Expr>>,
+}
+
+/// SP39: query bodies that may appear as set-operation leaves or derived tables.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryBody {
+    Select(Box<SelectStmt>),
+    Values(ValuesStmt),
+}
+
 /// SP38: a complete set-operation query expression. `body` is the operator tree
-/// (leaves are `SelectStmt`); `order_by` / `limit` / `offset` apply to the COMBINED
+/// (leaves are query bodies); `order_by` / `limit` / `offset` apply to the COMBINED
 /// result (PostgreSQL allows them only at the top of the query, or inside parens).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetQuery {
@@ -111,12 +137,12 @@ pub struct SetQuery {
     pub offset: Option<i64>,
 }
 
-/// SP38: a node in the set-operation tree. A `Select` leaf is one query block; a
+/// SP38: a node in the set-operation tree. A `Query` leaf is one query block; a
 /// `SetOp` combines two sub-trees. INTERSECT binds tighter than UNION/EXCEPT;
 /// UNION/EXCEPT are left-associative (the parser encodes this in the tree shape).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetExpr {
-    Select(Box<SelectStmt>),
+    Query(QueryBody),
     SetOp {
         op: SetOp,
         /// `true` for `… ALL …` (keep duplicates); `false` for the default
@@ -155,8 +181,9 @@ pub enum TableExpr {
         alias: Option<String>,
     },
     Derived {
-        subquery: Box<SelectStmt>,
+        subquery: QueryBody,
         alias: String, // PG requires a derived table to be aliased
+        columns: Option<Vec<String>>,
     },
     Join {
         left: Box<TableExpr>,
