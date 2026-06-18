@@ -1525,12 +1525,12 @@ impl Parser {
     }
 
     /// If an ORDER BY / LIMIT / OFFSET follows inside parentheses, attach it to a
-    /// lone-SELECT inner; reject it on a multi-branch subtree (deferred).
+    /// lone-SELECT inner; otherwise preserve the tailed query as a nested primary.
     fn attach_paren_tail(
         &mut self,
         inner: crate::ast::SetExpr,
     ) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::{QueryBody, SetExpr};
+        use crate::ast::{QueryBody, QueryExpr, SetExpr};
         let has_tail = matches!(
             self.peek(),
             Token::Keyword(Keyword::Order)
@@ -1548,10 +1548,16 @@ impl Parser {
                 s.offset = offset;
                 Ok(SetExpr::Query(QueryBody::Select(s)))
             }
-            _ => Err(ParseError::new(
-                "ORDER BY/LIMIT/OFFSET on this parenthesized query must be parsed as a nested query expression",
-                self.peek_pos(),
-            )),
+            body => {
+                let (order_by, limit, offset) = self.parse_set_tail()?;
+                Ok(SetExpr::Query(QueryBody::Nested(Box::new(QueryExpr {
+                    body,
+                    order_by,
+                    limit,
+                    offset,
+                    locking: None,
+                }))))
+            }
         }
     }
 
@@ -1951,6 +1957,49 @@ mod tests {
         let q = only_query("(SELECT 2 UNION SELECT 1 ORDER BY 1) LIMIT 1");
         assert_eq!(q.limit, Some(1));
         assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+    }
+
+    #[test]
+    fn redundant_parenthesized_query_expr_preserves_inner_values_and_setop_tails() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("((VALUES (2), (1) ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("((VALUES (2), (1) ORDER BY 1) LIMIT 1)");
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, Some(1));
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("((SELECT 2 UNION SELECT 1 ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+
+        let q = only_query("((SELECT 2 UNION SELECT 1 ORDER BY 1) LIMIT 1)");
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, Some(1));
         let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
             panic!("expected nested set-op query body");
         };
