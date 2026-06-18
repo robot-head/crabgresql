@@ -103,3 +103,51 @@ async fn locking_select_still_uses_locking_path() {
     );
     assert_eq!(err_code(&c, "VALUES (1) FOR UPDATE").await, "42601");
 }
+
+#[tokio::test]
+async fn expression_subqueries_accept_values_and_setops() {
+    let c = connect_new().await;
+    c.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    c.simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        rows(&c, "SELECT (VALUES (2) UNION SELECT 1 ORDER BY 1 LIMIT 1)").await,
+        vec![vec![Some("1".into())]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT (VALUES (2))").await,
+        vec![vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT id FROM t WHERE id IN (VALUES (1), (3)) ORDER BY id",
+        )
+        .await,
+        vec![vec![Some("1".into())], vec![Some("3".into())]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT EXISTS (SELECT 1 EXCEPT SELECT 1)").await,
+        vec![vec![Some("f".into())]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT 3 > ALL (VALUES (1), (2))").await,
+        vec![vec![Some("t".into())]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT 2 = ANY (SELECT 1 UNION SELECT 2)").await,
+        vec![vec![Some("t".into())]]
+    );
+}
+
+#[tokio::test]
+async fn expression_subquery_error_surface_is_preserved() {
+    let c = connect_new().await;
+    assert_eq!(err_code(&c, "SELECT (VALUES (1), (2))").await, "21000");
+    assert_eq!(err_code(&c, "SELECT (VALUES (1, 2))").await, "42601");
+    assert_eq!(err_code(&c, "SELECT 1 IN (VALUES (1, 2))").await, "42601");
+}
