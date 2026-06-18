@@ -24,6 +24,7 @@ mod seq;
 mod session;
 mod setops;
 mod subquery;
+mod values;
 
 use std::path::Path;
 use std::sync::Arc;

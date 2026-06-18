@@ -55,6 +55,13 @@ pub enum ExecError {
         left: usize,
         right: usize,
     },
+    /// SP39: VALUES rows have different column counts (42601).
+    ValuesColumnCount,
+    /// SP39: a derived table column alias list has the wrong number of names (42601).
+    DerivedColumnAliasCount {
+        expected: usize,
+        got: usize,
+    },
     /// SP38: an `ORDER BY <n>` positional reference is 0 or past the number of
     /// output columns (42P10 — invalid_column_reference).
     InvalidColumnReference(String),
@@ -129,6 +136,13 @@ impl ExecError {
                     format!("each {op_name} query must have the same number of columns"),
                 )
             }
+            ExecError::ValuesColumnCount => {
+                PgError::error("42601", "VALUES lists must all be the same length")
+            }
+            ExecError::DerivedColumnAliasCount { expected, got } => PgError::error(
+                "42601",
+                format!("table has {expected} columns available but {got} columns specified"),
+            ),
             ExecError::InvalidColumnReference(m) => PgError::error("42P10", m),
             ExecError::MissingFromEntry(t) => PgError::error(
                 "42P01",
