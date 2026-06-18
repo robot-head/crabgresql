@@ -49,21 +49,35 @@ never touch Kafka), the integration lives in a **new crate `kafka_fdw` behind a
 
 ### Depend on crabka's client crates as-is
 
-The FDW depends on the **published** crabka crates (crates.io versions, with a
+The FDW depends on the **published** crabka crates (crates.io `0.3.x`, with a
 `[patch]`/path override for local cross-repo dev against the sibling checkout):
-`crabka-client-consumer`, `crabka-client-admin`, `crabka-client-core`, and
-`crabka-schema-serde`. `crabka-client-producer` is reserved for a future write path.
-No fork, no vendoring — the synergy *is* the dependency.
+`crabka-client-core` (the bounded federated scan — connect, `ListOffsets`,
+`fetch_partition_with_isolation`), `crabka-client-admin` (topic/partition metadata),
+and `crabka-schema-serde` (Confluent wire framing + Schema Registry client + cache).
+`crabka-client-consumer` is **not** used for the federated read — it is a
+subscribe/group consumer with no manual `assign()`, whereas a bounded snapshot scan
+needs per-partition seek+fetch, which `crabka-client-core` exposes directly.
+`crabka-client-producer` is reserved for a future write path. No fork, no vendoring —
+the synergy *is* the dependency.
 
-### rustls CryptoProvider coexistence (flagged risk)
+### rustls CryptoProvider coexistence (flagged risk — early spike)
 
-With `--features kafka`, two rustls `CryptoProvider`s are in the tree: crabka's
-(`ring`/`aws-lc-rs`) for the Kafka connection and crabgresql's (`rustcrypto`) for the
-pgwire frontend. rustls permits only one *process-global default* provider. The FDW
-therefore **constructs `ClientConfig` with an explicit provider per connection**
-(`ClientConfig::builder_with_provider`) and never calls
-`install_default()`/relies on the ambient default, so the two stacks coexist without
-a panic or a silent provider swap. This is a tested invariant (Component H, #7).
+With `--features kafka`, two rustls crypto backends are in the tree: crabka's `ring`
+(via `crabka-client-core`) for the Kafka connection and crabgresql's `rustcrypto`
+for the pgwire frontend. rustls 0.23 resolves the provider for a builder-constructed
+`ClientConfig`/`ServerConfig` from the **process-global default**, and
+`crabka-client-core` constructs its `ClientConfig` that way (it exposes **no**
+`builder_with_provider` hook). So the spec's original "explicit provider per
+connection" cannot be done from crabgresql's side alone. The resolution, validated by
+an **early spike (plan Task 2) before any other Kafka work**: crabgresql's binary
+installs the **`rustcrypto` provider as the process default** at startup, and
+crabka-client rides on that same default (its TLS code is provider-agnostic — it asks
+for the default, it does not hard-pin ring's primitives). The spike stands up pgwire
+TLS *and* a Kafka TLS connection in one process and asserts both handshake. **If** the
+spike shows crabka-client implicitly depends on ring-specific behavior, the fallback
+is a minimal upstream `crabka-client-core` change to accept an injected provider
+(`ClientSecurity { crypto_provider: Option<Arc<CryptoProvider>> }`) — small, additive,
+and a genuine shared-code win. Tested invariant: Component H, #7.
 
 ### Registry-typed decoding, with a raw fallback
 
@@ -132,9 +146,10 @@ noted future enhancements.
   excludes it; `check-no-native.sh` + `cargo-deny` run on the default set. A new CI
   job builds/tests `--features kafka` (no-native check skipped, C permitted).
   `crabgresql` binary gains a `kafka` passthrough feature. Dependencies:
-  `crabka-client-consumer`, `crabka-client-admin`, `crabka-client-core`,
-  `crabka-schema-serde` (crates.io + local `[patch]`), and the crabgresql crates
-  `pgtypes`, `executor`, `catalog`, `pgparser`, `kv`.
+  `crabka-client-core`, `crabka-client-admin`, `crabka-schema-serde` (crates.io
+  `0.3.x` + local `[patch]`), the decode libs `apache-avro` / `serde_json` /
+  `prost-reflect`, and the crabgresql crates `pgtypes`, `executor`, `catalog`,
+  `pgparser`, `kv`.
 - **B. Parser — FDW DDL (`pgparser`).** New keywords/statements + AST for
   `CREATE/DROP FOREIGN DATA WRAPPER`, `CREATE/DROP/ALTER SERVER`,
   `CREATE/DROP/ALTER USER MAPPING`, `CREATE/DROP FOREIGN TABLE`, and
@@ -145,21 +160,30 @@ noted future enhancements.
   per-table options), with PG-faithful SQLSTATEs (`42704` undefined object, `42710`
   duplicate, dependency errors on `DROP`). A foreign table carries enough to plan a
   scan without a network round-trip: topic name, value/key formats, declared columns.
-- **D. Type mapping (`kafka_fdw::types`, `pgtypes`).** Registry schema → crabgresql
-  `ColumnType`, and decoded value → `Datum`: Avro (`int`→`int4`, `long`→`int8`,
-  `string`→`text`, `boolean`→`bool`, `float`→`float4`, `double`→`float8`,
-  `bytes`→`bytea`, logical `timestamp-millis/micros`→`timestamptz`, `date`→`date`,
-  `decimal`→`numeric`, union-with-`null`→nullable, `record`/`array`/`map`→`jsonb`);
-  analogous JSON Schema and Protobuf mappings. Drives both `IMPORT FOREIGN SCHEMA`
-  column generation and per-record value→`Datum` projection. Fields absent from a
-  record → `NULL`; an irreconcilable type clash → a clear decode error.
-- **E. Transport / consumer (`kafka_fdw::source`).** Wraps `crabka-client-consumer`
-  in **manual assign + seek** mode (no subscription, no group, no offset commit):
-  resolve partitions via `crabka-client-admin`, capture per-partition high-water
-  marks at scan start, seek to the lower bound, poll to the captured bound. Builds
-  the Kafka `ClientConfig` with an **explicit rustls provider** (see risk above) and
-  SASL/TLS from the resolved server + user mapping. Holds the registry client +
-  per-scan schema-id cache.
+- **D. Decode + type mapping (`kafka_fdw::decode`, `kafka_fdw::types`).** crabka's
+  `crabka-schema-serde` serdes are generic over a *compile-time* Rust type, so the FDW
+  decodes **dynamically**: `crabka_schema_serde::wire::decode` strips the Confluent
+  envelope (`0x00` + 4-byte schema id), `RegistryClient::schema_by_id` fetches the
+  schema text (cached), then the value is decoded against it with the underlying libs —
+  `apache_avro::from_avro_datum` → `avro::types::Value`, `serde_json` → `Value`, or
+  `prost_reflect::DynamicMessage` — and mapped to `Datum`. Schema → `ColumnType`
+  mapping: Avro (`int`→`int4`, `long`→`int8`, `string`→`text`, `boolean`→`bool`,
+  `float`→`float4` (note: pgtypes has no `Float4` yet — see Global Constraints,
+  decode→`float8`), `double`→`float8`, `bytes`→`bytea`, logical
+  `timestamp-millis/micros`→`timestamptz`, `date`→`date`, `decimal`→`numeric`,
+  union-with-`null`→nullable, `record`/`array`/`map`→`jsonb`); analogous JSON Schema
+  and Protobuf mappings. Drives both `IMPORT FOREIGN SCHEMA` column generation and
+  per-record value→`Datum` projection. Fields absent from a record → `NULL`; an
+  irreconcilable type clash → a clear decode error. Avro + JSON land first; Protobuf
+  is a follow-on task in this slice.
+- **E. Transport / source (`kafka_fdw::source`).** Uses **`crabka-client-core`
+  directly** (not the subscribe-only `crabka-client-consumer`): `crabka-client-admin`
+  resolves the topic's partitions; a `ListOffsets` send captures each partition's
+  earliest + high-water mark at scan start; `fetch_partition_with_isolation(...,
+  ReadCommitted, ...)` reads each partition from the lower bound up to the captured
+  HWM. Builds the Kafka client from the resolved server + user mapping (SASL/TLS),
+  with the process-default `rustcrypto` provider established at startup (see risk
+  above). Holds the `SchemaCache` (registry client + schema-id cache).
 - **F. Foreign-scan executor + pushdown (`executor`, `cluster::range::router`).** A
   new **foreign-scan node**: when a scanned relation resolves to a `kafka_fdw`
   foreign table, the executor delegates to the wrapper instead of `scan_live`.
@@ -173,9 +197,13 @@ noted future enhancements.
   `security_protocol`, `sasl_mechanism`, credentials. Validate option keys at DDL
   time with PG-style errors for unknown/missing required options.
 - **H. Conformance / testing (`kafka_fdw` tests, `conformance`).** Round-trip
-  differential: a real crabka broker + Schema Registry (testcontainers), produce
-  known Avro/JSON/Protobuf/raw records, query via the FDW, assert rows equal what was
-  produced. Pushdown property tests. FDW-grammar conformance vs `libpg_query`.
+  differential: stand up a crabka broker + Schema Registry **in-process** via crabka
+  dev-dependencies (`crabka-broker`, `crabka-schema-registry`, `crabka-client-producer`)
+  — matching crabgresql's spawn-in-process, condition-driven (no-`sleep`) test style;
+  produce known Avro/JSON/raw records, query via the FDW, assert rows equal what was
+  produced. (Child-process broker/registry binaries are the documented fallback if
+  in-process bring-up proves heavy.) Pushdown property tests. FDW-grammar conformance
+  vs `libpg_query`.
 
 ## Testing / traceability
 
