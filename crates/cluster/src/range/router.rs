@@ -793,7 +793,9 @@ fn collect_expr_ranges(
 ) -> Result<(), ExecError> {
     use pgparser::ast::{Expr, FuncArgs};
     match e {
-        Expr::ScalarSubquery(s) | Expr::Exists(s) => collect_query_expr_ranges(router, s, ctx, out)?,
+        Expr::ScalarSubquery(s) | Expr::Exists(s) => {
+            collect_query_expr_ranges(router, s, ctx, out)?
+        }
         Expr::InSubquery { expr, subquery, .. } | Expr::Quantified { expr, subquery, .. } => {
             collect_expr_ranges(router, expr, ctx, out)?;
             collect_query_expr_ranges(router, subquery, ctx, out)?;

@@ -120,8 +120,18 @@ pub(crate) fn query_to_relation_with_ctes(
         SetExpr::SetOp { .. } => {
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::setops::set_expr_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &order_by, q.offset,
-                q.limit, &query_ctes, ctx,
+                catalog_kv,
+                kv,
+                global,
+                gsnap,
+                snapshot,
+                own,
+                &q.body,
+                &order_by,
+                q.offset,
+                q.limit,
+                &query_ctes,
+                ctx,
             )
         }
     }
@@ -154,7 +164,8 @@ fn describe_query_expr_inner(
             "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
         ));
     }
-    if allow_locking && q.locking.is_some()
+    if allow_locking
+        && q.locking.is_some()
         && let Some(with) = &q.with
     {
         crate::cte::reject_recursive(with)?;

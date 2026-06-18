@@ -735,15 +735,7 @@ pub(crate) fn select_to_relation_with_ctes(
         }
     } else {
         build_from(
-            catalog_kv,
-            kv,
-            global,
-            gsnap,
-            snapshot,
-            own,
-            &s.from,
-            ctes,
-            ctx,
+            catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctes, ctx,
         )?
     };
     let mut kept = Vec::new();
