@@ -788,9 +788,9 @@ pub(crate) fn build_from_schema_with_ctes(
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from_schema on empty FROM".into()))?;
-    let mut acc = build_table_expr_schema(catalog_kv, first, ctes)?;
+    let mut acc = build_table_expr_schema_with_ctes(catalog_kv, first, ctes)?;
     for te in iter {
-        let next = build_table_expr_schema(catalog_kv, te, ctes)?;
+        let next = build_table_expr_schema_with_ctes(catalog_kv, te, ctes)?;
         // Schema-only: no rows, so no ON predicate is ever evaluated — a default
         // (UTC/epoch) eval context is correct here.
         acc = join_relations(
@@ -804,7 +804,7 @@ pub(crate) fn build_from_schema_with_ctes(
     Ok(acc)
 }
 
-fn build_table_expr_schema(
+fn build_table_expr_schema_with_ctes(
     catalog_kv: &dyn Kv,
     te: &pgparser::ast::TableExpr,
     ctes: &crate::cte::CteContext,
@@ -813,7 +813,8 @@ fn build_table_expr_schema(
     match te {
         TableExpr::Table { name, alias } => {
             if let Some(rel) = ctes.lookup(name) {
-                let mut rel = crate::cte::requalify_cte(rel, alias.as_deref().unwrap_or(name));
+                let qualifier = alias.as_deref().unwrap_or(name);
+                let mut rel = crate::cte::requalify_cte(rel, qualifier);
                 rel.rows.clear();
                 return Ok(rel);
             }
@@ -830,8 +831,8 @@ fn build_table_expr_schema(
             kind,
             constraint,
         } => {
-            let l = build_table_expr_schema(catalog_kv, left, ctes)?;
-            let r = build_table_expr_schema(catalog_kv, right, ctes)?;
+            let l = build_table_expr_schema_with_ctes(catalog_kv, left, ctes)?;
+            let r = build_table_expr_schema_with_ctes(catalog_kv, right, ctes)?;
             // Schema-only: no rows, so no ON predicate is ever evaluated.
             join_relations(
                 l,
@@ -846,7 +847,7 @@ fn build_table_expr_schema(
             alias,
             columns,
         } => {
-            let fields = crate::query::describe_query_expr(catalog_kv, subquery)?;
+            let fields = crate::query::describe_query_expr_with_ctes(catalog_kv, subquery, ctes)?;
             let bindings = fields
                 .iter()
                 .map(|f| {

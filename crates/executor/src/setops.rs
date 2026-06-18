@@ -92,8 +92,11 @@ fn resolve_set_columns(
             };
             // Run the SP34 scalar-subquery type pass (so a subquery column's OID is
             // known without executing), then resolve names + types + unknown-ness.
-            let projection =
-                crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
+            let projection = crate::subquery::resolve_types_in_projection_with_ctes(
+                catalog_kv,
+                &s.projection,
+                ctes,
+            )?;
             let (fields, exprs, tys) = crate::exec::resolve_projection(&projection, &scope)?;
             Ok(fields
                 .into_iter()

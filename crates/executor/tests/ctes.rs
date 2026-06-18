@@ -132,6 +132,26 @@ async fn values_and_set_operation_ctes_work() {
         .await,
         vec![vec![Some("2".into())], vec![Some("1".into())]]
     );
+    assert_eq!(
+        rows(
+            &c,
+            "WITH a AS (SELECT 1 AS x), \
+             u AS (SELECT x FROM a UNION SELECT 2) \
+             SELECT x FROM u ORDER BY x"
+        )
+        .await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "WITH a AS (SELECT 1 AS x), \
+             u AS (SELECT (SELECT x FROM a) AS x UNION SELECT 2) \
+             SELECT x FROM u ORDER BY x"
+        )
+        .await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
 }
 
 #[tokio::test]
