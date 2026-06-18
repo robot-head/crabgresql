@@ -155,6 +155,50 @@ async fn values_and_set_operation_ctes_work() {
 }
 
 #[tokio::test]
+async fn nested_with_scopes_through_derived_tables_subqueries_and_describe() {
+    let c = connect_new().await;
+    assert_eq!(
+        rows(
+            &c,
+            "WITH c AS (VALUES (1)) SELECT * FROM (WITH c AS (VALUES (2)) SELECT * FROM c) AS d(x)"
+        )
+        .await,
+        vec![vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "WITH c AS (VALUES (1)) SELECT EXISTS (WITH d AS (SELECT * FROM c) SELECT 1 FROM d)"
+        )
+        .await,
+        vec![vec![Some("t".into())]]
+    );
+
+    let stmt = c
+        .prepare("WITH c(x) AS (VALUES (1)) SELECT x FROM c")
+        .await
+        .expect("describe CTE select");
+    let names: Vec<_> = stmt.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, vec!["x"]);
+
+    let stmt = c
+        .prepare("WITH u(x) AS (SELECT 1 UNION SELECT 2) SELECT x FROM u")
+        .await
+        .expect("describe set-op CTE select");
+    let names: Vec<_> = stmt.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, vec!["x"]);
+
+    let stmt = c
+        .prepare(
+            "WITH c(x) AS (VALUES (1)) SELECT * FROM (WITH c(y) AS (VALUES (2)) SELECT y FROM c) AS d",
+        )
+        .await
+        .expect("describe nested CTE shadowing");
+    let names: Vec<_> = stmt.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, vec!["y"]);
+}
+
+#[tokio::test]
 async fn locking_select_rejects_ctes() {
     let c = connect_new().await;
     assert_eq!(
