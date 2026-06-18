@@ -32,6 +32,13 @@ use crate::token::{Keyword, Token};
 /// what matters for closing the DoS.
 pub(crate) const MAX_DEPTH: usize = 50;
 
+type QueryTailAndLocking = (
+    Vec<crate::ast::OrderItem>,
+    Option<i64>,
+    Option<i64>,
+    Option<crate::ast::RowLockStrength>,
+);
+
 pub(crate) struct Parser {
     toks: Vec<(Token, usize)>,
     pos: usize,
@@ -1330,17 +1337,7 @@ impl Parser {
         self.finish_query_expr(body, order_by, limit, offset, locking)
     }
 
-    fn parse_query_tail_and_locking(
-        &mut self,
-    ) -> Result<
-        (
-            Vec<crate::ast::OrderItem>,
-            Option<i64>,
-            Option<i64>,
-            Option<crate::ast::RowLockStrength>,
-        ),
-        ParseError,
-    > {
+    fn parse_query_tail_and_locking(&mut self) -> Result<QueryTailAndLocking, ParseError> {
         let (order_by, limit, offset) = self.parse_set_tail()?;
         let locking = self.parse_locking()?;
         Ok((order_by, limit, offset, locking))
