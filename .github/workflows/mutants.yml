@@ -36,7 +36,7 @@ jobs:
         # their unit suites are hardened against the survivors this surfaces.
         crate: [kv, mvcc, pgtypes, catalog, pgparser]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
