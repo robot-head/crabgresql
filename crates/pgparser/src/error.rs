@@ -26,6 +26,18 @@ impl ParseError {
         }
     }
 
+    pub fn new_sqlstate(
+        sqlstate: &'static str,
+        message: impl Into<String>,
+        position: usize,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            position,
+            sqlstate,
+        }
+    }
+
     /// A recursion-depth-limit error: the statement nests more deeply than the
     /// parser's `MAX_DEPTH` allows. Maps to SQLSTATE `54001`
     /// (statement_too_complex) with PostgreSQL's "stack depth limit exceeded"

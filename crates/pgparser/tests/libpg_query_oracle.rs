@@ -58,6 +58,10 @@ const ACCEPTED: &[&str] = &[
     "SELECT (VALUES (1) UNION SELECT 2 ORDER BY 1 LIMIT 1)",
     "SELECT 2 IN (VALUES (1), (2))",
     "SELECT EXISTS (SELECT 1 EXCEPT SELECT 2)",
+    "WITH c AS (SELECT 1) SELECT * FROM c",
+    "WITH a AS (VALUES (1)), b AS (SELECT * FROM a) SELECT * FROM b",
+    "WITH u AS (SELECT 1 UNION SELECT 2) SELECT * FROM u",
+    "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
     // SP33: joins — every join type, comma form, USING/NATURAL, aliases,
     // qualified refs, qualified wildcard, multi-way, and derived tables.
     "SELECT t.a FROM t JOIN u ON t.id = u.id",
