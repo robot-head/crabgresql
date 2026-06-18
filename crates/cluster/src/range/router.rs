@@ -766,9 +766,17 @@ fn collect_table_expr_ranges(
         TableExpr::Derived { subquery, .. } => {
             collect_query_expr_ranges(router, subquery, ctx, out)?;
         }
-        TableExpr::Join { left, right, .. } => {
+        TableExpr::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => {
             collect_table_expr_ranges(router, left, ctx, out)?;
             collect_table_expr_ranges(router, right, ctx, out)?;
+            if let pgparser::ast::JoinConstraint::On(expr) = constraint {
+                collect_expr_ranges(router, expr, ctx, out)?;
+            }
         }
     }
     Ok(())
@@ -1194,6 +1202,41 @@ mod tests {
             .simple("WITH b AS (VALUES (9)) SELECT * FROM b")
             .await
             .expect("CTE named b shadows base table b and is range-neutral");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn join_on_subquery_cte_ranges_are_collected() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        router
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("insert a");
+        router
+            .simple("INSERT INTO b VALUES (1)")
+            .await
+            .expect("insert b");
+
+        let err = router
+            .simple(
+                "SELECT a.id FROM a JOIN a aa \
+                 ON EXISTS (WITH x AS (SELECT id FROM b) SELECT id FROM x)",
+            )
+            .await
+            .expect_err("cross-range JOIN ON subquery CTE rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(err.message.contains("cross-range"), "got {err:?}");
     }
 
     /// A cross-range transaction now escalates to two-phase commit instead of being
