@@ -1830,6 +1830,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_query_forms_still_parse_after_query_unification() {
+        for sql in [
+            "SELECT a, b FROM t WHERE a > 1 ORDER BY b LIMIT 5",
+            "VALUES (1), (2) ORDER BY 1",
+            "(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2 ORDER BY 1",
+            "SELECT * FROM (SELECT 1 AS x) AS d",
+            "SELECT * FROM (VALUES (1, 'a')) AS v(id, name)",
+        ] {
+            let q = only_query(sql);
+            assert!(q.locking.is_none());
+        }
+    }
+
+    #[test]
     fn derived_and_expression_subqueries_accept_query_exprs() {
         use crate::ast::{Expr, QueryBody, SelectItem, SetExpr, TableExpr};
 
