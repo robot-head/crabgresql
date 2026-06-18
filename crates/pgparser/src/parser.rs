@@ -390,20 +390,10 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let body = self.set_expr(0)?;
                 let (order_by, limit, offset) = self.parse_set_tail()?;
-                if limit.is_some() || offset.is_some() {
-                    return Err(ParseError::new(
-                        "LIMIT/OFFSET is not allowed in quantified subquery here",
-                        self.peek_pos(),
-                    ));
-                }
+                let locking = self.parse_locking()?;
                 self.expect(&Token::RParen)?;
-                let subquery = Box::new(crate::ast::QueryExpr {
-                    body,
-                    order_by,
-                    limit: None,
-                    offset: None,
-                    locking: None,
-                });
+                let subquery =
+                    Box::new(self.finish_query_expr(body, order_by, limit, offset, locking)?);
                 lhs = Expr::Quantified {
                     expr: Box::new(lhs),
                     op,
@@ -677,16 +667,11 @@ impl Parser {
         ) {
             let body = self.set_expr(0)?;
             let (order_by, limit, offset) = self.parse_set_tail()?;
+            let locking = self.parse_locking()?;
             self.expect(&Token::RParen)?;
             return Ok(Expr::InSubquery {
                 expr: Box::new(lhs),
-                subquery: Box::new(crate::ast::QueryExpr {
-                    body,
-                    order_by,
-                    limit,
-                    offset,
-                    locking: None,
-                }),
+                subquery: Box::new(self.finish_query_expr(body, order_by, limit, offset, locking)?),
                 negated,
             });
         }
@@ -1331,10 +1316,29 @@ impl Parser {
     }
 
     fn query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
-        use crate::ast::{QueryBody, QueryExpr, SetExpr};
+        if *self.peek() == Token::LParen {
+            let start = self.pos;
+            let q = self.parenthesized_query_expr()?;
+            if !self.query_continues_after_primary() {
+                return Ok(q);
+            }
+            self.pos = start;
+        }
         let body = self.set_expr(0)?;
         let (order_by, limit, offset) = self.parse_set_tail()?;
         let locking = self.parse_locking()?;
+        self.finish_query_expr(body, order_by, limit, offset, locking)
+    }
+
+    fn finish_query_expr(
+        &mut self,
+        body: crate::ast::SetExpr,
+        order_by: Vec<crate::ast::OrderItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        locking: Option<crate::ast::RowLockStrength>,
+    ) -> Result<crate::ast::QueryExpr, ParseError> {
+        use crate::ast::{QueryBody, QueryExpr, SetExpr};
         if locking.is_some() {
             match &body {
                 SetExpr::Query(QueryBody::Select(_)) => {}
@@ -1359,6 +1363,21 @@ impl Parser {
             offset,
             locking,
         })
+    }
+
+    fn query_continues_after_primary(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(
+                Keyword::Union
+                    | Keyword::Except
+                    | Keyword::Intersect
+                    | Keyword::Order
+                    | Keyword::Limit
+                    | Keyword::Offset
+                    | Keyword::For
+            )
+        )
     }
 
     /// Precedence-climbing set-op tree. INTERSECT = 2, UNION/EXCEPT = 1; all
@@ -1409,18 +1428,12 @@ impl Parser {
     /// parenthesized single SELECT that keeps its own ORDER BY / LIMIT), or a bare
     /// SELECT branch (`select_core`, no tail — the query owns the tail).
     fn parenthesized_query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
-        use crate::ast::QueryExpr;
         self.expect(&Token::LParen)?;
         let body = self.set_expr(0)?;
         let (order_by, limit, offset) = self.parse_set_tail()?;
+        let locking = self.parse_locking()?;
         self.expect(&Token::RParen)?;
-        Ok(QueryExpr {
-            body,
-            order_by,
-            limit,
-            offset,
-            locking: None,
-        })
+        self.finish_query_expr(body, order_by, limit, offset, locking)
     }
 
     fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
@@ -1586,19 +1599,14 @@ impl Parser {
             ) {
                 let body = self.set_expr(0)?;
                 let (order_by, limit, offset) = self.parse_set_tail()?;
+                let locking = self.parse_locking()?;
                 self.expect(&Token::RParen)?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
                     ParseError::new("subquery in FROM must have an alias", self.peek_pos())
                 })?;
                 let columns = self.opt_column_aliases()?;
                 return Ok(TableExpr::Derived {
-                    subquery: crate::ast::QueryExpr {
-                        body,
-                        order_by,
-                        limit,
-                        offset,
-                        locking: None,
-                    },
+                    subquery: self.finish_query_expr(body, order_by, limit, offset, locking)?,
                     alias,
                     columns,
                 });
@@ -1813,6 +1821,53 @@ mod tests {
         assert!(matches!(subquery.body, SetExpr::SetOp { .. }));
         assert_eq!(subquery.order_by.len(), 1);
         assert_eq!(subquery.limit, Some(1));
+    }
+
+    #[test]
+    fn quantified_query_expr_preserves_tail() {
+        let Expr::Quantified { subquery, .. } =
+            expr("1 = ANY (SELECT 1 ORDER BY 1 LIMIT 1 OFFSET 0)")
+        else {
+            panic!("expected quantified query expression");
+        };
+        assert_eq!(subquery.order_by.len(), 1);
+        assert_eq!(subquery.limit, Some(1));
+        assert_eq!(subquery.offset, Some(0));
+    }
+
+    #[test]
+    fn nested_query_expr_locking_is_preserved_and_validated() {
+        use crate::ast::{QueryBody, RowLockStrength, SelectItem, SetExpr};
+
+        let q = only_query("SELECT (SELECT 1 FOR UPDATE)");
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected outer SELECT");
+        };
+        let SelectItem::Expr { expr, .. } = &select.projection[0] else {
+            panic!("expected expression projection");
+        };
+        let Expr::ScalarSubquery(subquery) = expr else {
+            panic!("expected scalar subquery");
+        };
+        assert_eq!(subquery.locking, Some(RowLockStrength::ForUpdate));
+
+        assert!(crate::parse("SELECT (VALUES (1) FOR UPDATE)").is_err());
+        assert!(crate::parse("SELECT (SELECT 1 UNION SELECT 2 FOR UPDATE)").is_err());
+    }
+
+    #[test]
+    fn top_level_parenthesized_query_expr_tail_is_preserved() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1 LIMIT 1)");
+        assert!(matches!(q.body, SetExpr::Query(QueryBody::Values(_))));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+
+        let q = only_query("(SELECT 2 UNION SELECT 1 ORDER BY 1 LIMIT 1)");
+        assert!(matches!(q.body, SetExpr::SetOp { .. }));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
     }
 
     #[test]
