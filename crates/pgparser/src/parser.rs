@@ -3425,6 +3425,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_with_in_nested_select_subquery_positions() {
+        use crate::ast::{QueryBody, SetExpr, TableExpr};
+
+        let sel = only_select("SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT * FROM c) AS d");
+        let TableExpr::Derived { subquery, .. } = &sel.from[0] else {
+            panic!("expected derived table");
+        };
+        assert!(subquery.with.is_some());
+        let SetExpr::Query(QueryBody::Select(_)) = &subquery.body else {
+            panic!("expected SELECT derived table");
+        };
+
+        match expr("(WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::ScalarSubquery(s) => assert!(s.with.is_some()),
+            other => panic!("expected scalar subquery, got {other:?}"),
+        }
+        match expr("EXISTS (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::Exists(s) => assert!(s.with.is_some()),
+            other => panic!("expected EXISTS, got {other:?}"),
+        }
+        match expr("1 IN (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::InSubquery { subquery, .. } => assert!(subquery.with.is_some()),
+            other => panic!("expected IN subquery, got {other:?}"),
+        }
+        match expr("1 = ANY (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::Quantified { subquery, .. } => assert!(subquery.with.is_some()),
+            other => panic!("expected quantified subquery, got {other:?}"),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Recursion-depth guard (54001 / statement_too_complex).
     //
@@ -3746,5 +3777,56 @@ mod tests {
             panic!("expected SetOp")
         };
         assert!(!*all, "UNION DISTINCT is the dedup (all == false) form");
+    }
+
+    #[test]
+    fn parses_with_select_values_and_setop_bodies() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("WITH a AS (SELECT 1 AS x), b(y) AS (VALUES (2)) SELECT x FROM a");
+        let with = q.with.as_ref().expect("with clause");
+        assert!(!with.recursive);
+        assert_eq!(with.ctes.len(), 2);
+        assert_eq!(with.ctes[0].name, "a");
+        assert!(with.ctes[0].columns.is_none());
+        assert_eq!(with.ctes[1].name, "b");
+        assert_eq!(
+            with.ctes[1].columns.as_deref(),
+            Some(&["y".to_string()][..])
+        );
+        assert!(matches!(
+            with.ctes[0].query.body,
+            SetExpr::Query(QueryBody::Select(_))
+        ));
+        assert!(matches!(
+            with.ctes[1].query.body,
+            SetExpr::Query(QueryBody::Values(_))
+        ));
+
+        let q = only_query("WITH u AS (SELECT 1 UNION SELECT 2) SELECT * FROM u");
+        assert!(matches!(
+            q.with.as_ref().expect("with").ctes[0].query.body,
+            SetExpr::SetOp { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_with_recursive_and_rejects_duplicate_cte_names() {
+        let q = only_query("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r");
+        assert!(q.with.as_ref().expect("with").recursive);
+
+        let err = parse("WITH a AS (SELECT 1), a AS (SELECT 2) SELECT * FROM a")
+            .expect_err("duplicate CTE names rejected during parse");
+        assert_eq!(err.sqlstate(), "42712");
+    }
+
+    #[test]
+    fn duplicate_cte_names_follow_identifier_normalization() {
+        let err = parse("WITH a AS (SELECT 1), A AS (SELECT 2) SELECT * FROM a")
+            .expect_err("unquoted identifiers normalize before duplicate CTE check");
+        assert_eq!(err.sqlstate(), "42712");
+
+        parse("WITH \"A\" AS (SELECT 1), a AS (SELECT 2) SELECT * FROM a")
+            .expect("quoted case-distinct CTE names are parser-distinct");
     }
 }

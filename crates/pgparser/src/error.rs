@@ -26,7 +26,7 @@ impl ParseError {
         }
     }
 
-    pub fn new_sqlstate(
+    pub(crate) fn new_sqlstate(
         sqlstate: &'static str,
         message: impl Into<String>,
         position: usize,
