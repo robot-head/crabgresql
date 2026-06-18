@@ -1,6 +1,5 @@
-use pgparser::ast::{Expr, ValuesQuery, ValuesStmt};
+use pgparser::ast::{Expr, ValuesStmt};
 use pgtypes::{ColumnType, Datum};
-use pgwire::engine::FieldDescription;
 
 use crate::clock::EvalCtx;
 use crate::error::ExecError;
@@ -15,31 +14,6 @@ pub(crate) struct ValuesSchema {
 
 pub(crate) fn describe_values(v: &ValuesStmt) -> Result<ValuesSchema, ExecError> {
     analyze_values(v)
-}
-
-pub(crate) fn describe_values_query(q: &ValuesQuery) -> Result<Vec<FieldDescription>, ExecError> {
-    let schema = describe_values(&q.body)?;
-    Ok(schema
-        .names
-        .iter()
-        .zip(&schema.types)
-        .map(|(name, ty)| crate::exec::field(name, *ty))
-        .collect())
-}
-
-pub(crate) fn execute_values_query(
-    q: &ValuesQuery,
-    ctx: &EvalCtx,
-) -> Result<pgwire::engine::QueryResult, ExecError> {
-    let mut rel = values_to_relation(&q.body, ctx)?;
-    apply_query_order(&mut rel, &q.order_by, q.offset, q.limit, ctx)?;
-    let fields = rel
-        .scope
-        .columns
-        .iter()
-        .map(|c| crate::exec::field(&c.name, c.ty))
-        .collect();
-    Ok(crate::exec::rows_result(fields, &rel.rows, &ctx.time_zone))
 }
 
 pub(crate) fn values_to_relation(

@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use catalog::{Column, Table, TableId};
 use kv::Kv;
-use pgparser::ast::{Expr, OrderItem, QueryBody, SelectItem, SelectStmt, Statement};
+use pgparser::ast::{Expr, OrderItem, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 use zerocopy::FromBytes;
@@ -678,12 +678,9 @@ fn build_table_expr(
             alias,
             columns,
         } => {
-            let inner = match subquery {
-                QueryBody::Select(s) => {
-                    select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, s, ctx)?
-                }
-                QueryBody::Values(v) => crate::values::values_to_relation(v, ctx)?,
-            };
+            let inner = crate::query::query_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx,
+            )?;
             crate::values::requalify_derived(inner, alias, columns)
         }
     }
@@ -817,45 +814,20 @@ fn build_table_expr_schema(
             alias,
             columns,
         } => {
-            let inner = match subquery {
-                QueryBody::Select(s) => {
-                    let inner_scope = if s.from.is_empty() {
-                        Scope::empty()
-                    } else {
-                        build_from_schema(catalog_kv, &s.from)?.scope
-                    };
-                    let (fields, _exprs, tys) = resolve_projection(&s.projection, &inner_scope)?;
-                    let columns = fields
-                        .iter()
-                        .zip(&tys)
-                        .map(|(f, ty)| ColumnBinding {
-                            qualifier: None,
-                            name: f.name.clone(),
-                            ty: *ty,
-                        })
-                        .collect();
-                    Relation {
-                        scope: Scope { columns },
-                        rows: Vec::new(),
-                    }
-                }
-                QueryBody::Values(v) => {
-                    let schema = crate::values::describe_values(v)?;
-                    let columns = schema
-                        .names
-                        .iter()
-                        .zip(&schema.types)
-                        .map(|(name, ty)| ColumnBinding {
-                            qualifier: None,
-                            name: name.clone(),
-                            ty: *ty,
-                        })
-                        .collect();
-                    Relation {
-                        scope: Scope { columns },
-                        rows: Vec::new(),
-                    }
-                }
+            let fields = crate::query::describe_query_expr(catalog_kv, subquery)?;
+            let bindings = fields
+                .iter()
+                .map(|f| {
+                    Ok(ColumnBinding {
+                        qualifier: None,
+                        name: f.name.clone(),
+                        ty: column_type_from_oid(f.type_oid)?,
+                    })
+                })
+                .collect::<Result<_, ExecError>>()?;
+            let inner = Relation {
+                scope: Scope { columns: bindings },
+                rows: Vec::new(),
             };
             crate::values::requalify_derived(inner, alias, columns)
         }
@@ -873,50 +845,12 @@ pub(crate) fn execute_read(
     stmt: &Statement,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<QueryResult, ExecError> {
-    let Statement::Select(s) = stmt else {
-        return Err(ExecError::Unsupported("not a SELECT".into()));
+    let Statement::Query(q) = stmt else {
+        return Err(ExecError::Unsupported("not a query statement".into()));
     };
-
-    // SP34: resolve uncorrelated subquery expressions to constants first, under this
-    // statement's snapshot handles (nested subqueries recurse via select_to_relation).
-    let sub_ctx = crate::subquery::SubCtx {
-        catalog_kv,
-        kv,
-        global,
-        gsnap,
-        snapshot,
-        own,
-        eval_ctx: ctx,
-    };
-    let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
-    let s = &resolved;
-
-    // SP33: build the (possibly joined) relation. A FROM-less SELECT is one empty
-    // row over the empty scope; otherwise `build_from` folds the comma list as
-    // cross joins and recurses into each explicit join tree.
-    let relation = if s.from.is_empty() {
-        Relation {
-            scope: Scope::empty(),
-            rows: vec![vec![]],
-        }
-    } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
-    };
-
-    // Filter (WHERE runs before grouping).
-    let mut kept: Vec<Vec<Datum>> = Vec::new();
-    for row in &relation.rows {
-        if row_matches(s.filter.as_ref(), &relation.scope, row, ctx)? {
-            kept.push(row.clone());
-        }
-    }
-
-    // SP27: GROUP BY / HAVING / aggregate queries fold the filtered rows into
-    // groups; everything else projects rows one-for-one.
-    if crate::agg::is_aggregate_query(s) {
-        return crate::agg::execute_aggregate(s, &relation.scope, kept, ctx);
-    }
-    project_order_limit(s, &relation.scope, kept, ctx)
+    let rel =
+        crate::query::query_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, q, ctx)?;
+    Ok(crate::query::relation_to_rows_result(rel, ctx))
 }
 
 /// Locking SELECT (FOR UPDATE / FOR SHARE). Takes a row lock on each visible
@@ -1357,6 +1291,27 @@ pub(crate) fn field(name: &str, ty: ColumnType) -> FieldDescription {
     }
 }
 
+pub(crate) fn column_type_from_oid(oid: u32) -> Result<ColumnType, ExecError> {
+    Ok(match oid {
+        pgtypes::oids::BOOL => ColumnType::Bool,
+        pgtypes::oids::INT4 => ColumnType::Int4,
+        pgtypes::oids::INT8 => ColumnType::Int8,
+        pgtypes::oids::TEXT => ColumnType::Text,
+        pgtypes::oids::FLOAT8 => ColumnType::Float8,
+        pgtypes::oids::NUMERIC => ColumnType::Numeric(None),
+        pgtypes::oids::DATE => ColumnType::Date,
+        pgtypes::oids::TIME => ColumnType::Time,
+        pgtypes::oids::TIMESTAMP => ColumnType::Timestamp,
+        pgtypes::oids::TIMESTAMPTZ => ColumnType::Timestamptz,
+        pgtypes::oids::INTERVAL => ColumnType::Interval,
+        _ => {
+            return Err(ExecError::Unsupported(format!(
+                "unknown query field type oid {oid}"
+            )));
+        }
+    })
+}
+
 pub(crate) fn datum_to_cell(d: &Datum, tz: &jiff::tz::TimeZone) -> Option<Cell> {
     if d.is_null() {
         return None;
@@ -1425,36 +1380,17 @@ pub(crate) fn describe(
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
     let statements = pgparser::parse(sql)?;
     // Extended-protocol Describe targets a single statement.
-    let stmt = statements.first();
-    match stmt {
-        Some(Statement::SetOperation(q)) => {
-            return crate::setops::describe_set_query(catalog_kv, q);
-        }
-        Some(Statement::Values(q)) => {
-            return crate::values::describe_values_query(q);
-        }
-        _ => {}
-    }
-    let Some(Statement::Select(s)) = stmt else {
+    let Some(Statement::Query(q)) = statements.first() else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description
     };
-    let scope = if s.from.is_empty() {
-        Scope::empty()
-    } else {
-        build_from_schema(catalog_kv, &s.from)?.scope
-    };
-    // SP34: substitute scalar subqueries in the projection with typed-NULL consts so
-    // their column OIDs are known without executing (the catalog-only type pass).
-    let projection = crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
-    let (fields, _exprs, _tys) = resolve_projection(&projection, &scope)?;
-    Ok(fields)
+    crate::query::describe_query_expr(catalog_kv, q)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::scope::{ColumnBinding, Scope};
     use crate::{SqlEngine, SqlSession};
-    use pgparser::ast::{SelectStmt, Statement};
+    use pgparser::ast::{QueryBody, SelectStmt, SetExpr, Statement};
     use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult, Session};
 
     #[test]
@@ -1980,7 +1916,17 @@ mod tests {
 
     fn parsed_select(sql: &str) -> SelectStmt {
         match pgparser::parse(sql).expect("parse").pop().expect("one") {
-            Statement::Select(s) => s,
+            Statement::Query(q) => match q.body {
+                SetExpr::Query(QueryBody::Select(s)) => {
+                    let mut s = *s;
+                    s.order_by = q.order_by;
+                    s.limit = q.limit;
+                    s.offset = q.offset;
+                    s.locking = q.locking;
+                    s
+                }
+                other => panic!("expected select body, got {other:?}"),
+            },
             other => panic!("expected select, got {other:?}"),
         }
     }

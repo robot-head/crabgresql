@@ -11,7 +11,7 @@ use crate::token::{Keyword, Token};
 /// Maximum nesting depth the parser will build before returning `54001`
 /// (statement_too_complex). This bounds BOTH crash modes:
 ///   * mode 1 — deep parse recursion (nested parens / subqueries / CASE / NOT /
-///     unary minus, all of which funnel through `expr`/`select_inner`), and
+///     unary minus, all of which funnel through `expr`/`query_expr`), and
 ///   * mode 2 — a flat left-associative chain (`1+1+1+…`) whose Pratt loop is
 ///     iterative but builds an N-deep left-nested AST that would overflow later
 ///     in eval AND on recursive `Box` `Drop`; capping the loop iteration count
@@ -32,11 +32,18 @@ use crate::token::{Keyword, Token};
 /// what matters for closing the DoS.
 pub(crate) const MAX_DEPTH: usize = 50;
 
+type QueryTailAndLocking = (
+    Vec<crate::ast::OrderItem>,
+    Option<i64>,
+    Option<i64>,
+    Option<crate::ast::RowLockStrength>,
+);
+
 pub(crate) struct Parser {
     toks: Vec<(Token, usize)>,
     pos: usize,
     /// Current recursion depth of the recursive productions (`expr`,
-    /// `select_inner`). Held behind an `Rc<Cell<…>>` so the RAII [`DepthGuard`]
+    /// `select_core`). Held behind an `Rc<Cell<…>>` so the RAII [`DepthGuard`]
     /// can hold an OWNED clone of the handle rather than a borrow of `self` —
     /// that lets the guarded method keep calling `&mut self` methods freely while
     /// the guard is alive (a `&self.depth` borrow would conflict with `&mut self`
@@ -388,13 +395,12 @@ impl Parser {
                 let all = matches!(self.peek(), Token::Keyword(Keyword::All));
                 self.bump(); // ANY / SOME / ALL
                 self.expect(&Token::LParen)?;
-                let sub = self.select_inner()?;
-                self.expect(&Token::RParen)?;
+                let subquery = Box::new(self.query_expr_after_open_paren()?);
                 lhs = Expr::Quantified {
                     expr: Box::new(lhs),
                     op,
                     all,
-                    subquery: Box::new(sub),
+                    subquery,
                 };
                 continue;
             }
@@ -429,10 +435,12 @@ impl Parser {
             Token::LParen => {
                 // SP34: `( SELECT … )` is a scalar subquery; anything else is a
                 // parenthesised (grouping) expression.
-                if *self.peek2() == Token::Keyword(Keyword::Select) {
-                    self.bump(); // (
-                    let sub = self.select_inner()?;
-                    self.expect(&Token::RParen)?;
+                if matches!(
+                    self.peek2(),
+                    Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+                ) {
+                    self.bump();
+                    let sub = self.query_expr_after_open_paren()?;
                     Ok(Expr::ScalarSubquery(Box::new(sub)))
                 } else {
                     self.bump();
@@ -444,8 +452,7 @@ impl Parser {
             Token::Keyword(Keyword::Exists) => {
                 self.bump(); // EXISTS
                 self.expect(&Token::LParen)?;
-                let sub = self.select_inner()?;
-                self.expect(&Token::RParen)?;
+                let sub = self.query_expr_after_open_paren()?;
                 Ok(Expr::Exists(Box::new(sub)))
             }
             Token::IntLit(s) => {
@@ -658,12 +665,14 @@ impl Parser {
         self.expect(&Token::Keyword(Keyword::In))?;
         self.expect(&Token::LParen)?;
         // SP34: `IN ( SELECT … )` is a subquery; otherwise a value list.
-        if *self.peek() == Token::Keyword(Keyword::Select) {
-            let sub = self.select_inner()?;
-            self.expect(&Token::RParen)?;
+        if matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+        ) {
+            let subquery = self.query_expr_after_open_paren()?;
             return Ok(Expr::InSubquery {
                 expr: Box::new(lhs),
-                subquery: Box::new(sub),
+                subquery: Box::new(subquery),
                 negated,
             });
         }
@@ -815,13 +824,13 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        if self.starts_query_expr() {
+            return self.query_statement();
+        }
         match self.peek() {
             Token::Keyword(Keyword::Create) => self.create_table(),
             Token::Keyword(Keyword::Drop) => self.drop_table(),
             Token::Keyword(Keyword::Insert) => self.insert(),
-            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values) | Token::LParen => {
-                self.query_stmt()
-            }
             // SP4: transaction control
             Token::Keyword(Keyword::Begin) | Token::Keyword(Keyword::Start) => self.begin(),
             Token::Keyword(Keyword::Commit) | Token::Keyword(Keyword::End) => {
@@ -1125,28 +1134,13 @@ impl Parser {
         })
     }
 
-    /// Parse a single SELECT body INCLUDING its trailing ORDER BY / LIMIT / OFFSET /
-    /// locking. The refactor that split this into `select_core` + `parse_set_tail` +
-    /// `parse_locking` leaves the recursive callers (derived tables, subquery
-    /// expressions) unaffected: they still get a fully-parsed `SelectStmt` with any
-    /// trailing ORDER BY / LIMIT / OFFSET / locking, exactly as before.
-    fn select_inner(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
-        let mut s = self.select_core()?;
-        let (order_by, limit, offset) = self.parse_set_tail()?;
-        s.order_by = order_by;
-        s.limit = limit;
-        s.offset = offset;
-        s.locking = self.parse_locking()?;
-        Ok(s)
-    }
-
     /// Parse projection → HAVING. Leaves order_by / limit / offset / locking empty;
     /// the caller (single SELECT or set-op query) owns the tail.
     fn select_core(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
         use crate::ast::{SelectItem, SelectStmt};
         // Mode-1 depth guard: EVERY SELECT body funnels through `select_core` — a
         // top-level set-op branch (`set_primary → select_core`), a derived table,
-        // or a scalar/IN/EXISTS subquery (`select_inner → select_core`) — so
+        // or a scalar/IN/EXISTS subquery (`query_expr → set_primary → select_core`) — so
         // guarding here bounds all nested-SELECT recursion (e.g. a derived-table
         // chain `( SELECT … FROM ( SELECT … ) )`). Subqueries also pass through
         // `expr` first; guarding both is belt-and-braces.
@@ -1318,54 +1312,159 @@ impl Parser {
         }
     }
 
-    /// SP38: parse a full set-operation query (the statement entry for SELECT / `(`).
-    /// `set_expr(0)` builds the operator tree; the trailing tail binds to the whole
-    /// query. A lone Select (no set-op) collapses back to `Statement::Select` so the
-    /// single-SELECT shape — including FOR UPDATE — is byte-for-byte unchanged.
-    fn query_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
-        use crate::ast::{QueryBody, SetExpr, SetQuery, Statement, ValuesQuery};
-        let body = self.set_expr(0)?;
-        let (order_by, limit, offset) = self.parse_set_tail()?;
-        match body {
-            SetExpr::Query(QueryBody::Select(mut s)) => {
-                s.order_by = order_by;
-                s.limit = limit;
-                s.offset = offset;
-                s.locking = self.parse_locking()?;
-                Ok(Statement::Select(*s))
+    fn query_statement(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        Ok(crate::ast::Statement::Query(self.query_expr()?))
+    }
+
+    fn query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
+        if *self.peek() == Token::LParen {
+            let q = self.parenthesized_query_expr()?;
+            if self.peek_is_set_op() {
+                let left = self.query_expr_as_set_branch(q)?;
+                let body = self.set_expr_rest(left, 0)?;
+                let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+                return self.finish_query_expr(body, order_by, limit, offset, locking);
             }
-            SetExpr::Query(QueryBody::Values(v)) => Ok(Statement::Values(ValuesQuery {
-                body: v,
-                order_by,
-                limit,
-                offset,
-            })),
-            body => {
-                if matches!(self.peek(), Token::Keyword(Keyword::For)) {
+            if !self.query_tail_or_locking_starts() {
+                return Ok(q);
+            }
+            let body = self.query_expr_as_outer_primary(q);
+            let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+            return self.finish_query_expr(body, order_by, limit, offset, locking);
+        }
+        let body = self.set_expr(0)?;
+        let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+        self.finish_query_expr(body, order_by, limit, offset, locking)
+    }
+
+    fn parse_query_tail_and_locking(&mut self) -> Result<QueryTailAndLocking, ParseError> {
+        let (order_by, limit, offset) = self.parse_set_tail()?;
+        let locking = self.parse_locking()?;
+        Ok((order_by, limit, offset, locking))
+    }
+
+    fn query_expr_as_set_branch(
+        &mut self,
+        q: crate::ast::QueryExpr,
+    ) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::{QueryBody, SetExpr};
+        let has_tail = !q.order_by.is_empty()
+            || q.limit.is_some()
+            || q.offset.is_some()
+            || q.locking.is_some();
+        if !has_tail {
+            return Ok(q.body);
+        }
+        if q.locking.is_some() {
+            return Err(ParseError::new(
+                "FOR UPDATE/SHARE is not allowed with UNION/INTERSECT/EXCEPT",
+                self.peek_pos(),
+            ));
+        }
+        match q.body {
+            SetExpr::Query(QueryBody::Select(mut select)) => {
+                select.order_by = q.order_by;
+                select.limit = q.limit;
+                select.offset = q.offset;
+                Ok(SetExpr::Query(QueryBody::Select(select)))
+            }
+            body => Ok(SetExpr::Query(QueryBody::Nested(Box::new(
+                crate::ast::QueryExpr {
+                    body,
+                    order_by: q.order_by,
+                    limit: q.limit,
+                    offset: q.offset,
+                    locking: q.locking,
+                },
+            )))),
+        }
+    }
+
+    fn query_expr_as_outer_primary(&self, q: crate::ast::QueryExpr) -> crate::ast::SetExpr {
+        use crate::ast::{QueryBody, SetExpr};
+        let has_tail = !q.order_by.is_empty()
+            || q.limit.is_some()
+            || q.offset.is_some()
+            || q.locking.is_some();
+        if has_tail {
+            SetExpr::Query(QueryBody::Nested(Box::new(q)))
+        } else {
+            q.body
+        }
+    }
+
+    fn finish_query_expr(
+        &mut self,
+        body: crate::ast::SetExpr,
+        order_by: Vec<crate::ast::OrderItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        locking: Option<crate::ast::RowLockStrength>,
+    ) -> Result<crate::ast::QueryExpr, ParseError> {
+        use crate::ast::{QueryBody, QueryExpr, SetExpr};
+        if locking.is_some() {
+            match &body {
+                SetExpr::Query(QueryBody::Select(_)) => {}
+                SetExpr::Query(QueryBody::Values(_)) => {
+                    return Err(ParseError::new(
+                        "FOR UPDATE/SHARE is not allowed with VALUES",
+                        self.peek_pos(),
+                    ));
+                }
+                SetExpr::Query(QueryBody::Nested(_)) => {
+                    return Err(ParseError::new(
+                        "FOR UPDATE/SHARE is not allowed with a nested query expression",
+                        self.peek_pos(),
+                    ));
+                }
+                SetExpr::SetOp { .. } => {
                     return Err(ParseError::new(
                         "FOR UPDATE/SHARE is not allowed with UNION/INTERSECT/EXCEPT",
                         self.peek_pos(),
                     ));
                 }
-                Ok(Statement::SetOperation(SetQuery {
-                    body,
-                    order_by,
-                    limit,
-                    offset,
-                }))
             }
         }
+        Ok(QueryExpr {
+            body,
+            order_by,
+            limit,
+            offset,
+            locking,
+        })
+    }
+
+    fn peek_is_set_op(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Union | Keyword::Except | Keyword::Intersect)
+        )
+    }
+
+    fn query_tail_or_locking_starts(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Order | Keyword::Limit | Keyword::Offset | Keyword::For)
+        )
     }
 
     /// Precedence-climbing set-op tree. INTERSECT = 2, UNION/EXCEPT = 1; all
     /// left-associative (recurse for the RHS at `prec + 1`).
     fn set_expr(&mut self, min_prec: u8) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::{SetExpr, SetOp};
         // Mode-1 guard: a parenthesized set-op subtree recurses
         // `set_primary → set_expr → set_primary` for `(((… query …)))`, a path that
         // does NOT funnel through `expr`/`select_core`, so it needs its own guard.
         let _guard = DepthGuard::enter(&self.depth, self.peek_pos())?;
-        let mut left = self.set_primary()?;
+        let left = self.set_primary()?;
+        self.set_expr_rest(left, min_prec)
+    }
+
+    fn set_expr_rest(
+        &mut self,
+        mut left: crate::ast::SetExpr,
+        min_prec: u8,
+    ) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::{SetExpr, SetOp};
         // Mode-2 cap: a flat left-assoc chain `A UNION B UNION C …` is parsed by this
         // LOOP (not recursion), building an N-deep left-nested `SetExpr` that would
         // overflow the executor's `fold`/`resolve_set_columns` AND recursive `Drop`.
@@ -1404,6 +1503,18 @@ impl Parser {
     /// A set-op primary: a parenthesized sub-query (precedence grouping, or a
     /// parenthesized single SELECT that keeps its own ORDER BY / LIMIT), or a bare
     /// SELECT branch (`select_core`, no tail — the query owns the tail).
+    fn parenthesized_query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
+        self.expect(&Token::LParen)?;
+        self.query_expr_after_open_paren()
+    }
+
+    fn query_expr_after_open_paren(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
+        let body = self.set_expr(0)?;
+        let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+        self.expect(&Token::RParen)?;
+        self.finish_query_expr(body, order_by, limit, offset, locking)
+    }
+
     fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
         use crate::ast::{QueryBody, SetExpr};
         if *self.peek() == Token::LParen {
@@ -1422,12 +1533,12 @@ impl Parser {
     }
 
     /// If an ORDER BY / LIMIT / OFFSET follows inside parentheses, attach it to a
-    /// lone-SELECT inner; reject it on a multi-branch subtree (deferred).
+    /// lone-SELECT inner; otherwise preserve the tailed query as a nested primary.
     fn attach_paren_tail(
         &mut self,
         inner: crate::ast::SetExpr,
     ) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::{QueryBody, SetExpr};
+        use crate::ast::{QueryBody, QueryExpr, SetExpr};
         let has_tail = matches!(
             self.peek(),
             Token::Keyword(Keyword::Order)
@@ -1445,14 +1556,16 @@ impl Parser {
                 s.offset = offset;
                 Ok(SetExpr::Query(QueryBody::Select(s)))
             }
-            SetExpr::Query(QueryBody::Values(_)) => Err(ParseError::new(
-                "ORDER BY/LIMIT on a parenthesized VALUES branch is not supported",
-                self.peek_pos(),
-            )),
-            _ => Err(ParseError::new(
-                "ORDER BY/LIMIT on a parenthesized set-operation subtree is not supported",
-                self.peek_pos(),
-            )),
+            body => {
+                let (order_by, limit, offset) = self.parse_set_tail()?;
+                Ok(SetExpr::Query(QueryBody::Nested(Box::new(QueryExpr {
+                    body,
+                    order_by,
+                    limit,
+                    offset,
+                    locking: None,
+                }))))
+            }
         }
     }
 
@@ -1548,6 +1661,13 @@ impl Parser {
         Ok(kind)
     }
 
+    fn starts_query_expr(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values) | Token::LParen
+        )
+    }
+
     /// A table factor: a base table (`t` / `t alias` / `t AS alias`), a derived
     /// table (`( SELECT … ) alias`), or a parenthesized join (`( … )`).
     fn table_factor(&mut self) -> Result<crate::ast::TableExpr, ParseError> {
@@ -1558,13 +1678,7 @@ impl Parser {
                 self.peek(),
                 Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
             ) {
-                use crate::ast::QueryBody;
-                let subquery = if *self.peek() == Token::Keyword(Keyword::Select) {
-                    QueryBody::Select(Box::new(self.select_inner()?))
-                } else {
-                    QueryBody::Values(self.values_stmt()?)
-                };
-                self.expect(&Token::RParen)?;
+                let subquery = self.query_expr_after_open_paren()?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
                     ParseError::new("subquery in FROM must have an alias", self.peek_pos())
                 })?;
@@ -1679,6 +1793,262 @@ mod tests {
         let mut v = parse(sql).expect("parse");
         assert_eq!(v.len(), 1);
         v.pop().expect("one statement")
+    }
+
+    fn only_query(sql: &str) -> crate::ast::QueryExpr {
+        let statements = crate::parse(sql).expect("parse ok");
+        assert_eq!(statements.len(), 1);
+        match statements.into_iter().next().expect("one statement") {
+            Statement::Query(q) => q,
+            other => panic!("expected Statement::Query, got {other:?}"),
+        }
+    }
+
+    fn only_select(sql: &str) -> crate::ast::SelectStmt {
+        use crate::ast::{QueryBody, SetExpr};
+        let q = only_query(sql);
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT query body");
+        };
+        let mut select = *select;
+        select.order_by = q.order_by;
+        select.limit = q.limit;
+        select.offset = q.offset;
+        select.locking = q.locking;
+        select
+    }
+
+    #[test]
+    fn row_producing_statements_share_query_expr_shape() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("SELECT 1 ORDER BY 1 LIMIT 1");
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+        assert!(matches!(q.body, SetExpr::Query(QueryBody::Select(_))));
+
+        let q = only_query("VALUES (1), (2) ORDER BY 1 OFFSET 1");
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.offset, Some(1));
+        assert!(matches!(q.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("SELECT 1 UNION ALL VALUES (2) ORDER BY 1");
+        assert_eq!(q.order_by.len(), 1);
+        assert!(matches!(q.body, SetExpr::SetOp { .. }));
+    }
+
+    #[test]
+    fn legacy_query_forms_still_parse_after_query_unification() {
+        for sql in [
+            "SELECT a, b FROM t WHERE a > 1 ORDER BY b LIMIT 5",
+            "VALUES (1), (2) ORDER BY 1",
+            "(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2 ORDER BY 1",
+            "SELECT * FROM (SELECT 1 AS x) AS d",
+            "SELECT * FROM (VALUES (1, 'a')) AS v(id, name)",
+        ] {
+            let q = only_query(sql);
+            assert!(q.locking.is_none());
+        }
+    }
+
+    #[test]
+    fn derived_and_expression_subqueries_accept_query_exprs() {
+        use crate::ast::{Expr, QueryBody, SelectItem, SetExpr, TableExpr};
+
+        let outer = only_query("SELECT t.x FROM (SELECT 1 AS x UNION SELECT 2) AS t ORDER BY t.x");
+        let SetExpr::Query(QueryBody::Select(select)) = outer.body else {
+            panic!("expected outer SELECT query body");
+        };
+        let [
+            TableExpr::Derived {
+                subquery, alias, ..
+            },
+        ] = select.from.as_slice()
+        else {
+            panic!("expected one derived table");
+        };
+        assert_eq!(alias, "t");
+        assert!(matches!(subquery.body, SetExpr::SetOp { .. }));
+
+        let scalar = only_query("SELECT (VALUES (1) UNION SELECT 2 ORDER BY 1 LIMIT 1)");
+        let SetExpr::Query(QueryBody::Select(select)) = scalar.body else {
+            panic!("expected SELECT");
+        };
+        let SelectItem::Expr { expr, .. } = &select.projection[0] else {
+            panic!("expected expression projection");
+        };
+        let Expr::ScalarSubquery(q) = expr else {
+            panic!("expected scalar query expression");
+        };
+        assert!(matches!(q.body, SetExpr::SetOp { .. }));
+        assert_eq!(q.limit, Some(1));
+    }
+
+    #[test]
+    fn parenthesized_query_expr_tail_is_preserved_for_values_and_setops() {
+        use crate::ast::{QueryBody, SetExpr, TableExpr};
+
+        let q = only_query("SELECT v.x FROM (VALUES (2), (1) ORDER BY 1 LIMIT 1) AS v(x)");
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT");
+        };
+        let [TableExpr::Derived { subquery, .. }] = select.from.as_slice() else {
+            panic!("expected one derived table");
+        };
+        assert!(matches!(
+            subquery.body,
+            SetExpr::Query(QueryBody::Values(_))
+        ));
+        assert_eq!(subquery.order_by.len(), 1);
+        assert_eq!(subquery.limit, Some(1));
+
+        let q =
+            only_query("SELECT s.x FROM (SELECT 2 AS x UNION SELECT 1 ORDER BY 1 LIMIT 1) AS s");
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT");
+        };
+        let [TableExpr::Derived { subquery, .. }] = select.from.as_slice() else {
+            panic!("expected one derived table");
+        };
+        assert!(matches!(subquery.body, SetExpr::SetOp { .. }));
+        assert_eq!(subquery.order_by.len(), 1);
+        assert_eq!(subquery.limit, Some(1));
+    }
+
+    #[test]
+    fn quantified_query_expr_preserves_tail() {
+        let Expr::Quantified { subquery, .. } =
+            expr("1 = ANY (SELECT 1 ORDER BY 1 LIMIT 1 OFFSET 0)")
+        else {
+            panic!("expected quantified query expression");
+        };
+        assert_eq!(subquery.order_by.len(), 1);
+        assert_eq!(subquery.limit, Some(1));
+        assert_eq!(subquery.offset, Some(0));
+    }
+
+    #[test]
+    fn nested_query_expr_locking_is_preserved_and_validated() {
+        use crate::ast::{QueryBody, RowLockStrength, SelectItem, SetExpr};
+
+        let q = only_query("SELECT (SELECT 1 FOR UPDATE)");
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected outer SELECT");
+        };
+        let SelectItem::Expr { expr, .. } = &select.projection[0] else {
+            panic!("expected expression projection");
+        };
+        let Expr::ScalarSubquery(subquery) = expr else {
+            panic!("expected scalar subquery");
+        };
+        assert_eq!(subquery.locking, Some(RowLockStrength::ForUpdate));
+
+        assert!(crate::parse("SELECT (VALUES (1) FOR UPDATE)").is_err());
+        assert!(crate::parse("SELECT (SELECT 1 UNION SELECT 2 FOR UPDATE)").is_err());
+    }
+
+    #[test]
+    fn top_level_parenthesized_query_expr_tail_is_preserved() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1 LIMIT 1)");
+        assert!(matches!(q.body, SetExpr::Query(QueryBody::Values(_))));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+
+        let q = only_query("(SELECT 2 UNION SELECT 1 ORDER BY 1 LIMIT 1)");
+        assert!(matches!(q.body, SetExpr::SetOp { .. }));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+    }
+
+    #[test]
+    fn parenthesized_query_expr_outer_tail_preserves_inner_values_and_setop_tails() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1) LIMIT 1");
+        assert_eq!(q.limit, Some(1));
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("(SELECT 2 UNION SELECT 1 ORDER BY 1) LIMIT 1");
+        assert_eq!(q.limit, Some(1));
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+    }
+
+    #[test]
+    fn redundant_parenthesized_query_expr_preserves_inner_values_and_setop_tails() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("((VALUES (2), (1) ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("((VALUES (2), (1) ORDER BY 1) LIMIT 1)");
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, Some(1));
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("((SELECT 2 UNION SELECT 1 ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+
+        let q = only_query("((SELECT 2 UNION SELECT 1 ORDER BY 1) LIMIT 1)");
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, Some(1));
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+    }
+
+    #[test]
+    fn raw_query_expr_tail_placement_is_visible() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("SELECT 1 ORDER BY 1 LIMIT 1");
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT body");
+        };
+        assert!(select.order_by.is_empty());
+        assert_eq!(select.limit, None);
+
+        let q = only_query("((SELECT 1 ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(select.order_by.len(), 1);
     }
 
     #[test]
@@ -1892,81 +2262,72 @@ mod tests {
 
     #[test]
     fn parses_select_with_all_clauses() {
-        match one("SELECT a, b AS bee FROM t WHERE a > 1 ORDER BY a DESC, b LIMIT 10") {
-            Statement::Select(s) => {
-                assert_eq!(s.projection.len(), 2);
-                assert!(
-                    matches!(s.projection[1], SelectItem::Expr { alias: Some(ref n), .. } if n == "bee")
-                );
-                assert!(matches!(
-                    s.from.as_slice(),
-                    [crate::ast::TableExpr::Table { name, alias: None }] if name == "t"
-                ));
-                assert!(s.filter.is_some());
-                assert_eq!(s.order_by.len(), 2);
-                assert!(!s.order_by[0].asc); // DESC
-                assert!(s.order_by[1].asc); // default ASC
-                assert_eq!(s.limit, Some(10));
-            }
-            other => panic!("expected Select, got {other:?}"),
-        }
+        let s = only_select("SELECT a, b AS bee FROM t WHERE a > 1 ORDER BY a DESC, b LIMIT 10");
+        assert_eq!(s.projection.len(), 2);
+        assert!(
+            matches!(s.projection[1], SelectItem::Expr { alias: Some(ref n), .. } if n == "bee")
+        );
+        assert!(matches!(
+            s.from.as_slice(),
+            [crate::ast::TableExpr::Table { name, alias: None }] if name == "t"
+        ));
+        assert!(s.filter.is_some());
+        assert_eq!(s.order_by.len(), 2);
+        assert!(!s.order_by[0].asc); // DESC
+        assert!(s.order_by[1].asc); // default ASC
+        assert_eq!(s.limit, Some(10));
     }
 
     #[test]
     fn parses_aggregates_group_by_having() {
         use crate::ast::{FuncArgs, FuncCall};
-        match one("SELECT k, count(*), sum(v) FROM t WHERE v > 0 \
-             GROUP BY k HAVING count(*) > 1 ORDER BY k LIMIT 5")
-        {
-            Statement::Select(s) => {
-                assert_eq!(s.projection.len(), 3);
-                // count(*)
-                assert!(matches!(
-                    s.projection[1],
-                    SelectItem::Expr {
-                        expr: Expr::Func(FuncCall { ref name, distinct: false, args: FuncArgs::Star }),
-                        ..
-                    } if name == "count"
-                ));
-                assert_eq!(
-                    s.group_by,
-                    vec![Expr::Column {
-                        table: None,
-                        name: "k".into()
-                    }]
-                );
-                assert!(s.having.is_some());
-                assert_eq!(s.order_by.len(), 1);
-                assert_eq!(s.limit, Some(5));
-            }
-            other => panic!("expected Select, got {other:?}"),
-        }
+        let s = only_select(
+            "SELECT k, count(*), sum(v) FROM t WHERE v > 0 \
+             GROUP BY k HAVING count(*) > 1 ORDER BY k LIMIT 5",
+        );
+        assert_eq!(s.projection.len(), 3);
+        // count(*)
+        assert!(matches!(
+            s.projection[1],
+            SelectItem::Expr {
+                expr: Expr::Func(FuncCall { ref name, distinct: false, args: FuncArgs::Star }),
+                ..
+            } if name == "count"
+        ));
+        assert_eq!(
+            s.group_by,
+            vec![Expr::Column {
+                table: None,
+                name: "k".into()
+            }]
+        );
+        assert!(s.having.is_some());
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.limit, Some(5));
     }
 
     #[test]
     fn parses_count_distinct_and_func_args() {
         use crate::ast::{FuncArgs, FuncCall};
-        match one("SELECT count(DISTINCT a + 1) FROM t") {
-            Statement::Select(s) => match &s.projection[0] {
-                SelectItem::Expr {
-                    expr:
-                        Expr::Func(FuncCall {
-                            name,
-                            distinct,
-                            args,
-                        }),
-                    ..
-                } => {
-                    assert_eq!(name, "count");
-                    assert!(*distinct);
-                    match args {
-                        FuncArgs::Exprs(v) => assert_eq!(v.len(), 1),
-                        other => panic!("expected Exprs, got {other:?}"),
-                    }
+        let s = only_select("SELECT count(DISTINCT a + 1) FROM t");
+        match &s.projection[0] {
+            SelectItem::Expr {
+                expr:
+                    Expr::Func(FuncCall {
+                        name,
+                        distinct,
+                        args,
+                    }),
+                ..
+            } => {
+                assert_eq!(name, "count");
+                assert!(*distinct);
+                match args {
+                    FuncArgs::Exprs(v) => assert_eq!(v.len(), 1),
+                    other => panic!("expected Exprs, got {other:?}"),
                 }
-                other => panic!("expected a Func projection, got {other:?}"),
-            },
-            other => panic!("expected Select, got {other:?}"),
+            }
+            other => panic!("expected a Func projection, got {other:?}"),
         }
     }
 
@@ -1978,36 +2339,28 @@ mod tests {
 
     #[test]
     fn parses_multi_key_group_by() {
-        match one("SELECT a, b, max(c) FROM t GROUP BY a, b") {
-            Statement::Select(s) => {
-                assert_eq!(
-                    s.group_by,
-                    vec![
-                        Expr::Column {
-                            table: None,
-                            name: "a".into()
-                        },
-                        Expr::Column {
-                            table: None,
-                            name: "b".into()
-                        }
-                    ]
-                );
-                assert!(s.having.is_none());
-            }
-            other => panic!("expected Select, got {other:?}"),
-        }
+        let s = only_select("SELECT a, b, max(c) FROM t GROUP BY a, b");
+        assert_eq!(
+            s.group_by,
+            vec![
+                Expr::Column {
+                    table: None,
+                    name: "a".into()
+                },
+                Expr::Column {
+                    table: None,
+                    name: "b".into()
+                }
+            ]
+        );
+        assert!(s.having.is_none());
     }
 
     #[test]
     fn parses_select_star_no_from() {
-        match one("SELECT *") {
-            Statement::Select(s) => {
-                assert_eq!(s.projection, vec![SelectItem::Wildcard]);
-                assert!(s.from.is_empty());
-            }
-            other => panic!("expected Select, got {other:?}"),
-        }
+        let s = only_select("SELECT *");
+        assert_eq!(s.projection, vec![SelectItem::Wildcard]);
+        assert!(s.from.is_empty());
     }
 
     #[test]
@@ -2081,18 +2434,15 @@ mod tests {
     #[test]
     fn parses_select_for_update_and_share() {
         use crate::ast::RowLockStrength;
-        match one("SELECT id FROM t FOR UPDATE") {
-            Statement::Select(s) => assert_eq!(s.locking, Some(RowLockStrength::ForUpdate)),
-            other => panic!("expected Select, got {other:?}"),
-        }
-        match one("SELECT id FROM t WHERE id > 1 FOR SHARE") {
-            Statement::Select(s) => assert_eq!(s.locking, Some(RowLockStrength::ForShare)),
-            other => panic!("expected Select, got {other:?}"),
-        }
-        match one("SELECT id FROM t") {
-            Statement::Select(s) => assert_eq!(s.locking, None),
-            other => panic!("expected Select, got {other:?}"),
-        }
+        assert_eq!(
+            only_query("SELECT id FROM t FOR UPDATE").locking,
+            Some(RowLockStrength::ForUpdate)
+        );
+        assert_eq!(
+            only_query("SELECT id FROM t WHERE id > 1 FOR SHARE").locking,
+            Some(RowLockStrength::ForShare)
+        );
+        assert_eq!(only_query("SELECT id FROM t").locking, None);
     }
 
     #[test]
@@ -2512,14 +2862,8 @@ mod tests {
 
     #[test]
     fn parses_select_distinct() {
-        match one("SELECT DISTINCT a FROM t") {
-            Statement::Select(s) => assert!(s.distinct),
-            other => panic!("expected Select, got {other:?}"),
-        }
-        match one("SELECT a FROM t") {
-            Statement::Select(s) => assert!(!s.distinct),
-            other => panic!("expected Select, got {other:?}"),
-        }
+        assert!(only_select("SELECT DISTINCT a FROM t").distinct);
+        assert!(!only_select("SELECT a FROM t").distinct);
     }
 
     // ---- SP31: explicit casts ----
@@ -2853,66 +3197,52 @@ mod tests {
             "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
             "SELECT a FROM t ORDER BY a OFFSET 10 LIMIT 5",
         ] {
-            match one(sql) {
-                Statement::Select(s) => {
-                    assert_eq!(s.limit, Some(5));
-                    assert_eq!(s.offset, Some(10));
-                }
-                other => panic!("expected Select, got {other:?}"),
-            }
+            let q = only_query(sql);
+            assert_eq!(q.limit, Some(5));
+            assert_eq!(q.offset, Some(10));
         }
     }
 
     #[test]
     fn parses_inner_join_on() {
         use crate::ast::{JoinConstraint, JoinKind, TableExpr};
-        match one("SELECT a.x FROM a JOIN b ON a.id = b.id") {
-            Statement::Select(s) => {
-                assert_eq!(s.from.len(), 1);
-                match &s.from[0] {
-                    TableExpr::Join {
-                        kind, constraint, ..
-                    } => {
-                        assert_eq!(*kind, JoinKind::Inner);
-                        assert!(matches!(constraint, JoinConstraint::On(_)));
-                    }
-                    other => panic!("expected Join, got {other:?}"),
-                }
+        let s = only_select("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        assert_eq!(s.from.len(), 1);
+        match &s.from[0] {
+            TableExpr::Join {
+                kind, constraint, ..
+            } => {
+                assert_eq!(*kind, JoinKind::Inner);
+                assert!(matches!(constraint, JoinConstraint::On(_)));
             }
-            other => panic!("{other:?}"),
+            other => panic!("expected Join, got {other:?}"),
         }
     }
 
     #[test]
     fn parses_left_join_using_and_aliases_and_comma() {
         use crate::ast::{JoinConstraint, JoinKind, TableExpr};
-        match one("SELECT * FROM a x LEFT OUTER JOIN b AS y USING (id), c") {
-            Statement::Select(s) => {
-                assert_eq!(s.from.len(), 2); // comma -> two top-level items
-                match &s.from[0] {
-                    TableExpr::Join {
-                        kind,
-                        constraint,
-                        left,
-                        right,
-                    } => {
-                        assert_eq!(*kind, JoinKind::Left);
-                        assert_eq!(*constraint, JoinConstraint::Using(vec!["id".into()]));
-                        assert!(
-                            matches!(**left, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("x"))
-                        );
-                        assert!(
-                            matches!(**right, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("y"))
-                        );
-                    }
-                    other => panic!("expected Join, got {other:?}"),
-                }
+        let s = only_select("SELECT * FROM a x LEFT OUTER JOIN b AS y USING (id), c");
+        assert_eq!(s.from.len(), 2); // comma -> two top-level items
+        match &s.from[0] {
+            TableExpr::Join {
+                kind,
+                constraint,
+                left,
+                right,
+            } => {
+                assert_eq!(*kind, JoinKind::Left);
+                assert_eq!(*constraint, JoinConstraint::Using(vec!["id".into()]));
                 assert!(
-                    matches!(&s.from[1], TableExpr::Table { name, alias: None } if name == "c")
+                    matches!(**left, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("x"))
+                );
+                assert!(
+                    matches!(**right, TableExpr::Table { ref alias, .. } if alias.as_deref() == Some("y"))
                 );
             }
-            other => panic!("{other:?}"),
+            other => panic!("expected Join, got {other:?}"),
         }
+        assert!(matches!(&s.from[1], TableExpr::Table { name, alias: None } if name == "c"));
     }
 
     #[test]
@@ -2920,33 +3250,25 @@ mod tests {
         use crate::ast::TableExpr;
         assert!(matches!(
             one("SELECT * FROM a NATURAL JOIN b"),
-            Statement::Select(_)
+            Statement::Query(_)
         ));
         assert!(matches!(
             one("SELECT * FROM a CROSS JOIN b"),
-            Statement::Select(_)
+            Statement::Query(_)
         ));
         assert!(matches!(
             one("SELECT * FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id"),
-            Statement::Select(_)
+            Statement::Query(_)
         ));
-        match one("SELECT d.n FROM (SELECT n FROM t) AS d") {
-            Statement::Select(s) => {
-                assert!(matches!(&s.from[0], TableExpr::Derived { alias, .. } if alias == "d"))
-            }
-            other => panic!("{other:?}"),
-        }
+        let s = only_select("SELECT d.n FROM (SELECT n FROM t) AS d");
+        assert!(matches!(&s.from[0], TableExpr::Derived { alias, .. } if alias == "d"));
     }
 
     #[test]
     fn parses_qualified_wildcard() {
         use crate::ast::SelectItem;
-        match one("SELECT a.* FROM a JOIN b ON a.id=b.id") {
-            Statement::Select(s) => {
-                assert_eq!(s.projection[0], SelectItem::QualifiedWildcard("a".into()))
-            }
-            other => panic!("{other:?}"),
-        }
+        let s = only_select("SELECT a.* FROM a JOIN b ON a.id=b.id");
+        assert_eq!(s.projection[0], SelectItem::QualifiedWildcard("a".into()));
     }
 
     #[test]
@@ -2960,8 +3282,12 @@ mod tests {
     fn parses_scalar_subquery_in_expression_position() {
         match expr("(SELECT 1)") {
             Expr::ScalarSubquery(s) => {
-                assert_eq!(s.projection.len(), 1);
-                assert!(s.from.is_empty());
+                let crate::ast::SetExpr::Query(crate::ast::QueryBody::Select(select)) = &s.body
+                else {
+                    panic!("expected SELECT scalar subquery");
+                };
+                assert_eq!(select.projection.len(), 1);
+                assert!(select.from.is_empty());
             }
             other => panic!("expected ScalarSubquery, got {other:?}"),
         }
@@ -3084,7 +3410,7 @@ mod tests {
     /// (no stack overflow). If this test ABORTS the process (stack overflow rather
     /// than a clean pass), `MAX_DEPTH` is too high for the runner's ~2 MiB stack
     /// and must be lowered. Each `(` adds one `expr` frame (one `DepthGuard`
-    /// level); `select_inner` + the outermost projection `expr` add 2 guard
+    /// level); `select_core` + the outermost projection `expr` add 2 guard
     /// levels on top, so `MAX_DEPTH - 2` is the deepest paren query the parser
     /// admits — this test uses `MAX_DEPTH - 3` for one extra level of headroom.
     #[test]
@@ -3153,15 +3479,14 @@ mod tests {
 
     #[test]
     fn parses_standalone_values_query() {
-        use crate::ast::{Expr, Statement};
-        let s = crate::parse("VALUES (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 1 OFFSET 1")
-            .expect("parse standalone VALUES");
-        let Statement::Values(q) = &s[0] else {
-            panic!("expected VALUES, got {:?}", s[0])
+        use crate::ast::{Expr, QueryBody, SetExpr};
+        let q = only_query("VALUES (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 1 OFFSET 1");
+        let SetExpr::Query(QueryBody::Values(body)) = &q.body else {
+            panic!("expected VALUES, got {q:?}")
         };
-        assert_eq!(q.body.rows.len(), 2);
-        assert_eq!(q.body.rows[0].len(), 2);
-        assert!(matches!(q.body.rows[0][0], Expr::IntLiteral(_)));
+        assert_eq!(body.rows.len(), 2);
+        assert_eq!(body.rows[0].len(), 2);
+        assert!(matches!(body.rows[0][0], Expr::IntLiteral(_)));
         assert_eq!(q.order_by.len(), 1);
         assert_eq!(q.limit, Some(1));
         assert_eq!(q.offset, Some(1));
@@ -3169,11 +3494,8 @@ mod tests {
 
     #[test]
     fn parses_values_as_set_operation_branch() {
-        use crate::ast::{QueryBody, SetExpr, SetOp, Statement};
-        let s = crate::parse("VALUES (1) UNION ALL SELECT 2").expect("parse values set op");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op")
-        };
+        use crate::ast::{QueryBody, SetExpr, SetOp};
+        let q = only_query("VALUES (1) UNION ALL SELECT 2");
         let SetExpr::SetOp {
             op,
             all,
@@ -3185,18 +3507,20 @@ mod tests {
         };
         assert_eq!(*op, SetOp::Union);
         assert!(*all);
-        assert!(matches!(&**left, SetExpr::Query(QueryBody::Values(_))));
-        assert!(matches!(&**right, SetExpr::Query(QueryBody::Select(_))));
+        assert!(matches!(
+            left.as_ref(),
+            SetExpr::Query(QueryBody::Values(_))
+        ));
+        assert!(matches!(
+            right.as_ref(),
+            SetExpr::Query(QueryBody::Select(_))
+        ));
     }
 
     #[test]
     fn parses_values_derived_table_with_column_aliases() {
-        use crate::ast::{QueryBody, Statement, TableExpr};
-        let s = crate::parse("SELECT id, name FROM (VALUES (1, 'a')) AS v(id, name)")
-            .expect("parse values derived table");
-        let Statement::Select(sel) = &s[0] else {
-            panic!("expected select")
-        };
+        use crate::ast::{QueryBody, SetExpr, TableExpr};
+        let sel = only_select("SELECT id, name FROM (VALUES (1, 'a')) AS v(id, name)");
         let TableExpr::Derived {
             subquery,
             alias,
@@ -3205,7 +3529,10 @@ mod tests {
         else {
             panic!("expected derived table")
         };
-        assert!(matches!(subquery, QueryBody::Values(_)));
+        assert!(matches!(
+            subquery.body,
+            SetExpr::Query(QueryBody::Values(_))
+        ));
         assert_eq!(alias, "v");
         assert_eq!(
             columns.as_ref().expect("column aliases"),
@@ -3215,12 +3542,8 @@ mod tests {
 
     #[test]
     fn parses_select_derived_table_with_column_aliases() {
-        use crate::ast::{QueryBody, Statement, TableExpr};
-        let s = crate::parse("SELECT n FROM (SELECT a FROM t) AS d(n)")
-            .expect("parse derived SELECT column aliases");
-        let Statement::Select(sel) = &s[0] else {
-            panic!("expected select")
-        };
+        use crate::ast::{QueryBody, SetExpr, TableExpr};
+        let sel = only_select("SELECT n FROM (SELECT a FROM t) AS d(n)");
         let TableExpr::Derived {
             subquery,
             alias,
@@ -3229,7 +3552,10 @@ mod tests {
         else {
             panic!("expected derived table")
         };
-        assert!(matches!(subquery, QueryBody::Select(_)));
+        assert!(matches!(
+            subquery.body,
+            SetExpr::Query(QueryBody::Select(_))
+        ));
         assert_eq!(alias, "d");
         assert_eq!(
             columns.as_ref().expect("column aliases"),
@@ -3244,19 +3570,16 @@ mod tests {
 
     #[test]
     fn parses_union_all_and_precedence() {
-        use crate::ast::{SetExpr, SetOp, Statement};
+        use crate::ast::{SetExpr, SetOp};
         // INTERSECT binds tighter than UNION: A UNION B INTERSECT C => A UNION (B INTERSECT C)
-        let s = crate::parse("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3").expect("parse");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op, got {:?}", s[0])
-        };
+        let q = only_query("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3");
         let SetExpr::SetOp { op, all, right, .. } = &q.body else {
             panic!("expected top SetOp")
         };
         assert_eq!(*op, SetOp::Union);
         assert!(!*all);
         assert!(matches!(
-            &**right,
+            right.as_ref(),
             SetExpr::SetOp {
                 op: SetOp::Intersect,
                 ..
@@ -3264,16 +3587,13 @@ mod tests {
         ));
 
         // UNION ALL sets `all`; left-associativity: A UNION B UNION C => (A UNION B) UNION C
-        let s = crate::parse("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3").expect("parse");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op")
-        };
+        let q = only_query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
         let SetExpr::SetOp { all, left, .. } = &q.body else {
             panic!()
         };
         assert!(*all);
         assert!(matches!(
-            &**left,
+            left.as_ref(),
             SetExpr::SetOp {
                 op: SetOp::Union,
                 ..
@@ -3283,11 +3603,7 @@ mod tests {
 
     #[test]
     fn union_order_by_limit_bind_to_whole_query() {
-        use crate::ast::Statement;
-        let s = crate::parse("SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 5 OFFSET 1").expect("parse");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op")
-        };
+        let q = only_query("SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 5 OFFSET 1");
         assert_eq!(q.order_by.len(), 1);
         assert_eq!(q.limit, Some(5));
         assert_eq!(q.offset, Some(1));
@@ -3295,15 +3611,12 @@ mod tests {
 
     #[test]
     fn parenthesized_branch_keeps_its_own_order_limit() {
-        use crate::ast::{QueryBody, SetExpr, Statement};
-        let s = crate::parse("(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2").expect("parse");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op")
-        };
+        use crate::ast::{QueryBody, SetExpr};
+        let q = only_query("(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2");
         let SetExpr::SetOp { left, .. } = &q.body else {
             panic!("expected top SetOp")
         };
-        let SetExpr::Query(QueryBody::Select(b)) = &**left else {
+        let SetExpr::Query(QueryBody::Select(b)) = left.as_ref() else {
             panic!("left branch is a SELECT leaf")
         };
         assert_eq!(b.limit, Some(1));
@@ -3312,14 +3625,13 @@ mod tests {
 
     #[test]
     fn plain_select_is_unchanged() {
-        use crate::ast::Statement;
-        // No set-op keyword => still Statement::Select, tail on the struct.
-        let s = crate::parse("SELECT a FROM t ORDER BY a LIMIT 3").expect("parse");
-        let Statement::Select(sel) = &s[0] else {
-            panic!("plain select must stay Statement::Select")
-        };
-        assert_eq!(sel.limit, Some(3));
-        assert_eq!(sel.order_by.len(), 1);
+        let q = only_query("SELECT a FROM t ORDER BY a LIMIT 3");
+        assert!(matches!(
+            q.body,
+            crate::ast::SetExpr::Query(crate::ast::QueryBody::Select(_))
+        ));
+        assert_eq!(q.limit, Some(3));
+        assert_eq!(q.order_by.len(), 1);
     }
 
     #[test]
@@ -3328,20 +3640,37 @@ mod tests {
     }
 
     #[test]
-    fn order_by_on_parenthesized_set_op_subtree_is_rejected() {
-        // Deferred non-goal: a tail on a parenthesized MULTI-branch subtree.
-        assert!(crate::parse("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3").is_err());
+    fn parenthesized_tailed_query_exprs_can_be_set_op_branches() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3");
+        let SetExpr::SetOp { left, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        let SetExpr::Query(QueryBody::Nested(inner)) = left.as_ref() else {
+            panic!("left branch preserves the tailed set-op as a nested QueryExpr")
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1 LIMIT 1) UNION SELECT 3");
+        let SetExpr::SetOp { left, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        let SetExpr::Query(QueryBody::Nested(inner)) = left.as_ref() else {
+            panic!("left branch preserves the tailed VALUES as a nested QueryExpr")
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, Some(1));
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
     }
 
     #[test]
     fn union_distinct_is_the_default_form() {
-        use crate::ast::{SetExpr, Statement};
+        use crate::ast::SetExpr;
         // `UNION DISTINCT` is the explicit spelling of the default (dedup) form:
         // it parses to the same tree as a bare `UNION` (all == false).
-        let s = crate::parse("SELECT 1 UNION DISTINCT SELECT 2").expect("parse");
-        let Statement::SetOperation(q) = &s[0] else {
-            panic!("expected set op, got {:?}", s[0])
-        };
+        let q = only_query("SELECT 1 UNION DISTINCT SELECT 2");
         let SetExpr::SetOp { all, .. } = &q.body else {
             panic!("expected SetOp")
         };

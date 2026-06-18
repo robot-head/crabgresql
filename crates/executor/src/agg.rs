@@ -813,6 +813,7 @@ fn as_f64(d: &Datum) -> Option<f64> {
 /// producing core shared with derived tables (`select_to_relation`). `ctx` carries
 /// the session zone + clock for any temporal evaluation; non-temporal aggregation
 /// ignores it (UTC/epoch reproduces prior behavior).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_aggregate(
     s: &SelectStmt,
     scope: &Scope,
@@ -960,7 +961,7 @@ pub(crate) fn aggregate_rows(
 mod tests {
     use super::*;
     use catalog::{Column, Table};
-    use pgparser::ast::{SelectStmt, Statement};
+    use pgparser::ast::{QueryBody, SelectStmt, SetExpr, Statement};
     use pgwire::engine::Cell;
 
     fn table() -> Table {
@@ -988,16 +989,30 @@ mod tests {
         }
     }
 
+    fn parsed_select(sql: &str) -> SelectStmt {
+        match pgparser::parse(sql).expect("parse").pop().expect("one") {
+            Statement::Query(q) => match q.body {
+                SetExpr::Query(QueryBody::Select(s)) => {
+                    let mut s = *s;
+                    s.order_by = q.order_by;
+                    s.limit = q.limit;
+                    s.offset = q.offset;
+                    s.locking = q.locking;
+                    s
+                }
+                other => panic!("expected select body, got {other:?}"),
+            },
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
     /// Parse one SELECT and run it over the given (already-WHERE-filtered) rows.
     fn agg(
         sql: &str,
         t: Option<&Table>,
         rows: Vec<Vec<Datum>>,
     ) -> Result<Vec<Vec<Datum>>, ExecError> {
-        let stmt = pgparser::parse(sql).expect("parse").pop().expect("one");
-        let Statement::Select(s) = stmt else {
-            panic!("not a select");
-        };
+        let s = parsed_select(sql);
         assert!(
             is_aggregate_query(&s),
             "test sql must be an aggregate query"
@@ -1034,10 +1049,7 @@ mod tests {
         t: Option<&Table>,
         rows: Vec<Vec<Datum>>,
     ) -> Result<Vec<Vec<Option<String>>>, ExecError> {
-        let stmt = pgparser::parse(sql).expect("parse").pop().expect("one");
-        let Statement::Select(s) = stmt else {
-            panic!("not a select");
-        };
+        let s = parsed_select(sql);
         let ctx = crate::clock::EvalCtx::test_default();
         match execute_aggregate(&s, &scope_of(t), rows, &ctx)? {
             QueryResult::Rows { rows, .. } => Ok(rows
@@ -1222,11 +1234,7 @@ mod tests {
     fn unknown_function_is_42883() {
         let t = table();
         // Not an aggregate query unless an aggregate is present, so pair with count(*).
-        let stmt = pgparser::parse("SELECT frobnicate(v), count(*) FROM t GROUP BY v")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT frobnicate(v), count(*) FROM t GROUP BY v");
         let err = execute_aggregate(
             &s,
             &scope_of(Some(&t)),
@@ -1241,11 +1249,7 @@ mod tests {
     fn sum_of_text_is_42883() {
         let mut t = table();
         t.columns[1].ty = ColumnType::Text;
-        let stmt = pgparser::parse("SELECT sum(v) FROM t")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT sum(v) FROM t");
         let err = execute_aggregate(
             &s,
             &scope_of(Some(&t)),
@@ -1259,11 +1263,7 @@ mod tests {
     #[test]
     fn nested_aggregate_is_42803() {
         let t = table();
-        let stmt = pgparser::parse("SELECT sum(count(v)) FROM t")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT sum(count(v)) FROM t");
         let err = execute_aggregate(
             &s,
             &scope_of(Some(&t)),
@@ -1299,11 +1299,7 @@ mod tests {
     fn aggregate_result_types_are_inferred_for_row_description() {
         let mut t = table();
         t.columns[1].ty = ColumnType::Text;
-        let stmt = pgparser::parse("SELECT count(*), sum(k), min(v), max(k) FROM t GROUP BY k")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT count(*), sum(k), min(v), max(k) FROM t GROUP BY k");
         let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&t))).expect("fields");
         // count -> int8, sum(int4) -> int8, min(text) -> text, max(int4) -> int4
@@ -1545,11 +1541,7 @@ mod tests {
     #[test]
     fn float8_result_types_for_row_description() {
         let t = float_table();
-        let stmt = pgparser::parse("SELECT avg(v), sum(v), min(v) FROM t")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT avg(v), sum(v), min(v) FROM t");
         let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&t))).expect("fields");
         assert_eq!(fields[0].type_oid, ColumnType::Float8.oid()); // avg(float8)
@@ -1557,11 +1549,7 @@ mod tests {
         assert_eq!(fields[2].type_oid, ColumnType::Float8.oid()); // min(float8)
         // SP32: avg(int) now types as numeric (1700) for RowDescription.
         let it = table();
-        let stmt = pgparser::parse("SELECT avg(v) FROM t")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT avg(v) FROM t");
         let (fields, _, _) =
             crate::exec::resolve_projection(&s.projection, &scope_of(Some(&it))).expect("fields");
         assert_eq!(fields[0].type_oid, ColumnType::Numeric(None).oid());
@@ -1595,11 +1583,7 @@ mod tests {
     fn avg_of_text_is_42883() {
         let mut t = table();
         t.columns[1].ty = ColumnType::Text;
-        let stmt = pgparser::parse("SELECT avg(v) FROM t")
-            .expect("parse")
-            .pop()
-            .expect("one");
-        let Statement::Select(s) = stmt else { panic!() };
+        let s = parsed_select("SELECT avg(v) FROM t");
         let err = execute_aggregate(
             &s,
             &scope_of(Some(&t)),
@@ -1613,10 +1597,7 @@ mod tests {
     #[test]
     fn is_aggregate_query_detection() {
         fn sel(sql: &str) -> SelectStmt {
-            match pgparser::parse(sql).expect("parse").pop().expect("one") {
-                Statement::Select(s) => s,
-                _ => panic!(),
-            }
+            parsed_select(sql)
         }
         assert!(is_aggregate_query(&sel("SELECT count(*) FROM t")));
         assert!(is_aggregate_query(&sel("SELECT k FROM t GROUP BY k")));
