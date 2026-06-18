@@ -145,6 +145,64 @@ async fn expression_subqueries_accept_values_and_setops() {
 }
 
 #[tokio::test]
+async fn derived_tables_accept_setops_and_tailed_values() {
+    let c = connect_new().await;
+
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT d.x FROM (VALUES (2), (3) UNION SELECT 1) AS d(x) ORDER BY d.x",
+        )
+        .await,
+        vec![
+            vec![Some("1".into())],
+            vec![Some("2".into())],
+            vec![Some("3".into())],
+        ]
+    );
+
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT v.x FROM (VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2) AS v(x) ORDER BY v.x",
+        )
+        .await,
+        vec![vec![Some("2".into())], vec![Some("3".into())]]
+    );
+}
+
+#[tokio::test]
+async fn derived_query_expr_describe_uses_alias_columns() {
+    let c = connect_new().await;
+
+    let stmt = c
+        .prepare(
+            "SELECT d.id, d.label \
+             FROM (VALUES (2, 'b') UNION SELECT 1, 'a') AS d(id, label) \
+             ORDER BY d.id",
+        )
+        .await
+        .expect("describe derived query expr");
+
+    let names: Vec<_> = stmt.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, vec!["id", "label"]);
+
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT d.id, d.label \
+             FROM (VALUES (2, 'b') UNION SELECT 1, 'a') AS d(id, label) \
+             ORDER BY d.id",
+        )
+        .await,
+        vec![
+            vec![Some("1".into()), Some("a".into())],
+            vec![Some("2".into()), Some("b".into())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn expression_subquery_error_surface_is_preserved() {
     let c = connect_new().await;
     assert_eq!(err_code(&c, "SELECT (VALUES (1), (2))").await, "21000");
