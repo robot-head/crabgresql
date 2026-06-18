@@ -154,6 +154,14 @@ fn describe_query_expr_inner(
             "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
         ));
     }
+    if allow_locking && q.locking.is_some()
+        && let Some(with) = &q.with
+    {
+        crate::cte::reject_recursive(with)?;
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE with CTEs is not supported".into(),
+        ));
+    }
     let query_ctes = crate::cte::describe_with_clause(catalog_kv, q.with.as_ref(), ctes)?;
     match &q.body {
         SetExpr::Query(QueryBody::Select(s)) => {

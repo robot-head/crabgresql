@@ -317,6 +317,10 @@ async fn describe_rejects_nested_locking_selects() {
         .expect("top-level locking describe");
 
     assert_eq!(
+        prepare_err_code(&c, "WITH c AS (SELECT 1 AS x) SELECT * FROM c FOR UPDATE").await,
+        "0A000"
+    );
+    assert_eq!(
         prepare_err_code(&c, "WITH c AS (SELECT x FROM t FOR UPDATE) SELECT * FROM c").await,
         "0A000"
     );
