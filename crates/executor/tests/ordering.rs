@@ -83,6 +83,13 @@ async fn plain_select_order_by_position_alias_and_source_fallback() {
         .expect("source order");
     let got: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
     assert_eq!(got, vec![2, 1, 3]);
+
+    let rows = client
+        .query("SELECT a AS x, a AS x FROM t ORDER BY x", &[])
+        .await
+        .expect("identical duplicate output labels");
+    let got: Vec<(i32, i32)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+    assert_eq!(got, vec![(1, 1), (2, 2), (3, 3)]);
 }
 
 #[tokio::test]
@@ -101,6 +108,13 @@ async fn distinct_and_aggregate_order_by_parity() {
         .query("SELECT DISTINCT a AS x FROM t ORDER BY x DESC", &[])
         .await
         .expect("distinct order");
+    let got: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(got, vec![3, 2, 1]);
+
+    let rows = client
+        .query("SELECT DISTINCT a FROM t ORDER BY t.a DESC", &[])
+        .await
+        .expect("distinct qualified output order");
     let got: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
     assert_eq!(got, vec![3, 2, 1]);
 
@@ -147,6 +161,10 @@ async fn order_by_pg_error_surface() {
             "SELECT a FROM t ORDER BY 999999999999999999999999999"
         )
         .await,
+        "42601"
+    );
+    assert_eq!(
+        err_code(&client, "SELECT a FROM t ORDER BY 2147483648").await,
         "42601"
     );
     assert_eq!(

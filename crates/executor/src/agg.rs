@@ -837,8 +837,13 @@ pub(crate) fn aggregate_rows(
     // Output columns: the expressions that produce each column via the shared
     // projection resolver (infer_type now understands aggregate result types).
     let (fields, out_exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
-    let order_keys =
-        crate::exec::resolve_select_order_keys(&s.order_by, &fields, &out_exprs, s.distinct)?;
+    let order_keys = crate::exec::resolve_select_order_keys(
+        &s.order_by,
+        scope,
+        &fields,
+        &out_exprs,
+        s.distinct,
+    )?;
 
     // GROUP BY expressions may not themselves be aggregates.
     for g in &s.group_by {
@@ -929,15 +934,9 @@ pub(crate) fn aggregate_rows(
         for order_key in &order_keys {
             sort_keys.push(match order_key {
                 crate::exec::SelectOrderKey::Output(i) => projected[*i].clone(),
-                crate::exec::SelectOrderKey::SourceExpr(expr) => eval_grouped(
-                    expr,
-                    scope,
-                    &s.group_by,
-                    key,
-                    &specs,
-                    &results,
-                    ctx,
-                )?,
+                crate::exec::SelectOrderKey::SourceExpr(expr) => {
+                    eval_grouped(expr, scope, &s.group_by, key, &specs, &results, ctx)?
+                }
             });
         }
         out.push((sort_keys, projected));
@@ -1463,6 +1462,16 @@ mod tests {
             )
             .expect("DISTINCT aggregate alias ORDER BY"),
             vec![vec![int(40)], vec![int(30)], vec![int(10)]]
+        );
+
+        assert_eq!(
+            agg(
+                "SELECT DISTINCT k FROM t GROUP BY k ORDER BY t.k DESC",
+                Some(&t),
+                rows.clone()
+            )
+            .expect("qualified DISTINCT aggregate output ORDER BY"),
+            vec![vec![int(3)], vec![int(2)], vec![int(1)]]
         );
 
         let err = agg(

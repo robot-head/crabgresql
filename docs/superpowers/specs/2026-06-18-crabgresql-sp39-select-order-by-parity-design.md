@@ -23,8 +23,9 @@ positions, `SELECT DISTINCT`, and aggregate/grouped queries.
   - `ORDER BY 1`, `ORDER BY 2 DESC`, etc. are 1-based output positions.
   - A bare unqualified name that matches an output alias/name orders by that output
     column.
-  - A bare unqualified name that matches more than one output column is ambiguous
-    (`42702`), matching PostgreSQL 18.
+  - A bare unqualified name that matches more than one non-equivalent output expression
+    is ambiguous (`42702`), matching PostgreSQL 18; duplicate labels over the same
+    expression are allowed.
   - A bare unqualified name that does not match an output column falls back to the
     existing source-scope expression path, preserving `SELECT a FROM t ORDER BY b`.
   - A non-bare expression, including `b + 0`, remains a source-scope expression; output
@@ -42,8 +43,8 @@ positions, `SELECT DISTINCT`, and aggregate/grouped queries.
   - `ORDER BY 0` / out-of-range position -> `42P10`.
   - Too-large integer constant in ordinal position -> `42601`
     ("non-integer constant in ORDER BY").
-  - Duplicate output label selected by bare name -> `42702`
-    (`ORDER BY "x" is ambiguous`).
+  - Duplicate output label selected by bare name over different expressions -> `42702`
+    (`ORDER BY "x" is ambiguous`); duplicate labels over the same expression are allowed.
 
 **Out:**
 - `VALUES`, CTEs, nested set operations in derived/subquery positions, window
@@ -91,8 +92,9 @@ enum SelectOrderKey {
 
 The resolver returns `Output(i)` for positional and output-name references, and
 `SourceExpr(expr)` for the preserved source-expression path. Duplicate output-name
-matches produce `ExecError::AmbiguousColumn` with the PostgreSQL-style
-`ORDER BY "name" is ambiguous` message. Out-of-range positions use the existing
+matches over different projected expressions produce `ExecError::AmbiguousOrderBy`
+with the PostgreSQL-style `ORDER BY "name" is ambiguous` message; duplicate labels
+over equivalent projected expressions pick that output. Out-of-range positions use the existing
 `ExecError::InvalidColumnReference`.
 
 This helper should live near the existing projection/order helpers in
@@ -122,8 +124,9 @@ For this path, every `ORDER BY` item must resolve to an output column. Positions
 output labels are allowed; source expressions are rejected with `42P10`.
 
 The existing `distinct_order_indices` should be replaced or widened so it understands
-positions and aliases, and so it emits `42P10` rather than the current `0A000`
-unsupported error.
+positions, aliases, and equivalent projected expressions such as a qualified `t.a`
+matching output `a`; it emits `42P10` rather than the current `0A000` unsupported
+error for source-only expressions.
 
 ### Aggregate/grouped queries
 
@@ -145,9 +148,9 @@ Add only the error surface needed to match PostgreSQL:
   non-output ordering, both `42P10`.
 - Add a narrow `ExecError::Syntax(String)` -> `42601` for the PostgreSQL
   "non-integer constant in ORDER BY" overflow case.
-- Add `ExecError::AmbiguousOrderBy(String)` -> `42702` so duplicate output-label
-  references render as `ORDER BY "x" is ambiguous` rather than the generic source-column
-  ambiguity message.
+- Add `ExecError::AmbiguousOrderBy(String)` -> `42702` so non-equivalent duplicate
+  output-label references render as `ORDER BY "x" is ambiguous` rather than the
+  generic source-column ambiguity message.
 
 Do not remap ordinary source expression failures: undefined columns remain `42703`,
 ambiguous source columns remain `42702`, and missing qualified FROM entries remain
@@ -168,11 +171,11 @@ PostgreSQL conformance oracle.
   - alias / output-name ordering;
   - output alias beats source column for a bare name;
   - qualified source expression and expression source fallback still work;
-  - duplicate output aliases -> `42702`;
+  - non-equivalent duplicate output aliases -> `42702`, equivalent duplicates allowed;
   - bad positions -> `42P10`;
   - integer overflow -> `42601`;
-  - `SELECT DISTINCT` accepts output positions/aliases and rejects source-only keys
-    with `42P10`.
+  - `SELECT DISTINCT` accepts output positions/aliases/equivalent expressions and
+    rejects source-only keys with `42P10`.
 - **`executor::agg` unit tests**:
   - grouped projection alias (`SELECT k AS g ... GROUP BY k ORDER BY g`);
   - aggregate alias (`count(*) AS c ORDER BY c DESC`);
