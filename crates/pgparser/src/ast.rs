@@ -16,9 +16,7 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
-    Select(SelectStmt),
-    /// SP39: a standalone VALUES query expression with result-level ORDER BY/LIMIT/OFFSET.
-    Values(ValuesQuery),
+    Query(QueryExpr),
     Begin {
         isolation: Option<IsolationLevel>,
     },
@@ -47,10 +45,6 @@ pub enum Statement {
     Reset {
         name: String,
     },
-    /// SP38: a set-operation query — `<select> UNION|INTERSECT|EXCEPT [ALL] <select> …`
-    /// with a result-level ORDER BY / LIMIT / OFFSET. A plain single SELECT stays
-    /// `Statement::Select`; only a query containing a set-op keyword lands here.
-    SetOperation(SetQuery),
 }
 
 /// SP37: the right-hand side of a `SET` (or the value form of `SET TIME ZONE`).
@@ -102,14 +96,16 @@ pub struct SelectStmt {
     pub locking: Option<RowLockStrength>,
 }
 
-/// SP39: a complete standalone VALUES query. Set-operation queries still use
-/// `SetQuery`; this variant is only for a lone VALUES statement.
+/// A complete row-producing SQL query expression. The body may be a lone SELECT,
+/// a lone VALUES list, or a set-operation tree. The tail applies to the complete
+/// query expression.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ValuesQuery {
-    pub body: ValuesStmt,
+pub struct QueryExpr {
+    pub body: SetExpr,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub locking: Option<RowLockStrength>,
 }
 
 /// SP39: a VALUES row constructor list. Every row is non-empty; cross-row arity
@@ -124,17 +120,6 @@ pub struct ValuesStmt {
 pub enum QueryBody {
     Select(Box<SelectStmt>),
     Values(ValuesStmt),
-}
-
-/// SP38: a complete set-operation query expression. `body` is the operator tree
-/// (leaves are query bodies); `order_by` / `limit` / `offset` apply to the COMBINED
-/// result (PostgreSQL allows them only at the top of the query, or inside parens).
-#[derive(Debug, Clone, PartialEq)]
-pub struct SetQuery {
-    pub body: SetExpr,
-    pub order_by: Vec<OrderItem>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
 }
 
 /// SP38: a node in the set-operation tree. A `Query` leaf is one query block; a
@@ -181,7 +166,7 @@ pub enum TableExpr {
         alias: Option<String>,
     },
     Derived {
-        subquery: QueryBody,
+        subquery: QueryExpr,
         alias: String, // PG requires a derived table to be aliased
         columns: Option<Vec<String>>,
     },
@@ -289,14 +274,14 @@ pub enum Expr {
     },
     /// SP34: a scalar subquery `(SELECT …)` — one row, one column, usable as an
     /// expression. Resolved (uncorrelated) to `Const` by the executor pre-pass.
-    ScalarSubquery(Box<SelectStmt>),
+    ScalarSubquery(Box<QueryExpr>),
     /// SP34: `EXISTS (SELECT …)` — true iff the subquery returns ≥1 row. `NOT
     /// EXISTS` is the prefix `NOT` wrapping this.
-    Exists(Box<SelectStmt>),
+    Exists(Box<QueryExpr>),
     /// SP34: `expr [NOT] IN (SELECT …)` — subquery membership (single-column subquery).
     InSubquery {
         expr: Box<Expr>,
-        subquery: Box<SelectStmt>,
+        subquery: Box<QueryExpr>,
         negated: bool,
     },
     /// SP34: `expr op ANY|SOME|ALL (SELECT …)`. `all` is the `ALL` form; `ANY`/`SOME`
@@ -305,7 +290,7 @@ pub enum Expr {
         expr: Box<Expr>,
         op: BinaryOp,
         all: bool,
-        subquery: Box<SelectStmt>,
+        subquery: Box<QueryExpr>,
     },
     /// SP34: an executor-produced literal — a resolved subquery folded to a value
     /// carrying its static type. The parser NEVER emits this; `ty` matters because a
