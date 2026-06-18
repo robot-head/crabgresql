@@ -1297,11 +1297,11 @@ impl Parser {
     /// query. A lone Select (no set-op) collapses back to `Statement::Select` so the
     /// single-SELECT shape — including FOR UPDATE — is byte-for-byte unchanged.
     fn query_stmt(&mut self) -> Result<crate::ast::Statement, ParseError> {
-        use crate::ast::{SetExpr, SetQuery, Statement};
+        use crate::ast::{QueryBody, SetExpr, SetQuery, Statement};
         let body = self.set_expr(0)?;
         let (order_by, limit, offset) = self.parse_set_tail()?;
         match body {
-            SetExpr::Select(mut s) => {
+            SetExpr::Query(QueryBody::Select(mut s)) => {
                 s.order_by = order_by;
                 s.limit = limit;
                 s.offset = offset;
@@ -1373,7 +1373,7 @@ impl Parser {
     /// parenthesized single SELECT that keeps its own ORDER BY / LIMIT), or a bare
     /// SELECT branch (`select_core`, no tail — the query owns the tail).
     fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::SetExpr;
+        use crate::ast::{QueryBody, SetExpr};
         if *self.peek() == Token::LParen {
             self.bump(); // (
             let inner = self.set_expr(0)?;
@@ -1381,7 +1381,9 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Ok(inner)
         } else {
-            Ok(SetExpr::Select(Box::new(self.select_core()?)))
+            Ok(SetExpr::Query(QueryBody::Select(Box::new(
+                self.select_core()?,
+            ))))
         }
     }
 
@@ -1391,7 +1393,7 @@ impl Parser {
         &mut self,
         inner: crate::ast::SetExpr,
     ) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::SetExpr;
+        use crate::ast::{QueryBody, SetExpr};
         let has_tail = matches!(
             self.peek(),
             Token::Keyword(Keyword::Order)
@@ -1402,12 +1404,12 @@ impl Parser {
             return Ok(inner);
         }
         match inner {
-            SetExpr::Select(mut s) => {
+            SetExpr::Query(QueryBody::Select(mut s)) => {
                 let (order_by, limit, offset) = self.parse_set_tail()?;
                 s.order_by = order_by;
                 s.limit = limit;
                 s.offset = offset;
-                Ok(SetExpr::Select(s))
+                Ok(SetExpr::Query(QueryBody::Select(s)))
             }
             _ => Err(ParseError::new(
                 "ORDER BY/LIMIT on a parenthesized set-operation subtree is not supported",
@@ -1515,12 +1517,17 @@ impl Parser {
         if *self.peek() == Token::LParen {
             self.bump();
             if *self.peek() == Token::Keyword(Keyword::Select) {
+                use crate::ast::QueryBody;
                 let subquery = Box::new(self.select_inner()?);
                 self.expect(&Token::RParen)?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
                     ParseError::new("subquery in FROM must have an alias", self.peek_pos())
                 })?;
-                return Ok(TableExpr::Derived { subquery, alias });
+                return Ok(TableExpr::Derived {
+                    subquery: QueryBody::Select(subquery),
+                    alias,
+                    columns: None,
+                });
             }
             let inner = self.join_tree()?;
             self.expect(&Token::RParen)?;
@@ -3138,7 +3145,7 @@ mod tests {
 
     #[test]
     fn parenthesized_branch_keeps_its_own_order_limit() {
-        use crate::ast::{SetExpr, Statement};
+        use crate::ast::{QueryBody, SetExpr, Statement};
         let s = crate::parse("(SELECT 1 ORDER BY 1 LIMIT 1) UNION SELECT 2").expect("parse");
         let Statement::SetOperation(q) = &s[0] else {
             panic!("expected set op")
@@ -3146,7 +3153,7 @@ mod tests {
         let SetExpr::SetOp { left, .. } = &q.body else {
             panic!("expected top SetOp")
         };
-        let SetExpr::Select(b) = &**left else {
+        let SetExpr::Query(QueryBody::Select(b)) = &**left else {
             panic!("left branch is a SELECT leaf")
         };
         assert_eq!(b.limit, Some(1));
