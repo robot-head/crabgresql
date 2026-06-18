@@ -836,7 +836,9 @@ pub(crate) fn aggregate_rows(
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     // Output columns: the expressions that produce each column via the shared
     // projection resolver (infer_type now understands aggregate result types).
-    let (_fields, out_exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
+    let (fields, out_exprs, _tys) = crate::exec::resolve_projection(&s.projection, scope)?;
+    let order_keys =
+        crate::exec::resolve_select_order_keys(&s.order_by, &fields, &out_exprs, s.distinct)?;
 
     // GROUP BY expressions may not themselves be aggregates.
     for g in &s.group_by {
@@ -850,10 +852,14 @@ pub(crate) fn aggregate_rows(
     // Collect (deduped) the aggregates to compute, then validate every output /
     // HAVING / ORDER BY expression is grouped-valid (data-independent).
     let mut specs: Vec<AggSpec> = Vec::new();
+    let source_order_exprs = order_keys.iter().filter_map(|key| match key {
+        crate::exec::SelectOrderKey::Output(_) => None,
+        crate::exec::SelectOrderKey::SourceExpr(expr) => Some(expr),
+    });
     for e in out_exprs
         .iter()
         .chain(s.having.iter())
-        .chain(s.order_by.iter().map(|o| &o.expr))
+        .chain(source_order_exprs)
     {
         collect_specs(e, scope, &mut specs)?;
         validate_grouped(e, &s.group_by)?;
@@ -907,18 +913,6 @@ pub(crate) fn aggregate_rows(
                 }
             }
         }
-        let mut order_keys = Vec::with_capacity(s.order_by.len());
-        for o in &s.order_by {
-            order_keys.push(eval_grouped(
-                &o.expr,
-                scope,
-                &s.group_by,
-                key,
-                &specs,
-                &results,
-                ctx,
-            )?);
-        }
         let mut projected = Vec::with_capacity(out_exprs.len());
         for e in &out_exprs {
             projected.push(eval_grouped(
@@ -931,7 +925,22 @@ pub(crate) fn aggregate_rows(
                 ctx,
             )?);
         }
-        out.push((order_keys, projected));
+        let mut sort_keys = Vec::with_capacity(order_keys.len());
+        for order_key in &order_keys {
+            sort_keys.push(match order_key {
+                crate::exec::SelectOrderKey::Output(i) => projected[*i].clone(),
+                crate::exec::SelectOrderKey::SourceExpr(expr) => eval_grouped(
+                    expr,
+                    scope,
+                    &s.group_by,
+                    key,
+                    &specs,
+                    &results,
+                    ctx,
+                )?,
+            });
+        }
+        out.push((sort_keys, projected));
     }
 
     // SP28: SELECT DISTINCT dedups identical projected rows (first appearance).
@@ -1383,6 +1392,90 @@ mod tests {
             )
             .expect("agg"),
             vec![vec![int(10)], vec![int(20)]]
+        );
+    }
+
+    #[test]
+    fn aggregate_order_by_position_and_alias_use_projected_output() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(40)]),
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(3), Datum::Int4(30)]),
+        ];
+
+        assert_eq!(
+            agg(
+                "SELECT k, sum(v) AS total FROM t GROUP BY k ORDER BY 2 DESC",
+                Some(&t),
+                rows.clone()
+            )
+            .expect("ordinal ORDER BY"),
+            vec![
+                vec![int(2), int(40)],
+                vec![int(3), int(30)],
+                vec![int(1), int(20)],
+            ]
+        );
+        assert_eq!(
+            agg(
+                "SELECT k, sum(v) AS total FROM t GROUP BY k ORDER BY total DESC",
+                Some(&t),
+                rows.clone()
+            )
+            .expect("aggregate alias ORDER BY"),
+            vec![
+                vec![int(2), int(40)],
+                vec![int(3), int(30)],
+                vec![int(1), int(20)],
+            ]
+        );
+        assert_eq!(
+            agg(
+                "SELECT k AS g, sum(v) FROM t GROUP BY k ORDER BY g DESC",
+                Some(&t),
+                rows
+            )
+            .expect("group alias ORDER BY"),
+            vec![
+                vec![int(3), int(30)],
+                vec![int(2), int(40)],
+                vec![int(1), int(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_distinct_order_by_requires_output() {
+        let t = table();
+        let rows = vec![
+            r(&[Datum::Int4(1), Datum::Int4(10)]),
+            r(&[Datum::Int4(2), Datum::Int4(40)]),
+            r(&[Datum::Int4(3), Datum::Int4(30)]),
+        ];
+
+        assert_eq!(
+            agg(
+                "SELECT DISTINCT sum(v) AS total FROM t GROUP BY k ORDER BY total DESC",
+                Some(&t),
+                rows.clone()
+            )
+            .expect("DISTINCT aggregate alias ORDER BY"),
+            vec![vec![int(40)], vec![int(30)], vec![int(10)]]
+        );
+
+        let err = agg(
+            "SELECT DISTINCT sum(v) FROM t GROUP BY k ORDER BY k",
+            Some(&t),
+            rows,
+        )
+        .expect_err("DISTINCT ORDER BY source column");
+        let pg = err.into_pg();
+        assert_eq!(pg.code, "42P10");
+        assert_eq!(
+            pg.message,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
         );
     }
 
