@@ -120,6 +120,7 @@ pub struct ValuesStmt {
 pub enum QueryBody {
     Select(Box<SelectStmt>),
     Values(ValuesStmt),
+    Nested(Box<QueryExpr>),
 }
 
 /// SP38: a node in the set-operation tree. A `Query` leaf is one query block; a

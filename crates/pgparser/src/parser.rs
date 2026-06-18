@@ -1321,7 +1321,7 @@ impl Parser {
             if !self.query_tail_or_locking_starts() {
                 return Ok(q);
             }
-            let body = self.query_expr_as_set_branch(q)?;
+            let body = self.query_expr_as_outer_primary(q);
             let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
             return self.finish_query_expr(body, order_by, limit, offset, locking);
         }
@@ -1372,6 +1372,19 @@ impl Parser {
         }
     }
 
+    fn query_expr_as_outer_primary(&self, q: crate::ast::QueryExpr) -> crate::ast::SetExpr {
+        use crate::ast::{QueryBody, SetExpr};
+        let has_tail = !q.order_by.is_empty()
+            || q.limit.is_some()
+            || q.offset.is_some()
+            || q.locking.is_some();
+        if has_tail {
+            SetExpr::Query(QueryBody::Nested(Box::new(q)))
+        } else {
+            q.body
+        }
+    }
+
     fn finish_query_expr(
         &mut self,
         body: crate::ast::SetExpr,
@@ -1387,6 +1400,12 @@ impl Parser {
                 SetExpr::Query(QueryBody::Values(_)) => {
                     return Err(ParseError::new(
                         "FOR UPDATE/SHARE is not allowed with VALUES",
+                        self.peek_pos(),
+                    ));
+                }
+                SetExpr::Query(QueryBody::Nested(_)) => {
+                    return Err(ParseError::new(
+                        "FOR UPDATE/SHARE is not allowed with a nested query expression",
                         self.peek_pos(),
                     ));
                 }
@@ -1913,6 +1932,31 @@ mod tests {
         assert!(matches!(q.body, SetExpr::SetOp { .. }));
         assert_eq!(q.order_by.len(), 1);
         assert_eq!(q.limit, Some(1));
+    }
+
+    #[test]
+    fn parenthesized_query_expr_outer_tail_preserves_inner_values_and_setop_tails() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1) LIMIT 1");
+        assert_eq!(q.limit, Some(1));
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested VALUES query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
+
+        let q = only_query("(SELECT 2 UNION SELECT 1 ORDER BY 1) LIMIT 1");
+        assert_eq!(q.limit, Some(1));
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Nested(inner)) = q.body else {
+            panic!("expected nested set-op query body");
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, None);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
     }
 
     #[test]
