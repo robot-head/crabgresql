@@ -114,24 +114,23 @@ async fn cte_column_aliases_and_recursive_error() {
 }
 
 #[tokio::test]
-async fn values_cte_body_can_be_materialized() {
-    let c = connect_new().await;
-    assert_eq!(
-        rows(&c, "WITH c AS (VALUES (2), (1)) SELECT * FROM c ORDER BY 1").await,
-        vec![vec![Some("1".into())], vec![Some("2".into())]]
-    );
-}
-
-#[tokio::test]
-async fn set_operation_cte_body_can_be_materialized() {
+async fn values_and_set_operation_ctes_work() {
     let c = connect_new().await;
     assert_eq!(
         rows(
             &c,
-            "WITH u AS (SELECT 1 UNION SELECT 2) SELECT * FROM u ORDER BY 1"
+            "WITH v(x) AS (VALUES (2), (1)) SELECT x FROM v ORDER BY x"
         )
         .await,
         vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "WITH u(x) AS (SELECT 1 UNION SELECT 2) SELECT x FROM u ORDER BY x DESC"
+        )
+        .await,
+        vec![vec![Some("2".into())], vec![Some("1".into())]]
     );
 }
 
