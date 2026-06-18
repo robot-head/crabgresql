@@ -3154,7 +3154,8 @@ mod tests {
     #[test]
     fn parses_standalone_values_query() {
         use crate::ast::{Expr, Statement};
-        let s = crate::parse("VALUES (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 1 OFFSET 1").unwrap();
+        let s = crate::parse("VALUES (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 1 OFFSET 1")
+            .expect("parse standalone VALUES");
         let Statement::Values(q) = &s[0] else {
             panic!("expected VALUES, got {:?}", s[0])
         };
@@ -3169,7 +3170,7 @@ mod tests {
     #[test]
     fn parses_values_as_set_operation_branch() {
         use crate::ast::{QueryBody, SetExpr, SetOp, Statement};
-        let s = crate::parse("VALUES (1) UNION ALL SELECT 2").unwrap();
+        let s = crate::parse("VALUES (1) UNION ALL SELECT 2").expect("parse values set op");
         let Statement::SetOperation(q) = &s[0] else {
             panic!("expected set op")
         };
@@ -3191,7 +3192,8 @@ mod tests {
     #[test]
     fn parses_values_derived_table_with_column_aliases() {
         use crate::ast::{QueryBody, Statement, TableExpr};
-        let s = crate::parse("SELECT id, name FROM (VALUES (1, 'a')) AS v(id, name)").unwrap();
+        let s = crate::parse("SELECT id, name FROM (VALUES (1, 'a')) AS v(id, name)")
+            .expect("parse values derived table");
         let Statement::Select(sel) = &s[0] else {
             panic!("expected select")
         };
@@ -3206,7 +3208,7 @@ mod tests {
         assert!(matches!(subquery, QueryBody::Values(_)));
         assert_eq!(alias, "v");
         assert_eq!(
-            columns.as_ref().unwrap(),
+            columns.as_ref().expect("column aliases"),
             &vec!["id".to_string(), "name".to_string()]
         );
     }
@@ -3214,7 +3216,8 @@ mod tests {
     #[test]
     fn parses_select_derived_table_with_column_aliases() {
         use crate::ast::{QueryBody, Statement, TableExpr};
-        let s = crate::parse("SELECT n FROM (SELECT a FROM t) AS d(n)").unwrap();
+        let s = crate::parse("SELECT n FROM (SELECT a FROM t) AS d(n)")
+            .expect("parse derived SELECT column aliases");
         let Statement::Select(sel) = &s[0] else {
             panic!("expected select")
         };
@@ -3228,7 +3231,10 @@ mod tests {
         };
         assert!(matches!(subquery, QueryBody::Select(_)));
         assert_eq!(alias, "d");
-        assert_eq!(columns.as_ref().unwrap(), &vec!["n".to_string()]);
+        assert_eq!(
+            columns.as_ref().expect("column aliases"),
+            &vec!["n".to_string()]
+        );
     }
 
     #[test]
