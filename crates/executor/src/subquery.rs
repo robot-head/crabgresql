@@ -10,12 +10,10 @@
 //! to an outer column) is out of scope: a subquery's scope is built solely from its
 //! own FROM, so an outer-column reference fails name resolution (42703).
 
-use pgparser::ast::{BinaryOp, Expr, FuncArgs, FuncCall, SelectItem, SelectStmt};
+use pgparser::ast::{BinaryOp, Expr, FuncArgs, FuncCall, QueryExpr, SelectItem, SelectStmt};
 use pgtypes::{ColumnType, Datum};
 
 use crate::error::ExecError;
-use crate::exec::{build_from_schema, resolve_projection, select_to_relation};
-use crate::scope::Scope;
 
 /// The read-side handles a subquery needs to execute (mirrors `execute_read`'s
 /// parameters). Threaded through the resolution recursion so each nested subquery
@@ -190,8 +188,8 @@ fn resolve_expr(ctx: &SubCtx, e: &Expr) -> Result<Expr, ExecError> {
 }
 
 /// Reject a `FOR UPDATE/SHARE` inside a subquery (meaningless for a folded read).
-fn no_locking(s: &SelectStmt) -> Result<(), ExecError> {
-    if s.locking.is_some() {
+fn no_locking(q: &QueryExpr) -> Result<(), ExecError> {
+    if q.locking.is_some() {
         return Err(ExecError::Unsupported(
             "FOR UPDATE/SHARE is not allowed inside a subquery".into(),
         ));
@@ -200,28 +198,28 @@ fn no_locking(s: &SelectStmt) -> Result<(), ExecError> {
 }
 
 /// Run a subquery through the join read path to its materialized rows.
-fn run_relation(ctx: &SubCtx, s: &SelectStmt) -> Result<crate::join::Relation, ExecError> {
-    no_locking(s)?;
-    select_to_relation(
+fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, ExecError> {
+    no_locking(q)?;
+    crate::query::query_to_relation(
         ctx.catalog_kv,
         ctx.kv,
         ctx.global,
         ctx.gsnap,
         ctx.snapshot,
         ctx.own,
-        s,
+        q,
         ctx.eval_ctx,
     )
 }
 
 /// Run a subquery to its raw rows (any shape) — used by `EXISTS`.
-fn run_rows(ctx: &SubCtx, s: &SelectStmt) -> Result<Vec<Vec<Datum>>, ExecError> {
-    Ok(run_relation(ctx, s)?.rows)
+fn run_rows(ctx: &SubCtx, q: &QueryExpr) -> Result<Vec<Vec<Datum>>, ExecError> {
+    Ok(run_relation(ctx, q)?.rows)
 }
 
 /// Run a scalar subquery: exactly one column, at most one row → `(value, type)`.
-fn run_scalar(ctx: &SubCtx, s: &SelectStmt) -> Result<(Datum, ColumnType), ExecError> {
-    let rel = run_relation(ctx, s)?;
+fn run_scalar(ctx: &SubCtx, q: &QueryExpr) -> Result<(Datum, ColumnType), ExecError> {
+    let rel = run_relation(ctx, q)?;
     if rel.scope.width() != 1 {
         return Err(ExecError::SubqueryColumns);
     }
@@ -239,8 +237,8 @@ fn run_scalar(ctx: &SubCtx, s: &SelectStmt) -> Result<(Datum, ColumnType), ExecE
 }
 
 /// Run a single-column subquery → its column type + every value (in row order).
-fn run_single_column(ctx: &SubCtx, s: &SelectStmt) -> Result<(ColumnType, Vec<Datum>), ExecError> {
-    let rel = run_relation(ctx, s)?;
+fn run_single_column(ctx: &SubCtx, q: &QueryExpr) -> Result<(ColumnType, Vec<Datum>), ExecError> {
+    let rel = run_relation(ctx, q)?;
     if rel.scope.width() != 1 {
         return Err(ExecError::SubqueryColumns);
     }
@@ -333,19 +331,12 @@ fn resolve_types_in_expr(catalog_kv: &dyn kv::Kv, e: &Expr) -> Result<Expr, Exec
 }
 
 /// The static type of a scalar subquery's single projection column (catalog only).
-fn scalar_subquery_type(catalog_kv: &dyn kv::Kv, s: &SelectStmt) -> Result<ColumnType, ExecError> {
-    let scope = if s.from.is_empty() {
-        Scope::empty()
-    } else {
-        build_from_schema(catalog_kv, &s.from)?.scope
-    };
-    // Type-resolve nested scalar subqueries inside this subquery's projection first.
-    let projection = resolve_types_in_projection(catalog_kv, &s.projection)?;
-    let (fields, _exprs, tys) = resolve_projection(&projection, &scope)?;
+fn scalar_subquery_type(catalog_kv: &dyn kv::Kv, q: &QueryExpr) -> Result<ColumnType, ExecError> {
+    let fields = crate::query::describe_query_expr(catalog_kv, q)?;
     if fields.len() != 1 {
         return Err(ExecError::SubqueryColumns);
     }
-    Ok(tys[0])
+    crate::exec::column_type_from_oid(fields[0].type_oid)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use kv::Kv;
 use mvcc::visibility::Snapshot;
-use pgparser::ast::{Expr, QueryBody, SetExpr, SetOp, SetQuery};
+use pgparser::ast::{Expr, QueryBody, SetExpr, SetOp};
 use pgtypes::{ColumnType, Datum};
 
 use crate::clock::EvalCtx;
@@ -69,8 +69,8 @@ fn unify_col(
 /// Resolve a set-op subtree's output columns (name + type + unknown-ness),
 /// schema-only (no rows). Names come from the LEFT branch; types are the
 /// unknown-aware unification across branches; a column-count mismatch raises 42601
-/// with the offending operator. Shared by `describe_set_query` (extended-protocol
-/// Describe) and `execute_set_operation` (to precompute the coercion target types).
+/// with the offending operator. Shared by `describe_set_expr` and
+/// `set_expr_to_relation`.
 fn resolve_set_columns(
     catalog_kv: &dyn Kv,
     e: &SetExpr,
@@ -118,6 +118,18 @@ fn resolve_set_columns(
                 })
                 .collect())
         }
+        SetExpr::Query(QueryBody::Nested(nested)) => {
+            crate::query::describe_query_expr(catalog_kv, nested)?
+                .into_iter()
+                .map(|f| {
+                    Ok(ResolvedCol {
+                        name: f.name,
+                        ty: crate::exec::column_type_from_oid(f.type_oid)?,
+                        unknown: false,
+                    })
+                })
+                .collect()
+        }
         SetExpr::SetOp {
             op, left, right, ..
         } => {
@@ -151,78 +163,63 @@ fn output_type(c: &ResolvedCol) -> ColumnType {
     if c.unknown { ColumnType::Text } else { c.ty }
 }
 
-/// Schema-only RowDescription for a set-op query (extended-protocol Describe, no
-/// execution): field NAMES from the first leaf, TYPES unified across all leaves.
-pub(crate) fn describe_set_query(
+pub(crate) fn describe_set_expr(
     catalog_kv: &dyn Kv,
-    q: &SetQuery,
+    body: &SetExpr,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, &q.body, 0)?;
+    let cols = resolve_set_columns(catalog_kv, body, 0)?;
     Ok(cols
         .iter()
         .map(|c| crate::exec::field(&c.name, output_type(c)))
         .collect())
 }
 
-/// Evaluate a complete set-operation query to a wire result. The output columns are
-/// resolved once (names + the common coercion type per column, unknown-aware); each
-/// leaf runs through the existing single-SELECT read path (`exec::select_to_relation`)
-/// under the statement's snapshot handles and has its rows coerced to those common
-/// types; the tree folds via the per-operator multiset combine; the query-level
-/// ORDER BY / OFFSET / LIMIT then apply to the combined output.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_set_operation(
+pub(crate) fn set_expr_to_relation(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     global: &dyn Kv,
     gsnap: &Snapshot,
     snapshot: &Snapshot,
     own: Option<u64>,
-    q: &SetQuery,
+    body: &SetExpr,
+    order_by: &[pgparser::ast::OrderItem],
+    offset: Option<i64>,
+    limit: Option<i64>,
     ctx: &EvalCtx,
-) -> Result<pgwire::engine::QueryResult, ExecError> {
-    // Resolve the output columns once: names + the common type per column. Coercing
-    // every branch to ONE common type per column is exactly PG's model
-    // (`select_common_type` over the whole set-op tree), so the leaves coerce to
-    // these types regardless of where they sit in the tree.
-    let cols = resolve_set_columns(catalog_kv, &q.body, 0)?;
+) -> Result<crate::join::Relation, ExecError> {
+    let cols = resolve_set_columns(catalog_kv, body, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
-
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &out_tys, ctx, 0,
+        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctx, 0,
     )?;
 
-    // Query-level ORDER BY over the OUTPUT columns: a bare integer is a 1-based
-    // position; anything else is evaluated against the output scope.
-    if !q.order_by.is_empty() {
-        let out_scope = Scope {
-            columns: cols
-                .iter()
-                .map(|c| ColumnBinding {
-                    qualifier: None,
-                    name: c.name.clone(),
-                    ty: output_type(c),
-                })
-                .collect(),
-        };
+    let scope = Scope {
+        columns: cols
+            .iter()
+            .map(|c| ColumnBinding {
+                qualifier: None,
+                name: c.name.clone(),
+                ty: output_type(c),
+            })
+            .collect(),
+    };
+
+    if !order_by.is_empty() {
         let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut keys = Vec::with_capacity(q.order_by.len());
-            for item in &q.order_by {
-                keys.push(order_key(&item.expr, &out_scope, &row, ctx)?);
+            let mut keys = Vec::with_capacity(order_by.len());
+            for item in order_by {
+                keys.push(order_key(&item.expr, &scope, &row, ctx)?);
             }
             keyed.push((keys, row));
         }
-        keyed.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, &q.order_by));
+        keyed.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, order_by));
         rows = keyed.into_iter().map(|(_, r)| r).collect();
     }
-    crate::exec::apply_offset_limit(&mut rows, q.offset, q.limit);
+    crate::exec::apply_offset_limit(&mut rows, offset, limit);
 
-    let fields = cols
-        .iter()
-        .map(|c| crate::exec::field(&c.name, output_type(c)))
-        .collect();
-    Ok(crate::exec::rows_result(fields, &rows, &ctx.time_zone))
+    Ok(crate::join::Relation { scope, rows })
 }
 
 /// One ORDER BY key for the set-op output: integer literal → 1-based position;
@@ -276,6 +273,12 @@ fn fold(
         }
         SetExpr::Query(QueryBody::Values(v)) => {
             let rel = crate::values::values_to_relation(v, ctx)?;
+            coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
+        }
+        SetExpr::Query(QueryBody::Nested(nested)) => {
+            let rel = crate::query::query_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx,
+            )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::SetOp {
@@ -535,7 +538,7 @@ mod tests {
     }
 
     /// End-to-end: UNION deduplicates across two tables and ORDER BY positions
-    /// the combined output — exercises `execute_set_operation` + session dispatch.
+    /// the combined output — exercises the query relation pipeline plus session dispatch.
     #[tokio::test]
     async fn union_runs_end_to_end() {
         use pgwire::engine::{Engine, QueryResult, Session};

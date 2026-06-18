@@ -18,6 +18,7 @@ mod gtm;
 mod join;
 mod lockmgr;
 mod procarray;
+mod query;
 mod read_gate;
 mod scope;
 mod seq;

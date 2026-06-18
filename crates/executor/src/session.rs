@@ -11,7 +11,7 @@ use std::sync::Arc;
 use kv::Kv;
 use mvcc::clog::XidStatus;
 use mvcc::visibility::Snapshot;
-use pgparser::ast::{IsolationLevel, RowLockStrength, Statement};
+use pgparser::ast::{IsolationLevel, QueryBody, QueryExpr, RowLockStrength, SetExpr, Statement};
 use pgwire::engine::{FieldDescription, QueryResult, Session, TxStatus};
 use pgwire::error::PgError;
 
@@ -397,10 +397,8 @@ impl SqlSession {
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
-            Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
-            Statement::Select(_) => self.run_select(stmt).await,
-            Statement::Values(_) => self.run_values(stmt).await,
-            Statement::SetOperation(_) => self.run_set_operation(stmt).await,
+            Statement::Query(q) if q.locking.is_some() => self.run_query_locking(q).await,
+            Statement::Query(_) => self.run_select(stmt).await,
             // SP37: GUC control. These are NOT exempt from the failed-txn guard
             // above (only COMMIT/ROLLBACK are), so a SET in an aborted block is
             // rejected — matching PostgreSQL.
@@ -575,31 +573,18 @@ impl SqlSession {
         )
     }
 
-    async fn run_values(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        let Statement::Values(q) = stmt else {
-            unreachable!("run_one only routes a Values here");
+    async fn run_query_locking(&mut self, q: &QueryExpr) -> Result<QueryResult, ExecError> {
+        let SetExpr::Query(QueryBody::Select(s)) = &q.body else {
+            return Err(ExecError::Unsupported(
+                "locking is only supported on SELECT".into(),
+            ));
         };
-        let (_snapshot, _own, _gsnap) = self.read_context().await?;
-        let ctx = self.eval_ctx();
-        crate::values::execute_values_query(q, &ctx)
-    }
-
-    async fn run_set_operation(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
-        let Statement::SetOperation(q) = stmt else {
-            unreachable!("run_one only routes a SetOperation here");
-        };
-        let (snapshot, own, gsnap) = self.read_context().await?;
-        let ctx = self.eval_ctx();
-        crate::setops::execute_set_operation(
-            &*self.catalog_kv,
-            &*self.kv,
-            &*self.catalog_kv,
-            &gsnap,
-            &snapshot,
-            own,
-            q,
-            &ctx,
-        )
+        let mut s = (**s).clone();
+        s.order_by = q.order_by.clone();
+        s.limit = q.limit;
+        s.offset = q.offset;
+        s.locking = q.locking;
+        self.run_select_locking(&s).await
     }
 
     /// Locking SELECT (FOR UPDATE / FOR SHARE). Allocates an xid if none is
