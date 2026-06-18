@@ -132,7 +132,7 @@ pub(crate) fn describe_query_expr(
     q: &QueryExpr,
 ) -> Result<Vec<FieldDescription>, ExecError> {
     let ctes = crate::cte::CteContext::empty();
-    describe_query_expr_with_ctes(catalog_kv, q, &ctes)
+    describe_query_expr_inner(catalog_kv, q, &ctes, true)
 }
 
 pub(crate) fn describe_query_expr_with_ctes(
@@ -140,9 +140,26 @@ pub(crate) fn describe_query_expr_with_ctes(
     q: &QueryExpr,
     ctes: &crate::cte::CteContext,
 ) -> Result<Vec<FieldDescription>, ExecError> {
+    describe_query_expr_inner(catalog_kv, q, ctes, false)
+}
+
+fn describe_query_expr_inner(
+    catalog_kv: &dyn Kv,
+    q: &QueryExpr,
+    ctes: &crate::cte::CteContext,
+    allow_locking: bool,
+) -> Result<Vec<FieldDescription>, ExecError> {
+    if !allow_locking && q.locking.is_some() {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
+        ));
+    }
     let query_ctes = crate::cte::describe_with_clause(catalog_kv, q.with.as_ref(), ctes)?;
     match &q.body {
         SetExpr::Query(QueryBody::Select(s)) => {
+            if !allow_locking {
+                crate::exec::reject_nested_relation_locking(s)?;
+            }
             let scope = if s.from.is_empty() {
                 Scope::empty()
             } else {
@@ -163,7 +180,7 @@ pub(crate) fn describe_query_expr_with_ctes(
                 .collect())
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
-            describe_query_expr_with_ctes(catalog_kv, nested, &query_ctes)
+            describe_query_expr_inner(catalog_kv, nested, &query_ctes, false)
         }
         SetExpr::SetOp { .. } => {
             crate::setops::describe_set_expr_with_ctes(catalog_kv, &q.body, &query_ctes)

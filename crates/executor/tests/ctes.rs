@@ -56,6 +56,18 @@ async fn err_code(client: &tokio_postgres::Client, sql: &str) -> String {
         .to_string()
 }
 
+async fn prepare_err_code(client: &tokio_postgres::Client, sql: &str) -> String {
+    client
+        .prepare(sql)
+        .await
+        .expect_err("expected prepare error")
+        .as_db_error()
+        .expect("db error")
+        .code()
+        .code()
+        .to_string()
+}
+
 #[tokio::test]
 async fn simple_cte_later_cte_and_forward_reference() {
     let c = connect_new().await;
@@ -289,6 +301,27 @@ async fn locking_inside_cte_body_is_rejected() {
         .expect("insert t");
     assert_eq!(
         err_code(&c, "WITH c AS (SELECT x FROM t FOR UPDATE) SELECT * FROM c").await,
+        "0A000"
+    );
+}
+
+#[tokio::test]
+async fn describe_rejects_nested_locking_selects() {
+    let c = connect_new().await;
+    c.simple_query("CREATE TABLE t (x int4)")
+        .await
+        .expect("create t");
+
+    c.prepare("SELECT x FROM t FOR UPDATE")
+        .await
+        .expect("top-level locking describe");
+
+    assert_eq!(
+        prepare_err_code(&c, "WITH c AS (SELECT x FROM t FOR UPDATE) SELECT * FROM c").await,
+        "0A000"
+    );
+    assert_eq!(
+        prepare_err_code(&c, "SELECT * FROM (SELECT x FROM t FOR UPDATE) d").await,
         "0A000"
     );
 }

@@ -712,11 +712,7 @@ pub(crate) fn select_to_relation_with_ctes(
     ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
-    if s.locking.is_some() {
-        return Err(ExecError::Unsupported(
-            "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
-        ));
-    }
+    reject_nested_relation_locking(s)?;
 
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
@@ -865,6 +861,15 @@ fn build_table_expr_schema_with_ctes(
             crate::values::requalify_derived(inner, alias, columns)
         }
     }
+}
+
+pub(crate) fn reject_nested_relation_locking(s: &SelectStmt) -> Result<(), ExecError> {
+    if s.locking.is_some() {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

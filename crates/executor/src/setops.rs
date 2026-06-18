@@ -85,6 +85,7 @@ fn resolve_set_columns(
     }
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
+            crate::exec::reject_nested_relation_locking(s)?;
             let scope = if s.from.is_empty() {
                 Scope::empty()
             } else {
