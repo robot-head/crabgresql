@@ -1166,10 +1166,10 @@ fn resolve_select_order_key(
         return Ok(SelectOrderKey::Output(pos as usize - 1));
     }
 
-    if let Expr::Column { table: None, name } = &item.expr {
-        if let Some(i) = output_label_index(scope, fields, out_exprs, name)? {
-            return Ok(SelectOrderKey::Output(i));
-        }
+    if let Expr::Column { table: None, name } = &item.expr
+        && let Some(i) = output_label_index(scope, fields, out_exprs, name)?
+    {
+        return Ok(SelectOrderKey::Output(i));
     }
 
     if require_output {
