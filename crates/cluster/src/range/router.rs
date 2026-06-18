@@ -305,9 +305,10 @@ impl RangeRouter {
                     )),
                 }
             }
-            // SP38: a set-operation query (UNION / INTERSECT / EXCEPT). Walk every
-            // leaf SELECT in the set-op tree; if they all touch one range, route
-            // there; if they span ranges, reject 0A000.
+            // SP38/SP39: a set-operation query (UNION / INTERSECT / EXCEPT). Walk
+            // every query-body leaf in the set-op tree; SELECT leaves contribute
+            // ranges and VALUES leaves are neutral. If the SELECT leaves all touch
+            // one range, route there; if they span ranges, reject 0A000.
             Statement::SetOperation(q) => {
                 let mut ranges = std::collections::BTreeSet::new();
                 // Only `q.body` is walked: the query-level ORDER BY references the
@@ -328,6 +329,7 @@ impl RangeRouter {
             // not pin: a txn can still be pinned to a data range by a later DML.
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
+            | Statement::Values(_)
             | Statement::Begin { .. }
             | Statement::Commit
             | Statement::Rollback
@@ -669,8 +671,19 @@ fn collect_select_ranges(
     Ok(())
 }
 
-/// SP38: collect every base-table range a set-operation tree references by walking
-/// each leaf SELECT through `collect_select_ranges`.
+/// SP39: collect every base-table range a query body references. SELECT bodies
+/// walk normally; VALUES bodies are range-neutral.
+fn collect_query_body_ranges(
+    router: &RangeRouter,
+    body: &pgparser::ast::QueryBody,
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    match body {
+        pgparser::ast::QueryBody::Select(s) => collect_select_ranges(router, s, out),
+        pgparser::ast::QueryBody::Values(_) => Ok(()),
+    }
+}
+
 fn collect_set_expr_ranges(
     router: &RangeRouter,
     e: &pgparser::ast::SetExpr,
@@ -678,7 +691,7 @@ fn collect_set_expr_ranges(
 ) -> Result<(), ExecError> {
     use pgparser::ast::SetExpr;
     match e {
-        SetExpr::Select(s) => collect_select_ranges(router, s, out),
+        SetExpr::Query(body) => collect_query_body_ranges(router, body, out),
         SetExpr::SetOp { left, right, .. } => {
             collect_set_expr_ranges(router, left, out)?;
             collect_set_expr_ranges(router, right, out)
@@ -697,7 +710,7 @@ fn collect_table_expr_ranges(
             out.insert(router.range_of(name)?);
         }
         TableExpr::Derived { subquery, .. } => {
-            collect_select_ranges(router, subquery, out)?;
+            collect_query_body_ranges(router, subquery, out)?;
         }
         TableExpr::Join { left, right, .. } => {
             collect_table_expr_ranges(router, left, out)?;
@@ -1006,6 +1019,42 @@ mod tests {
                 .scan_one_i32("SELECT id FROM a UNION ALL SELECT id FROM a")
                 .await,
             vec![1, 1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn values_queries_are_range_neutral_and_set_ops_still_check_select_ranges() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("VALUES (1), (2)")
+            .await
+            .expect("standalone values");
+        router.simple("CREATE TABLE a (id int4)").await.expect("a"); // id 1 -> range 0
+        router.simple("CREATE TABLE b (id int4)").await.expect("b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("insert a");
+
+        assert_eq!(
+            router
+                .scan_one_i32("VALUES (2) UNION SELECT id FROM a ORDER BY 1")
+                .await,
+            vec![1, 2]
+        );
+
+        let err = router
+            .simple("SELECT id FROM a UNION SELECT id FROM b")
+            .await
+            .expect_err("cross-range set op rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(
+            err.message.contains("set operations spanning ranges"),
+            "got {err:?}"
         );
     }
 
