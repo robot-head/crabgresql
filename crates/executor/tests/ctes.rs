@@ -196,6 +196,26 @@ async fn nested_with_scopes_through_derived_tables_subqueries_and_describe() {
         .expect("describe nested CTE shadowing");
     let names: Vec<_> = stmt.columns().iter().map(|c| c.name()).collect();
     assert_eq!(names, vec!["y"]);
+
+    let stmt = c
+        .prepare("SELECT (WITH c AS (SELECT 1 AS x) SELECT x FROM c)")
+        .await
+        .expect("describe scalar subquery CTE");
+    assert_eq!(stmt.columns().len(), 1);
+    assert_eq!(
+        stmt.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT4
+    );
+
+    let stmt = c
+        .prepare("WITH c(x) AS (VALUES (1)) SELECT (WITH c(y) AS (VALUES (2)) SELECT y FROM c)")
+        .await
+        .expect("describe scalar subquery CTE shadowing");
+    assert_eq!(stmt.columns().len(), 1);
+    assert_eq!(
+        stmt.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT4
+    );
 }
 
 #[tokio::test]
