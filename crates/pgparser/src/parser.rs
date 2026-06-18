@@ -388,12 +388,7 @@ impl Parser {
                 let all = matches!(self.peek(), Token::Keyword(Keyword::All));
                 self.bump(); // ANY / SOME / ALL
                 self.expect(&Token::LParen)?;
-                let body = self.set_expr(0)?;
-                let (order_by, limit, offset) = self.parse_set_tail()?;
-                let locking = self.parse_locking()?;
-                self.expect(&Token::RParen)?;
-                let subquery =
-                    Box::new(self.finish_query_expr(body, order_by, limit, offset, locking)?);
+                let subquery = Box::new(self.query_expr_after_open_paren()?);
                 lhs = Expr::Quantified {
                     expr: Box::new(lhs),
                     op,
@@ -437,7 +432,8 @@ impl Parser {
                     self.peek2(),
                     Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
                 ) {
-                    let sub = self.query_expr_in_parens()?;
+                    self.bump();
+                    let sub = self.query_expr_after_open_paren()?;
                     Ok(Expr::ScalarSubquery(Box::new(sub)))
                 } else {
                     self.bump();
@@ -448,7 +444,8 @@ impl Parser {
             }
             Token::Keyword(Keyword::Exists) => {
                 self.bump(); // EXISTS
-                let sub = self.query_expr_in_parens()?;
+                self.expect(&Token::LParen)?;
+                let sub = self.query_expr_after_open_paren()?;
                 Ok(Expr::Exists(Box::new(sub)))
             }
             Token::IntLit(s) => {
@@ -665,13 +662,10 @@ impl Parser {
             self.peek(),
             Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
         ) {
-            let body = self.set_expr(0)?;
-            let (order_by, limit, offset) = self.parse_set_tail()?;
-            let locking = self.parse_locking()?;
-            self.expect(&Token::RParen)?;
+            let subquery = self.query_expr_after_open_paren()?;
             return Ok(Expr::InSubquery {
                 expr: Box::new(lhs),
-                subquery: Box::new(self.finish_query_expr(body, order_by, limit, offset, locking)?),
+                subquery: Box::new(subquery),
                 negated,
             });
         }
@@ -1317,17 +1311,65 @@ impl Parser {
 
     fn query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
         if *self.peek() == Token::LParen {
-            let start = self.pos;
             let q = self.parenthesized_query_expr()?;
-            if !self.query_continues_after_primary() {
+            if self.peek_is_set_op() {
+                let left = self.query_expr_as_set_branch(q)?;
+                let body = self.set_expr_rest(left, 0)?;
+                let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+                return self.finish_query_expr(body, order_by, limit, offset, locking);
+            }
+            if !self.query_tail_or_locking_starts() {
                 return Ok(q);
             }
-            self.pos = start;
+            let body = self.query_expr_as_set_branch(q)?;
+            let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+            return self.finish_query_expr(body, order_by, limit, offset, locking);
         }
         let body = self.set_expr(0)?;
+        let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
+        self.finish_query_expr(body, order_by, limit, offset, locking)
+    }
+
+    fn parse_query_tail_and_locking(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<crate::ast::OrderItem>,
+            Option<i64>,
+            Option<i64>,
+            Option<crate::ast::RowLockStrength>,
+        ),
+        ParseError,
+    > {
         let (order_by, limit, offset) = self.parse_set_tail()?;
         let locking = self.parse_locking()?;
-        self.finish_query_expr(body, order_by, limit, offset, locking)
+        Ok((order_by, limit, offset, locking))
+    }
+
+    fn query_expr_as_set_branch(
+        &mut self,
+        q: crate::ast::QueryExpr,
+    ) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::{QueryBody, SetExpr};
+        let has_tail = !q.order_by.is_empty()
+            || q.limit.is_some()
+            || q.offset.is_some()
+            || q.locking.is_some();
+        if !has_tail {
+            return Ok(q.body);
+        }
+        match q.body {
+            SetExpr::Query(QueryBody::Select(mut select)) if q.locking.is_none() => {
+                select.order_by = q.order_by;
+                select.limit = q.limit;
+                select.offset = q.offset;
+                Ok(SetExpr::Query(QueryBody::Select(select)))
+            }
+            _ => Err(ParseError::new(
+                "ORDER BY/LIMIT/OFFSET on this parenthesized query must be parsed as a nested query expression",
+                self.peek_pos(),
+            )),
+        }
     }
 
     fn finish_query_expr(
@@ -1365,30 +1407,37 @@ impl Parser {
         })
     }
 
-    fn query_continues_after_primary(&self) -> bool {
+    fn peek_is_set_op(&self) -> bool {
         matches!(
             self.peek(),
-            Token::Keyword(
-                Keyword::Union
-                    | Keyword::Except
-                    | Keyword::Intersect
-                    | Keyword::Order
-                    | Keyword::Limit
-                    | Keyword::Offset
-                    | Keyword::For
-            )
+            Token::Keyword(Keyword::Union | Keyword::Except | Keyword::Intersect)
+        )
+    }
+
+    fn query_tail_or_locking_starts(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::Order | Keyword::Limit | Keyword::Offset | Keyword::For)
         )
     }
 
     /// Precedence-climbing set-op tree. INTERSECT = 2, UNION/EXCEPT = 1; all
     /// left-associative (recurse for the RHS at `prec + 1`).
     fn set_expr(&mut self, min_prec: u8) -> Result<crate::ast::SetExpr, ParseError> {
-        use crate::ast::{SetExpr, SetOp};
         // Mode-1 guard: a parenthesized set-op subtree recurses
         // `set_primary → set_expr → set_primary` for `(((… query …)))`, a path that
         // does NOT funnel through `expr`/`select_core`, so it needs its own guard.
         let _guard = DepthGuard::enter(&self.depth, self.peek_pos())?;
-        let mut left = self.set_primary()?;
+        let left = self.set_primary()?;
+        self.set_expr_rest(left, min_prec)
+    }
+
+    fn set_expr_rest(
+        &mut self,
+        mut left: crate::ast::SetExpr,
+        min_prec: u8,
+    ) -> Result<crate::ast::SetExpr, ParseError> {
+        use crate::ast::{SetExpr, SetOp};
         // Mode-2 cap: a flat left-assoc chain `A UNION B UNION C …` is parsed by this
         // LOOP (not recursion), building an N-deep left-nested `SetExpr` that would
         // overflow the executor's `fold`/`resolve_set_columns` AND recursive `Drop`.
@@ -1429,9 +1478,12 @@ impl Parser {
     /// SELECT branch (`select_core`, no tail — the query owns the tail).
     fn parenthesized_query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
         self.expect(&Token::LParen)?;
+        self.query_expr_after_open_paren()
+    }
+
+    fn query_expr_after_open_paren(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
         let body = self.set_expr(0)?;
-        let (order_by, limit, offset) = self.parse_set_tail()?;
-        let locking = self.parse_locking()?;
+        let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
         self.expect(&Token::RParen)?;
         self.finish_query_expr(body, order_by, limit, offset, locking)
     }
@@ -1576,12 +1628,6 @@ impl Parser {
         Ok(kind)
     }
 
-    /// A table factor: a base table (`t` / `t alias` / `t AS alias`), a derived
-    /// table (`( SELECT … ) alias`), or a parenthesized join (`( … )`).
-    fn query_expr_in_parens(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
-        self.parenthesized_query_expr()
-    }
-
     fn starts_query_expr(&self) -> bool {
         matches!(
             self.peek(),
@@ -1589,6 +1635,8 @@ impl Parser {
         )
     }
 
+    /// A table factor: a base table (`t` / `t alias` / `t AS alias`), a derived
+    /// table (`( SELECT … ) alias`), or a parenthesized join (`( … )`).
     fn table_factor(&mut self) -> Result<crate::ast::TableExpr, ParseError> {
         use crate::ast::TableExpr;
         if *self.peek() == Token::LParen {
@@ -1597,16 +1645,13 @@ impl Parser {
                 self.peek(),
                 Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
             ) {
-                let body = self.set_expr(0)?;
-                let (order_by, limit, offset) = self.parse_set_tail()?;
-                let locking = self.parse_locking()?;
-                self.expect(&Token::RParen)?;
+                let subquery = self.query_expr_after_open_paren()?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
                     ParseError::new("subquery in FROM must have an alias", self.peek_pos())
                 })?;
                 let columns = self.opt_column_aliases()?;
                 return Ok(TableExpr::Derived {
-                    subquery: self.finish_query_expr(body, order_by, limit, offset, locking)?,
+                    subquery,
                     alias,
                     columns,
                 });
@@ -1868,6 +1913,27 @@ mod tests {
         assert!(matches!(q.body, SetExpr::SetOp { .. }));
         assert_eq!(q.order_by.len(), 1);
         assert_eq!(q.limit, Some(1));
+    }
+
+    #[test]
+    fn raw_query_expr_tail_placement_is_visible() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("SELECT 1 ORDER BY 1 LIMIT 1");
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(1));
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT body");
+        };
+        assert!(select.order_by.is_empty());
+        assert_eq!(select.limit, None);
+
+        let q = only_query("((SELECT 1 ORDER BY 1))");
+        assert!(q.order_by.is_empty());
+        let SetExpr::Query(QueryBody::Select(select)) = q.body else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(select.order_by.len(), 1);
     }
 
     #[test]
