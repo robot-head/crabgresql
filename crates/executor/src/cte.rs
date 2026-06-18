@@ -75,6 +75,11 @@ pub(crate) fn evaluate_with_clause(
 
     let mut out = parent.child();
     for cte in &with.ctes {
+        if cte.query.locking.is_some() {
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE is not supported in CTEs".into(),
+            ));
+        }
         let rel = crate::query::query_to_relation_with_ctes(
             catalog_kv, kv, global, gsnap, snapshot, own, &cte.query, &out, ctx,
         )?;

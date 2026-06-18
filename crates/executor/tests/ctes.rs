@@ -114,6 +114,15 @@ async fn cte_column_aliases_and_recursive_error() {
 }
 
 #[tokio::test]
+async fn values_cte_body_can_be_materialized() {
+    let c = connect_new().await;
+    assert_eq!(
+        rows(&c, "WITH c AS (VALUES (2), (1)) SELECT * FROM c ORDER BY 1").await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+}
+
+#[tokio::test]
 async fn locking_select_rejects_ctes() {
     let c = connect_new().await;
     assert_eq!(
@@ -126,6 +135,21 @@ async fn locking_select_rejects_ctes() {
             "WITH RECURSIVE c AS (SELECT 1 AS x) SELECT * FROM c FOR UPDATE"
         )
         .await,
+        "0A000"
+    );
+}
+
+#[tokio::test]
+async fn locking_inside_cte_body_is_rejected() {
+    let c = connect_new().await;
+    c.simple_query("CREATE TABLE t (x int4)")
+        .await
+        .expect("create t");
+    c.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert t");
+    assert_eq!(
+        err_code(&c, "WITH c AS (SELECT x FROM t FOR UPDATE) SELECT * FROM c").await,
         "0A000"
     );
 }
