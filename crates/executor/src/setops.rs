@@ -110,14 +110,14 @@ fn resolve_set_columns(
                 .collect())
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let schema = crate::values::describe_values(v)?;
-            Ok(schema
-                .names
+            let rel = crate::values::values_schema_relation_with_ctes(catalog_kv, v, ctes)?;
+            Ok(rel
+                .scope
+                .columns
                 .into_iter()
-                .zip(schema.types)
-                .map(|(name, ty)| ResolvedCol {
-                    name,
-                    ty,
+                .map(|c| ResolvedCol {
+                    name: c.name,
+                    ty: c.ty,
                     unknown: false,
                 })
                 .collect())
@@ -279,7 +279,9 @@ fn fold(
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let rel = crate::values::values_to_relation(v, ctx)?;
+            let rel = crate::values::values_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, v, ctes, ctx,
+            )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {

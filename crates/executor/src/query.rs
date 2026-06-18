@@ -81,7 +81,17 @@ pub(crate) fn query_to_relation_with_ctes(
             )
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let mut rel = crate::values::values_to_relation(v, ctx)?;
+            let mut rel = crate::values::values_to_relation_with_ctes(
+                catalog_kv,
+                kv,
+                global,
+                gsnap,
+                snapshot,
+                own,
+                v,
+                &query_ctes,
+                ctx,
+            )?;
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
             Ok(rel)
@@ -144,12 +154,12 @@ pub(crate) fn describe_query_expr_with_ctes(
             Ok(fields)
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let schema = crate::values::describe_values(v)?;
-            Ok(schema
-                .names
+            let rel = crate::values::values_schema_relation_with_ctes(catalog_kv, v, &query_ctes)?;
+            Ok(rel
+                .scope
+                .columns
                 .iter()
-                .zip(&schema.types)
-                .map(|(name, ty)| crate::exec::field(name, *ty))
+                .map(|c| crate::exec::field(&c.name, c.ty))
                 .collect())
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {

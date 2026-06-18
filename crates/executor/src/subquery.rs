@@ -11,7 +11,7 @@
 //! own FROM, so an outer-column reference fails name resolution (42703).
 
 use pgparser::ast::{
-    BinaryOp, Expr, FuncArgs, FuncCall, OrderItem, QueryExpr, SelectItem, SelectStmt,
+    BinaryOp, Expr, FuncArgs, FuncCall, OrderItem, QueryExpr, SelectItem, SelectStmt, ValuesStmt,
 };
 use pgtypes::{ColumnType, Datum};
 
@@ -74,6 +74,16 @@ pub(crate) fn resolve_order_items(
             })
         })
         .collect()
+}
+
+pub(crate) fn resolve_in_values(ctx: &SubCtx, v: &ValuesStmt) -> Result<ValuesStmt, ExecError> {
+    Ok(ValuesStmt {
+        rows: v
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|expr| resolve_expr(ctx, expr)).collect())
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// Recursively rewrite subquery nodes in `e`, bottom-up.
@@ -336,6 +346,24 @@ pub(crate) fn resolve_types_in_projection_with_ctes(
             other => Ok(other.clone()),
         })
         .collect()
+}
+
+pub(crate) fn resolve_types_in_values_with_ctes(
+    catalog_kv: &dyn kv::Kv,
+    v: &ValuesStmt,
+    ctes: &crate::cte::CteContext,
+) -> Result<ValuesStmt, ExecError> {
+    Ok(ValuesStmt {
+        rows: v
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| resolve_types_in_expr(catalog_kv, expr, ctes))
+                    .collect()
+            })
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// Recursively replace scalar subqueries with `Const { Null, <type> }` (type-only).

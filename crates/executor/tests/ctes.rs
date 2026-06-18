@@ -216,6 +216,30 @@ async fn nested_with_scopes_through_derived_tables_subqueries_and_describe() {
         stmt.columns()[0].type_(),
         &tokio_postgres::types::Type::INT4
     );
+
+    let stmt = c
+        .prepare("WITH c(x) AS (VALUES (1)) VALUES ((SELECT x FROM c))")
+        .await
+        .expect("describe VALUES scalar subquery CTE");
+    assert_eq!(stmt.columns().len(), 1);
+    assert_eq!(
+        stmt.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT4
+    );
+
+    assert_eq!(
+        rows(&c, "WITH c(x) AS (VALUES (1)) VALUES ((SELECT x FROM c))").await,
+        vec![vec![Some("1".into())]]
+    );
+
+    assert_eq!(
+        rows(
+            &c,
+            "WITH c(x) AS (VALUES (1)) VALUES ((SELECT x FROM c)) UNION SELECT 2 ORDER BY 1"
+        )
+        .await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
 }
 
 #[tokio::test]
