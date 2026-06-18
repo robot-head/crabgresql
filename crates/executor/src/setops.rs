@@ -74,6 +74,7 @@ fn unify_col(
 fn resolve_set_columns(
     catalog_kv: &dyn Kv,
     e: &SetExpr,
+    ctes: &crate::cte::CteContext,
     depth: usize,
 ) -> Result<Vec<ResolvedCol>, ExecError> {
     // Defense-in-depth: the parser caps set-op tree depth at MAX_DEPTH (50), so this
@@ -87,7 +88,7 @@ fn resolve_set_columns(
             let scope = if s.from.is_empty() {
                 Scope::empty()
             } else {
-                crate::exec::build_from_schema(catalog_kv, &s.from)?.scope
+                crate::exec::build_from_schema_with_ctes(catalog_kv, &s.from, ctes)?.scope
             };
             // Run the SP34 scalar-subquery type pass (so a subquery column's OID is
             // known without executing), then resolve names + types + unknown-ness.
@@ -119,7 +120,7 @@ fn resolve_set_columns(
                 .collect())
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
-            crate::query::describe_query_expr(catalog_kv, nested)?
+            crate::query::describe_query_expr_with_ctes(catalog_kv, nested, ctes)?
                 .into_iter()
                 .map(|f| {
                     Ok(ResolvedCol {
@@ -133,8 +134,8 @@ fn resolve_set_columns(
         SetExpr::SetOp {
             op, left, right, ..
         } => {
-            let l = resolve_set_columns(catalog_kv, left, depth + 1)?;
-            let r = resolve_set_columns(catalog_kv, right, depth + 1)?;
+            let l = resolve_set_columns(catalog_kv, left, ctes, depth + 1)?;
+            let r = resolve_set_columns(catalog_kv, right, ctes, depth + 1)?;
             if l.len() != r.len() {
                 return Err(ExecError::SetOpColumnCount {
                     op: *op,
@@ -163,11 +164,12 @@ fn output_type(c: &ResolvedCol) -> ColumnType {
     if c.unknown { ColumnType::Text } else { c.ty }
 }
 
-pub(crate) fn describe_set_expr(
+pub(crate) fn describe_set_expr_with_ctes(
     catalog_kv: &dyn Kv,
     body: &SetExpr,
+    ctes: &crate::cte::CteContext,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, body, 0)?;
+    let cols = resolve_set_columns(catalog_kv, body, ctes, 0)?;
     Ok(cols
         .iter()
         .map(|c| crate::exec::field(&c.name, output_type(c)))
@@ -186,12 +188,13 @@ pub(crate) fn set_expr_to_relation(
     order_by: &[pgparser::ast::OrderItem],
     offset: Option<i64>,
     limit: Option<i64>,
+    ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
 ) -> Result<crate::join::Relation, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, body, 0)?;
+    let cols = resolve_set_columns(catalog_kv, body, ctes, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctx, 0,
+        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctes, ctx, 0,
     )?;
 
     let scope = Scope {
@@ -257,6 +260,7 @@ fn fold(
     own: Option<u64>,
     e: &SetExpr,
     out_tys: &[ColumnType],
+    ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
     depth: usize,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
@@ -266,8 +270,8 @@ fn fold(
     }
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
-            let rel = crate::exec::select_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, s, ctx,
+            let rel = crate::exec::select_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, s, ctes, ctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -276,8 +280,8 @@ fn fold(
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
-            let rel = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx,
+            let rel = crate::query::query_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctes, ctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -296,6 +300,7 @@ fn fold(
                 own,
                 left,
                 out_tys,
+                ctes,
                 ctx,
                 depth + 1,
             )?;
@@ -308,6 +313,7 @@ fn fold(
                 own,
                 right,
                 out_tys,
+                ctes,
                 ctx,
                 depth + 1,
             )?;

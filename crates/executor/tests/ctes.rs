@@ -1,0 +1,114 @@
+use std::sync::Arc;
+
+use executor::SqlEngine;
+use pgwire::session::SessionConfig;
+use tokio::net::TcpListener;
+use tokio_postgres::NoTls;
+
+async fn spawn() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(pgwire::server::serve(
+        listener,
+        Arc::new(SqlEngine::new()),
+        Arc::new(SessionConfig::trust()),
+    ));
+    port
+}
+
+async fn connect_new() -> tokio_postgres::Client {
+    let (client, conn) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(spawn().await)
+        .user("crab")
+        .dbname("crab")
+        .connect(NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    client
+}
+
+async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    use tokio_postgres::SimpleQueryMessage;
+    let mut out = Vec::new();
+    for m in client.simple_query(sql).await.expect("query") {
+        if let SimpleQueryMessage::Row(row) = m {
+            out.push(
+                (0..row.len())
+                    .map(|i| row.get(i).map(str::to_string))
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+async fn err_code(client: &tokio_postgres::Client, sql: &str) -> String {
+    client
+        .simple_query(sql)
+        .await
+        .expect_err("expected error")
+        .as_db_error()
+        .expect("db error")
+        .code()
+        .code()
+        .to_string()
+}
+
+#[tokio::test]
+async fn simple_cte_later_cte_and_forward_reference() {
+    let c = connect_new().await;
+    assert_eq!(
+        rows(
+            &c,
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT x + 1 AS y FROM a) SELECT y FROM b"
+        )
+        .await,
+        vec![vec![Some("2".into())]]
+    );
+    assert_eq!(
+        err_code(
+            &c,
+            "WITH b AS (SELECT * FROM a), a AS (SELECT 1 AS x) SELECT * FROM b"
+        )
+        .await,
+        "42P01"
+    );
+}
+
+#[tokio::test]
+async fn cte_shadows_base_table_and_can_be_reused() {
+    let c = connect_new().await;
+    c.simple_query("CREATE TABLE src (x int4)")
+        .await
+        .expect("create src");
+    c.simple_query("INSERT INTO src VALUES (9)")
+        .await
+        .expect("insert src");
+    assert_eq!(
+        rows(
+            &c,
+            "WITH src AS (SELECT 1 AS x) SELECT a.x, b.x FROM src a, src b"
+        )
+        .await,
+        vec![vec![Some("1".into()), Some("1".into())]]
+    );
+}
+
+#[tokio::test]
+async fn cte_column_aliases_and_recursive_error() {
+    let c = connect_new().await;
+    assert_eq!(
+        rows(&c, "WITH c(y) AS (SELECT 7 AS x) SELECT y FROM c").await,
+        vec![vec![Some("7".into())]]
+    );
+    assert_eq!(
+        err_code(&c, "WITH c(y, z) AS (SELECT 7 AS x) SELECT * FROM c").await,
+        "42601"
+    );
+    assert_eq!(
+        err_code(&c, "WITH RECURSIVE r AS (SELECT 1 AS x) SELECT * FROM r").await,
+        "0A000"
+    );
+}

@@ -27,6 +27,7 @@ pub(crate) struct SubCtx<'a> {
     pub gsnap: &'a mvcc::visibility::Snapshot,
     pub snapshot: &'a mvcc::visibility::Snapshot,
     pub own: Option<u64>,
+    pub ctes: &'a crate::cte::CteContext,
     /// The session eval context (zone + clock) — forwarded to the subquery's read
     /// path so a temporal expression inside a subquery evaluates in the session zone.
     pub eval_ctx: &'a crate::clock::EvalCtx,
@@ -220,7 +221,7 @@ fn no_locking(q: &QueryExpr) -> Result<(), ExecError> {
 /// Run a subquery through the join read path to its materialized rows.
 fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, ExecError> {
     no_locking(q)?;
-    crate::query::query_to_relation(
+    crate::query::query_to_relation_with_ctes(
         ctx.catalog_kv,
         ctx.kv,
         ctx.global,
@@ -228,6 +229,7 @@ fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, Ex
         ctx.snapshot,
         ctx.own,
         q,
+        ctx.ctes,
         ctx.eval_ctx,
     )
 }

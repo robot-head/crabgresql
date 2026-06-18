@@ -620,15 +620,18 @@ fn build_from(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     from: &[pgparser::ast::TableExpr],
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
-    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first, ctx)?;
+    let mut acc = build_table_expr(
+        catalog_kv, kv, global, gsnap, snapshot, own, first, ctes, ctx,
+    )?;
     for te in iter {
-        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctx)?;
+        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctes, ctx)?;
         acc = join_relations(
             acc,
             next,
@@ -649,11 +652,16 @@ fn build_table_expr(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     te: &pgparser::ast::TableExpr,
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
+            if let Some(rel) = ctes.lookup(name) {
+                let qualifier = alias.as_deref().unwrap_or(name);
+                return Ok(crate::cte::requalify_cte(rel, qualifier));
+            }
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
             let scope = Scope::single(&t, qualifier);
@@ -669,8 +677,12 @@ fn build_table_expr(
             kind,
             constraint,
         } => {
-            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
-            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
+            let l = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, left, ctes, ctx,
+            )?;
+            let r = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, right, ctes, ctx,
+            )?;
             join_relations(l, r, *kind, constraint, ctx)
         }
         TableExpr::Derived {
@@ -678,20 +690,18 @@ fn build_table_expr(
             alias,
             columns,
         } => {
-            let inner = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx,
+            let inner = crate::query::query_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctes, ctx,
             )?;
             crate::values::requalify_derived(inner, alias, columns)
         }
     }
 }
 
-/// Run a SELECT to a `Relation` (output columns + rows). The top-level
-/// `execute_read` renders this to a `QueryResult`; a derived table re-qualifies
-/// its columns under the derived alias. Non-correlated only (the subquery's scope
-/// is built solely from its own FROM clause).
+/// Run a SELECT to a `Relation` with an already-evaluated CTE scope. `WITH`
+/// belongs to `QueryExpr`; this function handles the SELECT body under that scope.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn select_to_relation(
+pub(crate) fn select_to_relation_with_ctes(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     global: &dyn Kv,
@@ -699,6 +709,7 @@ pub(crate) fn select_to_relation(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     s: &SelectStmt,
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
@@ -710,6 +721,7 @@ pub(crate) fn select_to_relation(
         gsnap,
         snapshot,
         own,
+        ctes,
         eval_ctx: ctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
@@ -720,7 +732,17 @@ pub(crate) fn select_to_relation(
             rows: vec![vec![]],
         }
     } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
+        build_from(
+            catalog_kv,
+            kv,
+            global,
+            gsnap,
+            snapshot,
+            own,
+            &s.from,
+            ctes,
+            ctx,
+        )?
     };
     let mut kept = Vec::new();
     for row in &relation.rows {
@@ -751,20 +773,18 @@ pub(crate) fn select_to_relation(
     })
 }
 
-/// Schema-only relation builder for `describe` — parallels `build_from` but base
-/// tables produce no rows (no `scan_live`). Joining empty relations yields the
-/// correct combined scope with no rows, so it reuses `join_relations`.
-pub(crate) fn build_from_schema(
+pub(crate) fn build_from_schema_with_ctes(
     catalog_kv: &dyn Kv,
     from: &[pgparser::ast::TableExpr],
+    ctes: &crate::cte::CteContext,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from_schema on empty FROM".into()))?;
-    let mut acc = build_table_expr_schema(catalog_kv, first)?;
+    let mut acc = build_table_expr_schema(catalog_kv, first, ctes)?;
     for te in iter {
-        let next = build_table_expr_schema(catalog_kv, te)?;
+        let next = build_table_expr_schema(catalog_kv, te, ctes)?;
         // Schema-only: no rows, so no ON predicate is ever evaluated — a default
         // (UTC/epoch) eval context is correct here.
         acc = join_relations(
@@ -781,10 +801,16 @@ pub(crate) fn build_from_schema(
 fn build_table_expr_schema(
     catalog_kv: &dyn Kv,
     te: &pgparser::ast::TableExpr,
+    ctes: &crate::cte::CteContext,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
+            if let Some(rel) = ctes.lookup(name) {
+                let mut rel = crate::cte::requalify_cte(rel, alias.as_deref().unwrap_or(name));
+                rel.rows.clear();
+                return Ok(rel);
+            }
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
             Ok(Relation {
@@ -798,8 +824,8 @@ fn build_table_expr_schema(
             kind,
             constraint,
         } => {
-            let l = build_table_expr_schema(catalog_kv, left)?;
-            let r = build_table_expr_schema(catalog_kv, right)?;
+            let l = build_table_expr_schema(catalog_kv, left, ctes)?;
+            let r = build_table_expr_schema(catalog_kv, right, ctes)?;
             // Schema-only: no rows, so no ON predicate is ever evaluated.
             join_relations(
                 l,
@@ -873,6 +899,7 @@ pub(crate) async fn execute_read_locking(
 ) -> Result<QueryResult, ExecError> {
     // SP34: resolve uncorrelated subqueries (e.g. in the WHERE of a FOR UPDATE) to
     // constants first, under this statement's snapshot handles.
+    let empty_ctes = crate::cte::CteContext::empty();
     let sub_ctx = crate::subquery::SubCtx {
         catalog_kv,
         kv,
@@ -880,6 +907,7 @@ pub(crate) async fn execute_read_locking(
         gsnap,
         snapshot,
         own: Some(xid),
+        ctes: &empty_ctes,
         eval_ctx: ctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
