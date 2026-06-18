@@ -719,8 +719,8 @@ fn collect_values_ranges(
 }
 
 /// SP39: collect every base-table range a query body references. SELECT bodies
-/// walk normally; VALUES bodies are range-neutral; nested query expressions and
-/// set-op trees recurse into their children.
+/// walk normally; VALUES bodies contribute ranges through expression subqueries;
+/// nested query expressions and set-op trees recurse into their children.
 fn collect_query_body_ranges(
     router: &RangeRouter,
     body: &pgparser::ast::QueryBody,
@@ -1202,6 +1202,74 @@ mod tests {
             .simple("WITH b AS (VALUES (9)) SELECT * FROM b")
             .await
             .expect("CTE named b shadows base table b and is range-neutral");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quoted_case_distinct_cte_name_does_not_shadow_base_table() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        router
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO b VALUES (2)")
+            .await
+            .expect("insert b");
+
+        assert_eq!(
+            router
+                .scan_one_i32(r#"WITH "B" AS (VALUES (9)) SELECT id FROM b"#)
+                .await,
+            vec![2]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn values_expression_subquery_ranges_are_collected() {
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router
+            .simple("CREATE TABLE a (id int4)")
+            .await
+            .expect("create a"); // id 1 -> range 0
+        router
+            .simple("CREATE TABLE b (id int4)")
+            .await
+            .expect("create b"); // id 2 -> range 1
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("insert a");
+        router
+            .simple("INSERT INTO b VALUES (2)")
+            .await
+            .expect("insert b");
+
+        assert_eq!(
+            router.scan_one_i32("VALUES ((SELECT id FROM b))").await,
+            vec![2]
+        );
+
+        let err = router
+            .simple("VALUES ((SELECT id FROM b)) UNION SELECT id FROM a")
+            .await
+            .expect_err("cross-range VALUES subquery set op rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(
+            err.message.contains("set operations spanning ranges"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
