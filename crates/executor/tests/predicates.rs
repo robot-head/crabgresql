@@ -268,5 +268,10 @@ async fn distinct_order_by_not_in_select_list_is_rejected() {
         .query("SELECT DISTINCT amount FROM pr ORDER BY id", &[])
         .await
         .expect_err("order by not in select list");
-    assert_eq!(err.as_db_error().expect("db error").code().code(), "0A000");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "42P10");
+    assert_eq!(
+        db.message(),
+        "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+    );
 }

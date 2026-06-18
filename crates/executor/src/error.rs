@@ -40,6 +40,13 @@ pub enum ExecError {
     /// A subquery used as an expression / IN / quantified source returned more than
     /// one column (42601).
     SubqueryColumns,
+    /// PostgreSQL syntax/parse-analysis error surfaced by executor analysis
+    /// (42601), used for SQL92 ORDER BY integer constants that cannot fit in
+    /// a positional reference.
+    Syntax(String),
+    /// A bare ORDER BY output label matched more than one projected column
+    /// (42702). PostgreSQL's message differs from generic column ambiguity.
+    AmbiguousOrderBy(String),
     /// SP38: the branches of a UNION/INTERSECT/EXCEPT have different column counts
     /// (42601). `op` names the specific operator for the PG-exact message; `left`/
     /// `right` are kept for internal use (the message does not print them).
@@ -104,6 +111,10 @@ impl ExecError {
             ),
             ExecError::SubqueryColumns => {
                 PgError::error("42601", "subquery must return only one column")
+            }
+            ExecError::Syntax(m) => PgError::error("42601", m),
+            ExecError::AmbiguousOrderBy(n) => {
+                PgError::error("42702", format!("ORDER BY \"{n}\" is ambiguous"))
             }
             ExecError::SetOpColumnCount { op, .. } => {
                 // PG-exact: the message names the specific operator and has no count,
@@ -175,5 +186,24 @@ impl From<TypeError> for ExecError {
 impl From<KvError> for ExecError {
     fn from(e: KvError) -> Self {
         ExecError::Kv(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syntax_maps_to_42601() {
+        let pg = ExecError::Syntax("non-integer constant in ORDER BY".into()).into_pg();
+        assert_eq!(pg.code, "42601");
+        assert_eq!(pg.message, "non-integer constant in ORDER BY");
+    }
+
+    #[test]
+    fn ambiguous_order_by_maps_to_pg_message() {
+        let pg = ExecError::AmbiguousOrderBy("x".into()).into_pg();
+        assert_eq!(pg.code, "42702");
+        assert_eq!(pg.message, "ORDER BY \"x\" is ambiguous");
     }
 }
