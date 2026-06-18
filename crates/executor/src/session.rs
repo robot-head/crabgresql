@@ -574,6 +574,12 @@ impl SqlSession {
     }
 
     async fn run_query_locking(&mut self, q: &QueryExpr) -> Result<QueryResult, ExecError> {
+        if let Some(with) = &q.with {
+            crate::cte::reject_recursive(with)?;
+            return Err(ExecError::Unsupported(
+                "FOR UPDATE/SHARE with CTEs is not supported".into(),
+            ));
+        }
         let SetExpr::Query(QueryBody::Select(s)) = &q.body else {
             return Err(ExecError::Unsupported(
                 "locking is only supported on SELECT".into(),

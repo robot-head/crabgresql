@@ -112,3 +112,20 @@ async fn cte_column_aliases_and_recursive_error() {
         "0A000"
     );
 }
+
+#[tokio::test]
+async fn locking_select_rejects_ctes() {
+    let c = connect_new().await;
+    assert_eq!(
+        err_code(&c, "WITH c AS (SELECT 1 AS x) SELECT * FROM c FOR UPDATE").await,
+        "0A000"
+    );
+    assert_eq!(
+        err_code(
+            &c,
+            "WITH RECURSIVE c AS (SELECT 1 AS x) SELECT * FROM c FOR UPDATE"
+        )
+        .await,
+        "0A000"
+    );
+}
