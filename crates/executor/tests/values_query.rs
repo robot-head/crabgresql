@@ -214,16 +214,20 @@ async fn values_set_ops_share_unknown_resolution() {
         vec![vec![Some("a".into())], vec![Some("b".into())]]
     );
     assert_eq!(
-        rows(&c, "VALUES (NULL), ('5') UNION SELECT 2 ORDER BY 1").await,
+        err_code(&c, "VALUES (NULL), ('5') UNION SELECT 2 ORDER BY 1").await,
+        "42804"
+    );
+    assert_eq!(
+        rows(&c, "VALUES (NULL), ('5') UNION SELECT 2::text ORDER BY 1").await,
         vec![vec![Some("2".into())], vec![Some("5".into())], vec![None]]
     );
     assert_eq!(
-        rows(&c, "VALUES ('1') UNION SELECT 2 ORDER BY 1").await,
-        vec![vec![Some("1".into())], vec![Some("2".into())]]
+        err_code(&c, "VALUES ('1') UNION SELECT 2 ORDER BY 1").await,
+        "42804"
     );
     assert_eq!(
         err_code(&c, "VALUES ('x') UNION SELECT 3").await,
-        "22P02",
-        "a bad unknown literal fails after the set-op resolves the column to int4"
+        "42804",
+        "an all-unknown VALUES body resolves to text before set-op matching"
     );
 }

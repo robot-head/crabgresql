@@ -50,26 +50,6 @@ pub(crate) fn values_to_relation(
     values_to_relation_with_schema(v, ctx, schema)
 }
 
-pub(crate) fn values_to_relation_with_types(
-    v: &ValuesStmt,
-    ctx: &EvalCtx,
-    target_types: &[ColumnType],
-) -> Result<crate::join::Relation, ExecError> {
-    let schema = analyze_values(v)?;
-    if schema.types.len() != target_types.len() {
-        return Err(ExecError::ValuesColumnCount);
-    }
-    values_to_relation_with_schema(
-        v,
-        ctx,
-        ValuesSchema {
-            names: schema.names,
-            types: target_types.to_vec(),
-            unknown: vec![false; target_types.len()],
-        },
-    )
-}
-
 fn values_to_relation_with_schema(
     v: &ValuesStmt,
     ctx: &EvalCtx,
