@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use catalog::{Column, Table, TableId};
 use kv::Kv;
-use pgparser::ast::{Expr, SelectItem, SelectStmt, Statement};
+use pgparser::ast::{Expr, OrderItem, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 use zerocopy::FromBytes;
@@ -1103,6 +1103,83 @@ pub(crate) fn rows_result(
     QueryResult::Rows { fields, rows, tag }
 }
 
+/// One resolved ORDER BY key for a plain SELECT. SQL92-style output references
+/// (`ORDER BY 1`, `ORDER BY alias`) are represented as output indices; all other
+/// expressions are evaluated against the source/group scope.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum SelectOrderKey {
+    Output(usize),
+    SourceExpr(Expr),
+}
+
+/// Resolve SELECT ORDER BY items using PostgreSQL's SQL92 rules:
+/// integer constant -> output ordinal, bare output label -> output column, and
+/// everything else -> source expression unless `require_output` is true.
+#[allow(dead_code)]
+pub(crate) fn resolve_select_order_keys(
+    order_by: &[OrderItem],
+    fields: &[FieldDescription],
+    out_exprs: &[Expr],
+    require_output: bool,
+) -> Result<Vec<SelectOrderKey>, ExecError> {
+    order_by
+        .iter()
+        .map(|item| resolve_select_order_key(item, fields, out_exprs, require_output))
+        .collect()
+}
+
+#[allow(dead_code)]
+fn resolve_select_order_key(
+    item: &OrderItem,
+    fields: &[FieldDescription],
+    out_exprs: &[Expr],
+    require_output: bool,
+) -> Result<SelectOrderKey, ExecError> {
+    if let Expr::IntLiteral(s) = &item.expr {
+        let pos: usize = s
+            .parse()
+            .map_err(|_| ExecError::Syntax("non-integer constant in ORDER BY".into()))?;
+        if pos == 0 || pos > fields.len() {
+            return Err(ExecError::InvalidColumnReference(format!(
+                "ORDER BY position {pos} is not in select list"
+            )));
+        }
+        return Ok(SelectOrderKey::Output(pos - 1));
+    }
+
+    if let Expr::Column { table: None, name } = &item.expr {
+        if let Some(i) = output_label_index(fields, name)? {
+            return Ok(SelectOrderKey::Output(i));
+        }
+    }
+
+    if require_output {
+        if let Some(i) = out_exprs.iter().position(|e| e == &item.expr) {
+            return Ok(SelectOrderKey::Output(i));
+        }
+        return Err(ExecError::InvalidColumnReference(
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list".into(),
+        ));
+    }
+
+    Ok(SelectOrderKey::SourceExpr(item.expr.clone()))
+}
+
+#[allow(dead_code)]
+fn output_label_index(fields: &[FieldDescription], name: &str) -> Result<Option<usize>, ExecError> {
+    let mut found = None;
+    for (i, f) in fields.iter().enumerate() {
+        if f.name == name {
+            if found.is_some() {
+                return Err(ExecError::AmbiguousOrderBy(name.to_string()));
+            }
+            found = Some(i);
+        }
+    }
+    Ok(found)
+}
+
 /// SP28: map each `ORDER BY` expression to the output column it references. Under
 /// `SELECT DISTINCT` the sort keys must be select-list columns (PostgreSQL's
 /// rule); a non-matching expression is rejected (0A000).
@@ -1309,7 +1386,9 @@ pub(crate) fn describe(
 
 #[cfg(test)]
 mod tests {
+    use crate::scope::{ColumnBinding, Scope};
     use crate::{SqlEngine, SqlSession};
+    use pgparser::ast::{SelectStmt, Statement};
     use pgwire::engine::{Cell, Engine, FieldDescription, QueryResult, Session};
 
     #[test]
@@ -1724,6 +1803,110 @@ mod tests {
         assert_eq!(
             got,
             vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
+    }
+
+    fn order_scope() -> Scope {
+        Scope {
+            columns: vec![
+                ColumnBinding {
+                    qualifier: Some("t".into()),
+                    name: "a".into(),
+                    ty: pgtypes::ColumnType::Int4,
+                },
+                ColumnBinding {
+                    qualifier: Some("t".into()),
+                    name: "b".into(),
+                    ty: pgtypes::ColumnType::Int4,
+                },
+            ],
+        }
+    }
+
+    fn parsed_select(sql: &str) -> SelectStmt {
+        match pgparser::parse(sql).expect("parse").pop().expect("one") {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_order_keys_resolve_positions_aliases_and_source_fallback() {
+        use super::{SelectOrderKey, resolve_select_order_keys};
+
+        let s = parsed_select("SELECT a AS x, b FROM t ORDER BY 1, x DESC, t.b, b + 0");
+        let scope = order_scope();
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&s.projection, &scope).expect("projection");
+        let keys =
+            resolve_select_order_keys(&s.order_by, &fields, &out_exprs, false).expect("order keys");
+
+        assert!(matches!(keys[0], SelectOrderKey::Output(0)));
+        assert!(matches!(keys[1], SelectOrderKey::Output(0)));
+        assert!(matches!(keys[2], SelectOrderKey::SourceExpr(_)));
+        assert!(matches!(keys[3], SelectOrderKey::SourceExpr(_)));
+    }
+
+    #[test]
+    fn select_order_keys_report_pg_errors() {
+        use super::resolve_select_order_keys;
+
+        let scope = order_scope();
+
+        let bad_pos = parsed_select("SELECT a FROM t ORDER BY 0");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&bad_pos.projection, &scope).expect("projection");
+        let err = resolve_select_order_keys(&bad_pos.order_by, &fields, &out_exprs, false)
+            .expect_err("bad position");
+        assert_eq!(err.into_pg().code, "42P10");
+
+        let overflow = parsed_select("SELECT a FROM t ORDER BY 999999999999999999999999999");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&overflow.projection, &scope).expect("projection");
+        let err = resolve_select_order_keys(&overflow.order_by, &fields, &out_exprs, false)
+            .expect_err("overflow");
+        assert_eq!(err.into_pg().code, "42601");
+
+        let duplicate = parsed_select("SELECT a AS x, b AS x FROM t ORDER BY x");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&duplicate.projection, &scope).expect("projection");
+        let err = resolve_select_order_keys(&duplicate.order_by, &fields, &out_exprs, false)
+            .expect_err("ambiguous output label");
+        let pg = err.into_pg();
+        assert_eq!(pg.code, "42702");
+        assert_eq!(pg.message, "ORDER BY \"x\" is ambiguous");
+    }
+
+    #[test]
+    fn select_distinct_order_keys_require_output_columns() {
+        use super::{SelectOrderKey, resolve_select_order_keys};
+
+        let scope = order_scope();
+
+        let by_alias = parsed_select("SELECT DISTINCT a AS x FROM t ORDER BY x");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&by_alias.projection, &scope).expect("projection");
+        let keys = resolve_select_order_keys(&by_alias.order_by, &fields, &out_exprs, true)
+            .expect("alias is output");
+        assert_eq!(keys, vec![SelectOrderKey::Output(0)]);
+
+        let by_select_expr = parsed_select("SELECT DISTINCT a AS x FROM t ORDER BY a");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&by_select_expr.projection, &scope).expect("projection");
+        let keys = resolve_select_order_keys(&by_select_expr.order_by, &fields, &out_exprs, true)
+            .expect("select-list expression is output");
+        assert_eq!(keys, vec![SelectOrderKey::Output(0)]);
+
+        let source_only = parsed_select("SELECT DISTINCT a FROM t ORDER BY b");
+        let (fields, out_exprs, _) =
+            super::resolve_projection(&source_only.projection, &scope).expect("projection");
+        let err = resolve_select_order_keys(&source_only.order_by, &fields, &out_exprs, true)
+            .expect_err("source-only key");
+        let pg = err.into_pg();
+        assert_eq!(pg.code, "42P10");
+        assert_eq!(
+            pg.message,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
         );
     }
 
