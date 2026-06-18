@@ -712,6 +712,12 @@ pub(crate) fn select_to_relation_with_ctes(
     ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Relation, ExecError> {
+    if s.locking.is_some() {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
+        ));
+    }
+
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
     let sub_ctx = crate::subquery::SubCtx {
