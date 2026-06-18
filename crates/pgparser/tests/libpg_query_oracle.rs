@@ -50,6 +50,9 @@ const ACCEPTED: &[&str] = &[
     "SELECT DISTINCT a FROM t",
     "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
     "SELECT a FROM t LIMIT 5 OFFSET 2",
+    "VALUES (1), (2)",
+    "VALUES (1) UNION SELECT 2",
+    "SELECT x FROM (VALUES (1), (2)) AS v(x)",
     // SP33: joins — every join type, comma form, USING/NATURAL, aliases,
     // qualified refs, qualified wildcard, multi-way, and derived tables.
     "SELECT t.a FROM t JOIN u ON t.id = u.id",
