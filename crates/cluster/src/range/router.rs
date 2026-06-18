@@ -292,44 +292,28 @@ impl RangeRouter {
             Statement::Insert { table, .. }
             | Statement::Update { table, .. }
             | Statement::Delete { table, .. } => self.range_of(table).map(Some),
-            Statement::Select(s) => {
+            Statement::Query(q) => {
                 let mut ranges = std::collections::BTreeSet::new();
-                collect_select_ranges(self, s, &mut ranges)?;
+                collect_query_expr_ranges(self, q, &mut ranges)?;
                 match ranges.len() {
                     0 => Ok(None), // FROM-less -> range 0, unpinned
                     1 => Ok(Some(
                         *ranges.iter().next().expect("len()==1 has one element"),
                     )),
-                    _ => Err(ExecError::Unsupported(
-                        "cross-range joins or subqueries are not supported".into(),
-                    )),
-                }
-            }
-            // SP38/SP39: a set-operation query (UNION / INTERSECT / EXCEPT). Walk
-            // every query-body leaf in the set-op tree; SELECT leaves contribute
-            // ranges and VALUES leaves are neutral. If the SELECT leaves all touch
-            // one range, route there; if they span ranges, reject 0A000.
-            Statement::SetOperation(q) => {
-                let mut ranges = std::collections::BTreeSet::new();
-                // Only `q.body` is walked: the query-level ORDER BY references the
-                // combined OUTPUT columns (positions / output names), never a
-                // FROM-table, so it cannot introduce a new range.
-                collect_set_expr_ranges(self, &q.body, &mut ranges)?;
-                match ranges.len() {
-                    0 => Ok(None),
-                    1 => Ok(Some(
-                        *ranges.iter().next().expect("len()==1 has one element"),
-                    )),
-                    _ => Err(ExecError::Unsupported(
-                        "set operations spanning ranges are not supported".into(),
-                    )),
+                    _ => {
+                        let msg = if matches!(q.body, pgparser::ast::SetExpr::SetOp { .. }) {
+                            "set operations spanning ranges are not supported"
+                        } else {
+                            "cross-range joins or subqueries are not supported"
+                        };
+                        Err(ExecError::Unsupported(msg.into()))
+                    }
                 }
             }
             // DDL, transaction control, and GUC control resolve to range 0 but do
             // not pin: a txn can still be pinned to a data range by a later DML.
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
-            | Statement::Values(_)
             | Statement::Begin { .. }
             | Statement::Commit
             | Statement::Rollback
@@ -671,8 +655,24 @@ fn collect_select_ranges(
     Ok(())
 }
 
+/// Collect every base-table range a full query expression references. The body
+/// carries FROM tables, while query-level ORDER BY expressions may still contain
+/// subqueries that affect the routing decision.
+fn collect_query_expr_ranges(
+    router: &RangeRouter,
+    q: &pgparser::ast::QueryExpr,
+    out: &mut std::collections::BTreeSet<RangeId>,
+) -> Result<(), ExecError> {
+    collect_set_expr_ranges(router, &q.body, out)?;
+    for o in &q.order_by {
+        collect_expr_ranges(router, &o.expr, out)?;
+    }
+    Ok(())
+}
+
 /// SP39: collect every base-table range a query body references. SELECT bodies
-/// walk normally; VALUES bodies are range-neutral.
+/// walk normally; VALUES bodies are range-neutral; nested query expressions and
+/// set-op trees recurse into their children.
 fn collect_query_body_ranges(
     router: &RangeRouter,
     body: &pgparser::ast::QueryBody,
@@ -681,6 +681,7 @@ fn collect_query_body_ranges(
     match body {
         pgparser::ast::QueryBody::Select(s) => collect_select_ranges(router, s, out),
         pgparser::ast::QueryBody::Values(_) => Ok(()),
+        pgparser::ast::QueryBody::Nested(q) => collect_query_expr_ranges(router, q, out),
     }
 }
 
@@ -710,7 +711,7 @@ fn collect_table_expr_ranges(
             out.insert(router.range_of(name)?);
         }
         TableExpr::Derived { subquery, .. } => {
-            collect_query_body_ranges(router, subquery, out)?;
+            collect_query_expr_ranges(router, subquery, out)?;
         }
         TableExpr::Join { left, right, .. } => {
             collect_table_expr_ranges(router, left, out)?;
@@ -722,7 +723,7 @@ fn collect_table_expr_ranges(
 
 /// SP34: collect ranges referenced by subqueries nested in an expression. Recurses
 /// through every `Expr` variant that can hold a subquery or a sub-expression; a
-/// subquery node recurses into its full SELECT via `collect_select_ranges`.
+/// subquery node recurses into its full query expression.
 fn collect_expr_ranges(
     router: &RangeRouter,
     e: &pgparser::ast::Expr,
@@ -730,10 +731,10 @@ fn collect_expr_ranges(
 ) -> Result<(), ExecError> {
     use pgparser::ast::{Expr, FuncArgs};
     match e {
-        Expr::ScalarSubquery(s) | Expr::Exists(s) => collect_select_ranges(router, s, out)?,
+        Expr::ScalarSubquery(s) | Expr::Exists(s) => collect_query_expr_ranges(router, s, out)?,
         Expr::InSubquery { expr, subquery, .. } | Expr::Quantified { expr, subquery, .. } => {
             collect_expr_ranges(router, expr, out)?;
-            collect_select_ranges(router, subquery, out)?;
+            collect_query_expr_ranges(router, subquery, out)?;
         }
         Expr::Unary { expr, .. } => collect_expr_ranges(router, expr, out)?,
         Expr::Binary { left, right, .. } => {
@@ -1056,6 +1057,74 @@ mod tests {
             err.message.contains("set operations spanning ranges"),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nested_query_exprs_route_or_reject_by_all_referenced_ranges() {
+        // boundary at table 2: a (id 1) -> range 0, b (id 2) -> range 1.
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        router.simple("CREATE TABLE a (id int4)").await.expect("a");
+        router.simple("CREATE TABLE b (id int4)").await.expect("b");
+        router
+            .simple("INSERT INTO a VALUES (1)")
+            .await
+            .expect("seed a");
+        router
+            .simple("INSERT INTO b VALUES (2)")
+            .await
+            .expect("seed b");
+
+        // A top-level nested set-op QueryExpr that references only b must route to range 1.
+        assert_eq!(
+            router
+                .scan_one_i32("((VALUES (2) UNION SELECT id FROM b ORDER BY 1))")
+                .await,
+            vec![2]
+        );
+
+        // A derived QueryExpr that references only b must also route to range 1.
+        assert_eq!(
+            router
+                .scan_one_i32("SELECT d.id FROM (SELECT id FROM b ORDER BY id LIMIT 1) AS d(id)")
+                .await,
+            vec![2]
+        );
+
+        // A FROM-less outer SELECT with a nested scalar QueryExpr over b also
+        // routes to range 1; VALUES in the set-op leaf is range-neutral.
+        assert_eq!(
+            router
+                .scan_one_i32("SELECT ((VALUES (2) UNION SELECT id FROM b ORDER BY 1 LIMIT 1))")
+                .await,
+            vec![2]
+        );
+
+        // QueryExpr-level ORDER BY moved out of SelectStmt during AST
+        // unification; subqueries there must still contribute ranges.
+        assert_eq!(
+            router
+                .scan_one_i32("SELECT 1 ORDER BY (SELECT id FROM b LIMIT 1)")
+                .await,
+            vec![1]
+        );
+
+        let err = router
+            .simple("SELECT d.id FROM (SELECT id FROM a UNION SELECT id FROM b) AS d(id)")
+            .await
+            .expect_err("cross-range nested query expression rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(err.message.contains("cross-range"), "got {err:?}");
+
+        let err = router
+            .simple("SELECT id FROM a ORDER BY (SELECT id FROM b LIMIT 1)")
+            .await
+            .expect_err("cross-range query tail subquery rejected");
+        assert_eq!(err.code, "0A000", "got {err:?}");
+        assert!(err.message.contains("cross-range"), "got {err:?}");
     }
 
     /// A cross-range transaction now escalates to two-phase commit instead of being
