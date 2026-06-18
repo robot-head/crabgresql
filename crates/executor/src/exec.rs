@@ -751,7 +751,7 @@ pub(crate) fn select_to_relation(
     let rows = if crate::agg::is_aggregate_query(s) {
         crate::agg::aggregate_rows(s, &relation.scope, kept, ctx)?
     } else {
-        project_rows_ordered(s, &relation.scope, &out_exprs, kept, ctx)?
+        project_rows_ordered(s, &relation.scope, &fields, &out_exprs, kept, ctx)?
     };
     Ok(Relation {
         scope: out_scope,
@@ -1007,22 +1007,33 @@ pub(crate) async fn execute_read_locking(
 fn project_rows_ordered(
     s: &SelectStmt,
     scope: &Scope,
+    fields: &[FieldDescription],
     out_exprs: &[Expr],
     mut kept: Vec<Vec<Datum>>,
     ctx: &crate::clock::EvalCtx,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
-    // SP28: SELECT DISTINCT projects FIRST, dedups output rows, then ORDER BY
-    // sorts the deduped output (keys must be select-list columns).
+    let order_keys = resolve_select_order_keys(&s.order_by, fields, out_exprs, s.distinct)?;
+
+    // SP39: SELECT DISTINCT projects FIRST, dedups output rows, then ORDER BY
+    // sorts the deduped output. PostgreSQL requires every sort key to refer to
+    // the select-list output (ordinal, alias/name, or the exact select expression).
     if s.distinct {
         let mut projected = project_rows(out_exprs, scope, &kept, ctx)?;
         let mut seen: std::collections::HashSet<Vec<Datum>> = std::collections::HashSet::new();
         projected.retain(|r| seen.insert(r.clone()));
         if !s.order_by.is_empty() {
-            let idxs = distinct_order_indices(s, out_exprs)?;
             let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = projected
                 .into_iter()
                 .map(|r| {
-                    let keys = idxs.iter().map(|&i| r[i].clone()).collect();
+                    let keys = order_keys
+                        .iter()
+                        .map(|k| match k {
+                            SelectOrderKey::Output(i) => r[*i].clone(),
+                            SelectOrderKey::SourceExpr(_) => {
+                                unreachable!("DISTINCT order keys are output-only")
+                            }
+                        })
+                        .collect();
                     (keys, r)
                 })
                 .collect();
@@ -1032,13 +1043,21 @@ fn project_rows_ordered(
         apply_offset_limit(&mut projected, s.offset, s.limit);
         return Ok(projected);
     }
-    // ORDER BY over the source row, then OFFSET/LIMIT, then project.
+
+    // Non-DISTINCT keeps the existing source-row ordering shape so non-projected
+    // source expressions still work, but output ordinals/labels evaluate the
+    // corresponding projection expression for each source row.
     if !s.order_by.is_empty() {
         let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(kept.len());
         for row in kept {
-            let mut keys = Vec::with_capacity(s.order_by.len());
-            for item in &s.order_by {
-                keys.push(crate::eval::eval(&item.expr, scope, &row, ctx)?);
+            let mut keys = Vec::with_capacity(order_keys.len());
+            for key in &order_keys {
+                keys.push(match key {
+                    SelectOrderKey::Output(i) => {
+                        crate::eval::eval(&out_exprs[*i], scope, &row, ctx)?
+                    }
+                    SelectOrderKey::SourceExpr(expr) => crate::eval::eval(expr, scope, &row, ctx)?,
+                });
             }
             keyed.push((keys, row));
         }
@@ -1062,7 +1081,7 @@ fn project_order_limit(
     ctx: &crate::clock::EvalCtx,
 ) -> Result<QueryResult, ExecError> {
     let (fields, out_exprs, _tys) = resolve_projection(&s.projection, scope)?;
-    let rows = project_rows_ordered(s, scope, &out_exprs, kept, ctx)?;
+    let rows = project_rows_ordered(s, scope, &fields, &out_exprs, kept, ctx)?;
     Ok(rows_result(fields, &rows, &ctx.time_zone))
 }
 
@@ -1107,7 +1126,6 @@ pub(crate) fn rows_result(
 /// (`ORDER BY 1`, `ORDER BY alias`) are represented as output indices; all other
 /// expressions are evaluated against the source/group scope.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum SelectOrderKey {
     Output(usize),
     SourceExpr(Expr),
@@ -1116,7 +1134,6 @@ pub(crate) enum SelectOrderKey {
 /// Resolve SELECT ORDER BY items using PostgreSQL's SQL92 rules:
 /// integer constant -> output ordinal, bare output label -> output column, and
 /// everything else -> source expression unless `require_output` is true.
-#[allow(dead_code)]
 pub(crate) fn resolve_select_order_keys(
     order_by: &[OrderItem],
     fields: &[FieldDescription],
@@ -1129,7 +1146,6 @@ pub(crate) fn resolve_select_order_keys(
         .collect()
 }
 
-#[allow(dead_code)]
 fn resolve_select_order_key(
     item: &OrderItem,
     fields: &[FieldDescription],
@@ -1166,7 +1182,6 @@ fn resolve_select_order_key(
     Ok(SelectOrderKey::SourceExpr(item.expr.clone()))
 }
 
-#[allow(dead_code)]
 fn output_label_index(fields: &[FieldDescription], name: &str) -> Result<Option<usize>, ExecError> {
     let mut found = None;
     for (i, f) in fields.iter().enumerate() {
@@ -1178,25 +1193,6 @@ fn output_label_index(fields: &[FieldDescription], name: &str) -> Result<Option<
         }
     }
     Ok(found)
-}
-
-/// SP28: map each `ORDER BY` expression to the output column it references. Under
-/// `SELECT DISTINCT` the sort keys must be select-list columns (PostgreSQL's
-/// rule); a non-matching expression is rejected (0A000).
-fn distinct_order_indices(s: &SelectStmt, out_exprs: &[Expr]) -> Result<Vec<usize>, ExecError> {
-    let mut idxs = Vec::with_capacity(s.order_by.len());
-    for item in &s.order_by {
-        match out_exprs.iter().position(|e| e == &item.expr) {
-            Some(i) => idxs.push(i),
-            None => {
-                return Err(ExecError::Unsupported(
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in the select list"
-                        .into(),
-                ));
-            }
-        }
-    }
-    Ok(idxs)
 }
 
 /// SP28: drop the first `offset` rows then keep at most `limit` (negative values
@@ -1804,6 +1800,95 @@ mod tests {
             got,
             vec![Some("1".into()), Some("2".into()), Some("3".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn plain_select_order_by_position_and_alias_use_output() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (a int4, b int4, name text)").await;
+        run(
+            &engine,
+            "INSERT INTO t VALUES (1,20,'a'),(2,10,'b'),(3,30,'c')",
+        )
+        .await;
+
+        let r = &run(&engine, "SELECT name FROM t ORDER BY 1 DESC").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(
+            got,
+            vec![Some("c".into()), Some("b".into()), Some("a".into())]
+        );
+
+        let r = &run(&engine, "SELECT a AS b FROM t ORDER BY b").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(
+            got,
+            vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
+
+        let r = &run(&engine, "SELECT a AS b FROM t ORDER BY t.b").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(
+            got,
+            vec![Some("2".into()), Some("1".into()), Some("3".into())]
+        );
+
+        let r = &run(&engine, "SELECT a AS b FROM t ORDER BY b + 0").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(
+            got,
+            vec![Some("2".into()), Some("1".into()), Some("3".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_select_order_by_pg_error_surface() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (a int4, b int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,20),(2,10)").await;
+
+        let err = engine
+            .connect()
+            .simple_query("SELECT a FROM t ORDER BY 0")
+            .await
+            .expect_err("position zero");
+        assert_eq!(err.code, "42P10");
+
+        let err = engine
+            .connect()
+            .simple_query("SELECT a FROM t ORDER BY 999999999999999999999999999")
+            .await
+            .expect_err("overflow position");
+        assert_eq!(err.code, "42601");
+
+        let err = engine
+            .connect()
+            .simple_query("SELECT a AS x, b AS x FROM t ORDER BY x")
+            .await
+            .expect_err("ambiguous output label");
+        assert_eq!(err.code, "42702");
+    }
+
+    #[tokio::test]
+    async fn distinct_select_order_by_uses_output_only() {
+        let engine = SqlEngine::new();
+        run(&engine, "CREATE TABLE t (a int4, b int4)").await;
+        run(&engine, "INSERT INTO t VALUES (1,20),(1,10),(2,30)").await;
+
+        let r = &run(&engine, "SELECT DISTINCT a AS x FROM t ORDER BY x DESC").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(got, vec![Some("2".into()), Some("1".into())]);
+
+        let r = &run(&engine, "SELECT DISTINCT a AS x FROM t ORDER BY 1 DESC").await[0];
+        let got: Vec<_> = rows_of(r).iter().map(|row| text(&row[0])).collect();
+        assert_eq!(got, vec![Some("2".into()), Some("1".into())]);
+
+        let err = engine
+            .connect()
+            .simple_query("SELECT DISTINCT a FROM t ORDER BY b")
+            .await
+            .expect_err("source-only distinct key");
+        assert_eq!(err.code, "42P10");
     }
 
     fn order_scope() -> Scope {
