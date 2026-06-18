@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use catalog::{Column, Table, TableId};
 use kv::Kv;
-use pgparser::ast::{Expr, OrderItem, SelectItem, SelectStmt, Statement};
+use pgparser::ast::{Expr, OrderItem, QueryBody, SelectItem, SelectStmt, Statement};
 use pgtypes::{ColumnType, Datum};
 use pgwire::engine::{Cell, FieldDescription, QueryResult};
 use zerocopy::FromBytes;
@@ -673,23 +673,18 @@ fn build_table_expr(
             let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
             join_relations(l, r, *kind, constraint, ctx)
         }
-        TableExpr::Derived { subquery, alias } => {
-            let inner =
-                select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx)?;
-            // Re-qualify every output column under the derived alias.
-            let columns = inner
-                .scope
-                .columns
-                .into_iter()
-                .map(|c| ColumnBinding {
-                    qualifier: Some(alias.clone()),
-                    ..c
-                })
-                .collect();
-            Ok(Relation {
-                scope: Scope { columns },
-                rows: inner.rows,
-            })
+        TableExpr::Derived {
+            subquery,
+            alias,
+            columns,
+        } => {
+            let inner = match subquery {
+                QueryBody::Select(s) => {
+                    select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, s, ctx)?
+                }
+                QueryBody::Values(v) => crate::values::values_to_relation(v, ctx)?,
+            };
+            crate::values::requalify_derived(inner, alias, columns)
         }
     }
 }
@@ -817,26 +812,52 @@ fn build_table_expr_schema(
                 &crate::clock::EvalCtx::test_default(),
             )
         }
-        TableExpr::Derived { subquery, alias } => {
-            let inner_scope = if subquery.from.is_empty() {
-                Scope::empty()
-            } else {
-                build_from_schema(catalog_kv, &subquery.from)?.scope
+        TableExpr::Derived {
+            subquery,
+            alias,
+            columns,
+        } => {
+            let inner = match subquery {
+                QueryBody::Select(s) => {
+                    let inner_scope = if s.from.is_empty() {
+                        Scope::empty()
+                    } else {
+                        build_from_schema(catalog_kv, &s.from)?.scope
+                    };
+                    let (fields, _exprs, tys) = resolve_projection(&s.projection, &inner_scope)?;
+                    let columns = fields
+                        .iter()
+                        .zip(&tys)
+                        .map(|(f, ty)| ColumnBinding {
+                            qualifier: None,
+                            name: f.name.clone(),
+                            ty: *ty,
+                        })
+                        .collect();
+                    Relation {
+                        scope: Scope { columns },
+                        rows: Vec::new(),
+                    }
+                }
+                QueryBody::Values(v) => {
+                    let schema = crate::values::describe_values(v)?;
+                    let columns = schema
+                        .names
+                        .iter()
+                        .zip(&schema.types)
+                        .map(|(name, ty)| ColumnBinding {
+                            qualifier: None,
+                            name: name.clone(),
+                            ty: *ty,
+                        })
+                        .collect();
+                    Relation {
+                        scope: Scope { columns },
+                        rows: Vec::new(),
+                    }
+                }
             };
-            let (fields, _exprs, tys) = resolve_projection(&subquery.projection, &inner_scope)?;
-            let columns = fields
-                .iter()
-                .zip(&tys)
-                .map(|(f, ty)| ColumnBinding {
-                    qualifier: Some(alias.clone()),
-                    name: f.name.clone(),
-                    ty: *ty,
-                })
-                .collect();
-            Ok(Relation {
-                scope: Scope { columns },
-                rows: Vec::new(),
-            })
+            crate::values::requalify_derived(inner, alias, columns)
         }
     }
 }
@@ -1405,8 +1426,14 @@ pub(crate) fn describe(
     let statements = pgparser::parse(sql)?;
     // Extended-protocol Describe targets a single statement.
     let stmt = statements.first();
-    if let Some(Statement::SetOperation(q)) = stmt {
-        return crate::setops::describe_set_query(catalog_kv, q);
+    match stmt {
+        Some(Statement::SetOperation(q)) => {
+            return crate::setops::describe_set_query(catalog_kv, q);
+        }
+        Some(Statement::Values(q)) => {
+            return crate::values::describe_values_query(q);
+        }
+        _ => {}
     }
     let Some(Statement::Select(s)) = stmt else {
         return Ok(Vec::new()); // non-SELECT (or empty) returns no row description

@@ -399,6 +399,7 @@ impl SqlSession {
             }
             Statement::Select(s) if s.locking.is_some() => self.run_select_locking(s).await,
             Statement::Select(_) => self.run_select(stmt).await,
+            Statement::Values(_) => self.run_values(stmt).await,
             Statement::SetOperation(_) => self.run_set_operation(stmt).await,
             // SP37: GUC control. These are NOT exempt from the failed-txn guard
             // above (only COMMIT/ROLLBACK are), so a SET in an aborted block is
@@ -572,6 +573,15 @@ impl SqlSession {
             stmt,
             &ctx,
         )
+    }
+
+    async fn run_values(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
+        let Statement::Values(q) = stmt else {
+            unreachable!("run_one only routes a Values here");
+        };
+        let (_snapshot, _own, _gsnap) = self.read_context().await?;
+        let ctx = self.eval_ctx();
+        crate::values::execute_values_query(q, &ctx)
     }
 
     async fn run_set_operation(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {

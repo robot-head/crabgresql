@@ -1,5 +1,6 @@
-use pgparser::ast::{Expr, ValuesStmt};
-use pgtypes::ColumnType;
+use pgparser::ast::{Expr, ValuesQuery, ValuesStmt};
+use pgtypes::{ColumnType, Datum};
+use pgwire::engine::FieldDescription;
 
 use crate::clock::EvalCtx;
 use crate::error::ExecError;
@@ -13,6 +14,31 @@ pub(crate) struct ValuesSchema {
 
 pub(crate) fn describe_values(v: &ValuesStmt) -> Result<ValuesSchema, ExecError> {
     analyze_values(v)
+}
+
+pub(crate) fn describe_values_query(q: &ValuesQuery) -> Result<Vec<FieldDescription>, ExecError> {
+    let schema = describe_values(&q.body)?;
+    Ok(schema
+        .names
+        .iter()
+        .zip(&schema.types)
+        .map(|(name, ty)| crate::exec::field(name, *ty))
+        .collect())
+}
+
+pub(crate) fn execute_values_query(
+    q: &ValuesQuery,
+    ctx: &EvalCtx,
+) -> Result<pgwire::engine::QueryResult, ExecError> {
+    let mut rel = values_to_relation(&q.body, ctx)?;
+    apply_query_order(&mut rel, &q.order_by, q.offset, q.limit, ctx)?;
+    let fields = rel
+        .scope
+        .columns
+        .iter()
+        .map(|c| crate::exec::field(&c.name, c.ty))
+        .collect();
+    Ok(crate::exec::rows_result(fields, &rel.rows, &ctx.time_zone))
 }
 
 pub(crate) fn values_to_relation(
@@ -35,6 +61,51 @@ pub(crate) fn values_to_relation(
     })
 }
 
+pub(crate) fn apply_query_order(
+    rel: &mut crate::join::Relation,
+    order_by: &[pgparser::ast::OrderItem],
+    offset: Option<i64>,
+    limit: Option<i64>,
+    ctx: &EvalCtx,
+) -> Result<(), ExecError> {
+    if !order_by.is_empty() {
+        let mut keyed: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(rel.rows.len());
+        for row in rel.rows.drain(..) {
+            let mut keys = Vec::with_capacity(order_by.len());
+            for item in order_by {
+                keys.push(order_key(&item.expr, &rel.scope, &row, ctx)?);
+            }
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|a, b| crate::exec::order_cmp(&a.0, &b.0, order_by));
+        rel.rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    crate::exec::apply_offset_limit(&mut rel.rows, offset, limit);
+    Ok(())
+}
+
+pub(crate) fn requalify_derived(
+    mut rel: crate::join::Relation,
+    alias: &str,
+    columns: &Option<Vec<String>>,
+) -> Result<crate::join::Relation, ExecError> {
+    if let Some(names) = columns {
+        if names.len() != rel.scope.width() {
+            return Err(ExecError::DerivedColumnAliasCount {
+                expected: rel.scope.width(),
+                got: names.len(),
+            });
+        }
+        for (col, name) in rel.scope.columns.iter_mut().zip(names) {
+            col.name = name.clone();
+        }
+    }
+    for col in &mut rel.scope.columns {
+        col.qualifier = Some(alias.to_string());
+    }
+    Ok(rel)
+}
+
 fn scope_from_schema(schema: &ValuesSchema, qualifier: Option<&str>) -> Scope {
     Scope {
         columns: schema
@@ -48,6 +119,23 @@ fn scope_from_schema(schema: &ValuesSchema, qualifier: Option<&str>) -> Scope {
             })
             .collect(),
     }
+}
+
+fn order_key(expr: &Expr, scope: &Scope, row: &[Datum], ctx: &EvalCtx) -> Result<Datum, ExecError> {
+    if let Expr::IntLiteral(s) = expr {
+        let pos: usize = s.parse().map_err(|_| {
+            ExecError::InvalidColumnReference(format!(
+                "ORDER BY position {s} is not in select list"
+            ))
+        })?;
+        if pos == 0 || pos > scope.width() {
+            return Err(ExecError::InvalidColumnReference(format!(
+                "ORDER BY position {pos} is not in select list"
+            )));
+        }
+        return Ok(row[pos - 1].clone());
+    }
+    crate::eval::eval(expr, scope, row, ctx)
 }
 
 fn analyze_values(v: &ValuesStmt) -> Result<ValuesSchema, ExecError> {
