@@ -149,6 +149,31 @@ async fn derived_select_optional_column_aliases_still_work() {
 }
 
 #[tokio::test]
+async fn derived_select_column_alias_count_error_is_42601() {
+    let c = connect_new().await;
+    assert_eq!(
+        err_code(&c, "SELECT * FROM (SELECT 1, 2) AS d(one)").await,
+        "42601"
+    );
+}
+
+#[tokio::test]
+async fn values_derived_table_is_not_correlated() {
+    let c = connect_new().await;
+    c.simple_query("CREATE TABLE t (id int4)")
+        .await
+        .expect("create");
+    c.simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        err_code(&c, "SELECT * FROM t, (VALUES (t.id)) AS v(x)").await,
+        "42P01"
+    );
+}
+
+#[tokio::test]
 async fn values_can_participate_in_set_operations() {
     let c = connect_new().await;
     c.simple_query("CREATE TABLE t (a int4)")
@@ -189,13 +214,16 @@ async fn values_set_ops_share_unknown_resolution() {
         vec![vec![Some("a".into())], vec![Some("b".into())]]
     );
     assert_eq!(
-        err_code(&c, "VALUES ('1') UNION SELECT 2").await,
-        "42804",
-        "a one-row all-unknown VALUES leaf resolves to text before set-op analysis"
+        rows(&c, "VALUES (NULL), ('5') UNION SELECT 2 ORDER BY 1").await,
+        vec![vec![Some("2".into())], vec![Some("5".into())], vec![None]]
     );
     assert_eq!(
-        err_code(&c, "VALUES ('x'), (2) UNION SELECT 3").await,
+        rows(&c, "VALUES ('1') UNION SELECT 2 ORDER BY 1").await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        err_code(&c, "VALUES ('x') UNION SELECT 3").await,
         "22P02",
-        "a bad string literal fails after VALUES resolves the column to int4"
+        "a bad unknown literal fails after the set-op resolves the column to int4"
     );
 }

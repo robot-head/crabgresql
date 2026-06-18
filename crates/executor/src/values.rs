@@ -10,6 +10,7 @@ use crate::scope::{ColumnBinding, Scope};
 pub(crate) struct ValuesSchema {
     pub(crate) names: Vec<String>,
     pub(crate) types: Vec<ColumnType>,
+    pub(crate) unknown: Vec<bool>,
 }
 
 pub(crate) fn describe_values(v: &ValuesStmt) -> Result<ValuesSchema, ExecError> {
@@ -46,6 +47,34 @@ pub(crate) fn values_to_relation(
     ctx: &EvalCtx,
 ) -> Result<crate::join::Relation, ExecError> {
     let schema = analyze_values(v)?;
+    values_to_relation_with_schema(v, ctx, schema)
+}
+
+pub(crate) fn values_to_relation_with_types(
+    v: &ValuesStmt,
+    ctx: &EvalCtx,
+    target_types: &[ColumnType],
+) -> Result<crate::join::Relation, ExecError> {
+    let schema = analyze_values(v)?;
+    if schema.types.len() != target_types.len() {
+        return Err(ExecError::ValuesColumnCount);
+    }
+    values_to_relation_with_schema(
+        v,
+        ctx,
+        ValuesSchema {
+            names: schema.names,
+            types: target_types.to_vec(),
+            unknown: vec![false; target_types.len()],
+        },
+    )
+}
+
+fn values_to_relation_with_schema(
+    v: &ValuesStmt,
+    ctx: &EvalCtx,
+    schema: ValuesSchema,
+) -> Result<crate::join::Relation, ExecError> {
     let mut rows = Vec::with_capacity(v.rows.len());
     for row in &v.rows {
         let mut out = Vec::with_capacity(row.len());
@@ -151,12 +180,19 @@ fn analyze_values(v: &ValuesStmt) -> Result<ValuesSchema, ExecError> {
             cols[idx] = unify_values_col(cols[idx].0, cols[idx].1, ty, unknown)?;
         }
     }
-    let types = cols
+    let (types, unknown): (Vec<_>, Vec<_>) = cols
         .into_iter()
-        .map(|(ty, unknown)| if unknown { ColumnType::Text } else { ty })
-        .collect::<Vec<_>>();
+        .map(|(ty, unknown)| {
+            let output_ty = if unknown { ColumnType::Text } else { ty };
+            (output_ty, unknown)
+        })
+        .unzip();
     let names = (1..=width).map(|n| format!("column{n}")).collect();
-    Ok(ValuesSchema { names, types })
+    Ok(ValuesSchema {
+        names,
+        types,
+        unknown,
+    })
 }
 
 fn is_unknown_literal(e: &Expr) -> bool {

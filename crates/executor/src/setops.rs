@@ -111,11 +111,8 @@ fn resolve_set_columns(
                 .names
                 .into_iter()
                 .zip(schema.types)
-                .map(|(name, ty)| ResolvedCol {
-                    name,
-                    ty,
-                    unknown: false,
-                })
+                .zip(schema.unknown)
+                .map(|((name, ty), unknown)| ResolvedCol { name, ty, unknown })
                 .collect())
         }
         SetExpr::SetOp {
@@ -275,8 +272,8 @@ fn fold(
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let rel = crate::values::values_to_relation(v, ctx)?;
-            coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
+            let rel = crate::values::values_to_relation_with_types(v, ctx, out_tys)?;
+            Ok(rel.rows)
         }
         SetExpr::SetOp {
             op,
