@@ -19,6 +19,15 @@ pub(crate) fn query_to_relation(
     q: &QueryExpr,
     ctx: &EvalCtx,
 ) -> Result<Relation, ExecError> {
+    let sub_ctx = crate::subquery::SubCtx {
+        catalog_kv,
+        kv,
+        global,
+        gsnap,
+        snapshot,
+        own,
+        eval_ctx: ctx,
+    };
     match &q.body {
         SetExpr::Query(QueryBody::Select(s)) => {
             if q.locking.is_some() {
@@ -35,7 +44,8 @@ pub(crate) fn query_to_relation(
         }
         SetExpr::Query(QueryBody::Values(v)) => {
             let mut rel = crate::values::values_to_relation(v, ctx)?;
-            crate::values::apply_query_order(&mut rel, &q.order_by, q.offset, q.limit, ctx)?;
+            let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
+            crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
             Ok(rel)
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
@@ -46,22 +56,17 @@ pub(crate) fn query_to_relation(
             }
             let mut rel =
                 query_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx)?;
-            crate::values::apply_query_order(&mut rel, &q.order_by, q.offset, q.limit, ctx)?;
+            let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
+            crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
             Ok(rel)
         }
-        SetExpr::SetOp { .. } => crate::setops::set_expr_to_relation(
-            catalog_kv,
-            kv,
-            global,
-            gsnap,
-            snapshot,
-            own,
-            &q.body,
-            &q.order_by,
-            q.offset,
-            q.limit,
-            ctx,
-        ),
+        SetExpr::SetOp { .. } => {
+            let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
+            crate::setops::set_expr_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &order_by, q.offset,
+                q.limit, ctx,
+            )
+        }
     }
 }
 

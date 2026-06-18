@@ -10,7 +10,9 @@
 //! to an outer column) is out of scope: a subquery's scope is built solely from its
 //! own FROM, so an outer-column reference fails name resolution (42703).
 
-use pgparser::ast::{BinaryOp, Expr, FuncArgs, FuncCall, QueryExpr, SelectItem, SelectStmt};
+use pgparser::ast::{
+    BinaryOp, Expr, FuncArgs, FuncCall, OrderItem, QueryExpr, SelectItem, SelectStmt,
+};
 use pgtypes::{ColumnType, Datum};
 
 use crate::error::ExecError;
@@ -53,6 +55,24 @@ pub(crate) fn resolve_in_select(ctx: &SubCtx, s: &SelectStmt) -> Result<SelectSt
         o.expr = resolve_expr(ctx, &o.expr)?;
     }
     Ok(out)
+}
+
+/// Rewrite subqueries in query-expression ORDER BY tail items. Non-SELECT query
+/// bodies apply these tails outside `resolve_in_select`, but they need the same
+/// snapshot-consistent subquery folding before scalar `eval`.
+pub(crate) fn resolve_order_items(
+    ctx: &SubCtx,
+    order_by: &[OrderItem],
+) -> Result<Vec<OrderItem>, ExecError> {
+    order_by
+        .iter()
+        .map(|item| {
+            Ok(OrderItem {
+                expr: resolve_expr(ctx, &item.expr)?,
+                asc: item.asc,
+            })
+        })
+        .collect()
 }
 
 /// Recursively rewrite subquery nodes in `e`, bottom-up.

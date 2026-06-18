@@ -1355,17 +1355,28 @@ impl Parser {
         if !has_tail {
             return Ok(q.body);
         }
+        if q.locking.is_some() {
+            return Err(ParseError::new(
+                "FOR UPDATE/SHARE is not allowed with UNION/INTERSECT/EXCEPT",
+                self.peek_pos(),
+            ));
+        }
         match q.body {
-            SetExpr::Query(QueryBody::Select(mut select)) if q.locking.is_none() => {
+            SetExpr::Query(QueryBody::Select(mut select)) => {
                 select.order_by = q.order_by;
                 select.limit = q.limit;
                 select.offset = q.offset;
                 Ok(SetExpr::Query(QueryBody::Select(select)))
             }
-            _ => Err(ParseError::new(
-                "ORDER BY/LIMIT/OFFSET on this parenthesized query must be parsed as a nested query expression",
-                self.peek_pos(),
-            )),
+            body => Ok(SetExpr::Query(QueryBody::Nested(Box::new(
+                crate::ast::QueryExpr {
+                    body,
+                    order_by: q.order_by,
+                    limit: q.limit,
+                    offset: q.offset,
+                    locking: q.locking,
+                },
+            )))),
         }
     }
 
@@ -3629,9 +3640,29 @@ mod tests {
     }
 
     #[test]
-    fn order_by_on_parenthesized_set_op_subtree_is_rejected() {
-        // Deferred non-goal: a tail on a parenthesized MULTI-branch subtree.
-        assert!(crate::parse("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3").is_err());
+    fn parenthesized_tailed_query_exprs_can_be_set_op_branches() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("(SELECT 1 UNION SELECT 2 ORDER BY 1) UNION SELECT 3");
+        let SetExpr::SetOp { left, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        let SetExpr::Query(QueryBody::Nested(inner)) = left.as_ref() else {
+            panic!("left branch preserves the tailed set-op as a nested QueryExpr")
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert!(matches!(inner.body, SetExpr::SetOp { .. }));
+
+        let q = only_query("(VALUES (2), (1) ORDER BY 1 LIMIT 1) UNION SELECT 3");
+        let SetExpr::SetOp { left, .. } = &q.body else {
+            panic!("expected top SetOp")
+        };
+        let SetExpr::Query(QueryBody::Nested(inner)) = left.as_ref() else {
+            panic!("left branch preserves the tailed VALUES as a nested QueryExpr")
+        };
+        assert_eq!(inner.order_by.len(), 1);
+        assert_eq!(inner.limit, Some(1));
+        assert!(matches!(inner.body, SetExpr::Query(QueryBody::Values(_))));
     }
 
     #[test]

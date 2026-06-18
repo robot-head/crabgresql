@@ -203,6 +203,28 @@ async fn derived_query_expr_describe_uses_alias_columns() {
 }
 
 #[tokio::test]
+async fn non_select_query_tails_resolve_subqueries() {
+    let c = connect_new().await;
+
+    assert_eq!(
+        rows(&c, "VALUES (2), (1) ORDER BY (SELECT 1), 1").await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT v.x FROM (VALUES (2), (1) ORDER BY (SELECT 1), 1) AS v(x)",
+        )
+        .await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT 2 UNION SELECT 1 ORDER BY (SELECT 1), 1").await,
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+}
+
+#[tokio::test]
 async fn expression_subquery_error_surface_is_preserved() {
     let c = connect_new().await;
     assert_eq!(err_code(&c, "SELECT (VALUES (1), (2))").await, "21000");

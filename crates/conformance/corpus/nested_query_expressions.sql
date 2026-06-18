@@ -14,6 +14,10 @@ SELECT v.id
 FROM (VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2) AS v(id)
 ORDER BY v.id;
 
+-- tailed parenthesized query expressions as set-operation operands
+(VALUES (2), (1) ORDER BY 1 LIMIT 1) UNION SELECT 3 ORDER BY 1;
+(SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT 1) UNION SELECT 3 ORDER BY 1;
+
 -- scalar subqueries over pure VALUES and over a set operation
 SELECT (VALUES (42)) AS answer;
 SELECT (VALUES (2) UNION SELECT 1 ORDER BY 1 LIMIT 1) AS first_value;
