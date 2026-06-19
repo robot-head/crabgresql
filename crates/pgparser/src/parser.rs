@@ -1136,7 +1136,7 @@ impl Parser {
         self.expect(&Token::Keyword(Keyword::Drop))?;
         self.expect(&Token::Keyword(Keyword::Table))?;
         // SP40: accept IF EXISTS (consistent with DROP SERVER / FOREIGN TABLE).
-        self.eat_if_exists();
+        self.eat_if_exists()?;
         Ok(Statement::DropTable {
             name: self.expect_ident()?,
         })
@@ -1875,7 +1875,7 @@ impl Parser {
         self.expect(&Token::Keyword(Keyword::Foreign))?;
         self.expect(&Token::Keyword(Keyword::Data))?;
         self.expect(&Token::Keyword(Keyword::Wrapper))?;
-        let if_exists = self.eat_if_exists();
+        let if_exists = self.eat_if_exists()?;
         let name = self.expect_ident()?;
         Ok(Statement::DropFdw { name, if_exists })
     }
@@ -1914,7 +1914,7 @@ impl Parser {
         use crate::ast::Statement;
         self.expect(&Token::Keyword(Keyword::Drop))?;
         self.expect(&Token::Keyword(Keyword::Server))?;
-        let if_exists = self.eat_if_exists();
+        let if_exists = self.eat_if_exists()?;
         let name = self.expect_ident()?;
         Ok(Statement::DropServer { name, if_exists })
     }
@@ -1960,7 +1960,7 @@ impl Parser {
         self.expect(&Token::Keyword(Keyword::Drop))?;
         self.expect(&Token::Keyword(Keyword::User))?;
         self.expect(&Token::Keyword(Keyword::Mapping))?;
-        let if_exists = self.eat_if_exists();
+        let if_exists = self.eat_if_exists()?;
         let user = self.parse_user_mapping_user()?;
         self.expect(&Token::Keyword(Keyword::Server))?;
         let server = self.expect_ident()?;
@@ -2007,7 +2007,7 @@ impl Parser {
         self.expect(&Token::Keyword(Keyword::Drop))?;
         self.expect(&Token::Keyword(Keyword::Foreign))?;
         self.expect(&Token::Keyword(Keyword::Table))?;
-        let if_exists = self.eat_if_exists();
+        let if_exists = self.eat_if_exists()?;
         let name = self.expect_ident()?;
         Ok(Statement::DropForeignTable { name, if_exists })
     }
@@ -2068,17 +2068,25 @@ impl Parser {
     }
 
     /// Consume `IF EXISTS` if present, returning whether it was seen.
-    fn eat_if_exists(&mut self) -> bool {
+    ///
+    /// Returns `Ok(true)` when `IF EXISTS` is consumed, `Ok(false)` when `IF`
+    /// is absent, and `Err` (SQLSTATE 42601) when `IF` is present but `EXISTS`
+    /// does not follow — a malformed clause like `DROP SERVER IF NOTEXIST s`.
+    fn eat_if_exists(&mut self) -> Result<bool, ParseError> {
         if self.eat_keyword(Keyword::If) {
             // `EXISTS` is always a keyword (Keyword::Exists) in the lexer.
             if *self.peek() == Token::Keyword(Keyword::Exists) {
                 self.bump();
-                return true;
+                return Ok(true);
             }
-            // IF was consumed but EXISTS was not found — this is a parse error.
-            // Caller will get confused; let it surface naturally.
+            // `IF` was consumed but `EXISTS` did not follow — reject with a
+            // clear syntax error instead of silently mis-parsing the statement.
+            return Err(ParseError::new(
+                format!("expected EXISTS after IF, found {:?}", self.peek()),
+                self.peek_pos(),
+            ));
         }
-        false
+        Ok(false)
     }
 }
 
@@ -4374,5 +4382,34 @@ mod tests {
         // Kills: `s.eq_ignore_ascii_case("exists")` match guard replaced with true/false —
         // "IF notexists" must NOT consume IF EXISTS
         assert!(crate::parse("DROP SERVER IF notexists myserver").is_err());
+    }
+
+    #[test]
+    fn drop_if_without_exists_is_error() {
+        // IF followed by a non-EXISTS token must produce a 42601 parse error, not
+        // silently mis-parse the statement (e.g. treating the next ident as the
+        // object name while `if_exists` comes back false).
+        let e = crate::parse("DROP SERVER IF NOTEXIST s")
+            .expect_err("IF not followed by EXISTS must fail");
+        assert_eq!(e.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn drop_foreign_table_if_without_exists_is_error() {
+        // Same invariant verified for a second DROP variant (DROP FOREIGN TABLE).
+        let e = crate::parse("DROP FOREIGN TABLE IF foo t")
+            .expect_err("IF not followed by EXISTS must fail");
+        assert_eq!(e.sqlstate(), "42601");
+    }
+
+    /// Valid `IF EXISTS` and no-`IF` forms still parse correctly after the fix.
+    #[test]
+    fn drop_if_exists_valid_forms_still_parse() {
+        crate::parse("DROP SERVER IF EXISTS s").expect("DROP SERVER IF EXISTS must parse");
+        crate::parse("DROP SERVER s").expect("DROP SERVER without IF EXISTS must parse");
+        crate::parse("DROP FOREIGN TABLE IF EXISTS t")
+            .expect("DROP FOREIGN TABLE IF EXISTS must parse");
+        crate::parse("DROP FOREIGN TABLE t")
+            .expect("DROP FOREIGN TABLE without IF EXISTS must parse");
     }
 }
