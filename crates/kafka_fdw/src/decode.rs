@@ -30,6 +30,12 @@ pub enum DecodedValue {
 
 /// Decode a Kafka message payload according to `fmt`.
 ///
+/// Returns the decoded value alongside the writer [`apache_avro::Schema`] that
+/// was used to decode it (Avro only) — the schema is `None` for the JSON and
+/// Raw paths. The scanner threads this schema into [`crate::types::project`] so
+/// that decimal `scale` is applied during projection (the parse already happens
+/// here, so returning it avoids fetching/parsing the schema a second time).
+///
 /// * `Wire::Raw`  — wraps the bytes verbatim; no registry access.
 /// * `Wire::Avro` — strips the Confluent 5-byte header, fetches the writer
 ///   schema from `cache` by id, then decodes the body with
@@ -41,9 +47,9 @@ pub async fn decode_value(
     fmt: Wire,
     _topic: &str,
     bytes: &[u8],
-) -> Result<DecodedValue, KafkaFdwError> {
+) -> Result<(DecodedValue, Option<apache_avro::Schema>), KafkaFdwError> {
     match fmt {
-        Wire::Raw => Ok(DecodedValue::Raw(bytes.to_vec())),
+        Wire::Raw => Ok((DecodedValue::Raw(bytes.to_vec()), None)),
 
         Wire::Avro => {
             let (schema_id, body) = crabka_schema_serde::wire::decode(bytes)
@@ -60,7 +66,7 @@ pub async fn decode_value(
             let value = apache_avro::from_avro_datum(&schema, &mut &body[..], None)
                 .map_err(|e| KafkaFdwError::Other(format!("avro datum decode: {e}")))?;
 
-            Ok(DecodedValue::Avro(value))
+            Ok((DecodedValue::Avro(value), Some(schema)))
         }
 
         Wire::Json => {
@@ -70,7 +76,7 @@ pub async fn decode_value(
             let value: serde_json::Value = serde_json::from_slice(body)
                 .map_err(|e| KafkaFdwError::Other(format!("json decode: {e}")))?;
 
-            Ok(DecodedValue::Json(value))
+            Ok((DecodedValue::Json(value), None))
         }
     }
 }
