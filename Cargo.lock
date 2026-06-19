@@ -2424,6 +2424,8 @@ dependencies = [
  "executor",
  "kv",
  "pgtypes",
+ "rustls",
+ "rustls-rustcrypto",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

@@ -5,7 +5,7 @@
 mod config;
 mod decode;
 mod error;
-mod provider;
+pub mod provider;
 mod scan;
 mod source;
 mod types;
