@@ -1,11 +1,10 @@
 //! Versioned (de)serialization of a table schema — the value stored under
-//! `kv::key::catalog_key(name)`. Format: version byte, table_id (u32 BE),
-//! column count (u32 BE), then per column: u32 name length, name bytes, type tag.
-//!
-//! Version 2 extends version 1 by appending a `foreign` flag byte after the
-//! column list:  `0` = ordinary table;  `1` = foreign table, followed by
-//! (server name len u32, server name bytes, option count u32, then per option:
-//!  key len u32, key bytes, value len u32, value bytes).
+//! `kv::key::catalog_key(name)`. Format: version byte (`2`), table_id (u32 BE),
+//! column count (u32 BE), then per column: u32 name length, name bytes, type
+//! tag; followed by a `foreign` flag byte: `0` = ordinary table (no further
+//! payload), `1` = foreign table (server name len u32, server name bytes,
+//! option count u32, then per option: key len u32, key bytes, value len u32,
+//! value bytes).
 //!
 //! Foreign-data-wrapper, foreign-server, and user-mapping objects use their own
 //! simple binary format (not the schema format).
@@ -16,10 +15,10 @@ use pgtypes::numeric::Typmod;
 
 use crate::{Column, ForeignDataWrapper, ForeignServer, ForeignTableMeta, UserMapping};
 
-/// Schema-value format version for ordinary tables (columns only).
-pub const SCHEMA_VERSION: u8 = 1;
-/// Schema-value format version for tables that may carry foreign-table metadata.
-pub const SCHEMA_VERSION_V2: u8 = 2;
+/// The single schema-value format version. All tables (ordinary and foreign)
+/// are written with this version byte; a flag byte after the column list
+/// distinguishes ordinary (`0`) from foreign (`1`).
+pub const SCHEMA_VERSION: u8 = 2;
 
 mod type_tag {
     pub const BOOL: u8 = 0;
@@ -187,31 +186,28 @@ fn read_options(cur: &mut &[u8]) -> Result<Vec<(String, String)>, KvError> {
 
 /// Serialize a table schema (ordinary or foreign).
 ///
-/// - `meta = None`  → version byte `1`, no trailing foreign payload (backwards
-///   compatible with the original format).
-/// - `meta = Some(_)` → version byte `2`, foreign payload appended.
+/// Always writes version byte `2`, then the column list, then a flag byte:
+/// `0` for an ordinary table, `1` for a foreign table followed by the foreign
+/// metadata payload.
 pub fn serialize_schema(
     table_id: u32,
     columns: &[Column],
     meta: Option<&ForeignTableMeta>,
 ) -> Vec<u8> {
-    let version = if meta.is_some() {
-        SCHEMA_VERSION_V2
-    } else {
-        SCHEMA_VERSION
-    };
-    let mut out = vec![version];
+    let mut out = vec![SCHEMA_VERSION];
     out.extend_from_slice(&table_id.to_be_bytes());
     out.extend_from_slice(&(columns.len() as u32).to_be_bytes());
     for c in columns {
         write_str(&mut out, &c.name);
         write_type(&mut out, c.ty);
     }
-    if let Some(m) = meta {
-        // foreign flag = 1 (already implied by version 2, but belt + suspenders)
-        out.push(1);
-        write_str(&mut out, &m.server);
-        write_options(&mut out, &m.options);
+    match meta {
+        None => out.push(0), // ordinary table flag
+        Some(m) => {
+            out.push(1); // foreign table flag
+            write_str(&mut out, &m.server);
+            write_options(&mut out, &m.options);
+        }
     }
     out
 }
@@ -219,12 +215,15 @@ pub fn serialize_schema(
 /// Deserialize a table schema.
 ///
 /// Returns `(table_id, columns, Option<ForeignTableMeta>)`.
+///
+/// Returns `KvError::CorruptRow` if the version byte is not `2`, or if the
+/// flag byte after the column list is not `0` (ordinary) or `1` (foreign).
 pub fn deserialize_schema(
     bytes: &[u8],
 ) -> Result<(u32, Vec<Column>, Option<ForeignTableMeta>), KvError> {
     let mut cur = bytes;
     let version = take_u8(&mut cur)?;
-    if version != SCHEMA_VERSION && version != SCHEMA_VERSION_V2 {
+    if version != SCHEMA_VERSION {
         return Err(KvError::CorruptRow(format!(
             "unknown schema version {version}"
         )));
@@ -237,17 +236,16 @@ pub fn deserialize_schema(
         let ty = read_type(&mut cur)?;
         columns.push(Column { name, ty });
     }
-    let foreign = if version == SCHEMA_VERSION_V2 {
-        let flag = take_u8(&mut cur)?;
-        if flag == 1 {
+    let foreign = match take_u8(&mut cur)? {
+        0 => None,
+        1 => {
             let server = read_string(&mut cur)?;
             let options = read_options(&mut cur)?;
             Some(ForeignTableMeta { server, options })
-        } else {
-            None
         }
-    } else {
-        None
+        flag => {
+            return Err(KvError::CorruptRow(format!("unknown foreign flag {flag}")));
+        }
     };
     Ok((table_id, columns, foreign))
 }
@@ -491,9 +489,43 @@ mod tests {
         assert_eq!(m.options[0], ("token".into(), "secret".into()));
     }
 
+    /// A non-`2` version byte must produce a CorruptRow error.
     #[test]
     fn unknown_version_errors() {
+        // Version byte 1 (legacy) is no longer valid.
+        assert!(deserialize_schema(&[1, 0, 0, 0, 0]).is_err());
+        // Arbitrary unknown version byte is also invalid.
         assert!(deserialize_schema(&[99, 0, 0, 0, 0]).is_err());
+    }
+
+    /// Ordinary-table round-trip: flag byte `0` is written and read back as `None`.
+    #[test]
+    fn ordinary_table_flag_zero_roundtrip() {
+        let columns = vec![Column {
+            name: "x".into(),
+            ty: ColumnType::Int4,
+        }];
+        let bytes = serialize_schema(1, &columns, None);
+        // Flag byte position: 1 (version) + 4 (table_id) + 4 (ncols) + col payload
+        // col payload = 4 (name len) + 1 (name "x") + 1 (type tag INT4) = 6
+        // so flag is at index 15
+        assert_eq!(bytes[15], 0, "ordinary flag byte must be 0");
+        let (_, _, foreign) = deserialize_schema(&bytes).expect("ordinary table decode");
+        assert!(foreign.is_none(), "ordinary table has no foreign meta");
+    }
+
+    /// A flag byte that is neither 0 nor 1 must produce a CorruptRow error.
+    #[test]
+    fn unknown_flag_byte_errors() {
+        let columns = vec![Column {
+            name: "x".into(),
+            ty: ColumnType::Int4,
+        }];
+        let mut bytes = serialize_schema(1, &columns, None);
+        // Overwrite the flag byte with an invalid value.
+        let flag_pos = bytes.len() - 1;
+        bytes[flag_pos] = 2;
+        assert!(deserialize_schema(&bytes).is_err());
     }
 
     #[test]
