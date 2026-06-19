@@ -35,6 +35,9 @@ mod tag {
     /// SP37: `interval` — i64 µs ++ i32 days ++ i32 months, all big-endian (16 bytes).
     /// Append-only — no version bump.
     pub const INTERVAL: u8 = 11;
+    /// SP40: `bytea` — u32 big-endian length prefix followed by raw bytes.
+    /// Append-only — no version bump.
+    pub const BYTEA: u8 = 12;
 }
 
 pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
@@ -90,6 +93,13 @@ pub fn encode_row(cols: &[Datum]) -> Vec<u8> {
             Datum::Interval(iv) => {
                 out.push(tag::INTERVAL);
                 out.extend_from_slice(&pgtypes::datetime::interval_to_binary(*iv));
+            }
+            // SP40: bytea — u32 length prefix + raw bytes.
+            Datum::Bytea(b) => {
+                out.push(tag::BYTEA);
+                let len = u32::try_from(b.len()).expect("bytea column exceeds 4 GiB");
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(b);
             }
         }
     }
@@ -176,6 +186,13 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Datum>, KvError> {
                     pgtypes::datetime::interval_from_binary(raw)
                         .map_err(|e| KvError::CorruptRow(format!("corrupt interval: {e}")))?,
                 )
+            }
+            // SP40: bytea — u32 length prefix + raw bytes.
+            tag::BYTEA => {
+                let len_raw = take_n(&mut cur, 4)?;
+                let len = u32::from_be_bytes(len_raw.try_into().expect("4 bytes fit u32")) as usize;
+                let raw = take_n(&mut cur, len)?;
+                Datum::Bytea(raw.to_vec())
             }
             other => return Err(KvError::CorruptRow(format!("unknown field tag {other}"))),
         };

@@ -18,9 +18,12 @@ pub(crate) fn query_to_relation(
     own: Option<u64>,
     q: &QueryExpr,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<Relation, ExecError> {
     let ctes = crate::cte::CteContext::empty();
-    query_to_relation_with_ctes(catalog_kv, kv, global, gsnap, snapshot, own, q, &ctes, ctx)
+    query_to_relation_with_ctes(
+        catalog_kv, kv, global, gsnap, snapshot, own, q, &ctes, ctx, fctx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -34,6 +37,7 @@ pub(crate) fn query_to_relation_with_ctes(
     q: &QueryExpr,
     ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<Relation, ExecError> {
     let query_ctes = crate::cte::evaluate_with_clause(
         catalog_kv,
@@ -45,6 +49,7 @@ pub(crate) fn query_to_relation_with_ctes(
         q.with.as_ref(),
         ctes,
         ctx,
+        fctx,
     )?;
     let sub_ctx = crate::subquery::SubCtx {
         catalog_kv,
@@ -55,6 +60,7 @@ pub(crate) fn query_to_relation_with_ctes(
         own,
         ctes: &query_ctes,
         eval_ctx: ctx,
+        fctx,
     };
     match &q.body {
         SetExpr::Query(QueryBody::Select(s)) => {
@@ -78,6 +84,7 @@ pub(crate) fn query_to_relation_with_ctes(
                 &s,
                 &query_ctes,
                 ctx,
+                fctx,
             )
         }
         SetExpr::Query(QueryBody::Values(v)) => {
@@ -91,6 +98,7 @@ pub(crate) fn query_to_relation_with_ctes(
                 v,
                 &query_ctes,
                 ctx,
+                fctx,
             )?;
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
@@ -112,6 +120,7 @@ pub(crate) fn query_to_relation_with_ctes(
                 nested,
                 &query_ctes,
                 ctx,
+                fctx,
             )?;
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
@@ -132,6 +141,7 @@ pub(crate) fn query_to_relation_with_ctes(
                 q.limit,
                 &query_ctes,
                 ctx,
+                fctx,
             )
         }
     }

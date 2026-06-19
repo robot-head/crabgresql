@@ -116,6 +116,12 @@ const ACCEPTED: &[&str] = &[
     "SHOW timezone",
     "SHOW TIME ZONE",
     "RESET timezone",
+    // SP40: FDW DDL
+    "CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (a 'b')",
+    "CREATE FOREIGN TABLE t (id int4) SERVER s OPTIONS (topic 't')",
+    "IMPORT FOREIGN SCHEMA kafka FROM SERVER s INTO public",
+    "CREATE USER MAPPING FOR PUBLIC SERVER s OPTIONS (u 'x')",
+    "DROP FOREIGN TABLE IF EXISTS t",
 ];
 
 /// Clear syntax errors — BOTH parsers must reject.
@@ -136,6 +142,9 @@ const REJECTED: &[&str] = &[
     // requires a predicate — gram.y rejects both (raw-parse agreement).
     "SELECT a FROM t JOIN u",
     "SELECT a FROM t JOIN u ON",
+    // SP40: FDW DDL malformed
+    "CREATE FOREIGN TABLE t SERVER",
+    "IMPORT FOREIGN SCHEMA FROM SERVER s",
 ];
 
 fn pg_accepts(sql: &str) -> bool {

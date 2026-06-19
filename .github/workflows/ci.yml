@@ -26,8 +26,14 @@ jobs:
       - run: cargo test --locked --workspace --doc
       - name: Parser differential oracle (libpg_query)
         run: cargo nextest run --locked -p pgparser --features oracle --profile ci
+      # Check the SHIPPED tree only. The action defaults `arguments` to --all-features,
+      # which enables the optional `kafka` feature whose deps legitimately pull C
+      # (ring/zstd/aws-lc) — banned in the shipped binary but an explicit opt-in. The
+      # zero-C / supply-chain guarantee covers the DEFAULT build (also see
+      # graph.exclude-dev in deny.toml and check-no-native.sh). --workspace overrides
+      # the all-features default with default-feature resolution.
       - uses: EmbarkStudios/cargo-deny-action@v2
-        with: { command: check bans licenses }
+        with: { command: check bans licenses, arguments: "--workspace" }
       - run: ./scripts/check-no-native.sh
 
   coverage:
@@ -156,6 +162,18 @@ jobs:
             echo "::endgroup::"
           done
 
+  kafka-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: nextest }
+      - run: cargo clippy --locked -p kafka_fdw -p crabgresql --features kafka --all-targets -- -D warnings
+      - run: cargo nextest run --locked -p kafka_fdw --features kafka --profile ci
+
   clippy-sarif:
     name: Clippy (SARIF code scanning)
     runs-on: ubuntu-latest
@@ -184,7 +202,7 @@ jobs:
 
   pr-gate:
     runs-on: ubuntu-latest
-    needs: [check, coverage, conformance, property, fuzz-smoke, clippy-sarif]
+    needs: [check, coverage, conformance, property, fuzz-smoke, clippy-sarif, kafka-check]
     if: always()
     steps:
       - name: All jobs passed

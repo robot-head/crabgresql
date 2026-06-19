@@ -35,6 +35,7 @@ pub(crate) fn values_to_relation_with_ctes(
     v: &ValuesStmt,
     ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<crate::join::Relation, ExecError> {
     let sub_ctx = crate::subquery::SubCtx {
         catalog_kv,
@@ -45,6 +46,7 @@ pub(crate) fn values_to_relation_with_ctes(
         own,
         ctes,
         eval_ctx: ctx,
+        fctx,
     };
     let resolved = crate::subquery::resolve_in_values(&sub_ctx, v)?;
     values_to_relation(&resolved, ctx)

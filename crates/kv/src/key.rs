@@ -54,6 +54,34 @@ pub fn meta_next_table_id_key() -> Vec<u8> {
     k
 }
 
+/// Key for a foreign-data wrapper stored in the catalog: `/0/fdw/<name>`.
+pub fn fdw_key(name: &str) -> Vec<u8> {
+    let mut k = system_prefix("fdw");
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// Key for a foreign server stored in the catalog: `/0/fsrv/<name>`.
+pub fn server_key(name: &str) -> Vec<u8> {
+    let mut k = system_prefix("fsrv");
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// Key for a user mapping stored in the catalog: `/0/umap/<user>\0<server>`.
+pub fn user_mapping_key(user: &str, server: &str) -> Vec<u8> {
+    let mut k = system_prefix("umap");
+    k.extend_from_slice(user.as_bytes());
+    k.push(0);
+    k.extend_from_slice(server.as_bytes());
+    k
+}
+
+/// Shared prefix for all foreign-server entries (for listing / IMPORT scans).
+pub fn server_prefix() -> Vec<u8> {
+    system_prefix("fsrv")
+}
+
 /// Key for the replicated range-descriptor blob: `/0/meta/range_map`.
 pub fn meta_range_map_key() -> Vec<u8> {
     let mut k = system_prefix("meta");
@@ -304,5 +332,69 @@ mod tests {
         assert_eq!(clog_xid_of(&wrong), None);
         // Prefix only, no 8-byte xid suffix → too short.
         assert_eq!(clog_xid_of(&clog_prefix()), None);
+    }
+
+    // ── SP40: FDW / server / user-mapping key tests ─────────────────────────
+
+    /// fdw_key, server_key, user_mapping_key must be non-empty and distinct
+    /// from each other and from catalog_key — kills the vec![] / vec![0] /
+    /// vec![1] replacement mutants on all three functions.
+    #[test]
+    fn fdw_server_umap_keys_are_non_empty_and_distinct() {
+        let fdw_a = fdw_key("a");
+        let fdw_b = fdw_key("b");
+        let srv_a = server_key("a");
+        let umap = user_mapping_key("alice", "s");
+        let cat = catalog_key("a");
+
+        // Non-empty (kills vec![]).
+        assert!(!fdw_a.is_empty());
+        assert!(!srv_a.is_empty());
+        assert!(!umap.is_empty());
+
+        // Name-differentiated (kills vec![0] and vec![1] which are the same for every call).
+        assert_ne!(fdw_a, fdw_b, "fdw_key includes the name");
+        assert_ne!(srv_a, server_key("b"), "server_key includes the name");
+        assert_ne!(
+            user_mapping_key("alice", "s"),
+            user_mapping_key("bob", "s"),
+            "user_mapping_key includes the user"
+        );
+        assert_ne!(
+            user_mapping_key("alice", "s1"),
+            user_mapping_key("alice", "s2"),
+            "user_mapping_key includes the server"
+        );
+
+        // Namespaces are disjoint (kills any mutant that returns a sibling key).
+        assert_ne!(fdw_a, srv_a, "fdw and server keys are distinct");
+        assert_ne!(fdw_a, cat, "fdw and catalog keys are distinct");
+        assert_ne!(srv_a, cat, "server and catalog keys are distinct");
+        assert_ne!(umap, srv_a, "umap and server keys are distinct");
+    }
+
+    /// server_prefix must be a non-empty proper prefix of every server_key — kills
+    /// the vec![] / vec![0] / vec![1] replacement mutants on server_prefix.
+    #[test]
+    fn server_prefix_is_a_prefix_of_server_key() {
+        let prefix = server_prefix();
+        assert!(!prefix.is_empty(), "server_prefix must be non-empty");
+        assert!(
+            server_key("kafka").starts_with(&prefix),
+            "server_key starts with server_prefix"
+        );
+        assert!(
+            server_key("pg").starts_with(&prefix),
+            "server_key starts with server_prefix"
+        );
+        // Must NOT be a prefix of fdw_key or catalog_key (namespaces are disjoint).
+        assert!(
+            !fdw_key("x").starts_with(&prefix),
+            "server_prefix does not cover fdw keys"
+        );
+        assert!(
+            !catalog_key("t").starts_with(&prefix),
+            "server_prefix does not cover catalog keys"
+        );
     }
 }

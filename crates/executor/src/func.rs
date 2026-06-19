@@ -1038,6 +1038,7 @@ mod tests {
                     ty: ColumnType::Int4,
                 },
             ],
+            foreign: None,
         }
     }
 
@@ -1049,6 +1050,7 @@ mod tests {
                 name: "qn".into(),
                 ty: ColumnType::Numeric(None),
             }],
+            foreign: None,
         }
     }
 

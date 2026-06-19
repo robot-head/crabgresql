@@ -45,6 +45,84 @@ pub enum Statement {
     Reset {
         name: String,
     },
+    // SP40: FDW DDL
+    /// `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (…)`
+    CreateFdw {
+        name: String,
+        options: OptionList,
+    },
+    /// `DROP FOREIGN DATA WRAPPER [IF EXISTS] <name>`
+    DropFdw {
+        name: String,
+        if_exists: bool,
+    },
+    /// `CREATE SERVER <name> FOREIGN DATA WRAPPER <wrapper> OPTIONS (…)`
+    CreateServer {
+        name: String,
+        wrapper: String,
+        options: OptionList,
+    },
+    /// `ALTER SERVER <name> OPTIONS (…)`
+    AlterServer {
+        name: String,
+        options: OptionList,
+    },
+    /// `DROP SERVER [IF EXISTS] <name>`
+    DropServer {
+        name: String,
+        if_exists: bool,
+    },
+    /// `CREATE USER MAPPING FOR <user> SERVER <server> OPTIONS (…)`
+    CreateUserMapping {
+        user: String,
+        server: String,
+        options: OptionList,
+    },
+    /// `ALTER USER MAPPING FOR <user> SERVER <server> OPTIONS (…)`
+    AlterUserMapping {
+        user: String,
+        server: String,
+        options: OptionList,
+    },
+    /// `DROP USER MAPPING [IF EXISTS] FOR <user> SERVER <server>`
+    DropUserMapping {
+        user: String,
+        server: String,
+        if_exists: bool,
+    },
+    /// `CREATE FOREIGN TABLE <name> (<col> <type>, …) SERVER <server> OPTIONS (…)`
+    CreateForeignTable {
+        name: String,
+        columns: Vec<ColumnDef>,
+        server: String,
+        options: OptionList,
+    },
+    /// `DROP FOREIGN TABLE [IF EXISTS] <name>`
+    DropForeignTable {
+        name: String,
+        if_exists: bool,
+    },
+    /// `IMPORT FOREIGN SCHEMA <remote_schema> [LIMIT TO | EXCEPT (<tables>)] FROM SERVER <server> [INTO <local_schema>]`
+    ImportForeignSchema {
+        remote_schema: String,
+        selector: ImportSelector,
+        server: String,
+        into_schema: String,
+    },
+}
+
+/// A key-value option list for FDW DDL: `OPTIONS (key 'value', …)`.
+pub type OptionList = Vec<(String, String)>;
+
+/// The optional table-filter for `IMPORT FOREIGN SCHEMA`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSelector {
+    /// Import all tables (no filter clause).
+    All,
+    /// `LIMIT TO (table, …)` — import only the listed tables.
+    LimitTo(Vec<String>),
+    /// `EXCEPT (table, …)` — import all tables except the listed ones.
+    Except(Vec<String>),
 }
 
 /// SP37: the right-hand side of a `SET` (or the value form of `SET TIME ZONE`).

@@ -17,6 +17,10 @@ multiprocess = { max-threads = 1 }
 # a multi-process test, but still cap how many run at once on a constrained runner.
 cluster = { max-threads = 4 }
 
+# Kafka FDW roundtrip tests: container/broker-heavy; cap to avoid port conflicts
+# and broker saturation on constrained CI runners.
+kafka = { max-threads = 2 }
+
 [[profile.default.overrides]]
 # crabgresql's integration tests are the multi-process e2e suites
 # (multiprocess, jepsen_elle, multirange_gateway).
@@ -28,6 +32,11 @@ test-group = 'multiprocess'
 # jepsen_bank, durable_scenarios, sql_durable, sql_over_raft, scenarios, model).
 filter = 'package(cluster) & kind(test)'
 test-group = 'cluster'
+
+[[profile.default.overrides]]
+# Kafka FDW integration tests: broker/container-heavy.
+filter = 'package(kafka_fdw) & kind(test)'
+test-group = 'kafka'
 
 # CI profile (selected with `--profile ci`): the test-group caps above apply to
 # every profile; here we just surface every failure instead of stopping at the

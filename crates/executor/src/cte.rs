@@ -67,6 +67,7 @@ pub(crate) fn evaluate_with_clause(
     with: Option<&WithClause>,
     parent: &CteContext,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<CteContext, ExecError> {
     let Some(with) = with else {
         return Ok(parent.child());
@@ -81,7 +82,7 @@ pub(crate) fn evaluate_with_clause(
             ));
         }
         let rel = crate::query::query_to_relation_with_ctes(
-            catalog_kv, kv, global, gsnap, snapshot, own, &cte.query, &out, ctx,
+            catalog_kv, kv, global, gsnap, snapshot, own, &cte.query, &out, ctx, fctx,
         )?;
         let rel = apply_cte_column_aliases(rel, &cte.name, &cte.columns)?;
         out.insert(cte.name.clone(), rel);

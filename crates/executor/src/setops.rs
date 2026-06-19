@@ -194,11 +194,12 @@ pub(crate) fn set_expr_to_relation(
     limit: Option<i64>,
     ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<crate::join::Relation, ExecError> {
     let cols = resolve_set_columns(catalog_kv, body, ctes, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctes, ctx, 0,
+        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctes, ctx, fctx, 0,
     )?;
 
     let scope = Scope {
@@ -266,6 +267,7 @@ fn fold(
     out_tys: &[ColumnType],
     ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
     depth: usize,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     // Defense-in-depth (parser already caps the tree at MAX_DEPTH): 54001, not a crash.
@@ -275,19 +277,19 @@ fn fold(
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
             let rel = crate::exec::select_to_relation_with_ctes(
-                catalog_kv, kv, global, gsnap, snapshot, own, s, ctes, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, s, ctes, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Values(v)) => {
             let rel = crate::values::values_to_relation_with_ctes(
-                catalog_kv, kv, global, gsnap, snapshot, own, v, ctes, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, v, ctes, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
             let rel = crate::query::query_to_relation_with_ctes(
-                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctes, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctes, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -308,6 +310,7 @@ fn fold(
                 out_tys,
                 ctes,
                 ctx,
+                fctx,
                 depth + 1,
             )?;
             let rrows = fold(
@@ -321,6 +324,7 @@ fn fold(
                 out_tys,
                 ctes,
                 ctx,
+                fctx,
                 depth + 1,
             )?;
             Ok(combine_rows(*op, *all, lrows, rrows))

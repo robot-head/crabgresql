@@ -7,6 +7,8 @@ use crate::numeric::Typmod;
 /// PostgreSQL type OIDs (from pg_type.dat) for the slice's types.
 pub mod oids {
     pub const BOOL: u32 = 16;
+    /// SP40: `bytea` — variable-length binary string.
+    pub const BYTEA: u32 = 17;
     pub const INT8: u32 = 20;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
@@ -50,6 +52,8 @@ pub enum ColumnType {
     Timestamptz,
     /// SP37: PostgreSQL `interval` (OID 1186) — months + days + microseconds.
     Interval,
+    /// SP40: PostgreSQL `bytea` (OID 17) — variable-length binary string.
+    Bytea,
 }
 
 impl ColumnType {
@@ -73,6 +77,8 @@ impl ColumnType {
             "timestamp" | "timestamp without time zone" => Some(ColumnType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(ColumnType::Timestamptz),
             "interval" => Some(ColumnType::Interval),
+            // SP40: `bytea` — variable-length binary string.
+            "bytea" => Some(ColumnType::Bytea),
             _ => None,
         }
     }
@@ -90,6 +96,7 @@ impl ColumnType {
             ColumnType::Timestamp => oids::TIMESTAMP,
             ColumnType::Timestamptz => oids::TIMESTAMPTZ,
             ColumnType::Interval => oids::INTERVAL,
+            ColumnType::Bytea => oids::BYTEA,
         }
     }
 
@@ -107,6 +114,7 @@ impl ColumnType {
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Timestamptz => "timestamp with time zone",
             ColumnType::Interval => "interval",
+            ColumnType::Bytea => "bytea",
         }
     }
 
@@ -124,6 +132,7 @@ impl ColumnType {
             ColumnType::Timestamp => 8,
             ColumnType::Timestamptz => 8,
             ColumnType::Interval => 16,
+            ColumnType::Bytea => -1,
         }
     }
 
@@ -167,6 +176,8 @@ pub enum Datum {
     Timestamptz(jiff::Timestamp),
     /// SP37: PostgreSQL `interval` — months + days + microseconds.
     Interval(crate::datetime::Interval),
+    /// SP40: PostgreSQL `bytea` — variable-length binary string (raw bytes).
+    Bytea(Vec<u8>),
 }
 
 impl PartialEq for Datum {
@@ -191,6 +202,8 @@ impl PartialEq for Datum {
             (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a == b,
             // interval uses its canonical-estimate Eq (Task 2).
             (Datum::Interval(a), Datum::Interval(b)) => a == b,
+            // SP40: bytea equality is byte-for-byte (matches PostgreSQL's `byteaeq`).
+            (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
             _ => false,
         }
     }
@@ -233,6 +246,8 @@ impl std::hash::Hash for Datum {
             Datum::Timestamp(dt) => dt.hash(state),
             Datum::Timestamptz(ts) => ts.hash(state),
             Datum::Interval(i) => i.hash(state),
+            // SP40: bytea hashes its bytes.
+            Datum::Bytea(b) => b.hash(state),
         }
     }
 }
@@ -254,6 +269,7 @@ impl Datum {
             Datum::Timestamp(_) => Some(ColumnType::Timestamp),
             Datum::Timestamptz(_) => Some(ColumnType::Timestamptz),
             Datum::Interval(_) => Some(ColumnType::Interval),
+            Datum::Bytea(_) => Some(ColumnType::Bytea),
         }
     }
 
@@ -500,6 +516,28 @@ mod tests {
     /// Pins three SP32 `numeric` lines that a full-file mutation sweep flagged as
     /// uncovered: the `numeric`/`decimal` name arm (from_sql_name), the `-1`
     /// variable typlen for `numeric`, and the `(Numeric, Numeric)` equality arm.
+    #[test]
+    fn bytea_text_is_hex_format() {
+        let d = Datum::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(d.column_type(), Some(ColumnType::Bytea));
+        assert_eq!(
+            crate::encoding::encode_text(&d, &jiff::tz::TimeZone::UTC),
+            b"\\xdeadbeef"
+        );
+        assert_eq!(
+            crate::encoding::encode_binary(&d),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        assert_eq!(ColumnType::from_sql_name("bytea"), Some(ColumnType::Bytea));
+        // type_size is -1 (variable-length), NOT a positive size; kills `delete -`.
+        assert_eq!(ColumnType::Bytea.type_size(), -1i16);
+        // Bytea equality is byte-for-byte; kills `delete arm` and `== → !=`.
+        let same = Datum::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let diff = Datum::Bytea(vec![0x00]);
+        assert_eq!(d, same, "identical byte sequences are equal");
+        assert_ne!(d, diff, "different byte sequences are not equal");
+    }
+
     #[test]
     fn numeric_column_type_name_size_and_equality() {
         use bigdecimal::BigDecimal;

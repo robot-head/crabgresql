@@ -115,6 +115,20 @@ pub enum Keyword {
     Union,
     Intersect,
     Except,
+    // SP40: FDW DDL keywords
+    Foreign,
+    Data,
+    Wrapper,
+    Server,
+    Mapping,
+    User,
+    Options,
+    Import,
+    Schema,
+    To,
+    If,
+    CurrentUser,
+    Public,
 }
 
 impl Keyword {
@@ -199,6 +213,20 @@ impl Keyword {
             "union" => Keyword::Union,
             "intersect" => Keyword::Intersect,
             "except" => Keyword::Except,
+            // SP40: FDW DDL keywords
+            "foreign" => Keyword::Foreign,
+            "data" => Keyword::Data,
+            "wrapper" => Keyword::Wrapper,
+            "server" => Keyword::Server,
+            "mapping" => Keyword::Mapping,
+            "user" => Keyword::User,
+            "options" => Keyword::Options,
+            "import" => Keyword::Import,
+            "schema" => Keyword::Schema,
+            "to" => Keyword::To,
+            "if" => Keyword::If,
+            "current_user" => Keyword::CurrentUser,
+            "public" => Keyword::Public,
             _ => return None,
         })
     }
@@ -275,6 +303,20 @@ mod tests {
             ("union", Keyword::Union),
             ("intersect", Keyword::Intersect),
             ("except", Keyword::Except),
+            // SP40: FDW DDL keywords
+            ("foreign", Keyword::Foreign),
+            ("data", Keyword::Data),
+            ("wrapper", Keyword::Wrapper),
+            ("server", Keyword::Server),
+            ("mapping", Keyword::Mapping),
+            ("user", Keyword::User),
+            ("options", Keyword::Options),
+            ("import", Keyword::Import),
+            ("schema", Keyword::Schema),
+            ("to", Keyword::To),
+            ("if", Keyword::If),
+            ("current_user", Keyword::CurrentUser),
+            ("public", Keyword::Public),
         ];
         for (word, kw) in pairs {
             assert_eq!(Keyword::from_word(word), Some(*kw), "from_word({word:?})");

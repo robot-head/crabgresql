@@ -1,0 +1,52 @@
+[package]
+name = "kafka_fdw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-protocol", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json", "dep:rustls", "dep:rustls-rustcrypto", "dep:jiff", "dep:bigdecimal", "dep:num-bigint", "dep:crabka-security", "dep:prost-reflect", "crabka-schema-serde?/protobuf"]
+
+[dependencies]
+catalog.workspace = true
+pgtypes.workspace = true
+executor.workspace = true
+kv.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+crabka-client-core  = { workspace = true, optional = true }
+crabka-client-admin = { workspace = true, optional = true }
+crabka-protocol     = { workspace = true, optional = true }
+crabka-schema-serde = { workspace = true, optional = true }
+crabka-security     = { workspace = true, optional = true }
+apache-avro = { workspace = true, optional = true }
+serde_json  = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+jiff = { version = "0.2", optional = true }
+bigdecimal = { workspace = true, optional = true }
+num-bigint = { version = "0.4", optional = true }
+prost-reflect = { workspace = true, optional = true }
+
+[dev-dependencies]
+protox = "0.9"
+# In-process round-trip test (kafka feature): broker + registry + producer +
+# pgwire client. Dev-deps are exempt from the workspace zero-C boundary.
+crabka-broker = "0.3"
+crabka-schema-registry = "0.3"
+crabka-client-producer = "0.3"
+crabka-client-consumer = "0.3"
+crabka-protocol = "0.3"
+crabka-client-core = "0.3"
+crabka-schema-serde = { version = "0.3", features = ["avro", "json"] }
+apache-avro = "0.21"
+pgwire = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = { workspace = true }
+bytes = { workspace = true }
+serde_json = "1"

@@ -186,6 +186,10 @@ pub struct SqlSession {
     /// `EvalCtx`'s `time_zone`; `SET`/`SHOW`/`RESET timezone` mutate/read it, and
     /// COMMIT/ROLLBACK promote/revert it in lockstep with the transaction outcome.
     guc: GucState,
+    /// SP40: the foreign-table scanner (shared from the engine). `Some` when the
+    /// binary registered a `kafka_fdw` via `SqlEngine::set_foreign_scanner`; a
+    /// `SELECT` from a foreign table with this `None` returns `0A000`.
+    foreign_scanner: Option<Arc<dyn crate::foreign::ForeignScanner>>,
     state: TxnState,
 }
 
@@ -207,6 +211,7 @@ impl SqlSession {
         gtm: Option<Arc<crate::gtm::Gtm>>,
         range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
         clock: Arc<dyn crate::clock::Clock>,
+        foreign_scanner: Option<Arc<dyn crate::foreign::ForeignScanner>>,
     ) -> Self {
         Self {
             kv,
@@ -223,6 +228,7 @@ impl SqlSession {
             global_xid: None,
             clock,
             guc: GucState::default(),
+            foreign_scanner,
             state: TxnState::Idle,
         }
     }
@@ -393,7 +399,22 @@ impl SqlSession {
             Statement::Begin { isolation } => self.begin(*isolation).await,
             Statement::Commit => self.commit_cmd().await,
             Statement::Rollback => self.rollback_cmd().await,
-            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
+            Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            // SP40: FDW DDL funnels through the same catalog-lock + execute_ddl + commit
+            // path as ordinary DDL. ALTER/IMPORT variants resolve to a clear 0A000 inside
+            // execute_ddl (not yet supported / deferred to a later task).
+            | Statement::CreateFdw { .. }
+            | Statement::DropFdw { .. }
+            | Statement::CreateServer { .. }
+            | Statement::AlterServer { .. }
+            | Statement::DropServer { .. }
+            | Statement::CreateUserMapping { .. }
+            | Statement::AlterUserMapping { .. }
+            | Statement::DropUserMapping { .. }
+            | Statement::CreateForeignTable { .. }
+            | Statement::DropForeignTable { .. }
+            | Statement::ImportForeignSchema { .. } => self.run_ddl(stmt).await,
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
@@ -561,6 +582,12 @@ impl SqlSession {
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let (snapshot, own, gsnap) = self.read_context().await?;
         let ctx = self.eval_ctx();
+        // SP40: the session does not track an authenticated SQL user, so foreign-table
+        // user-mapping lookups resolve against the conventional `"public"` mapping.
+        let fctx = crate::exec::ForeignCtx {
+            scanner: self.foreign_scanner.as_ref(),
+            current_user: "public",
+        };
         crate::exec::execute_read(
             &*self.catalog_kv,
             &*self.kv,
@@ -570,6 +597,7 @@ impl SqlSession {
             own,
             stmt,
             &ctx,
+            fctx,
         )
     }
 
@@ -764,7 +792,13 @@ impl SqlSession {
     /// async mutex).
     async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let _g = self.catalog_lock.lock().await;
-        let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt)?;
+        // SP40: IMPORT FOREIGN SCHEMA needs the registered scanner + current user
+        // to discover foreign tables; the rest of DDL ignores the ForeignCtx.
+        let fctx = crate::exec::ForeignCtx {
+            scanner: self.foreign_scanner.as_ref(),
+            current_user: "public",
+        };
+        let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt, fctx)?;
         self.committer.commit(ops).await?;
         Ok(result)
     }
@@ -1290,6 +1324,116 @@ mod tests {
             engine.procarray.running_len(),
             0,
             "xid must be deregistered when the session is dropped mid-transaction"
+        );
+    }
+
+    /// SP40: `IMPORT FOREIGN SCHEMA` materializes one foreign table per
+    /// `(name, value_columns)` the registered scanner returns, with the envelope
+    /// columns prepended and `OPTIONS (topic '<name>')` recorded. Driven by a fake
+    /// scanner (no Kafka), so it proves the `execute_ddl` wiring in isolation.
+    #[tokio::test]
+    async fn import_foreign_schema_creates_tables_from_scanner() {
+        use std::sync::Arc;
+
+        use catalog::{Column, ForeignServer, Table, UserMapping};
+        use pgtypes::{ColumnType, Datum};
+
+        use crate::clock::EvalCtx;
+        use crate::error::ExecError;
+        use crate::foreign::{ForeignScanner, ImportFilter, ImportedTable, ScanBounds};
+
+        /// Returns two canned tables; records the filter it was handed.
+        struct FakeImporter;
+        impl ForeignScanner for FakeImporter {
+            fn scan(
+                &self,
+                _table: &Table,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                _bounds: &ScanBounds,
+                _ctx: &EvalCtx,
+            ) -> Result<Vec<Vec<Datum>>, ExecError> {
+                Ok(Vec::new())
+            }
+
+            fn import_schema(
+                &self,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                filter: &ImportFilter,
+            ) -> Result<Vec<ImportedTable>, ExecError> {
+                // Honor the filter so the test can assert LIMIT TO works end-to-end.
+                let all = vec![
+                    ImportedTable {
+                        name: "orders".to_string(),
+                        columns: vec![Column {
+                            name: "id".to_string(),
+                            ty: ColumnType::Int8,
+                        }],
+                        options: vec![
+                            ("topic".to_string(), "orders".to_string()),
+                            ("value_format".to_string(), "raw".to_string()),
+                        ],
+                    },
+                    ImportedTable {
+                        name: "payments".to_string(),
+                        columns: vec![Column {
+                            name: "amount".to_string(),
+                            ty: ColumnType::Float8,
+                        }],
+                        options: vec![
+                            ("topic".to_string(), "payments".to_string()),
+                            ("value_format".to_string(), "raw".to_string()),
+                        ],
+                    },
+                ];
+                Ok(all
+                    .into_iter()
+                    .filter(|t| filter.retains(&t.name))
+                    .collect())
+            }
+        }
+
+        let mut engine = SqlEngine::new();
+        engine.set_foreign_scanner(Arc::new(FakeImporter));
+        let mut s = engine.connect();
+
+        s.simple_query(
+            "CREATE SERVER k FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'b:9092')",
+        )
+        .await
+        .expect("create server");
+
+        // LIMIT TO (orders) — only `orders` should be imported.
+        let res = s
+            .simple_query("IMPORT FOREIGN SCHEMA kafka LIMIT TO (orders) FROM SERVER k")
+            .await
+            .expect("import");
+        assert!(
+            matches!(&res[..], [pgwire::engine::QueryResult::Command { tag }] if tag == "IMPORT FOREIGN SCHEMA"),
+            "expected IMPORT FOREIGN SCHEMA command tag, got {res:?}"
+        );
+
+        // `orders` exists as a foreign table; envelope columns are prepended, then
+        // the value column `id`; OPTIONS carries the topic name.
+        let orders = catalog::get_table(&*engine.kv, "orders").expect("orders table exists");
+        let meta = orders.foreign.expect("orders is a foreign table");
+        assert_eq!(meta.server, "k");
+        assert!(
+            meta.options
+                .contains(&("topic".to_string(), "orders".to_string()))
+        );
+        let last = orders.columns.last().expect("at least one value column");
+        assert_eq!(last.name, "id");
+        assert!(
+            orders.columns.len() > 1,
+            "envelope columns must be prepended before the value column"
+        );
+
+        // `payments` was excluded by LIMIT TO and must not exist.
+        assert!(
+            catalog::get_table(&*engine.kv, "payments").is_err(),
+            "payments was not in LIMIT TO and must not be imported"
         );
     }
 }

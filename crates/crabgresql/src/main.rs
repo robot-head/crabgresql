@@ -111,8 +111,21 @@ fn tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Register the Kafka FDW scanner with an engine. Called at every `SqlEngine`
+/// construction site when the `kafka` feature is enabled.
+#[cfg(feature = "kafka")]
+fn register_kafka_scanner(engine: &mut SqlEngine) {
+    engine.set_foreign_scanner(Arc::new(kafka_fdw::KafkaFdw));
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Install the rustcrypto TLS provider as the process default before any
+    // TLS ServerConfig/ClientConfig is constructed so both pgwire and the
+    // crabka-client backend share the same provider.
+    #[cfg(feature = "kafka")]
+    kafka_fdw::provider::install_default_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -132,13 +145,15 @@ async fn run_serve(args: ServeArgs) -> std::io::Result<()> {
         (Some(c), Some(k)) => Some(tls_acceptor(c, k)?),
         _ => None,
     };
-    let engine = match &args.data_dir {
-        Some(dir) => Arc::new(
-            SqlEngine::open(dir)
-                .map_err(|e| std::io::Error::other(format!("opening data dir: {e:?}")))?,
-        ),
-        None => Arc::new(SqlEngine::new()),
+    #[allow(unused_mut)]
+    let mut engine = match &args.data_dir {
+        Some(dir) => SqlEngine::open(dir)
+            .map_err(|e| std::io::Error::other(format!("opening data dir: {e:?}")))?,
+        None => SqlEngine::new(),
     };
+    #[cfg(feature = "kafka")]
+    register_kafka_scanner(&mut engine);
+    let engine = Arc::new(engine);
     let session_config = build_session_config(&args)?;
     pgwire::server::serve_tls(listener, engine, Arc::new(session_config), tls).await
 }
