@@ -1,3 +1,14 @@
+# Dev-dependencies are EXCLUDED from all cargo-deny checks: they are test-only
+# tooling, never in the shipped binary. The zero-C / supply-chain guarantee covers
+# the SHIPPED tree (normal + build deps), independently enforced by
+# scripts/check-no-native.sh. In particular the `kafka` feature's round-trip test
+# pulls an in-process crabka broker (crabka-broker / -schema-registry / -client-producer
+# dev-deps) whose stack uses aws-lc-rs/zstd/cc/cmake — banned in the shipped tree but
+# fine as test-only dev-deps. This matches the dev-only rationale already used in the
+# [advisories] ignore list below.
+[graph]
+exclude-dev = true
+
 [advisories]
 # Each ignore below is a PRE-EXISTING advisory (not introduced by any feature
 # slice) that we accept with rationale. Revisit when upstream releases a fix.
