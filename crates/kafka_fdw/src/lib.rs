@@ -3,11 +3,13 @@
 #![cfg(feature = "kafka")]
 
 mod config;
-mod decode;
+pub mod decode;
 mod error;
 pub mod provider;
 mod scan;
 mod source;
-mod types;
+pub mod types;
 
+pub use decode::{DecodedValue, Wire, decode_value};
 pub use error::KafkaFdwError;
+pub use types::{avro_schema_to_columns, json_schema_to_columns, project};

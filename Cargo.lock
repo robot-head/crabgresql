@@ -2417,12 +2417,15 @@ name = "kafka_fdw"
 version = "0.1.0"
 dependencies = [
  "apache-avro",
+ "bigdecimal",
  "catalog",
  "crabka-client-admin",
  "crabka-client-core",
  "crabka-schema-serde",
  "executor",
+ "jiff",
  "kv",
+ "num-bigint",
  "pgtypes",
  "rustls",
  "rustls-rustcrypto",
