@@ -241,8 +241,11 @@ use pgtypes::Datum;
 /// A fake `ForeignScanner` for tests: returns canned rows aligned to the foreign
 /// table's column layout (envelope columns first, then value columns). Records the
 /// last server/mapping it was handed so a test can assert they were resolved.
+/// `import_tables` are the canned `(name, value_columns)` pairs IMPORT FOREIGN
+/// SCHEMA materializes (after the requested filter is applied).
 struct FakeScanner {
     rows: Vec<Vec<Datum>>,
+    import_tables: Vec<(String, Vec<catalog::Column>)>,
 }
 
 impl ForeignScanner for FakeScanner {
@@ -263,6 +266,20 @@ impl ForeignScanner for FakeScanner {
             );
         }
         Ok(self.rows.clone())
+    }
+
+    fn import_schema(
+        &self,
+        _server: &ForeignServer,
+        _mapping: Option<&UserMapping>,
+        filter: &executor::foreign::ImportFilter,
+    ) -> Result<Vec<(String, Vec<catalog::Column>)>, ExecError> {
+        Ok(self
+            .import_tables
+            .iter()
+            .filter(|(name, _)| filter.retains(name))
+            .cloned()
+            .collect())
     }
 }
 
@@ -344,6 +361,7 @@ async fn foreign_select_reads_scanner_rows_with_projection_and_where() {
     };
     let scanner = Arc::new(FakeScanner {
         rows: vec![row(0, 100, 1, 10), row(0, 101, 2, 20), row(1, 200, 3, 30)],
+        import_tables: Vec::new(),
     });
     let client = connect(spawn_with_scanner(scanner).await).await;
     client
@@ -408,5 +426,66 @@ async fn foreign_select_without_scanner_is_unsupported() {
         db.message().contains("foreign tables require"),
         "clear message, got: {}",
         db.message()
+    );
+}
+
+/// IMPORT FOREIGN SCHEMA through the full pgwire path: the fake scanner reports
+/// two tables; `EXCEPT (payments)` drops one; the survivor becomes a queryable
+/// foreign table (the scanner returns no rows here, so the SELECT is empty but
+/// the table — with its envelope + value columns — must exist and be selectable).
+#[tokio::test]
+async fn import_foreign_schema_materializes_foreign_tables() {
+    use catalog::Column;
+    use pgtypes::ColumnType;
+
+    let scanner = Arc::new(FakeScanner {
+        rows: Vec::new(),
+        import_tables: vec![
+            (
+                "orders".to_string(),
+                vec![Column {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int8,
+                }],
+            ),
+            (
+                "payments".to_string(),
+                vec![Column {
+                    name: "amount".to_string(),
+                    ty: ColumnType::Float8,
+                }],
+            ),
+        ],
+    });
+    let client = connect(spawn_with_scanner(scanner).await).await;
+    client
+        .batch_execute(
+            "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092')",
+        )
+        .await
+        .expect("create server");
+
+    client
+        .batch_execute("IMPORT FOREIGN SCHEMA kafka EXCEPT (payments) FROM SERVER s")
+        .await
+        .expect("import foreign schema");
+
+    // `orders` is now a queryable foreign table: its value column `id` plus the
+    // envelope columns are present (the scanner returns no rows → empty result).
+    let rows = client
+        .query("SELECT _partition, id FROM orders", &[])
+        .await
+        .expect("select imported orders");
+    assert_eq!(rows.len(), 0, "fake scanner returns no rows");
+
+    // `payments` was excluded — querying it is a 42P01 (undefined table).
+    let err = client
+        .batch_execute("SELECT amount FROM payments")
+        .await
+        .expect_err("payments must not exist");
+    assert_eq!(
+        err.as_db_error().expect("db").code().code(),
+        "42P01",
+        "excluded table must be undefined"
     );
 }

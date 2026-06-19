@@ -63,6 +63,7 @@ pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError>
 pub(crate) fn execute_ddl(
     kv: &dyn Kv,
     stmt: &Statement,
+    fctx: ForeignCtx,
 ) -> Result<(QueryResult, Vec<kv::WriteOp>), ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
@@ -165,11 +166,43 @@ pub(crate) fn execute_ddl(
         Statement::AlterUserMapping { .. } => Err(ExecError::Unsupported(
             "ALTER USER MAPPING not supported".into(),
         )),
-        // IMPORT FOREIGN SCHEMA's real logic (catalog inspection over the wire)
-        // lands in a later task; keep the match exhaustive + the build green.
-        Statement::ImportForeignSchema { .. } => Err(ExecError::Unsupported(
-            "IMPORT FOREIGN SCHEMA: implemented in a later task".into(),
-        )),
+        // SP40: IMPORT FOREIGN SCHEMA discovers the server's tables through the
+        // registered scanner (the `kafka_fdw` seam enumerates Kafka topics and
+        // derives each topic's value columns from its Schema Registry subject),
+        // then materializes a foreign table per discovered table into the catalog.
+        // Like CreateForeignTable, the catalog writes each small batch directly, so
+        // this returns an EMPTY ops vec (the caller commits a no-op batch).
+        //
+        // `remote_schema` is accepted but unused in phase 1 (Kafka has no nested
+        // schemas); `into_schema` is a flat namespace today — the discovered table
+        // name is used verbatim as the catalog name.
+        Statement::ImportForeignSchema {
+            remote_schema: _,
+            selector,
+            server,
+            into_schema: _,
+        } => {
+            // Resolve the server (42704 if undefined) and the current user's
+            // optional mapping (no mapping → no credentials).
+            let srv = catalog::get_server(kv, server)?;
+            let mapping = catalog::get_user_mapping(kv, fctx.current_user, server).ok();
+            // A scanner must be registered (the `kafka` feature is built in).
+            let scanner = fctx.scanner.ok_or_else(|| {
+                ExecError::Unsupported("foreign tables require the `kafka` feature".into())
+            })?;
+            let filter = crate::foreign::ImportFilter::from_selector(selector);
+            let tables = scanner.import_schema(&srv, mapping.as_ref(), &filter)?;
+            for (name, value_columns) in tables {
+                catalog::create_foreign_table(
+                    kv,
+                    &name,
+                    value_columns,
+                    &srv.name,
+                    vec![("topic".to_string(), name.clone())],
+                )?;
+            }
+            Ok((command("IMPORT FOREIGN SCHEMA"), Vec::new()))
+        }
         _ => Err(ExecError::Unsupported("not a DDL statement".into())),
     }
 }

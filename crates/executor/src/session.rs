@@ -786,7 +786,13 @@ impl SqlSession {
     /// async mutex).
     async fn run_ddl(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let _g = self.catalog_lock.lock().await;
-        let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt)?;
+        // SP40: IMPORT FOREIGN SCHEMA needs the registered scanner + current user
+        // to discover foreign tables; the rest of DDL ignores the ForeignCtx.
+        let fctx = crate::exec::ForeignCtx {
+            scanner: self.foreign_scanner.as_ref(),
+            current_user: "public",
+        };
+        let (result, ops) = crate::exec::execute_ddl(&*self.kv, stmt, fctx)?;
         self.committer.commit(ops).await?;
         Ok(result)
     }
@@ -1312,6 +1318,108 @@ mod tests {
             engine.procarray.running_len(),
             0,
             "xid must be deregistered when the session is dropped mid-transaction"
+        );
+    }
+
+    /// SP40: `IMPORT FOREIGN SCHEMA` materializes one foreign table per
+    /// `(name, value_columns)` the registered scanner returns, with the envelope
+    /// columns prepended and `OPTIONS (topic '<name>')` recorded. Driven by a fake
+    /// scanner (no Kafka), so it proves the `execute_ddl` wiring in isolation.
+    #[tokio::test]
+    async fn import_foreign_schema_creates_tables_from_scanner() {
+        use std::sync::Arc;
+
+        use catalog::{Column, ForeignServer, Table, UserMapping};
+        use pgtypes::{ColumnType, Datum};
+
+        use crate::clock::EvalCtx;
+        use crate::error::ExecError;
+        use crate::foreign::{ForeignScanner, ImportFilter, ScanBounds};
+
+        /// Returns two canned tables; records the filter it was handed.
+        struct FakeImporter;
+        impl ForeignScanner for FakeImporter {
+            fn scan(
+                &self,
+                _table: &Table,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                _bounds: &ScanBounds,
+                _ctx: &EvalCtx,
+            ) -> Result<Vec<Vec<Datum>>, ExecError> {
+                Ok(Vec::new())
+            }
+
+            fn import_schema(
+                &self,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                filter: &ImportFilter,
+            ) -> Result<Vec<(String, Vec<Column>)>, ExecError> {
+                // Honor the filter so the test can assert LIMIT TO works end-to-end.
+                let all = vec![
+                    (
+                        "orders".to_string(),
+                        vec![Column {
+                            name: "id".to_string(),
+                            ty: ColumnType::Int8,
+                        }],
+                    ),
+                    (
+                        "payments".to_string(),
+                        vec![Column {
+                            name: "amount".to_string(),
+                            ty: ColumnType::Float8,
+                        }],
+                    ),
+                ];
+                Ok(all
+                    .into_iter()
+                    .filter(|(name, _)| filter.retains(name))
+                    .collect())
+            }
+        }
+
+        let mut engine = SqlEngine::new();
+        engine.set_foreign_scanner(Arc::new(FakeImporter));
+        let mut s = engine.connect();
+
+        s.simple_query(
+            "CREATE SERVER k FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'b:9092')",
+        )
+        .await
+        .expect("create server");
+
+        // LIMIT TO (orders) — only `orders` should be imported.
+        let res = s
+            .simple_query("IMPORT FOREIGN SCHEMA kafka LIMIT TO (orders) FROM SERVER k")
+            .await
+            .expect("import");
+        assert!(
+            matches!(&res[..], [pgwire::engine::QueryResult::Command { tag }] if tag == "IMPORT FOREIGN SCHEMA"),
+            "expected IMPORT FOREIGN SCHEMA command tag, got {res:?}"
+        );
+
+        // `orders` exists as a foreign table; envelope columns are prepended, then
+        // the value column `id`; OPTIONS carries the topic name.
+        let orders = catalog::get_table(&*engine.kv, "orders").expect("orders table exists");
+        let meta = orders.foreign.expect("orders is a foreign table");
+        assert_eq!(meta.server, "k");
+        assert!(
+            meta.options
+                .contains(&("topic".to_string(), "orders".to_string()))
+        );
+        let last = orders.columns.last().expect("at least one value column");
+        assert_eq!(last.name, "id");
+        assert!(
+            orders.columns.len() > 1,
+            "envelope columns must be prepended before the value column"
+        );
+
+        // `payments` was excluded by LIMIT TO and must not exist.
+        assert!(
+            catalog::get_table(&*engine.kv, "payments").is_err(),
+            "payments was not in LIMIT TO and must not be imported"
         );
     }
 }
