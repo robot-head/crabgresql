@@ -111,8 +111,9 @@ fn parse_wire(s: &str) -> Result<Wire, KafkaFdwError> {
         "raw" => Ok(Wire::Raw),
         "avro" => Ok(Wire::Avro),
         "json" => Ok(Wire::Json),
+        "protobuf" => Ok(Wire::Protobuf),
         other => Err(KafkaFdwError::Config(format!(
-            "unknown wire format: {other:?}; expected one of: raw, avro, json"
+            "unknown wire format: {other:?}; expected one of: raw, avro, json, protobuf"
         ))),
     }
 }

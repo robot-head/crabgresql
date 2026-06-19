@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 default = []
-kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-protocol", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json", "dep:rustls", "dep:rustls-rustcrypto", "dep:jiff", "dep:bigdecimal", "dep:num-bigint", "dep:crabka-security"]
+kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-protocol", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json", "dep:rustls", "dep:rustls-rustcrypto", "dep:jiff", "dep:bigdecimal", "dep:num-bigint", "dep:crabka-security", "dep:prost-reflect", "crabka-schema-serde?/protobuf"]
 
 [dependencies]
 catalog.workspace = true
@@ -30,3 +30,7 @@ rustls-rustcrypto = { workspace = true, optional = true }
 jiff = { version = "0.2", optional = true }
 bigdecimal = { workspace = true, optional = true }
 num-bigint = { version = "0.4", optional = true }
+prost-reflect = { workspace = true, optional = true }
+
+[dev-dependencies]
+protox = "0.9"

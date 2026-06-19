@@ -1,8 +1,9 @@
 //! Schema→column and Value→Datum type mapping for the Kafka FDW.
 //!
-//! Two entry-points:
-//! - `avro_schema_to_columns` / `json_schema_to_columns` — derive the logical
-//!   column list from a writer schema.
+//! Three entry-points:
+//! - `avro_schema_to_columns` / `json_schema_to_columns` /
+//!   `protobuf_message_to_columns` — derive the logical column list from a
+//!   writer schema or message descriptor.
 //! - `project` — map a decoded value to `Vec<Datum>` in column order.
 
 use apache_avro::Schema as AvroSchema;
@@ -10,6 +11,7 @@ use apache_avro::schema::{DecimalSchema, RecordSchema, UnionSchema};
 use apache_avro::types::Value as AvroValue;
 use catalog::Column;
 use pgtypes::{ColumnType, Datum};
+use prost_reflect::{Kind, Value as ProtoValue};
 use serde_json::Value as JsonValue;
 
 use crate::decode::DecodedValue;
@@ -126,6 +128,146 @@ pub fn json_schema_to_columns(schema: &JsonValue) -> Vec<Column> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Protobuf schema → ColumnType
+// ---------------------------------------------------------------------------
+
+/// Map a Protobuf field [`Kind`] to a [`ColumnType`].
+///
+/// Repeated and map fields are handled at the call site; this function maps
+/// the scalar kind only.  Complex types (message) fall back to JSON-serialised
+/// `Text` so no field is silently dropped.
+fn proto_kind_to_column_type(kind: &Kind) -> ColumnType {
+    match kind {
+        // Signed 32-bit variants
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => ColumnType::Int4,
+        // Unsigned 32-bit variants — widen to Int8 (no Uint4 in this codebase)
+        Kind::Uint32 | Kind::Fixed32 => ColumnType::Int8,
+        // All 64-bit integer variants
+        Kind::Int64 | Kind::Sint64 | Kind::Uint64 | Kind::Fixed64 | Kind::Sfixed64 => {
+            ColumnType::Int8
+        }
+        Kind::Float | Kind::Double => ColumnType::Float8,
+        Kind::Bool => ColumnType::Bool,
+        Kind::String => ColumnType::Text,
+        Kind::Bytes => ColumnType::Bytea,
+        // Enum (represented as i32) → Int4
+        Kind::Enum(_) => ColumnType::Int4,
+        // Nested messages → JSON-serialised text.
+        Kind::Message(_) => ColumnType::Text,
+    }
+}
+
+/// Derive columns from a [`prost_reflect::MessageDescriptor`].
+///
+/// Repeated and map fields are mapped to `Text` (JSON-serialised), because
+/// there is no native array or map `ColumnType` in this codebase.  All other
+/// fields use the scalar mapping from [`proto_kind_to_column_type`].
+pub fn protobuf_message_to_columns(descriptor: &prost_reflect::MessageDescriptor) -> Vec<Column> {
+    descriptor
+        .fields()
+        .map(|field| {
+            let ty = if field.is_list() || field.is_map() {
+                // Repeated / map → JSON text.
+                ColumnType::Text
+            } else {
+                proto_kind_to_column_type(&field.kind())
+            };
+            Column {
+                name: field.name().to_owned(),
+                ty,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Protobuf Value → Datum
+// ---------------------------------------------------------------------------
+
+/// Convert a single [`prost_reflect::Value`] to a [`Datum`].
+///
+/// List and Map variants are JSON-serialised into a `Text` datum.  Missing
+/// (unset) fields are represented by the caller as `None` → `Datum::Null`.
+pub fn proto_value_to_datum(value: &ProtoValue) -> Datum {
+    match value {
+        ProtoValue::Bool(b) => Datum::Bool(*b),
+        ProtoValue::I32(i) => Datum::Int4(*i),
+        ProtoValue::I64(i) => Datum::Int8(*i),
+        // Unsigned 32-bit — widen to Int8.
+        ProtoValue::U32(u) => Datum::Int8(i64::from(*u)),
+        // Unsigned 64-bit — may overflow i64; best-effort via wrapping cast.
+        ProtoValue::U64(u) => Datum::Int8(*u as i64),
+        ProtoValue::F32(f) => Datum::Float8(f64::from(*f)),
+        ProtoValue::F64(f) => Datum::Float8(*f),
+        ProtoValue::String(s) => Datum::Text(s.clone()),
+        ProtoValue::Bytes(b) => Datum::Bytea(b.to_vec()),
+        // Enum number → Int4.
+        ProtoValue::EnumNumber(n) => Datum::Int4(*n),
+        // Nested message → JSON-serialised text.
+        ProtoValue::Message(msg) => {
+            // Walk the set fields and build a JSON object.
+            let obj: serde_json::Map<String, JsonValue> = msg
+                .fields()
+                .map(|(fd, v)| (fd.name().to_owned(), proto_value_to_json(v)))
+                .collect();
+            Datum::Text(serde_json::to_string(&JsonValue::Object(obj)).unwrap_or_default())
+        }
+        // Repeated field → JSON array.
+        ProtoValue::List(list) => {
+            let arr: Vec<JsonValue> = list.iter().map(proto_value_to_json).collect();
+            Datum::Text(serde_json::to_string(&arr).unwrap_or_default())
+        }
+        // Map field → JSON object (keys coerced to strings).
+        ProtoValue::Map(map) => {
+            let obj: serde_json::Map<String, JsonValue> = map
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), proto_value_to_json(v)))
+                .collect();
+            Datum::Text(serde_json::to_string(&JsonValue::Object(obj)).unwrap_or_default())
+        }
+    }
+}
+
+/// Best-effort conversion of a [`prost_reflect::Value`] to a
+/// [`serde_json::Value`] for nested serialisation.
+fn proto_value_to_json(value: &ProtoValue) -> JsonValue {
+    match value {
+        ProtoValue::Bool(b) => JsonValue::Bool(*b),
+        ProtoValue::I32(i) => JsonValue::from(*i),
+        ProtoValue::I64(i) => JsonValue::from(*i),
+        ProtoValue::U32(u) => JsonValue::from(*u),
+        ProtoValue::U64(u) => JsonValue::from(*u),
+        ProtoValue::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        ProtoValue::F64(f) => serde_json::Number::from_f64(*f)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        ProtoValue::String(s) => JsonValue::String(s.clone()),
+        ProtoValue::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+            JsonValue::String(format!("\\x{hex}"))
+        }
+        ProtoValue::EnumNumber(n) => JsonValue::from(*n),
+        ProtoValue::Message(msg) => {
+            let obj: serde_json::Map<String, JsonValue> = msg
+                .fields()
+                .map(|(fd, v)| (fd.name().to_owned(), proto_value_to_json(v)))
+                .collect();
+            JsonValue::Object(obj)
+        }
+        ProtoValue::List(list) => JsonValue::Array(list.iter().map(proto_value_to_json).collect()),
+        ProtoValue::Map(map) => {
+            let obj: serde_json::Map<String, JsonValue> = map
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), proto_value_to_json(v)))
+                .collect();
+            JsonValue::Object(obj)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +515,33 @@ pub fn project(
             .collect(),
 
         DecodedValue::Json(_) => value_columns.iter().map(|_| Datum::Null).collect(),
+
+        // Protobuf: look up each value column by field name in the DynamicMessage.
+        //
+        // `get_field_by_name` always returns `Some(default_value)` for fields
+        // that exist in the descriptor — even for unset optional fields.  We
+        // therefore gate on `has_field_by_name` first:
+        //
+        // * For `optional` (proto3 singular with presence) fields: if the
+        //   field was not explicitly set, `has_field_by_name` returns `false`
+        //   → `Datum::Null`.
+        // * For regular proto3 fields (no `optional`): `has_field_by_name` is
+        //   always `true` because they have an implicit default → the default
+        //   value is projected (e.g. `""` for string, `0` for integers).
+        // * If the column name does not exist in the descriptor at all,
+        //   `has_field_by_name` returns `false` → `Datum::Null`.
+        DecodedValue::Protobuf(msg) => value_columns
+            .iter()
+            .map(|col| {
+                if msg.has_field_by_name(&col.name) {
+                    msg.get_field_by_name(&col.name)
+                        .map(|v| proto_value_to_datum(&v))
+                        .unwrap_or(Datum::Null)
+                } else {
+                    Datum::Null
+                }
+            })
+            .collect(),
     }
 }
 
@@ -589,6 +758,307 @@ mod tests {
             datums[1],
             Datum::Null,
             "absent field must produce Datum::Null via unwrap_or fallback"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: helper to build a MessageDescriptor from inline .proto source
+    // -----------------------------------------------------------------------
+
+    /// Compile a small `.proto` source string at test time (no file I/O, no
+    /// protoc binary) using the pure-Rust `protox` compiler, then load the
+    /// resulting `FileDescriptorSet` into a `prost_reflect::DescriptorPool`
+    /// and return the descriptor for the named message.
+    #[cfg(feature = "kafka")]
+    fn make_descriptor(proto_src: &str, message_name: &str) -> prost_reflect::MessageDescriptor {
+        struct InMemoryResolver {
+            name: String,
+            src: String,
+        }
+
+        impl protox::file::FileResolver for InMemoryResolver {
+            fn open_file(&self, name: &str) -> Result<protox::file::File, protox::Error> {
+                if name == self.name {
+                    protox::file::File::from_source(name, &self.src)
+                } else {
+                    Err(protox::Error::file_not_found(name))
+                }
+            }
+        }
+
+        let resolver = InMemoryResolver {
+            name: "test.proto".to_owned(),
+            src: proto_src.to_owned(),
+        };
+        let mut compiler = protox::Compiler::with_file_resolver(resolver);
+        compiler
+            .open_file("test.proto")
+            .expect("protox compiles test.proto");
+        let fds = compiler.file_descriptor_set();
+
+        let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(fds)
+            .expect("DescriptorPool from FileDescriptorSet");
+        pool.get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("message {message_name} found in pool"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: proto_value_to_datum — unit-test the Value→Datum conversion
+    // directly with hand-built prost_reflect::Value variants.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_bool_to_datum() {
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::Bool(true)),
+            Datum::Bool(true),
+            "Bool(true) → Datum::Bool(true)"
+        );
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::Bool(false)),
+            Datum::Bool(false),
+            "Bool(false) → Datum::Bool(false)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_i32_to_datum() {
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::I32(42)),
+            Datum::Int4(42),
+            "I32(42) → Datum::Int4(42)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_i64_to_datum() {
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::I64(9_876_543_210)),
+            Datum::Int8(9_876_543_210),
+            "I64 → Datum::Int8"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_string_to_datum() {
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::String("hello".to_owned())),
+            Datum::Text("hello".to_owned()),
+            "String → Datum::Text"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_bytes_to_datum() {
+        assert_eq!(
+            proto_value_to_datum(&ProtoValue::Bytes(
+                prost_reflect::prost::bytes::Bytes::from_static(b"\xCA\xFE"),
+            )),
+            Datum::Bytea(vec![0xCA, 0xFE]),
+            "Bytes → Datum::Bytea"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn proto_value_f64_to_datum() {
+        let input = std::f64::consts::E;
+        let Datum::Float8(v) = proto_value_to_datum(&ProtoValue::F64(input)) else {
+            panic!("expected Datum::Float8");
+        };
+        assert!((v - input).abs() < f64::EPSILON, "F64 → Datum::Float8");
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: protobuf_message_to_columns — verify field-kind mapping via a
+    // real descriptor built from inline .proto source with protox.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn protobuf_columns_from_descriptor() {
+        let proto_src = r#"
+            syntax = "proto3";
+            package test;
+            message Event {
+                int64  id      = 1;
+                string label   = 2;
+                bool   active  = 3;
+                double score   = 4;
+                bytes  payload = 5;
+                int32  count   = 6;
+            }
+        "#;
+        let descriptor = make_descriptor(proto_src, "test.Event");
+        let cols = protobuf_message_to_columns(&descriptor);
+
+        let find = |name: &str| {
+            cols.iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("column {name} present"))
+                .ty
+        };
+
+        assert_eq!(find("id"), ColumnType::Int8, "int64 → Int8");
+        assert_eq!(find("label"), ColumnType::Text, "string → Text");
+        assert_eq!(find("active"), ColumnType::Bool, "bool → Bool");
+        assert_eq!(find("score"), ColumnType::Float8, "double → Float8");
+        assert_eq!(find("payload"), ColumnType::Bytea, "bytes → Bytea");
+        assert_eq!(find("count"), ColumnType::Int4, "int32 → Int4");
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: project over DynamicMessage — end-to-end Value→Datum pipeline.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn protobuf_project_dynamic_message() {
+        use prost_reflect::prost::Message as _;
+
+        let proto_src = r#"
+            syntax = "proto3";
+            package test;
+            message Row {
+                int64  id    = 1;
+                string name  = 2;
+            }
+        "#;
+        let descriptor = make_descriptor(proto_src, "test.Row");
+        let cols = protobuf_message_to_columns(&descriptor);
+
+        // Build a DynamicMessage with known field values.
+        let mut msg = prost_reflect::DynamicMessage::new(descriptor.clone());
+        msg.try_set_field_by_name("id", ProtoValue::I64(777))
+            .expect("set id");
+        msg.try_set_field_by_name("name", ProtoValue::String("kafka".to_owned()))
+            .expect("set name");
+
+        // Round-trip through protobuf encode/decode to exercise the decode path.
+        let encoded = msg.encode_to_vec();
+        let decoded_msg = prost_reflect::DynamicMessage::decode(descriptor, encoded.as_slice())
+            .expect("DynamicMessage decodes");
+
+        let datums = project(&DecodedValue::Protobuf(decoded_msg), &cols, None);
+
+        let id_datum = datums
+            .iter()
+            .zip(cols.iter())
+            .find(|(_, c)| c.name == "id")
+            .map(|(d, _)| d)
+            .expect("id datum present");
+        let name_datum = datums
+            .iter()
+            .zip(cols.iter())
+            .find(|(_, c)| c.name == "name")
+            .map(|(d, _)| d)
+            .expect("name datum present");
+
+        assert_eq!(*id_datum, Datum::Int8(777), "int64 field → Datum::Int8");
+        assert_eq!(
+            *name_datum,
+            Datum::Text("kafka".to_owned()),
+            "string field → Datum::Text"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: proto3 optional field not present → Datum::Null
+    //
+    // In proto3, a field declared without `optional` always has a default
+    // value (e.g. "" for string) and `get_field_by_name` returns
+    // Some(String("")) rather than None.  To get nullable semantics, the
+    // field must be declared `optional`, which enables field-presence tracking
+    // and causes unset fields to return None from get_field_by_name.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn protobuf_optional_absent_field_produces_null() {
+        let proto_src = r#"
+            syntax = "proto3";
+            package test;
+            message Sparse {
+                int64           id      = 1;
+                optional string comment = 2;
+            }
+        "#;
+        let descriptor = make_descriptor(proto_src, "test.Sparse");
+
+        // Only set `id`; leave optional `comment` unset — it should project as Null.
+        let mut msg = prost_reflect::DynamicMessage::new(descriptor.clone());
+        msg.try_set_field_by_name("id", ProtoValue::I64(1))
+            .expect("set id");
+
+        let cols = vec![
+            Column {
+                name: "id".to_owned(),
+                ty: ColumnType::Int8,
+            },
+            Column {
+                name: "comment".to_owned(),
+                ty: ColumnType::Text,
+            },
+        ];
+
+        let datums = project(&DecodedValue::Protobuf(msg), &cols, None);
+        assert_eq!(datums[0], Datum::Int8(1), "id → Int8(1)");
+        assert_eq!(datums[1], Datum::Null, "unset optional comment → Null");
+    }
+
+    // -----------------------------------------------------------------------
+    // Protobuf: proto3 non-optional field not explicitly set → Datum::Null
+    //
+    // `has_field_by_name` returns false for non-optional proto3 fields that
+    // haven't been explicitly set (prost-reflect tracks presence even for
+    // non-optional fields at the DynamicMessage level).  Our `project` uses
+    // `has_field_by_name` as the gate, so unset non-optional fields produce
+    // Datum::Null — which is the correct database semantic (absent = NULL).
+    // Use `optional` in the schema if you want field-presence semantics with
+    // wire-encoded default values.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn protobuf_non_optional_absent_field_produces_null() {
+        let proto_src = r#"
+            syntax = "proto3";
+            package test;
+            message Dense {
+                int64  id      = 1;
+                string comment = 2;
+            }
+        "#;
+        let descriptor = make_descriptor(proto_src, "test.Dense");
+
+        // Only set `id`; leave non-optional `comment` unset.
+        // has_field_by_name returns false → project yields Datum::Null.
+        let mut msg = prost_reflect::DynamicMessage::new(descriptor.clone());
+        msg.try_set_field_by_name("id", ProtoValue::I64(2))
+            .expect("set id");
+
+        let cols = vec![
+            Column {
+                name: "id".to_owned(),
+                ty: ColumnType::Int8,
+            },
+            Column {
+                name: "comment".to_owned(),
+                ty: ColumnType::Text,
+            },
+        ];
+
+        let datums = project(&DecodedValue::Protobuf(msg), &cols, None);
+        assert_eq!(datums[0], Datum::Int8(2), "id → Int8(2)");
+        assert_eq!(
+            datums[1],
+            Datum::Null,
+            "unset non-optional field: has_field_by_name is false → Datum::Null"
         );
     }
 }

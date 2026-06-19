@@ -84,6 +84,7 @@ crabka-protocol = "0.3"
 crabka-schema-serde = { version = "0.3", features = ["avro", "json"] }
 crabka-security = "0.3"
 apache-avro = "0.21"
+prost-reflect = "0.16"
 # serde_json = "1" is already declared above
 
 # local cross-repo dev override (sibling checkout); CI uses crates.io:
