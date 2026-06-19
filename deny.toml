@@ -40,7 +40,8 @@ allow = [
 [bans]
 multiple-versions = "warn"
 deny = [
-    { crate = "ring" },
+    # ring/aws-lc-rs are permitted ONLY via crabka-client-core under the `kafka` feature.
+    { crate = "ring", wrappers = ["crabka-client-core", "tokio-rustls"] },
     { crate = "aws-lc-rs" },
     { crate = "aws-lc-sys" },
     { crate = "openssl" },

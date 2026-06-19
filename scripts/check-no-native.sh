@@ -10,6 +10,10 @@ cd "$(dirname "$0")/.."
 # bindings (the rustix project's libc-free backend) — no C, no build-time
 # compilation — so it is allowlisted. It only appears on Linux targets (CI),
 # which is why it is invisible on a macOS dev box.
+# NOTE: `cargo tree` below runs with DEFAULT features (no --features flag).
+# The `kafka` feature is intentionally exempt from this check: it pulls ring/C
+# deps via crabka-client-core, but only when explicitly enabled. The `kafka` CI
+# lane (kafka-check job in ci.yml) covers that feature path separately.
 allow='^linux-raw-sys$'
 bad=$(cargo tree -p crabgresql -e normal,build --prefix none \
     | awk '{print $1}' | sort -u \

@@ -1,0 +1,25 @@
+[package]
+name = "kafka_fdw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json"]
+
+[dependencies]
+catalog.workspace = true
+pgtypes.workspace = true
+executor.workspace = true
+kv.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+crabka-client-core  = { workspace = true, optional = true }
+crabka-client-admin = { workspace = true, optional = true }
+crabka-schema-serde = { workspace = true, optional = true }
+apache-avro = { workspace = true, optional = true }
+serde_json  = { workspace = true, optional = true }

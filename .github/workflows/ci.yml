@@ -156,6 +156,18 @@ jobs:
             echo "::endgroup::"
           done
 
+  kafka-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: nextest }
+      - run: cargo clippy --locked -p kafka_fdw -p crabgresql --features kafka --all-targets -- -D warnings
+      - run: cargo nextest run --locked -p kafka_fdw --features kafka --profile ci
+
   clippy-sarif:
     name: Clippy (SARIF code scanning)
     runs-on: ubuntu-latest
@@ -184,7 +196,7 @@ jobs:
 
   pr-gate:
     runs-on: ubuntu-latest
-    needs: [check, coverage, conformance, property, fuzz-smoke, clippy-sarif]
+    needs: [check, coverage, conformance, property, fuzz-smoke, clippy-sarif, kafka-check]
     if: always()
     steps:
       - name: All jobs passed

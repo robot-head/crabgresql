@@ -7,7 +7,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+kafka = ["dep:kafka_fdw", "kafka_fdw/kafka"]
+
 [dependencies]
+kafka_fdw = { workspace = true, optional = true }
 cluster.workspace = true
 executor.workspace = true
 pgwire.workspace = true
