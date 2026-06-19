@@ -1,1 +1,444 @@
-//! config
+//! Resolution of catalog `ForeignServer` + `UserMapping` + table OPTIONS into
+//! a [`ConnProfile`] the scanner/source uses to connect to Kafka.
+
+use crabka_client_core::security::{ClientSecurity, SaslCredentials, TlsConnectorConfig};
+use crabka_security::{ListenerProtocol, SaslMechanism};
+
+use crate::decode::Wire;
+use crate::error::KafkaFdwError;
+
+/// A fully-resolved connection profile for one Kafka foreign table scan.
+#[derive(Debug)]
+pub struct ConnProfile {
+    /// Bootstrap broker addresses, e.g. `["h1:9092", "h2:9092"]`.
+    pub bootstrap: Vec<String>,
+    /// Schema registry URL (empty string when not needed).
+    pub registry_url: String,
+    /// TLS/SASL security settings; `None` for plain PLAINTEXT with no auth.
+    pub security: Option<ClientSecurity>,
+    /// The Kafka topic to scan.
+    pub topic: String,
+    /// Wire encoding for the message value.
+    pub value_format: Wire,
+    /// Wire encoding for the message key.
+    pub key_format: Wire,
+}
+
+/// Resolve a [`catalog::ForeignServer`] + optional [`catalog::UserMapping`] +
+/// foreign-table OPTIONS into a [`ConnProfile`].
+///
+/// # Required options
+/// * **Server option** `bootstrap` — comma-separated `host:port` list.
+/// * **Table option** `topic` — the Kafka topic name.
+///
+/// # Optional options
+/// | Source  | Key                 | Default       |
+/// |---------|---------------------|---------------|
+/// | Server  | `registry_url`      | `""`          |
+/// | Server  | `security_protocol` | `"PLAINTEXT"` |
+/// | Mapping | `sasl_mechanism`    | —             |
+/// | Mapping | `username`          | —             |
+/// | Mapping | `password`          | —             |
+/// | Table   | `value_format`      | `"raw"`       |
+/// | Table   | `key_format`        | `"raw"`       |
+///
+/// Unknown option keys are silently ignored (PostgreSQL FDW leniency).
+///
+/// # Errors
+/// Returns [`KafkaFdwError::Config`] when a required option is absent or an
+/// option value is unrecognised (e.g. unknown `security_protocol`).
+pub fn resolve(
+    server: &catalog::ForeignServer,
+    mapping: Option<&catalog::UserMapping>,
+    table_options: &[(String, String)],
+) -> Result<ConnProfile, KafkaFdwError> {
+    // ---- helpers ----
+    let server_opt = |key: &str| -> Option<&str> {
+        server
+            .options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let table_opt = |key: &str| -> Option<&str> {
+        table_options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+
+    // ---- bootstrap (required) ----
+    let bootstrap_raw = server_opt("bootstrap")
+        .ok_or_else(|| KafkaFdwError::Config("missing required option: bootstrap".to_string()))?;
+    let bootstrap: Vec<String> = bootstrap_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // ---- registry_url (optional, default empty) ----
+    let registry_url = server_opt("registry_url").unwrap_or("").to_string();
+
+    // ---- topic (required) ----
+    let topic = table_opt("topic")
+        .ok_or_else(|| KafkaFdwError::Config("missing required option: topic".to_string()))?
+        .to_string();
+
+    // ---- value_format / key_format (optional, default Raw) ----
+    let value_format = parse_wire(table_opt("value_format").unwrap_or("raw"))?;
+    let key_format = parse_wire(table_opt("key_format").unwrap_or("raw"))?;
+
+    // ---- security_protocol (optional, default PLAINTEXT) ----
+    let protocol_str = server_opt("security_protocol").unwrap_or("PLAINTEXT");
+    let protocol = parse_listener_protocol(protocol_str)?;
+
+    // ---- security ----
+    let mapping_options: &[(String, String)] = mapping.map_or(&[], |m| m.options.as_slice());
+    let security = build_security(protocol, &bootstrap, mapping_options)?;
+
+    Ok(ConnProfile {
+        bootstrap,
+        registry_url,
+        security,
+        topic,
+        value_format,
+        key_format,
+    })
+}
+
+fn parse_wire(s: &str) -> Result<Wire, KafkaFdwError> {
+    match s {
+        "raw" => Ok(Wire::Raw),
+        "avro" => Ok(Wire::Avro),
+        "json" => Ok(Wire::Json),
+        other => Err(KafkaFdwError::Config(format!(
+            "unknown wire format: {other:?}; expected one of: raw, avro, json"
+        ))),
+    }
+}
+
+fn parse_listener_protocol(s: &str) -> Result<ListenerProtocol, KafkaFdwError> {
+    match s {
+        "PLAINTEXT" => Ok(ListenerProtocol::Plaintext),
+        "SSL" => Ok(ListenerProtocol::Ssl),
+        "SASL_PLAINTEXT" => Ok(ListenerProtocol::SaslPlaintext),
+        "SASL_SSL" => Ok(ListenerProtocol::SaslSsl),
+        other => Err(KafkaFdwError::Config(format!(
+            "unknown security_protocol: {other:?}; expected one of: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL"
+        ))),
+    }
+}
+
+/// Build [`ClientSecurity`] from the resolved protocol and mapping options.
+///
+/// Deviation from the task sketch: `SaslCredentials` does **not** have
+/// `ScramSha256`/`ScramSha512` variants; it uses a single `Scram { mechanism,
+/// username, password }` variant where `mechanism` is
+/// [`crabka_security::SaslMechanism`]. Both `SCRAM-SHA-256` and
+/// `SCRAM-SHA-512` map to this variant with the appropriate
+/// `SaslMechanism::ScramSha256` / `SaslMechanism::ScramSha512` discriminant.
+fn build_security(
+    protocol: ListenerProtocol,
+    bootstrap: &[String],
+    mapping_options: &[(String, String)],
+) -> Result<Option<ClientSecurity>, KafkaFdwError> {
+    let map_opt = |key: &str| -> Option<&str> {
+        mapping_options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+
+    // PLAINTEXT with no SASL → no security object needed.
+    if protocol == ListenerProtocol::Plaintext {
+        return Ok(None);
+    }
+
+    // TLS config: present for SSL and SASL_SSL.
+    let tls = if protocol.requires_tls() {
+        // SNI = first bootstrap host (strip port if present).
+        let server_name = bootstrap
+            .first()
+            .map(|addr| {
+                addr.rsplit_once(':')
+                    .map_or(addr.as_str(), |(host, _)| host)
+                    .to_string()
+            })
+            .unwrap_or_default();
+        Some(TlsConnectorConfig {
+            trust_roots_pem: None,
+            server_name,
+            client_identity: None,
+        })
+    } else {
+        None
+    };
+
+    // SASL credentials: required when protocol requires SASL.
+    let sasl = if protocol.requires_sasl() {
+        let mechanism_str = map_opt("sasl_mechanism").ok_or_else(|| {
+            KafkaFdwError::Config(
+                "SASL protocol requires sasl_mechanism in the user mapping".to_string(),
+            )
+        })?;
+        let username = map_opt("username")
+            .ok_or_else(|| {
+                KafkaFdwError::Config(
+                    "SASL protocol requires username in the user mapping".to_string(),
+                )
+            })?
+            .to_string();
+        let password = map_opt("password")
+            .ok_or_else(|| {
+                KafkaFdwError::Config(
+                    "SASL protocol requires password in the user mapping".to_string(),
+                )
+            })?
+            .to_string();
+
+        let creds = match mechanism_str {
+            "PLAIN" => SaslCredentials::Plain { username, password },
+            "SCRAM-SHA-256" => SaslCredentials::Scram {
+                mechanism: SaslMechanism::ScramSha256,
+                username,
+                password,
+            },
+            "SCRAM-SHA-512" => SaslCredentials::Scram {
+                mechanism: SaslMechanism::ScramSha512,
+                username,
+                password,
+            },
+            other => {
+                return Err(KafkaFdwError::Config(format!(
+                    "unknown sasl_mechanism: {other:?}; expected one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512"
+                )));
+            }
+        };
+        Some(creds)
+    } else {
+        None
+    };
+
+    Ok(Some(ClientSecurity {
+        protocol,
+        tls,
+        sasl,
+        sasl_host: None,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(opts: &[(&str, &str)]) -> catalog::ForeignServer {
+        catalog::ForeignServer {
+            name: "s".into(),
+            wrapper: "kafka_fdw".into(),
+            options: opts
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn make_mapping(opts: &[(&str, &str)]) -> catalog::UserMapping {
+        catalog::UserMapping {
+            user: "public".into(),
+            server: "s".into(),
+            options: opts
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn table_opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Verbatim test from the task brief.
+    #[test]
+    fn resolve_builds_scram_profile() {
+        let server = catalog::ForeignServer {
+            name: "s".into(),
+            wrapper: "kafka_fdw".into(),
+            options: vec![
+                ("bootstrap".into(), "h:9092".into()),
+                ("registry_url".into(), "http://r".into()),
+                ("security_protocol".into(), "SASL_SSL".into()),
+            ],
+        };
+        let mapping = catalog::UserMapping {
+            user: "public".into(),
+            server: "s".into(),
+            options: vec![
+                ("sasl_mechanism".into(), "SCRAM-SHA-256".into()),
+                ("username".into(), "u".into()),
+                ("password".into(), "p".into()),
+            ],
+        };
+        let p = crate::config::resolve(
+            &server,
+            Some(&mapping),
+            &[
+                ("topic".into(), "orders".into()),
+                ("value_format".into(), "avro".into()),
+            ],
+        )
+        .expect("resolve");
+        assert_eq!(p.topic, "orders");
+        assert_eq!(p.bootstrap, vec!["h:9092".to_string()]);
+        assert!(matches!(p.value_format, crate::decode::Wire::Avro));
+        assert!(p.security.is_some());
+    }
+
+    #[test]
+    fn plaintext_no_mapping_yields_no_security() {
+        let server = make_server(&[
+            ("bootstrap", "broker:9092"),
+            ("security_protocol", "PLAINTEXT"),
+        ]);
+        let p =
+            resolve(&server, None, &table_opts(&[("topic", "events")])).expect("resolve PLAINTEXT");
+        assert!(p.security.is_none(), "PLAINTEXT should produce no security");
+        assert_eq!(p.topic, "events");
+        assert_eq!(p.bootstrap, vec!["broker:9092".to_string()]);
+        assert!(matches!(p.value_format, Wire::Raw));
+        assert!(matches!(p.key_format, Wire::Raw));
+    }
+
+    #[test]
+    fn missing_topic_returns_config_error() {
+        let server = make_server(&[("bootstrap", "broker:9092")]);
+        let err = resolve(&server, None, &[]).expect_err("missing topic should error");
+        assert!(
+            matches!(err, KafkaFdwError::Config(ref msg) if msg.contains("topic")),
+            "expected Config error mentioning 'topic', got: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_bootstrap_returns_config_error() {
+        let server = make_server(&[]);
+        let err = resolve(&server, None, &table_opts(&[("topic", "t")]))
+            .expect_err("missing bootstrap should error");
+        assert!(
+            matches!(err, KafkaFdwError::Config(ref msg) if msg.contains("bootstrap")),
+            "expected Config error mentioning 'bootstrap', got: {err}"
+        );
+    }
+
+    #[test]
+    fn sasl_plaintext_with_plain_credentials() {
+        let server = make_server(&[
+            ("bootstrap", "b:9093"),
+            ("security_protocol", "SASL_PLAINTEXT"),
+        ]);
+        let mapping = make_mapping(&[
+            ("sasl_mechanism", "PLAIN"),
+            ("username", "alice"),
+            ("password", "secret"),
+        ]);
+        let p = resolve(&server, Some(&mapping), &table_opts(&[("topic", "logins")]))
+            .expect("resolve SASL_PLAINTEXT/PLAIN");
+        let sec = p
+            .security
+            .expect("security must be Some for SASL_PLAINTEXT");
+        assert!(sec.tls.is_none(), "SASL_PLAINTEXT should have no TLS");
+        assert!(
+            matches!(sec.sasl, Some(SaslCredentials::Plain { .. })),
+            "expected Plain credentials"
+        );
+    }
+
+    #[test]
+    fn ssl_no_sasl_builds_tls_only_security() {
+        let server = make_server(&[
+            ("bootstrap", "secure-host:9093"),
+            ("security_protocol", "SSL"),
+        ]);
+        let p =
+            resolve(&server, None, &table_opts(&[("topic", "secure-topic")])).expect("resolve SSL");
+        let sec = p.security.expect("security must be Some for SSL");
+        assert!(sec.tls.is_some(), "SSL should have TLS config");
+        assert!(
+            sec.sasl.is_none(),
+            "SSL with no mapping should have no SASL"
+        );
+        let tls = sec
+            .tls
+            .expect("SSL security should have a TlsConnectorConfig");
+        assert_eq!(
+            tls.server_name, "secure-host",
+            "SNI should be the first bootstrap host without port"
+        );
+    }
+
+    #[test]
+    fn default_formats_are_raw() {
+        let server = make_server(&[("bootstrap", "b:9092")]);
+        let p = resolve(&server, None, &table_opts(&[("topic", "t")])).expect("resolve");
+        assert!(matches!(p.value_format, Wire::Raw));
+        assert!(matches!(p.key_format, Wire::Raw));
+    }
+
+    #[test]
+    fn json_wire_format_parses() {
+        let server = make_server(&[("bootstrap", "b:9092")]);
+        let p = resolve(
+            &server,
+            None,
+            &table_opts(&[
+                ("topic", "t"),
+                ("value_format", "json"),
+                ("key_format", "avro"),
+            ]),
+        )
+        .expect("resolve json/avro");
+        assert!(matches!(p.value_format, Wire::Json));
+        assert!(matches!(p.key_format, Wire::Avro));
+    }
+
+    #[test]
+    fn registry_url_defaults_to_empty_string() {
+        let server = make_server(&[("bootstrap", "b:9092")]);
+        let p = resolve(&server, None, &table_opts(&[("topic", "t")])).expect("resolve");
+        assert_eq!(p.registry_url, "");
+    }
+
+    #[test]
+    fn registry_url_is_forwarded() {
+        let server = make_server(&[("bootstrap", "b:9092"), ("registry_url", "http://sr:8081")]);
+        let p = resolve(&server, None, &table_opts(&[("topic", "t")])).expect("resolve");
+        assert_eq!(p.registry_url, "http://sr:8081");
+    }
+
+    #[test]
+    fn unknown_security_protocol_errors() {
+        let server = make_server(&[("bootstrap", "b:9092"), ("security_protocol", "BOGUS")]);
+        let err = resolve(&server, None, &table_opts(&[("topic", "t")]))
+            .expect_err("unknown security_protocol should error");
+        assert!(
+            matches!(err, KafkaFdwError::Config(ref msg) if msg.contains("security_protocol")),
+            "expected Config error mentioning 'security_protocol', got: {err}"
+        );
+    }
+
+    #[test]
+    fn comma_separated_bootstrap_is_split() {
+        let server = make_server(&[("bootstrap", "h1:9092 , h2:9092, h3:9092")]);
+        let p = resolve(&server, None, &table_opts(&[("topic", "t")])).expect("resolve");
+        assert_eq!(
+            p.bootstrap,
+            vec![
+                "h1:9092".to_string(),
+                "h2:9092".to_string(),
+                "h3:9092".to_string()
+            ]
+        );
+    }
+}

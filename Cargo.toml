@@ -81,6 +81,7 @@ kafka_fdw = { path = "crates/kafka_fdw" }
 crabka-client-core = "0.3"
 crabka-client-admin = "0.3"
 crabka-schema-serde = { version = "0.3", features = ["avro", "json"] }
+crabka-security = "0.3"
 apache-avro = "0.21"
 # serde_json = "1" is already declared above
 
