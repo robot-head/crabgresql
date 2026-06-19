@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 default = []
-kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json", "dep:rustls", "dep:rustls-rustcrypto", "dep:jiff", "dep:bigdecimal", "dep:num-bigint", "dep:crabka-security"]
+kafka = ["dep:crabka-client-core", "dep:crabka-client-admin", "dep:crabka-protocol", "dep:crabka-schema-serde", "dep:apache-avro", "dep:serde_json", "dep:rustls", "dep:rustls-rustcrypto", "dep:jiff", "dep:bigdecimal", "dep:num-bigint", "dep:crabka-security"]
 
 [dependencies]
 catalog.workspace = true
@@ -20,6 +20,7 @@ tokio = { workspace = true }
 thiserror.workspace = true
 crabka-client-core  = { workspace = true, optional = true }
 crabka-client-admin = { workspace = true, optional = true }
+crabka-protocol     = { workspace = true, optional = true }
 crabka-schema-serde = { workspace = true, optional = true }
 crabka-security     = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true }
