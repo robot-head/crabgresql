@@ -6,7 +6,7 @@
 //! - `project` — map a decoded value to `Vec<Datum>` in column order.
 
 use apache_avro::Schema as AvroSchema;
-use apache_avro::schema::{RecordSchema, UnionSchema};
+use apache_avro::schema::{DecimalSchema, RecordSchema, UnionSchema};
 use apache_avro::types::Value as AvroValue;
 use catalog::Column;
 use pgtypes::{ColumnType, Datum};
@@ -135,11 +135,15 @@ pub fn json_schema_to_columns(schema: &JsonValue) -> Vec<Column> {
 /// Map an Avro `Value` to a `Datum` for the given column type.
 ///
 /// `Union(_, inner)` is unwrapped; `Null` produces `Datum::Null`.
-fn avro_value_to_datum(value: &AvroValue, col_ty: ColumnType) -> Datum {
+///
+/// `decimal_scale` — the scale from the Avro field's `DecimalSchema` (number
+/// of fractional digits). Must be provided when the value may be
+/// `AvroValue::Decimal`; pass `None` for non-decimal fields.
+fn avro_value_to_datum(value: &AvroValue, col_ty: ColumnType, decimal_scale: Option<u32>) -> Datum {
     match value {
         AvroValue::Null => Datum::Null,
         // Unwrap nullable union — recurse on the inner value.
-        AvroValue::Union(_, inner) => avro_value_to_datum(inner, col_ty),
+        AvroValue::Union(_, inner) => avro_value_to_datum(inner, col_ty, decimal_scale),
 
         AvroValue::Boolean(b) => Datum::Bool(*b),
         AvroValue::Int(i) => Datum::Int4(*i),
@@ -173,12 +177,15 @@ fn avro_value_to_datum(value: &AvroValue, col_ty: ColumnType) -> Datum {
         }
 
         // Decimal → Numeric (bigdecimal).
-        // apache-avro's `Decimal` wraps a `BigInt` (unscaled value). We convert
-        // via `BigInt` (scale=0 since we don't have the schema's scale here).
+        // apache-avro's `Decimal` wraps a `BigInt` (unscaled value). The real
+        // scale lives in the field's schema (`DecimalSchema::scale`), threaded
+        // in via `decimal_scale`. `BigDecimal::new(bigint, scale)` represents
+        // `bigint * 10^-scale`, so we pass the Avro scale directly.
         AvroValue::Decimal(d) => {
             use num_bigint::BigInt;
             let big_int: BigInt = BigInt::from(d.clone());
-            let bd = bigdecimal::BigDecimal::from(big_int);
+            let scale = decimal_scale.unwrap_or(0) as i64;
+            let bd = bigdecimal::BigDecimal::new(big_int, scale);
             Datum::Numeric(bd)
         }
         AvroValue::BigDecimal(bd) => Datum::Numeric(bd.clone()),
@@ -206,7 +213,7 @@ fn avro_value_to_datum(value: &AvroValue, col_ty: ColumnType) -> Datum {
 
         // Catch-all: serialise as text.
         _ => {
-            let _ = col_ty; // suppress unused warning
+            let _ = (col_ty, decimal_scale); // suppress unused warnings
             Datum::Text(format!("{value:?}"))
         }
     }
@@ -263,6 +270,10 @@ fn json_value_to_datum(value: &JsonValue, col_ty: ColumnType) -> Datum {
     match (value, col_ty) {
         (JsonValue::Null, _) => Datum::Null,
         (JsonValue::Bool(b), ColumnType::Bool) => Datum::Bool(*b),
+        // NOTE: `json_schema_to_columns` maps JSON "integer" → Int8 only, so
+        // the Int4 arm below is never reached in practice. It is kept as a
+        // defensive fallback in case a caller supplies a hand-crafted Int4
+        // column for JSON data.
         (JsonValue::Number(n), ColumnType::Int4) => n
             .as_i64()
             .map(|i| Datum::Int4(i as i32))
@@ -294,20 +305,61 @@ fn json_value_to_datum(value: &JsonValue, col_ty: ColumnType) -> Datum {
 ///   JSON object.
 /// * `DecodedValue::Raw(bytes)` — return a single `Datum::Bytea` regardless
 ///   of `value_columns` (raw fallback is always one bytea column).
-pub fn project(decoded: &DecodedValue, value_columns: &[Column]) -> Vec<Datum> {
+///
+/// `avro_schema` — the parsed writer schema for the Avro case. When provided
+/// and the schema is a Record, field-level sub-schemas are consulted to
+/// recover the `scale` of `decimal` fields so that `AvroValue::Decimal` is
+/// correctly scaled. Pass `None` for JSON / Raw paths.
+pub fn project(
+    decoded: &DecodedValue,
+    value_columns: &[Column],
+    avro_schema: Option<&AvroSchema>,
+) -> Vec<Datum> {
     match decoded {
         DecodedValue::Raw(bytes) => vec![Datum::Bytea(bytes.clone())],
 
-        DecodedValue::Avro(AvroValue::Record(fields)) => value_columns
-            .iter()
-            .map(|col| {
-                fields
+        DecodedValue::Avro(AvroValue::Record(fields)) => {
+            // Build a lookup of field-name → DecimalSchema scale from the
+            // writer schema so `Decimal` values can be correctly scaled.
+            let decimal_scale_for = |name: &str| -> Option<u32> {
+                let schema = avro_schema?;
+                let AvroSchema::Record(RecordSchema {
+                    fields: schema_fields,
+                    ..
+                }) = schema
+                else {
+                    return None;
+                };
+                let field_schema = schema_fields
                     .iter()
-                    .find(|(name, _)| name == &col.name)
-                    .map(|(_, v)| avro_value_to_datum(v, col.ty))
-                    .unwrap_or(Datum::Null)
-            })
-            .collect(),
+                    .find(|f| f.name == name)
+                    .map(|f| &f.schema)?;
+                // The field schema may be wrapped in a nullable union `[null, decimal]`.
+                let inner = match field_schema {
+                    AvroSchema::Union(u) => u
+                        .variants()
+                        .iter()
+                        .find(|s| !matches!(s, AvroSchema::Null))?,
+                    other => other,
+                };
+                if let AvroSchema::Decimal(DecimalSchema { scale, .. }) = inner {
+                    Some(*scale as u32)
+                } else {
+                    None
+                }
+            };
+
+            value_columns
+                .iter()
+                .map(|col| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == &col.name)
+                        .map(|(name, v)| avro_value_to_datum(v, col.ty, decimal_scale_for(name)))
+                        .unwrap_or(Datum::Null)
+                })
+                .collect()
+        }
 
         DecodedValue::Avro(_) => value_columns.iter().map(|_| Datum::Null).collect(),
 
@@ -353,7 +405,11 @@ mod tests {
         record.put("id", 7i64);
         record.put("name", Some("x".to_string()));
         let val = apache_avro::types::Value::from(record);
-        let datums = crate::types::project(&crate::decode::DecodedValue::Avro(val), &cols);
+        let datums = crate::types::project(
+            &crate::decode::DecodedValue::Avro(val),
+            &cols,
+            Some(&schema),
+        );
         assert_eq!(datums[0], pgtypes::Datum::Int8(7));
         assert_eq!(datums[1], pgtypes::Datum::Text("x".into()));
     }
@@ -376,7 +432,7 @@ mod tests {
         let mut record = apache_avro::types::Record::new(&schema).expect("record");
         record.put("val", Option::<String>::None);
         let val = apache_avro::types::Value::from(record);
-        let datums = project(&DecodedValue::Avro(val), &cols);
+        let datums = project(&DecodedValue::Avro(val), &cols, Some(&schema));
         assert_eq!(datums[0], Datum::Null);
     }
 
@@ -397,7 +453,7 @@ mod tests {
         let mut record = apache_avro::types::Record::new(&schema).expect("record");
         record.put("blob", vec![0xCAu8, 0xFEu8]);
         let val = apache_avro::types::Value::from(record);
-        let datums = project(&DecodedValue::Avro(val), &cols);
+        let datums = project(&DecodedValue::Avro(val), &cols, Some(&schema));
         assert_eq!(datums[0], Datum::Bytea(vec![0xCA, 0xFE]));
     }
 
@@ -422,7 +478,7 @@ mod tests {
         assert_eq!(label_col.ty, ColumnType::Text);
 
         let payload: JsonValue = serde_json::json!({"count": 42, "label": "hello"});
-        let datums = project(&DecodedValue::Json(payload), &cols);
+        let datums = project(&DecodedValue::Json(payload), &cols, None);
         // Project in column order.
         let count_datum = datums
             .iter()
@@ -459,8 +515,80 @@ mod tests {
         record.put("id", 99i64);
         record.put("opt", Option::<String>::None);
         let val = apache_avro::types::Value::from(record);
-        let datums = project(&DecodedValue::Avro(val), &cols);
+        let datums = project(&DecodedValue::Avro(val), &cols, Some(&schema));
         assert_eq!(datums[0], Datum::Int8(99));
         assert_eq!(datums[1], Datum::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1: Avro decimal with scale=2 projects correctly (RED→GREEN)
+    // Unscaled value 1999 with scale 2 must produce Datum::Numeric "19.99".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn avro_decimal_scale_applied_correctly() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"D","fields":[
+            {"name":"price","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}]}"#,
+        )
+        .expect("schema parses");
+        let cols = avro_schema_to_columns(&schema);
+        assert_eq!(cols[0].name, "price");
+        assert_eq!(cols[0].ty, ColumnType::Numeric(None));
+
+        // Build an Avro Decimal value with unscaled integer 1999 (represents 19.99).
+        use num_bigint::BigInt;
+        let unscaled = BigInt::from(1999i64);
+        let decimal_val = apache_avro::Decimal::from(unscaled.to_signed_bytes_be());
+        let val = AvroValue::Record(vec![("price".to_string(), AvroValue::Decimal(decimal_val))]);
+
+        let datums = project(&DecodedValue::Avro(val), &cols, Some(&schema));
+        let Datum::Numeric(ref bd) = datums[0] else {
+            panic!("expected Datum::Numeric, got {:?}", datums[0]);
+        };
+        assert_eq!(
+            bd.to_string(),
+            "19.99",
+            "decimal scale must be applied: 1999 * 10^-2 = 19.99"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2: truly-absent field (not in record field list) → Datum::Null
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn avro_truly_absent_field_produces_null() {
+        // value_columns requests a field "extra" that is not present in the
+        // Avro Record's fields list at all (not merely present-but-null).
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"A","fields":[
+            {"name":"id","type":"long"}]}"#,
+        )
+        .expect("schema parses");
+
+        let mut record = apache_avro::types::Record::new(&schema).expect("record");
+        record.put("id", 5i64);
+        let val = apache_avro::types::Value::from(record);
+
+        // Ask for both "id" and a field "extra" that does not exist in the record.
+        let cols = vec![
+            Column {
+                name: "id".to_string(),
+                ty: ColumnType::Int8,
+            },
+            Column {
+                name: "extra".to_string(),
+                ty: ColumnType::Text,
+            },
+        ];
+
+        let datums = project(&DecodedValue::Avro(val), &cols, Some(&schema));
+        assert_eq!(datums[0], Datum::Int8(5), "id field must project correctly");
+        assert_eq!(
+            datums[1],
+            Datum::Null,
+            "absent field must produce Datum::Null via unwrap_or fallback"
+        );
     }
 }
