@@ -99,6 +99,7 @@ mod tests {
                     ty: *t,
                 })
                 .collect(),
+            foreign: None,
         }
     }
 

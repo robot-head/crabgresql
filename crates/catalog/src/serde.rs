@@ -1,15 +1,25 @@
 //! Versioned (de)serialization of a table schema — the value stored under
 //! `kv::key::catalog_key(name)`. Format: version byte, table_id (u32 BE),
 //! column count (u32 BE), then per column: u32 name length, name bytes, type tag.
+//!
+//! Version 2 extends version 1 by appending a `foreign` flag byte after the
+//! column list:  `0` = ordinary table;  `1` = foreign table, followed by
+//! (server name len u32, server name bytes, option count u32, then per option:
+//!  key len u32, key bytes, value len u32, value bytes).
+//!
+//! Foreign-data-wrapper, foreign-server, and user-mapping objects use their own
+//! simple binary format (not the schema format).
 
 use kv::KvError;
 use pgtypes::ColumnType;
 use pgtypes::numeric::Typmod;
 
-use crate::Column;
+use crate::{Column, ForeignDataWrapper, ForeignServer, ForeignTableMeta, UserMapping};
 
-/// Current schema-value format version.
+/// Schema-value format version for ordinary tables (columns only).
 pub const SCHEMA_VERSION: u8 = 1;
+/// Schema-value format version for tables that may carry foreign-table metadata.
+pub const SCHEMA_VERSION_V2: u8 = 2;
 
 mod type_tag {
     pub const BOOL: u8 = 0;
@@ -136,22 +146,85 @@ fn read_type(cur: &mut &[u8]) -> Result<ColumnType, KvError> {
     })
 }
 
-pub fn serialize_schema(table_id: u32, columns: &[Column]) -> Vec<u8> {
-    let mut out = vec![SCHEMA_VERSION];
+// ── Options helpers ───────────────────────────────────────────────────────────
+
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn write_options(out: &mut Vec<u8>, opts: &[(String, String)]) {
+    out.extend_from_slice(&(opts.len() as u32).to_be_bytes());
+    for (k, v) in opts {
+        write_str(out, k);
+        write_str(out, v);
+    }
+}
+
+fn read_str<'a>(cur: &mut &'a [u8]) -> Result<&'a [u8], KvError> {
+    let len = u32::from_be_bytes(take_n(cur, 4)?.try_into().expect("4")) as usize;
+    take_n(cur, len)
+}
+
+fn read_string(cur: &mut &[u8]) -> Result<String, KvError> {
+    let bytes = read_str(cur)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| KvError::CorruptRow("non-UTF-8 string in catalog".into()))
+}
+
+fn read_options(cur: &mut &[u8]) -> Result<Vec<(String, String)>, KvError> {
+    let n = u32::from_be_bytes(take_n(cur, 4)?.try_into().expect("4")) as usize;
+    let mut opts = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let k = read_string(cur)?;
+        let v = read_string(cur)?;
+        opts.push((k, v));
+    }
+    Ok(opts)
+}
+
+// ── Table schema ──────────────────────────────────────────────────────────────
+
+/// Serialize a table schema (ordinary or foreign).
+///
+/// - `meta = None`  → version byte `1`, no trailing foreign payload (backwards
+///   compatible with the original format).
+/// - `meta = Some(_)` → version byte `2`, foreign payload appended.
+pub fn serialize_schema(
+    table_id: u32,
+    columns: &[Column],
+    meta: Option<&ForeignTableMeta>,
+) -> Vec<u8> {
+    let version = if meta.is_some() {
+        SCHEMA_VERSION_V2
+    } else {
+        SCHEMA_VERSION
+    };
+    let mut out = vec![version];
     out.extend_from_slice(&table_id.to_be_bytes());
     out.extend_from_slice(&(columns.len() as u32).to_be_bytes());
     for c in columns {
-        out.extend_from_slice(&(c.name.len() as u32).to_be_bytes());
-        out.extend_from_slice(c.name.as_bytes());
+        write_str(&mut out, &c.name);
         write_type(&mut out, c.ty);
+    }
+    if let Some(m) = meta {
+        // foreign flag = 1 (already implied by version 2, but belt + suspenders)
+        out.push(1);
+        write_str(&mut out, &m.server);
+        write_options(&mut out, &m.options);
     }
     out
 }
 
-pub fn deserialize_schema(bytes: &[u8]) -> Result<(u32, Vec<Column>), KvError> {
+/// Deserialize a table schema.
+///
+/// Returns `(table_id, columns, Option<ForeignTableMeta>)`.
+pub fn deserialize_schema(
+    bytes: &[u8],
+) -> Result<(u32, Vec<Column>, Option<ForeignTableMeta>), KvError> {
     let mut cur = bytes;
     let version = take_u8(&mut cur)?;
-    if version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION && version != SCHEMA_VERSION_V2 {
         return Err(KvError::CorruptRow(format!(
             "unknown schema version {version}"
         )));
@@ -160,14 +233,89 @@ pub fn deserialize_schema(bytes: &[u8]) -> Result<(u32, Vec<Column>), KvError> {
     let ncols = u32::from_be_bytes(take_n(&mut cur, 4)?.try_into().expect("4")) as usize;
     let mut columns = Vec::with_capacity(ncols.min(1024));
     for _ in 0..ncols {
-        let nlen = u32::from_be_bytes(take_n(&mut cur, 4)?.try_into().expect("4")) as usize;
-        let name = String::from_utf8(take_n(&mut cur, nlen)?.to_vec())
-            .map_err(|_| KvError::CorruptRow("column name is not UTF-8".into()))?;
+        let name = read_string(&mut cur)?;
         let ty = read_type(&mut cur)?;
         columns.push(Column { name, ty });
     }
-    Ok((table_id, columns))
+    let foreign = if version == SCHEMA_VERSION_V2 {
+        let flag = take_u8(&mut cur)?;
+        if flag == 1 {
+            let server = read_string(&mut cur)?;
+            let options = read_options(&mut cur)?;
+            Some(ForeignTableMeta { server, options })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((table_id, columns, foreign))
 }
+
+// ── Foreign-data wrapper ──────────────────────────────────────────────────────
+
+/// Format: `name len (u32) | name | options`.
+pub fn serialize_fdw(name: &str, options: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_str(&mut out, name);
+    write_options(&mut out, options);
+    out
+}
+
+pub fn deserialize_fdw(bytes: &[u8]) -> Result<ForeignDataWrapper, KvError> {
+    let mut cur = bytes;
+    let name = read_string(&mut cur)?;
+    let options = read_options(&mut cur)?;
+    Ok(ForeignDataWrapper { name, options })
+}
+
+// ── Foreign server ────────────────────────────────────────────────────────────
+
+/// Format: `name len | name | wrapper len | wrapper | options`.
+pub fn serialize_server(name: &str, wrapper: &str, options: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_str(&mut out, name);
+    write_str(&mut out, wrapper);
+    write_options(&mut out, options);
+    out
+}
+
+pub fn deserialize_server(bytes: &[u8]) -> Result<ForeignServer, KvError> {
+    let mut cur = bytes;
+    let name = read_string(&mut cur)?;
+    let wrapper = read_string(&mut cur)?;
+    let options = read_options(&mut cur)?;
+    Ok(ForeignServer {
+        name,
+        wrapper,
+        options,
+    })
+}
+
+// ── User mapping ──────────────────────────────────────────────────────────────
+
+/// Format: `user len | user | server len | server | options`.
+pub fn serialize_user_mapping(user: &str, server: &str, options: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_str(&mut out, user);
+    write_str(&mut out, server);
+    write_options(&mut out, options);
+    out
+}
+
+pub fn deserialize_user_mapping(bytes: &[u8]) -> Result<UserMapping, KvError> {
+    let mut cur = bytes;
+    let user = read_string(&mut cur)?;
+    let server = read_string(&mut cur)?;
+    let options = read_options(&mut cur)?;
+    Ok(UserMapping {
+        user,
+        server,
+        options,
+    })
+}
+
+// ── Shared primitives ─────────────────────────────────────────────────────────
 
 fn take_u8(cur: &mut &[u8]) -> Result<u8, KvError> {
     let (h, rest) = cur
@@ -189,7 +337,7 @@ fn take_n<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], KvError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Column;
+    use crate::{Column, ForeignTableMeta};
     use pgtypes::ColumnType;
 
     #[test]
@@ -228,10 +376,11 @@ mod tests {
                 ty: ColumnType::Numeric(None),
             },
         ];
-        let bytes = serialize_schema(table_id, &columns);
-        let (id, cols) = deserialize_schema(&bytes).expect("decode");
+        let bytes = serialize_schema(table_id, &columns, None);
+        let (id, cols, foreign) = deserialize_schema(&bytes).expect("decode");
         assert_eq!(id, table_id);
         assert_eq!(cols, columns);
+        assert!(foreign.is_none());
     }
 
     #[test]
@@ -259,10 +408,87 @@ mod tests {
                 ty: ColumnType::Interval,
             },
         ];
-        let bytes = serialize_schema(table_id, &columns);
-        let (id, cols) = deserialize_schema(&bytes).expect("decode");
+        let bytes = serialize_schema(table_id, &columns, None);
+        let (id, cols, foreign) = deserialize_schema(&bytes).expect("decode");
         assert_eq!(id, table_id);
         assert_eq!(cols, columns);
+        assert!(foreign.is_none());
+    }
+
+    #[test]
+    fn roundtrip_foreign_table() {
+        let table_id = 7u32;
+        let columns = vec![
+            Column {
+                name: "_partition".into(),
+                ty: ColumnType::Int4,
+            },
+            Column {
+                name: "_offset".into(),
+                ty: ColumnType::Int8,
+            },
+            Column {
+                name: "_timestamp".into(),
+                ty: ColumnType::Timestamptz,
+            },
+            Column {
+                name: "_key".into(),
+                ty: ColumnType::Bytea,
+            },
+            Column {
+                name: "_headers".into(),
+                ty: ColumnType::Text,
+            },
+            Column {
+                name: "payload".into(),
+                ty: ColumnType::Text,
+            },
+        ];
+        let meta = ForeignTableMeta {
+            server: "kafka_srv".into(),
+            options: vec![("topic".into(), "events".into())],
+        };
+        let bytes = serialize_schema(table_id, &columns, Some(&meta));
+        let (id, cols, foreign) = deserialize_schema(&bytes).expect("decode");
+        assert_eq!(id, table_id);
+        assert_eq!(cols, columns);
+        let ft = foreign.expect("foreign meta round-trips");
+        assert_eq!(ft.server, "kafka_srv");
+        assert_eq!(ft.options, vec![("topic".into(), "events".into())]);
+    }
+
+    #[test]
+    fn roundtrip_fdw() {
+        let bytes = serialize_fdw(
+            "kafka_fdw",
+            &[("handler".into(), "kafka_fdw_handler".into())],
+        );
+        let fdw = deserialize_fdw(&bytes).expect("decode");
+        assert_eq!(fdw.name, "kafka_fdw");
+        assert_eq!(fdw.options[0].0, "handler");
+    }
+
+    #[test]
+    fn roundtrip_server() {
+        let bytes = serialize_server(
+            "kafka_s",
+            "kafka_fdw",
+            &[("bootstrap".into(), "h:9092".into())],
+        );
+        let s = deserialize_server(&bytes).expect("decode");
+        assert_eq!(s.name, "kafka_s");
+        assert_eq!(s.wrapper, "kafka_fdw");
+        assert_eq!(s.options[0], ("bootstrap".into(), "h:9092".into()));
+    }
+
+    #[test]
+    fn roundtrip_user_mapping() {
+        let bytes =
+            serialize_user_mapping("alice", "kafka_s", &[("token".into(), "secret".into())]);
+        let m = deserialize_user_mapping(&bytes).expect("decode");
+        assert_eq!(m.user, "alice");
+        assert_eq!(m.server, "kafka_s");
+        assert_eq!(m.options[0], ("token".into(), "secret".into()));
     }
 
     #[test]

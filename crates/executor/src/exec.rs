@@ -2375,6 +2375,7 @@ mod tests {
                 name: "val".into(),
                 ty: ColumnType::Int4,
             }],
+            foreign: None,
         };
         let rowid: u64 = 1;
 
