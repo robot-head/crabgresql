@@ -25,6 +25,16 @@ pub fn encode_text(d: &Datum, tz: &jiff::tz::TimeZone) -> Vec<u8> {
         Datum::Timestamp(ts) => crate::datetime::timestamp_to_text(*ts).into_bytes(),
         Datum::Timestamptz(ts) => crate::datetime::timestamptz_to_text(*ts, tz).into_bytes(),
         Datum::Interval(i) => crate::datetime::interval_to_text(*i).into_bytes(),
+        // SP40: PostgreSQL `byteaout` hex format: `\x` + lowercase hex digits.
+        Datum::Bytea(b) => {
+            let mut out = Vec::with_capacity(2 + b.len() * 2);
+            out.extend_from_slice(b"\\x");
+            for byte in b {
+                out.push(b"0123456789abcdef"[usize::from(*byte >> 4)]);
+                out.push(b"0123456789abcdef"[usize::from(*byte & 0xf)]);
+            }
+            out
+        }
     }
 }
 
@@ -62,6 +72,8 @@ pub fn encode_binary(d: &Datum) -> Vec<u8> {
         Datum::Timestamp(ts) => crate::datetime::timestamp_to_binary(*ts).to_vec(),
         Datum::Timestamptz(ts) => crate::datetime::timestamptz_to_binary(*ts).to_vec(),
         Datum::Interval(i) => crate::datetime::interval_to_binary(*i).to_vec(),
+        // SP40: `byteasend` — raw bytes (no transformation).
+        Datum::Bytea(b) => b.clone(),
     }
 }
 

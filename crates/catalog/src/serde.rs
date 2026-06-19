@@ -35,6 +35,8 @@ mod type_tag {
     /// SP37: `interval` — followed by a reserved precision byte (0).
     /// Append-only — no version bump.
     pub const INTERVAL: u8 = 10;
+    /// SP40: `bytea`. Append-only — no version bump.
+    pub const BYTEA: u8 = 11;
 }
 
 /// Append a column's type (tag byte, plus the numeric typmod payload).
@@ -73,6 +75,8 @@ fn write_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.push(type_tag::INTERVAL);
             out.push(0); // reserved fractional-second typmod byte (deferred)
         }
+        // SP40: `bytea` — no payload (no typmod).
+        ColumnType::Bytea => out.push(type_tag::BYTEA),
     }
 }
 
@@ -122,6 +126,8 @@ fn read_type(cur: &mut &[u8]) -> Result<ColumnType, KvError> {
             }
             ColumnType::Interval
         }
+        // SP40: `bytea` — no payload.
+        type_tag::BYTEA => ColumnType::Bytea,
         other => {
             return Err(KvError::CorruptRow(format!(
                 "unknown column type tag {other}"
