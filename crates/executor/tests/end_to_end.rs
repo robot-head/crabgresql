@@ -229,3 +229,271 @@ async fn wire_concurrent_update_blocks_then_succeeds() {
         .expect("t2 join");
     assert_eq!(affected, 1, "t2 must have updated exactly 1 row");
 }
+
+// ── SP40: foreign-table (Kafka FDW) executor seam ────────────────────────────
+
+use catalog::{ForeignServer, Table, UserMapping};
+use executor::ExecError;
+use executor::clock::EvalCtx;
+use executor::foreign::{ForeignScanner, ScanBounds};
+use pgtypes::Datum;
+
+/// A fake `ForeignScanner` for tests: returns canned rows aligned to the foreign
+/// table's column layout (envelope columns first, then value columns). Records the
+/// last server/mapping it was handed so a test can assert they were resolved.
+/// `import_tables` are the canned `(name, value_columns)` pairs IMPORT FOREIGN
+/// SCHEMA materializes (after the requested filter is applied); the FakeScanner
+/// supplies the standard `topic`/`value_format=raw` OPTIONS for each.
+struct FakeScanner {
+    rows: Vec<Vec<Datum>>,
+    import_tables: Vec<(String, Vec<catalog::Column>)>,
+}
+
+impl ForeignScanner for FakeScanner {
+    fn scan(
+        &self,
+        table: &Table,
+        _server: &ForeignServer,
+        _mapping: Option<&UserMapping>,
+        _bounds: &ScanBounds,
+        _ctx: &EvalCtx,
+    ) -> Result<Vec<Vec<Datum>>, ExecError> {
+        // Every canned row must match the table's full column width (envelope + value).
+        for r in &self.rows {
+            assert_eq!(
+                r.len(),
+                table.columns.len(),
+                "fake scanner row width must match the foreign table column count"
+            );
+        }
+        Ok(self.rows.clone())
+    }
+
+    fn import_schema(
+        &self,
+        _server: &ForeignServer,
+        _mapping: Option<&UserMapping>,
+        filter: &executor::foreign::ImportFilter,
+    ) -> Result<Vec<executor::foreign::ImportedTable>, ExecError> {
+        Ok(self
+            .import_tables
+            .iter()
+            .filter(|(name, _)| filter.retains(name))
+            .map(|(name, columns)| executor::foreign::ImportedTable {
+                name: name.clone(),
+                columns: columns.clone(),
+                options: vec![
+                    ("topic".to_string(), name.clone()),
+                    ("value_format".to_string(), "raw".to_string()),
+                ],
+            })
+            .collect())
+    }
+}
+
+/// Spawn a server whose engine has `scanner` registered as the foreign scanner.
+async fn spawn_with_scanner(scanner: Arc<dyn ForeignScanner>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let mut engine = SqlEngine::new();
+    engine.set_foreign_scanner(scanner);
+    tokio::spawn(pgwire::server::serve(
+        listener,
+        Arc::new(engine),
+        Arc::new(SessionConfig::trust()),
+    ));
+    port
+}
+
+/// DDL round-trip: CREATE SERVER + CREATE FOREIGN TABLE + DROP FOREIGN TABLE all
+/// succeed and report the PostgreSQL command tags. No scanner is needed (no scan
+/// runs), so this uses the default (scanner-less) `spawn()`.
+#[tokio::test]
+async fn create_drop_foreign_objects_roundtrip() {
+    let client = connect(spawn().await).await;
+    client
+        .batch_execute(
+            "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw \
+             OPTIONS (bootstrap 'h:9092', registry_url 'http://r')",
+        )
+        .await
+        .expect("create server");
+    client
+        .batch_execute(
+            "CREATE FOREIGN TABLE orders (id int4) SERVER s \
+             OPTIONS (topic 'orders', value_format 'avro')",
+        )
+        .await
+        .expect("create foreign table");
+    // Describe/plan of a foreign table resolves its schema (envelope + value columns)
+    // from the catalog without a scan.
+    let fields = client
+        .prepare("SELECT _partition, _offset, id FROM orders")
+        .await
+        .expect("describe foreign table");
+    assert_eq!(
+        fields.columns().len(),
+        3,
+        "three projected columns described"
+    );
+    client
+        .batch_execute("DROP FOREIGN TABLE orders")
+        .await
+        .expect("drop foreign table");
+    // Gone: a re-select errors 42P01.
+    let err = client
+        .batch_execute("SELECT id FROM orders")
+        .await
+        .expect_err("dropped");
+    assert_eq!(err.as_db_error().expect("db").code().code(), "42P01");
+}
+
+/// Read path: with a fake scanner registered, a `SELECT` from a foreign table
+/// returns the canned rows, and projection + WHERE compose over those rows exactly
+/// like an ordinary table.
+#[tokio::test]
+async fn foreign_select_reads_scanner_rows_with_projection_and_where() {
+    // Canned rows for `orders (id int4, amount int4)`: layout is the 5 envelope
+    // columns (_partition int4, _offset int8, _timestamp timestamptz, _key bytea,
+    // _headers text) followed by the 2 value columns.
+    let row = |partition: i32, offset: i64, id: i32, amount: i32| {
+        vec![
+            Datum::Int4(partition),
+            Datum::Int8(offset),
+            Datum::Timestamptz(jiff::Timestamp::UNIX_EPOCH),
+            Datum::Bytea(vec![0xDE, 0xAD]),
+            Datum::Text("{}".into()),
+            Datum::Int4(id),
+            Datum::Int4(amount),
+        ]
+    };
+    let scanner = Arc::new(FakeScanner {
+        rows: vec![row(0, 100, 1, 10), row(0, 101, 2, 20), row(1, 200, 3, 30)],
+        import_tables: Vec::new(),
+    });
+    let client = connect(spawn_with_scanner(scanner).await).await;
+    client
+        .batch_execute(
+            "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092')",
+        )
+        .await
+        .expect("create server");
+    client
+        .batch_execute(
+            "CREATE FOREIGN TABLE orders (id int4, amount int4) SERVER s OPTIONS (topic 'orders')",
+        )
+        .await
+        .expect("create foreign table");
+
+    // Full scan: all three canned rows come back, envelope + value columns present.
+    let rows = client
+        .query(
+            "SELECT _partition, _offset, id, amount FROM orders ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("select foreign");
+    assert_eq!(rows.len(), 3, "all canned rows returned");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>("id")).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    let partitions: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>("_partition")).collect();
+    assert_eq!(partitions, vec![0, 0, 1]);
+
+    // Projection + WHERE compose over the scanner rows: only amount >= 20 survive.
+    let filtered = client
+        .query("SELECT id FROM orders WHERE amount >= 20 ORDER BY id", &[])
+        .await
+        .expect("select foreign with where");
+    let ids: Vec<i32> = filtered.iter().map(|r| r.get::<_, i32>("id")).collect();
+    assert_eq!(ids, vec![2, 3], "WHERE filters the scanner rows");
+}
+
+/// No-scanner path: with no foreign scanner registered, a `SELECT` from a foreign
+/// table returns the clear 0A000 ("foreign tables require the `kafka` feature").
+/// DDL still works (no scan), so the table can be created without a scanner.
+#[tokio::test]
+async fn foreign_select_without_scanner_is_unsupported() {
+    let client = connect(spawn().await).await;
+    client
+        .batch_execute(
+            "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092')",
+        )
+        .await
+        .expect("create server");
+    client
+        .batch_execute("CREATE FOREIGN TABLE orders (id int4) SERVER s OPTIONS (topic 'orders')")
+        .await
+        .expect("create foreign table");
+    let err = client
+        .batch_execute("SELECT id FROM orders")
+        .await
+        .expect_err("no scanner registered");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "0A000", "feature_not_supported");
+    assert!(
+        db.message().contains("foreign tables require"),
+        "clear message, got: {}",
+        db.message()
+    );
+}
+
+/// IMPORT FOREIGN SCHEMA through the full pgwire path: the fake scanner reports
+/// two tables; `EXCEPT (payments)` drops one; the survivor becomes a queryable
+/// foreign table (the scanner returns no rows here, so the SELECT is empty but
+/// the table — with its envelope + value columns — must exist and be selectable).
+#[tokio::test]
+async fn import_foreign_schema_materializes_foreign_tables() {
+    use catalog::Column;
+    use pgtypes::ColumnType;
+
+    let scanner = Arc::new(FakeScanner {
+        rows: Vec::new(),
+        import_tables: vec![
+            (
+                "orders".to_string(),
+                vec![Column {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int8,
+                }],
+            ),
+            (
+                "payments".to_string(),
+                vec![Column {
+                    name: "amount".to_string(),
+                    ty: ColumnType::Float8,
+                }],
+            ),
+        ],
+    });
+    let client = connect(spawn_with_scanner(scanner).await).await;
+    client
+        .batch_execute(
+            "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092')",
+        )
+        .await
+        .expect("create server");
+
+    client
+        .batch_execute("IMPORT FOREIGN SCHEMA kafka EXCEPT (payments) FROM SERVER s")
+        .await
+        .expect("import foreign schema");
+
+    // `orders` is now a queryable foreign table: its value column `id` plus the
+    // envelope columns are present (the scanner returns no rows → empty result).
+    let rows = client
+        .query("SELECT _partition, id FROM orders", &[])
+        .await
+        .expect("select imported orders");
+    assert_eq!(rows.len(), 0, "fake scanner returns no rows");
+
+    // `payments` was excluded — querying it is a 42P01 (undefined table).
+    let err = client
+        .batch_execute("SELECT amount FROM payments")
+        .await
+        .expect_err("payments must not exist");
+    assert_eq!(
+        err.as_db_error().expect("db").code().code(),
+        "42P01",
+        "excluded table must be undefined"
+    );
+}

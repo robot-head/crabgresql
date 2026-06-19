@@ -187,11 +187,12 @@ pub(crate) fn set_expr_to_relation(
     offset: Option<i64>,
     limit: Option<i64>,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<crate::join::Relation, ExecError> {
     let cols = resolve_set_columns(catalog_kv, body, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctx, 0,
+        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctx, fctx, 0,
     )?;
 
     let scope = Scope {
@@ -258,6 +259,7 @@ fn fold(
     e: &SetExpr,
     out_tys: &[ColumnType],
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
     depth: usize,
 ) -> Result<Vec<Vec<Datum>>, ExecError> {
     // Defense-in-depth (parser already caps the tree at MAX_DEPTH): 54001, not a crash.
@@ -267,7 +269,7 @@ fn fold(
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
             let rel = crate::exec::select_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, s, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, s, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -277,7 +279,7 @@ fn fold(
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
             let rel = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -297,6 +299,7 @@ fn fold(
                 left,
                 out_tys,
                 ctx,
+                fctx,
                 depth + 1,
             )?;
             let rrows = fold(
@@ -309,6 +312,7 @@ fn fold(
                 right,
                 out_tys,
                 ctx,
+                fctx,
                 depth + 1,
             )?;
             Ok(combine_rows(*op, *all, lrows, rrows))

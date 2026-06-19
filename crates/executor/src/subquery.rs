@@ -30,6 +30,9 @@ pub(crate) struct SubCtx<'a> {
     /// The session eval context (zone + clock) — forwarded to the subquery's read
     /// path so a temporal expression inside a subquery evaluates in the session zone.
     pub eval_ctx: &'a crate::clock::EvalCtx,
+    /// SP40: the foreign-table read context (scanner + current user) — forwarded so a
+    /// subquery referencing a foreign table reads through the registered scanner.
+    pub fctx: crate::exec::ForeignCtx<'a>,
 }
 
 /// Rewrite every uncorrelated subquery in `s`'s expr-bearing clauses to a resolved
@@ -229,6 +232,7 @@ fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, Ex
         ctx.own,
         q,
         ctx.eval_ctx,
+        ctx.fctx,
     )
 }
 

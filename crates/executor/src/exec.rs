@@ -1,5 +1,7 @@
 //! Per-statement execution.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use catalog::{Column, Table, TableId};
 use kv::Kv;
@@ -10,8 +12,33 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
+use crate::foreign::{ForeignScanner, ScanBounds};
 use crate::join::{Relation, join_relations};
 use crate::scope::{ColumnBinding, Scope};
+
+/// SP40: the foreign-table read context threaded through the SELECT pipeline. It
+/// carries the registered scanner (the `kafka_fdw` seam) and the current user (for
+/// resolving the per-user `UserMapping`). Bundled into one borrowed struct so the
+/// already-wide read signatures gain a single argument rather than two. Paths that
+/// never reach a registered scanner (`describe`, the schema-only build) use
+/// `ForeignCtx::none()`; a foreign `SELECT` with no scanner registered returns
+/// `0A000` ("foreign tables require the `kafka` feature").
+#[derive(Clone, Copy)]
+pub(crate) struct ForeignCtx<'a> {
+    pub scanner: Option<&'a Arc<dyn ForeignScanner>>,
+    pub current_user: &'a str,
+}
+
+impl ForeignCtx<'_> {
+    /// A context with no scanner and the conventional `"public"` user — for paths
+    /// that never reach a registered scanner (schema-only describe).
+    pub(crate) fn none() -> Self {
+        Self {
+            scanner: None,
+            current_user: "public",
+        }
+    }
+}
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
 /// the sequence read.
@@ -36,6 +63,7 @@ pub(crate) fn read_seq_kv(kv: &dyn Kv, table: TableId) -> Result<u64, ExecError>
 pub(crate) fn execute_ddl(
     kv: &dyn Kv,
     stmt: &Statement,
+    fctx: ForeignCtx,
 ) -> Result<(QueryResult, Vec<kv::WriteOp>), ExecError> {
     match stmt {
         Statement::CreateTable { name, columns } => {
@@ -63,7 +91,161 @@ pub(crate) fn execute_ddl(
                 ops,
             ))
         }
+        // SP40 FDW DDL. The catalog's foreign-object CRUD writes its single small
+        // batch directly (it is not on the row-write hot path and has no ops-only
+        // variant), so these arms persist via the catalog and return an EMPTY ops
+        // vec — `run_ddl` then commits an empty batch (a no-op). The catalog
+        // validates existence/duplication and surfaces 42710 / 42704 / 42P07 / 42P01.
+        Statement::CreateFdw { name, options } => {
+            catalog::create_fdw(kv, name, options.clone())?;
+            Ok((command("CREATE FOREIGN DATA WRAPPER"), Vec::new()))
+        }
+        Statement::DropFdw { name, if_exists } => {
+            ignore_missing(catalog::drop_fdw(kv, name), *if_exists)?;
+            Ok((command("DROP FOREIGN DATA WRAPPER"), Vec::new()))
+        }
+        Statement::CreateServer {
+            name,
+            wrapper,
+            options,
+        } => {
+            catalog::create_server(kv, name, wrapper, options.clone())?;
+            Ok((command("CREATE SERVER"), Vec::new()))
+        }
+        Statement::DropServer { name, if_exists } => {
+            ignore_missing(catalog::drop_server(kv, name), *if_exists)?;
+            Ok((command("DROP SERVER"), Vec::new()))
+        }
+        Statement::CreateUserMapping {
+            user,
+            server,
+            options,
+        } => {
+            // Normalize `FOR CURRENT_USER` and `FOR PUBLIC` to the catalog key
+            // `"public"` — the same key that the scan path looks up via
+            // `get_user_mapping(kv, fctx.current_user, …)` where
+            // `current_user` is always `"public"` under trust-auth.
+            // Per-named-user mappings await real SQL authentication (phase-2).
+            let resolved_user = normalize_mapping_user(user);
+            catalog::create_user_mapping(kv, resolved_user, server, options.clone())?;
+            Ok((command("CREATE USER MAPPING"), Vec::new()))
+        }
+        Statement::DropUserMapping {
+            user,
+            server,
+            if_exists,
+        } => {
+            // Same normalization as CreateUserMapping so DROP matches CREATE.
+            let resolved_user = normalize_mapping_user(user);
+            ignore_missing(
+                catalog::drop_user_mapping(kv, resolved_user, server),
+                *if_exists,
+            )?;
+            Ok((command("DROP USER MAPPING"), Vec::new()))
+        }
+        Statement::CreateForeignTable {
+            name,
+            columns,
+            server,
+            options,
+        } => {
+            let cols = columns
+                .iter()
+                .map(|c| Column {
+                    name: c.name.clone(),
+                    ty: c.ty,
+                })
+                .collect();
+            catalog::create_foreign_table(kv, name, cols, server, options.clone())?;
+            Ok((command("CREATE FOREIGN TABLE"), Vec::new()))
+        }
+        Statement::DropForeignTable { name, if_exists } => {
+            // A foreign table shares the ordinary table catalog key, so `drop_table`
+            // removes it (catalog entry + sequence + any rows).
+            match catalog::drop_table(kv, name) {
+                Ok(()) => {}
+                Err(catalog::CatalogError::UndefinedTable(_)) if *if_exists => {}
+                Err(e) => return Err(e.into()),
+            }
+            Ok((command("DROP FOREIGN TABLE"), Vec::new()))
+        }
+        // The catalog has no ALTER for foreign objects, and phase-1 querying does
+        // not need one — surface a clear 0A000 rather than silently no-op'ing.
+        Statement::AlterServer { .. } => {
+            Err(ExecError::Unsupported("ALTER SERVER not supported".into()))
+        }
+        Statement::AlterUserMapping { .. } => Err(ExecError::Unsupported(
+            "ALTER USER MAPPING not supported".into(),
+        )),
+        // SP40: IMPORT FOREIGN SCHEMA discovers the server's tables through the
+        // registered scanner (the `kafka_fdw` seam enumerates Kafka topics and
+        // derives each topic's value columns from its Schema Registry subject),
+        // then materializes a foreign table per discovered table into the catalog.
+        // Like CreateForeignTable, the catalog writes each small batch directly, so
+        // this returns an EMPTY ops vec (the caller commits a no-op batch).
+        //
+        // `remote_schema` is accepted but unused in phase 1 (Kafka has no nested
+        // schemas); `into_schema` is a flat namespace today — the discovered table
+        // name is used verbatim as the catalog name.
+        Statement::ImportForeignSchema {
+            remote_schema: _,
+            selector,
+            server,
+            into_schema: _,
+        } => {
+            // Resolve the server (42704 if undefined) and the current user's
+            // optional mapping (no mapping → no credentials).
+            let srv = catalog::get_server(kv, server)?;
+            let mapping = catalog::get_user_mapping(kv, fctx.current_user, server).ok();
+            // A scanner must be registered (the `kafka` feature is built in).
+            let scanner = fctx.scanner.ok_or_else(|| {
+                ExecError::Unsupported("foreign tables require the `kafka` feature".into())
+            })?;
+            let filter = crate::foreign::ImportFilter::from_selector(selector);
+            let tables = scanner.import_schema(&srv, mapping.as_ref(), &filter)?;
+            for table in tables {
+                catalog::create_foreign_table(
+                    kv,
+                    &table.name,
+                    table.columns,
+                    &srv.name,
+                    table.options,
+                )?;
+            }
+            Ok((command("IMPORT FOREIGN SCHEMA"), Vec::new()))
+        }
         _ => Err(ExecError::Unsupported("not a DDL statement".into())),
+    }
+}
+
+/// A `QueryResult::Command` with the given PostgreSQL completion tag.
+fn command(tag: &str) -> QueryResult {
+    QueryResult::Command { tag: tag.into() }
+}
+
+/// Normalize the `user` spec from `CREATE / DROP USER MAPPING FOR <user>` to
+/// the catalog key used by the scan path.
+///
+/// The parser emits `"current_user"` for `FOR CURRENT_USER` and `"public"` for
+/// `FOR PUBLIC`.  Under trust-auth crabgresql has no authenticated SQL user, so
+/// the scan path always looks up the mapping under `"public"`.  Both variants
+/// must therefore resolve to the same catalog key so that a `FOR CURRENT_USER`
+/// mapping is actually found at scan time.
+fn normalize_mapping_user(user: &str) -> &str {
+    if user.eq_ignore_ascii_case("current_user") || user.eq_ignore_ascii_case("public") {
+        "public"
+    } else {
+        user
+    }
+}
+
+/// Swallow a `42704` (undefined object) when `IF EXISTS` was given; propagate
+/// every other error. Used by the foreign-object `DROP … IF EXISTS` arms.
+fn ignore_missing(r: Result<(), catalog::CatalogError>, if_exists: bool) -> Result<(), ExecError> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(catalog::CatalogError::UndefinedObject(_)) if if_exists => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -610,6 +792,231 @@ fn row_matches(
     }
 }
 
+/// SP40 Task 14: extract per-partition offset bounds from a single-foreign-table
+/// query's top-level `WHERE` for pushdown into the Kafka foreign scan.
+///
+/// Walks the top-level `AND` chain of the filter and, for every `_partition = N`
+/// constraint, collects the `_offset` range comparisons scoped to that partition
+/// into [`ScanBounds`]. This is a PURE OPTIMIZATION: anything not representable in
+/// `ScanBounds` (a bare `_offset` with no `_partition =`, a `_timestamp`/`LIMIT`
+/// constraint, an `OR`, a non-envelope predicate) is simply omitted here and
+/// remains a residual `WHERE` filter applied locally after the scan. Callers MUST
+/// keep evaluating the full `WHERE`; pushed bounds must never change results.
+///
+/// Conversions (the scan reads `[start, end)` per partition):
+/// - `_offset >= a` → start `a`; `_offset > a` → start `a + 1` (inclusive lower).
+/// - `_offset <= b` → end `b + 1`; `_offset < b` → end `b` (exclusive upper).
+/// - `_offset BETWEEN a AND b` → start `a`, end `b + 1` (PG bounds are inclusive).
+///
+/// Only offset bounds anchored to a concrete `_partition = N` are emitted: under
+/// this `ScanBounds` shape (`Vec<(partition, offset)>`) a partition-less offset
+/// cannot target a partition, so it stays residual.
+#[must_use]
+pub(crate) fn extract_scan_bounds(filter: Option<&Expr>) -> ScanBounds {
+    let mut bounds = ScanBounds::default();
+    let Some(filter) = filter else {
+        return bounds;
+    };
+
+    // Flatten the top-level AND chain into its conjuncts. An OR or any other
+    // shape is left intact (and thus never matches a comparison below), so it
+    // contributes nothing — it remains a residual filter.
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter, &mut conjuncts);
+
+    // Resolve the single `_partition = N` anchor, if exactly one is present. With
+    // zero (or conflicting/multiple) partition equalities we cannot scope offsets
+    // to a partition, so we push nothing and let WHERE do all the work.
+    let mut partition: Option<i32> = None;
+    for c in &conjuncts {
+        if let Some(p) = match_partition_eq(c) {
+            match partition {
+                None => partition = Some(p),
+                Some(prev) if prev == p => {}
+                // Two different `_partition =` values → unsatisfiable as written;
+                // don't try to push, let the residual WHERE return zero rows.
+                Some(_) => return ScanBounds::default(),
+            }
+        }
+    }
+    let Some(partition) = partition else {
+        return bounds;
+    };
+
+    // Tightest inclusive-start / exclusive-end across all offset conjuncts.
+    let mut start: Option<i64> = None;
+    let mut end: Option<i64> = None;
+    let mut tighten_start = |v: i64| {
+        start = Some(start.map_or(v, |cur: i64| cur.max(v)));
+    };
+    let mut tighten_end = |v: i64| {
+        end = Some(end.map_or(v, |cur: i64| cur.min(v)));
+    };
+
+    for c in &conjuncts {
+        match match_offset_bound(c) {
+            Some(OffsetBound::StartIncl(v)) => tighten_start(v),
+            Some(OffsetBound::EndExcl(v)) => tighten_end(v),
+            Some(OffsetBound::Between { start: s, end: e }) => {
+                tighten_start(s);
+                tighten_end(e);
+            }
+            None => {}
+        }
+    }
+
+    if let Some(s) = start {
+        bounds.start_offsets.push((partition, s));
+    }
+    if let Some(e) = end {
+        bounds.end_offsets.push((partition, e));
+    }
+    bounds
+}
+
+/// Flatten a top-level `AND` chain into its leaf conjuncts (depth-first). A node
+/// that is not an `AND` is itself one conjunct.
+fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::Binary {
+        op: pgparser::ast::BinaryOp::And,
+        left,
+        right,
+    } = expr
+    {
+        collect_conjuncts(left, out);
+        collect_conjuncts(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// An envelope-column reference by bare name (`_partition`/`_offset`/…). Envelope
+/// columns are unqualified in practice; a table-qualified `t._offset` also matches
+/// on the bare name (the qualifier is the single foreign table in scope).
+fn envelope_col(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Parse an integer literal expression to `i64`. Only bare/negated integer
+/// literals are recognized (offsets/partitions are integers); anything else
+/// (params, casts, non-integers) is not pushable and returns `None`.
+fn int_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::IntLiteral(s) => s.parse::<i64>().ok(),
+        Expr::Unary {
+            op: pgparser::ast::UnaryOp::Neg,
+            expr,
+        } => int_literal(expr).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// Match `_partition = N` (either operand order) and return `N`.
+fn match_partition_eq(expr: &Expr) -> Option<i32> {
+    let Expr::Binary {
+        op: pgparser::ast::BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let v = if envelope_col(left) == Some("_partition") {
+        int_literal(right)?
+    } else if envelope_col(right) == Some("_partition") {
+        int_literal(left)?
+    } else {
+        return None;
+    };
+    i32::try_from(v).ok()
+}
+
+/// An offset constraint normalized to the scan's `[start, end)` convention.
+enum OffsetBound {
+    /// Inclusive lower offset.
+    StartIncl(i64),
+    /// Exclusive upper offset.
+    EndExcl(i64),
+    /// `BETWEEN a AND b` → inclusive `start`, exclusive `end`.
+    Between { start: i64, end: i64 },
+}
+
+/// Match an `_offset` comparison / BETWEEN and normalize it to an [`OffsetBound`].
+/// Returns `None` for anything that is not an `_offset` range constraint. The
+/// comparison is recognized with the column on either side (the operator is
+/// mirrored when the column is on the right).
+fn match_offset_bound(expr: &Expr) -> Option<OffsetBound> {
+    use pgparser::ast::BinaryOp;
+    match expr {
+        Expr::Binary { op, left, right } => {
+            // Normalize to `_offset <op> literal` by mirroring when reversed.
+            let (op, lit) = if envelope_col(left) == Some("_offset") {
+                (*op, int_literal(right)?)
+            } else if envelope_col(right) == Some("_offset") {
+                (mirror_op(*op)?, int_literal(left)?)
+            } else {
+                return None;
+            };
+            match op {
+                BinaryOp::Ge => Some(OffsetBound::StartIncl(lit)),
+                BinaryOp::Gt => Some(OffsetBound::StartIncl(lit + 1)),
+                BinaryOp::Le => Some(OffsetBound::EndExcl(lit + 1)),
+                BinaryOp::Lt => Some(OffsetBound::EndExcl(lit)),
+                _ => None,
+            }
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } if envelope_col(expr) == Some("_offset") => {
+            let lo = int_literal(low)?;
+            let hi = int_literal(high)?;
+            Some(OffsetBound::Between {
+                start: lo,
+                end: hi + 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Mirror a comparison operator for the reversed-operand form (`5 < _offset`
+/// means `_offset > 5`). Only the inequalities used for offset bounds are mapped.
+fn mirror_op(op: pgparser::ast::BinaryOp) -> Option<pgparser::ast::BinaryOp> {
+    use pgparser::ast::BinaryOp;
+    match op {
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::Le => Some(BinaryOp::Ge),
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::Ge => Some(BinaryOp::Le),
+        _ => None,
+    }
+}
+
+/// SP40 Task 14: is the FROM clause exactly one foreign base table? Only then is
+/// offset pushdown applicable — a join, a comma-FROM (cross join), or a derived
+/// table all keep the full-scan path. A scanner must be registered (otherwise the
+/// foreign read errors anyway) and the single table's catalog entry must have
+/// `foreign` metadata. Non-foreign ordinary tables return `false` (unchanged).
+fn is_single_foreign_table(
+    catalog_kv: &dyn Kv,
+    from: &[pgparser::ast::TableExpr],
+    fctx: ForeignCtx,
+) -> bool {
+    if fctx.scanner.is_none() {
+        return false;
+    }
+    let [pgparser::ast::TableExpr::Table { name, .. }] = from else {
+        return false;
+    };
+    catalog::get_table(catalog_kv, name).is_ok_and(|t| t.foreign.is_some())
+}
+
 /// Build the relation for one FROM list (comma items folded as cross joins).
 #[allow(clippy::too_many_arguments)]
 fn build_from(
@@ -621,14 +1028,25 @@ fn build_from(
     own: Option<u64>,
     from: &[pgparser::ast::TableExpr],
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
+    // SP40 Task 14: pushed-down offset bounds for the single-foreign-table case.
+    // `Some` only when `from` is exactly one entry (set by `select_to_relation`);
+    // joins/comma-FROM never see it and keep the full-scan + local-filter path.
+    bounds: Option<&ScanBounds>,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
-    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first, ctx)?;
+    let mut acc = build_table_expr(
+        catalog_kv, kv, global, gsnap, snapshot, own, first, ctx, fctx, bounds,
+    )?;
     for te in iter {
-        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctx)?;
+        // A comma-FROM (multiple tables) is a cross join — no single-table
+        // pushdown applies, so subsequent items always scan in full.
+        let next = build_table_expr(
+            catalog_kv, kv, global, gsnap, snapshot, own, te, ctx, fctx, None,
+        )?;
         acc = join_relations(
             acc,
             next,
@@ -650,12 +1068,37 @@ fn build_table_expr(
     own: Option<u64>,
     te: &pgparser::ast::TableExpr,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
+    // SP40 Task 14: pushed-down offset bounds, `Some` only for a single foreign
+    // base table. Applied verbatim to the foreign scan; `None` ⇒ full scan.
+    bounds: Option<&ScanBounds>,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
+            // SP40: a foreign table reads through the registered scanner, not the
+            // local MVCC version store. `build_from` materializes BEFORE WHERE, so
+            // this scan runs even for `WHERE false` — there is no skip path.
+            if let Some(meta) = &t.foreign {
+                let scanner = fctx.scanner.ok_or_else(|| {
+                    ExecError::Unsupported("foreign tables require the `kafka` feature".into())
+                })?;
+                let server = catalog::get_server(catalog_kv, &meta.server)?;
+                // A per-user mapping is optional: fall back to no credentials when
+                // the current user has none registered for this server.
+                let mapping =
+                    catalog::get_user_mapping(catalog_kv, fctx.current_user, &meta.server).ok();
+                // SP40 Task 14: pass the pushed-down slice when present (single
+                // foreign table). The residual WHERE still re-filters locally, so
+                // results are identical whether or not the scan honors `bounds`.
+                let default_bounds = ScanBounds::default();
+                let scan_bounds = bounds.unwrap_or(&default_bounds);
+                let rows = scanner.scan(&t, &server, mapping.as_ref(), scan_bounds, ctx)?;
+                let scope = Scope::single(&t, qualifier);
+                return Ok(Relation { scope, rows });
+            }
             let scope = Scope::single(&t, qualifier);
             let rows = scan_live(kv, global, gsnap, snapshot, own, &t)?
                 .into_iter()
@@ -669,8 +1112,14 @@ fn build_table_expr(
             kind,
             constraint,
         } => {
-            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
-            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
+            // A join is never a single foreign table: each side scans in full and
+            // the join predicate / residual WHERE filters locally.
+            let l = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, left, ctx, fctx, None,
+            )?;
+            let r = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, right, ctx, fctx, None,
+            )?;
             join_relations(l, r, *kind, constraint, ctx)
         }
         TableExpr::Derived {
@@ -679,7 +1128,7 @@ fn build_table_expr(
             columns,
         } => {
             let inner = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx, fctx,
             )?;
             crate::values::requalify_derived(inner, alias, columns)
         }
@@ -700,6 +1149,7 @@ pub(crate) fn select_to_relation(
     own: Option<u64>,
     s: &SelectStmt,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<Relation, ExecError> {
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
@@ -711,6 +1161,7 @@ pub(crate) fn select_to_relation(
         snapshot,
         own,
         eval_ctx: ctx,
+        fctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -720,7 +1171,27 @@ pub(crate) fn select_to_relation(
             rows: vec![vec![]],
         }
     } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
+        // SP40 Task 14: when the FROM is EXACTLY one foreign base table, extract
+        // `_partition`/`_offset` bounds from the WHERE and push them into the
+        // scan. The WHERE is still applied below, so this only ever reads less —
+        // it never changes the result set.
+        let pushed = if is_single_foreign_table(catalog_kv, &s.from, fctx) {
+            Some(extract_scan_bounds(s.filter.as_ref()))
+        } else {
+            None
+        };
+        build_from(
+            catalog_kv,
+            kv,
+            global,
+            gsnap,
+            snapshot,
+            own,
+            &s.from,
+            ctx,
+            fctx,
+            pushed.as_ref(),
+        )?
     };
     let mut kept = Vec::new();
     for row in &relation.rows {
@@ -844,12 +1315,14 @@ pub(crate) fn execute_read(
     own: Option<u64>,
     stmt: &Statement,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<QueryResult, ExecError> {
     let Statement::Query(q) = stmt else {
         return Err(ExecError::Unsupported("not a query statement".into()));
     };
-    let rel =
-        crate::query::query_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, q, ctx)?;
+    let rel = crate::query::query_to_relation(
+        catalog_kv, kv, global, gsnap, snapshot, own, q, ctx, fctx,
+    )?;
     Ok(crate::query::relation_to_rows_result(rel, ctx))
 }
 
@@ -881,6 +1354,10 @@ pub(crate) async fn execute_read_locking(
         snapshot,
         own: Some(xid),
         eval_ctx: ctx,
+        // A locking SELECT only operates over local tables; a subquery referencing a
+        // foreign table here would surface the no-scanner error, which is acceptable
+        // (FOR UPDATE over Kafka is not a phase-1 path).
+        fctx: ForeignCtx::none(),
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -2375,6 +2852,7 @@ mod tests {
                 name: "val".into(),
                 ty: ColumnType::Int4,
             }],
+            foreign: None,
         };
         let rowid: u64 = 1;
 
@@ -2620,6 +3098,291 @@ mod tests {
             got.expect("visible").0,
             9,
             "highest xmin regardless of presentation order"
+        );
+    }
+
+    // ───────────────────────── SP40 Task 14: pushdown ─────────────────────────
+
+    mod pushdown {
+        use std::sync::{Arc, Mutex};
+
+        use catalog::{ForeignServer, Table, UserMapping};
+        use pgtypes::Datum;
+        use pgwire::engine::{Engine, QueryResult, Session};
+
+        use crate::SqlEngine;
+        use crate::clock::EvalCtx;
+        use crate::error::ExecError;
+        use crate::exec::extract_scan_bounds;
+        use crate::foreign::{ForeignScanner, ImportFilter, ScanBounds};
+
+        /// Parse `where_sql` into a WHERE [`Expr`] and run it through
+        /// `extract_scan_bounds`. The argument is the predicate text only.
+        fn bounds_of(where_sql: &str) -> ScanBounds {
+            let expr = pgparser::parser::parse_expr_for_test(where_sql)
+                .expect("the WHERE predicate parses");
+            extract_scan_bounds(Some(&expr))
+        }
+
+        #[test]
+        fn partition_and_lower_bound_pushes_inclusive_start() {
+            let b = bounds_of("_partition = 0 AND _offset >= 10");
+            assert_eq!(b.start_offsets, vec![(0, 10)]);
+            assert!(b.end_offsets.is_empty());
+        }
+
+        #[test]
+        fn partition_and_upper_strict_pushes_exclusive_end() {
+            // `_offset < 50` → exclusive end 50 (unchanged).
+            let b = bounds_of("_partition = 1 AND _offset < 50");
+            assert!(b.start_offsets.is_empty());
+            assert_eq!(b.end_offsets, vec![(1, 50)]);
+        }
+
+        #[test]
+        fn between_pushes_inclusive_start_and_exclusive_end_plus_one() {
+            // BETWEEN bounds are inclusive: [5, 9] → start 5, exclusive end 10.
+            let b = bounds_of("_partition = 2 AND _offset BETWEEN 5 AND 9");
+            assert_eq!(b.start_offsets, vec![(2, 5)]);
+            assert_eq!(b.end_offsets, vec![(2, 10)]);
+        }
+
+        #[test]
+        fn strict_lower_and_inclusive_upper_apply_exclusivity_correctly() {
+            // `_offset > 7` → start 8; `_offset <= 20` → exclusive end 21.
+            let b = bounds_of("_partition = 3 AND _offset > 7 AND _offset <= 20");
+            assert_eq!(b.start_offsets, vec![(3, 8)]);
+            assert_eq!(b.end_offsets, vec![(3, 21)]);
+        }
+
+        #[test]
+        fn reversed_operand_order_is_normalized() {
+            // `10 <= _offset` ≡ `_offset >= 10`; `50 > _offset` ≡ `_offset < 50`.
+            let b = bounds_of("_partition = 0 AND 10 <= _offset AND 50 > _offset");
+            assert_eq!(b.start_offsets, vec![(0, 10)]);
+            assert_eq!(b.end_offsets, vec![(0, 50)]);
+        }
+
+        #[test]
+        fn timestamp_predicate_is_not_pushed() {
+            // `_timestamp` cannot be represented in ScanBounds — stays residual.
+            let b = bounds_of("_partition = 0 AND _timestamp > '2020-01-01'");
+            assert_eq!(b, ScanBounds::default());
+        }
+
+        #[test]
+        fn non_envelope_predicate_is_not_pushed() {
+            let b = bounds_of("_partition = 0 AND id = 42");
+            // The partition anchor exists but no offset bound → empty bounds.
+            assert_eq!(b, ScanBounds::default());
+        }
+
+        #[test]
+        fn bare_offset_without_partition_is_not_pushed() {
+            // No `_partition =` to scope the offset to → cannot push.
+            let b = bounds_of("_offset >= 10");
+            assert_eq!(b, ScanBounds::default());
+        }
+
+        #[test]
+        fn no_filter_yields_default_bounds() {
+            assert_eq!(extract_scan_bounds(None), ScanBounds::default());
+        }
+
+        /// A scanner that RECORDS every `ScanBounds` it is handed and returns a
+        /// fixed corpus of rows IGNORING the bounds — so a result-equivalence test
+        /// proves the residual WHERE still filters, and a recording test proves the
+        /// pushed bounds reached the scan.
+        struct RecordingScanner {
+            seen: Arc<Mutex<Vec<ScanBounds>>>,
+            /// Fixed (partition, offset, value) corpus, returned verbatim.
+            corpus: Vec<(i32, i64, i64)>,
+        }
+
+        impl ForeignScanner for RecordingScanner {
+            fn scan(
+                &self,
+                table: &Table,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                bounds: &ScanBounds,
+                _ctx: &EvalCtx,
+            ) -> Result<Vec<Vec<Datum>>, ExecError> {
+                self.seen.lock().expect("lock").push(bounds.clone());
+                // Envelope columns then one value column `v`; deliberately ignore
+                // `bounds` to prove the residual WHERE re-filters.
+                assert_eq!(table.columns.len(), 6, "5 envelope cols + value `v`");
+                Ok(self
+                    .corpus
+                    .iter()
+                    .map(|&(p, off, v)| {
+                        vec![
+                            Datum::Int4(p),
+                            Datum::Int8(off),
+                            Datum::Null, // _timestamp
+                            Datum::Null, // _key
+                            Datum::Null, // _headers
+                            Datum::Int8(v),
+                        ]
+                    })
+                    .collect())
+            }
+
+            fn import_schema(
+                &self,
+                _server: &ForeignServer,
+                _mapping: Option<&UserMapping>,
+                _filter: &ImportFilter,
+            ) -> Result<Vec<crate::foreign::ImportedTable>, ExecError> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn seed_engine(
+            corpus: Vec<(i32, i64, i64)>,
+        ) -> (SqlEngine, Arc<Mutex<Vec<ScanBounds>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut engine = SqlEngine::new();
+            engine.set_foreign_scanner(Arc::new(RecordingScanner {
+                seen: Arc::clone(&seen),
+                corpus,
+            }));
+            {
+                let mut s = engine.connect();
+                s.simple_query(
+                    "CREATE SERVER k FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'b:9092')",
+                )
+                .await
+                .expect("create server");
+                s.simple_query("CREATE FOREIGN TABLE f (v int8) SERVER k OPTIONS (topic 'topic')")
+                    .await
+                    .expect("create foreign table");
+            }
+            (engine, seen)
+        }
+
+        fn rows_of(r: &QueryResult) -> &Vec<Vec<Option<pgwire::engine::Cell>>> {
+            match r {
+                QueryResult::Rows { rows, .. } => rows,
+                other => panic!("expected Rows, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn single_foreign_table_pushes_recorded_bounds() {
+            let (engine, seen) = seed_engine(vec![(0, 10, 100)]).await;
+            let mut s = engine.connect();
+            s.simple_query("SELECT v FROM f WHERE _partition = 0 AND _offset >= 10")
+                .await
+                .expect("scan ok");
+            let recorded = seen.lock().expect("lock");
+            assert_eq!(recorded.len(), 1, "exactly one scan");
+            assert_eq!(
+                recorded[0].start_offsets,
+                vec![(0, 10)],
+                "the `_partition = 0 AND _offset >= 10` slice was pushed into the scan"
+            );
+        }
+
+        #[tokio::test]
+        async fn full_scan_when_no_pushable_predicate() {
+            let (engine, seen) = seed_engine(vec![(0, 10, 100)]).await;
+            let mut s = engine.connect();
+            // A bare-offset predicate is NOT pushable → default (full) bounds.
+            s.simple_query("SELECT v FROM f WHERE _offset >= 10")
+                .await
+                .expect("scan ok");
+            let recorded = seen.lock().expect("lock");
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(
+                recorded[0],
+                ScanBounds::default(),
+                "an unanchored offset stays residual → full scan"
+            );
+        }
+
+        #[tokio::test]
+        async fn pushdown_does_not_change_results() {
+            // The scanner returns rows OUTSIDE the pushed slice (offsets 5 and 10,
+            // partitions 0 and 1) and ignores bounds; the residual WHERE must still
+            // yield exactly the rows passing the full predicate.
+            let corpus = vec![
+                (0, 5, 50),   // _offset 5 < 10 → excluded by WHERE
+                (0, 10, 100), // partition 0, offset 10, v=100 → kept
+                (0, 12, 7),   // v=7, fails `v > 50` → excluded by WHERE
+                (1, 10, 200), // partition 1 → excluded by `_partition = 0`
+            ];
+            let (engine, seen) = seed_engine(corpus).await;
+            let mut s = engine.connect();
+            let res = s
+                .simple_query("SELECT v FROM f WHERE _partition = 0 AND _offset >= 10 AND v > 50")
+                .await
+                .expect("scan ok");
+            // Only the (0,10,100) row passes the full predicate.
+            let rows = rows_of(&res[0]);
+            let got: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    String::from_utf8(row[0].as_ref().expect("v not null").text.to_vec())
+                        .expect("utf8")
+                })
+                .collect();
+            assert_eq!(got, vec!["100".to_string()], "residual WHERE still applied");
+            // And the bounds were pushed (proves it is a real pushdown, not a no-op).
+            assert_eq!(seen.lock().expect("lock")[0].start_offsets, vec![(0, 10)]);
+        }
+    }
+
+    // ─────────────────── Fix 2: CURRENT_USER / PUBLIC normalization ───────────
+
+    /// `normalize_mapping_user` must map both `"current_user"` and `"public"`
+    /// (any case) to `"public"`, and pass through any other user name unchanged.
+    #[test]
+    fn normalize_mapping_user_maps_current_user_and_public_to_public() {
+        use super::normalize_mapping_user;
+        assert_eq!(normalize_mapping_user("current_user"), "public");
+        assert_eq!(normalize_mapping_user("CURRENT_USER"), "public");
+        assert_eq!(normalize_mapping_user("Current_User"), "public");
+        assert_eq!(normalize_mapping_user("public"), "public");
+        assert_eq!(normalize_mapping_user("PUBLIC"), "public");
+        // Named users pass through unchanged.
+        assert_eq!(normalize_mapping_user("alice"), "alice");
+        assert_eq!(normalize_mapping_user("bob"), "bob");
+    }
+
+    /// `CREATE USER MAPPING FOR CURRENT_USER` must be findable via
+    /// `catalog::get_user_mapping(kv, "public", server)` — confirming the key is
+    /// stored under "public", not "current_user".
+    #[test]
+    fn create_user_mapping_for_current_user_stored_under_public() {
+        use kv::MemKv;
+
+        let kv = MemKv::new();
+        let stmt = pgparser::parser::parse(
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS (username 'u', password 'p')",
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+
+        // execute_ddl must succeed and store under "public".
+        let fctx = super::ForeignCtx {
+            scanner: None,
+            current_user: "public",
+        };
+        let (result, _ops) = super::execute_ddl(&kv, &stmt, fctx).expect("execute_ddl ok");
+        assert!(
+            matches!(result, pgwire::engine::QueryResult::Command { tag } if tag == "CREATE USER MAPPING"),
+            "expected CREATE USER MAPPING command tag"
+        );
+
+        // The mapping must be retrievable under the "public" key.
+        let mapping = catalog::get_user_mapping(&kv, "public", "s")
+            .expect("FOR CURRENT_USER mapping must be stored under 'public'");
+        assert!(
+            mapping.options.iter().any(|(k, _)| k == "username"),
+            "options preserved"
         );
     }
 }

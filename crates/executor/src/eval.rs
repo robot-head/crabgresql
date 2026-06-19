@@ -713,6 +713,7 @@ mod tests {
                     ty: ColumnType::Int4,
                 },
             ],
+            foreign: None,
         }
     }
 
@@ -904,6 +905,7 @@ mod tests {
                     ty: ColumnType::Interval,
                 },
             ],
+            foreign: None,
         };
         let tstz_scope = scope_of(Some(&tstz_col));
         assert_eq!(
@@ -1127,6 +1129,7 @@ mod tests {
                 name: "a".into(),
                 ty: ColumnType::Float8,
             }],
+            foreign: None,
         };
         let err = infer_type(&pexpr("a::bool").expect("parse"), &scope_of(Some(&ft)))
             .expect_err("float8->bool is undefined");

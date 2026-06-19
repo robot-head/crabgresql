@@ -978,6 +978,7 @@ mod tests {
                     ty: ColumnType::Int4,
                 },
             ],
+            foreign: None,
         }
     }
 
@@ -1631,6 +1632,7 @@ mod tests {
                     ty: ColumnType::Timestamp,
                 },
             ],
+            foreign: None,
         }
     }
 

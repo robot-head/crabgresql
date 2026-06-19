@@ -312,6 +312,8 @@ impl RangeRouter {
             }
             // DDL, transaction control, and GUC control resolve to range 0 but do
             // not pin: a txn can still be pinned to a data range by a later DML.
+            // SP40 FDW DDL (catalog objects + foreign tables) is range-0 catalog DDL
+            // too, so it routes to range 0 and never pins.
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::Begin { .. }
@@ -319,7 +321,18 @@ impl RangeRouter {
             | Statement::Rollback
             | Statement::Set { .. }
             | Statement::Show { .. }
-            | Statement::Reset { .. } => Ok(None),
+            | Statement::Reset { .. }
+            | Statement::CreateFdw { .. }
+            | Statement::DropFdw { .. }
+            | Statement::CreateServer { .. }
+            | Statement::AlterServer { .. }
+            | Statement::DropServer { .. }
+            | Statement::CreateUserMapping { .. }
+            | Statement::AlterUserMapping { .. }
+            | Statement::DropUserMapping { .. }
+            | Statement::CreateForeignTable { .. }
+            | Statement::DropForeignTable { .. }
+            | Statement::ImportForeignSchema { .. } => Ok(None),
         }
     }
 
@@ -708,7 +721,15 @@ fn collect_table_expr_ranges(
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, .. } => {
-            out.insert(router.range_of(name)?);
+            // SP40: a foreign table is UNPINNED — it lives in no data range (its rows
+            // come from the FDW scanner, not the MVCC store). Contributing no range
+            // means an all-foreign FROM resolves to range 0 (like a FROM-less SELECT),
+            // and a foreign+local join pins to the local table's range rather than
+            // erroring as cross-range.
+            let t = catalog::get_table(&*router.catalog_kv, name)?;
+            if t.foreign.is_none() {
+                out.insert(router.map.range_for_table(t.id));
+            }
         }
         TableExpr::Derived { subquery, .. } => {
             collect_query_expr_ranges(router, subquery, out)?;
@@ -1442,6 +1463,64 @@ mod tests {
         assert_eq!(
             fresh.scan_one_i32("SELECT id FROM b").await,
             Vec::<i32>::new()
+        );
+    }
+
+    /// SP40: a foreign table is UNPINNED. A `SELECT` over only a foreign table
+    /// resolves to range 0 (`pinning_range` → `None`, like a FROM-less SELECT) and
+    /// is NOT rejected as cross-range; a foreign+local join pins to the LOCAL table's
+    /// range (the foreign table contributes no range to the dedup set). Asserts the
+    /// router's routing DECISION directly via `pinning_range`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn foreign_table_is_unpinned_and_joins_pin_to_the_local_range() {
+        // boundary at table 2: the first table (id 1) -> range 0, later (id >= 2) -> range 1.
+        let c = MultiRangeCluster::new(3, RangeMap::with_boundaries(vec![2])).await;
+        for r in c.range_map().range_ids() {
+            c.wait_for_leader(r).await;
+        }
+        let mut router = RangeRouter::connect(&c).await;
+        // Range-0 catalog DDL: register a server and a foreign table (foreign tables
+        // are unpinned regardless of the table id they are assigned).
+        router
+            .simple("CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092')")
+            .await
+            .expect("create server"); // routes to range 0, no pin
+        router
+            .simple("CREATE FOREIGN TABLE orders (id int4) SERVER s OPTIONS (topic 'orders')")
+            .await
+            .expect("create foreign table"); // id 1
+        router
+            .simple("CREATE TABLE local_t (id int4)")
+            .await
+            .expect("create local"); // id 2 -> range 1
+
+        let parse = |sql: &str| {
+            pgparser::parse_with_source(sql)
+                .expect("parse")
+                .into_iter()
+                .next()
+                .expect("one statement")
+                .0
+        };
+
+        // A SELECT over only the foreign table contributes no range -> None (range 0,
+        // unpinned), NOT a cross-range rejection.
+        let only_foreign = parse("SELECT id FROM orders");
+        assert_eq!(
+            router.pinning_range(&only_foreign).expect("routes ok"),
+            None,
+            "an all-foreign FROM resolves to range 0 (unpinned), not cross-range",
+        );
+
+        // A foreign+local join pins to the LOCAL table's range (range 1): the foreign
+        // table adds no range, so the dedup set is exactly {1} -> Some(1), not 0A000.
+        let join = parse("SELECT orders.id FROM orders JOIN local_t ON orders.id = local_t.id");
+        assert_eq!(
+            router
+                .pinning_range(&join)
+                .expect("routes ok, not cross-range"),
+            Some(1),
+            "a foreign+local join pins to the local table's range",
         );
     }
 }
