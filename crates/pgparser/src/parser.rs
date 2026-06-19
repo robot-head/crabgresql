@@ -828,8 +828,50 @@ impl Parser {
             return self.query_statement();
         }
         match self.peek() {
-            Token::Keyword(Keyword::Create) => self.create_table(),
-            Token::Keyword(Keyword::Drop) => self.drop_table(),
+            Token::Keyword(Keyword::Create) => {
+                // SP40: lookahead dispatch for FDW DDL vs CREATE TABLE
+                match self.peek2() {
+                    Token::Keyword(Keyword::Foreign) => {
+                        // CREATE FOREIGN ... — look at the third token
+                        match self.peek3() {
+                            Token::Keyword(Keyword::Table) => self.create_foreign_table(),
+                            Token::Keyword(Keyword::Data) => self.create_fdw(),
+                            _ => Err(ParseError::new(
+                                format!(
+                                    "unexpected token after CREATE FOREIGN: {:?}",
+                                    self.peek3()
+                                ),
+                                self.peek_pos(),
+                            )),
+                        }
+                    }
+                    Token::Keyword(Keyword::Server) => self.create_server(),
+                    Token::Keyword(Keyword::User) => self.create_user_mapping(),
+                    _ => self.create_table(),
+                }
+            }
+            Token::Keyword(Keyword::Drop) => {
+                // SP40: lookahead dispatch for FDW DDL vs DROP TABLE.
+                // Each drop function handles its own `IF EXISTS` via `eat_if_exists`.
+                match self.peek2() {
+                    Token::Keyword(Keyword::Foreign) => {
+                        // DROP FOREIGN ... — look at the third token to distinguish
+                        // DROP FOREIGN DATA WRAPPER from DROP FOREIGN TABLE.
+                        match self.peek3() {
+                            Token::Keyword(Keyword::Table) => self.drop_foreign_table(),
+                            Token::Keyword(Keyword::Data) => self.drop_fdw(),
+                            _ => Err(ParseError::new(
+                                format!("unexpected token after DROP FOREIGN: {:?}", self.peek3()),
+                                self.peek_pos(),
+                            )),
+                        }
+                    }
+                    Token::Keyword(Keyword::Server) => self.drop_server(),
+                    Token::Keyword(Keyword::User) => self.drop_user_mapping(),
+                    _ => self.drop_table(),
+                }
+            }
+            Token::Keyword(Keyword::Import) => self.import_foreign_schema(),
             Token::Keyword(Keyword::Insert) => self.insert(),
             // SP4: transaction control
             Token::Keyword(Keyword::Begin) | Token::Keyword(Keyword::Start) => self.begin(),
@@ -844,11 +886,20 @@ impl Parser {
             // SP4: DML
             Token::Keyword(Keyword::Update) => self.update(),
             Token::Keyword(Keyword::Delete) => self.delete(),
-            // SP37: GUC control. `SET` is a keyword; `SHOW`/`RESET` are matched as
+            // SP37: GUC control. `SET` is a keyword; `SHOW`/`RESET`/`ALTER` are matched as
             // plain (lowercased) idents — keyword-free so they stay usable as names.
             Token::Keyword(Keyword::Set) => self.set_stmt(),
             Token::Ident(s) if s == "show" => self.show_stmt(),
             Token::Ident(s) if s == "reset" => self.reset_stmt(),
+            // SP40: ALTER SERVER / ALTER USER MAPPING
+            Token::Ident(s) if s == "alter" => match self.peek2() {
+                Token::Keyword(Keyword::Server) => self.alter_server(),
+                Token::Keyword(Keyword::User) => self.alter_user_mapping(),
+                _ => Err(ParseError::new(
+                    format!("unexpected token after ALTER: {:?}", self.peek2()),
+                    self.peek_pos(),
+                )),
+            },
             other => Err(ParseError::new(
                 format!("unexpected statement start {other:?}"),
                 self.peek_pos(),
@@ -888,8 +939,9 @@ impl Parser {
         }
         // `SET [LOCAL] <name> (= | TO) <value>`.
         let name = self.expect_ident()?.to_ascii_lowercase();
-        // `=` is a token; `TO` is a (lowercased) ident — either separates name from value.
+        // `=` is a token; `TO` is now a keyword (Keyword::To) — either separates name from value.
         let sep = *self.peek() == Token::Eq
+            || *self.peek() == Token::Keyword(Keyword::To)
             || matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("to"));
         if !sep {
             return Err(ParseError::new(
@@ -1083,6 +1135,8 @@ impl Parser {
         use crate::ast::Statement;
         self.expect(&Token::Keyword(Keyword::Drop))?;
         self.expect(&Token::Keyword(Keyword::Table))?;
+        // SP40: accept IF EXISTS (consistent with DROP SERVER / FOREIGN TABLE).
+        self.eat_if_exists();
         Ok(Statement::DropTable {
             name: self.expect_ident()?,
         })
@@ -1745,6 +1799,286 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    /// Consume a string literal or return a 42601 parse error. Used for OPTIONS values.
+    fn expect_string_lit(&mut self) -> Result<String, ParseError> {
+        match self.bump() {
+            Token::StringLit(s) => Ok(s),
+            other => Err(ParseError::new(
+                format!("expected string literal, found {other:?}"),
+                self.peek_pos(),
+            )),
+        }
+    }
+
+    /// Parse `OPTIONS ( ident 'string' [, …] )`. Returns an empty list if OPTIONS is absent.
+    fn parse_options(&mut self) -> Result<crate::ast::OptionList, ParseError> {
+        if !self.eat_keyword(Keyword::Options) {
+            return Ok(vec![]);
+        }
+        self.expect(&Token::LParen)?;
+        let mut opts = Vec::new();
+        loop {
+            let k = self.expect_ident()?;
+            let v = self.expect_string_lit()?;
+            opts.push((k, v));
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        Ok(opts)
+    }
+
+    /// Parse the `FOR <user>` clause of `CREATE/ALTER/DROP USER MAPPING`.
+    /// Returns the user name as a lowercase string. Accepts `PUBLIC`, `CURRENT_USER`,
+    /// or a plain identifier.
+    fn parse_user_mapping_user(&mut self) -> Result<String, ParseError> {
+        self.expect(&Token::Keyword(Keyword::For))?;
+        match self.peek().clone() {
+            Token::Keyword(Keyword::Public) => {
+                self.bump();
+                Ok("public".into())
+            }
+            Token::Keyword(Keyword::CurrentUser) => {
+                self.bump();
+                Ok("current_user".into())
+            }
+            Token::Ident(_) => self.expect_ident(),
+            other => Err(ParseError::new(
+                format!("expected user name after FOR, found {other:?}"),
+                self.peek_pos(),
+            )),
+        }
+    }
+
+    // SP40: FDW DDL parse functions
+
+    /// `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (…)`
+    fn create_fdw(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Create))?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Data))?;
+        self.expect(&Token::Keyword(Keyword::Wrapper))?;
+        let name = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::CreateFdw { name, options })
+    }
+
+    /// `DROP FOREIGN DATA WRAPPER [IF EXISTS] <name>`
+    fn drop_fdw(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Drop))?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Data))?;
+        self.expect(&Token::Keyword(Keyword::Wrapper))?;
+        let if_exists = self.eat_if_exists();
+        let name = self.expect_ident()?;
+        Ok(Statement::DropFdw { name, if_exists })
+    }
+
+    /// `CREATE SERVER <name> FOREIGN DATA WRAPPER <wrapper> OPTIONS (…)`
+    fn create_server(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Create))?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Data))?;
+        self.expect(&Token::Keyword(Keyword::Wrapper))?;
+        let wrapper = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::CreateServer {
+            name,
+            wrapper,
+            options,
+        })
+    }
+
+    /// `ALTER SERVER <name> OPTIONS (…)`
+    fn alter_server(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        // ALTER is not a keyword yet; matched as ident
+        self.bump(); // ALTER
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let name = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::AlterServer { name, options })
+    }
+
+    /// `DROP SERVER [IF EXISTS] <name>`
+    fn drop_server(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Drop))?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let if_exists = self.eat_if_exists();
+        let name = self.expect_ident()?;
+        Ok(Statement::DropServer { name, if_exists })
+    }
+
+    /// `CREATE USER MAPPING FOR <user> SERVER <server> OPTIONS (…)`
+    fn create_user_mapping(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Create))?;
+        self.expect(&Token::Keyword(Keyword::User))?;
+        self.expect(&Token::Keyword(Keyword::Mapping))?;
+        let user = self.parse_user_mapping_user()?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let server = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::CreateUserMapping {
+            user,
+            server,
+            options,
+        })
+    }
+
+    /// `ALTER USER MAPPING FOR <user> SERVER <server> OPTIONS (…)`
+    fn alter_user_mapping(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        // ALTER is not a keyword yet; matched as ident
+        self.bump(); // ALTER
+        self.expect(&Token::Keyword(Keyword::User))?;
+        self.expect(&Token::Keyword(Keyword::Mapping))?;
+        let user = self.parse_user_mapping_user()?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let server = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::AlterUserMapping {
+            user,
+            server,
+            options,
+        })
+    }
+
+    /// `DROP USER MAPPING [IF EXISTS] FOR <user> SERVER <server>`
+    fn drop_user_mapping(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Drop))?;
+        self.expect(&Token::Keyword(Keyword::User))?;
+        self.expect(&Token::Keyword(Keyword::Mapping))?;
+        let if_exists = self.eat_if_exists();
+        let user = self.parse_user_mapping_user()?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let server = self.expect_ident()?;
+        Ok(Statement::DropUserMapping {
+            user,
+            server,
+            if_exists,
+        })
+    }
+
+    /// `CREATE FOREIGN TABLE <name> (<col> <type>, …) SERVER <server> OPTIONS (…)`
+    fn create_foreign_table(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{ColumnDef, Statement};
+        self.expect(&Token::Keyword(Keyword::Create))?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Table))?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            let col_name = self.expect_ident()?;
+            let ty = self.parse_type_name()?;
+            columns.push(ColumnDef { name: col_name, ty });
+            if self.eat_comma() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let server = self.expect_ident()?;
+        let options = self.parse_options()?;
+        Ok(Statement::CreateForeignTable {
+            name,
+            columns,
+            server,
+            options,
+        })
+    }
+
+    /// `DROP FOREIGN TABLE [IF EXISTS] <name>`
+    fn drop_foreign_table(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::Statement;
+        self.expect(&Token::Keyword(Keyword::Drop))?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Table))?;
+        let if_exists = self.eat_if_exists();
+        let name = self.expect_ident()?;
+        Ok(Statement::DropForeignTable { name, if_exists })
+    }
+
+    /// `IMPORT FOREIGN SCHEMA <remote_schema> [LIMIT TO | EXCEPT (<tables>)] FROM SERVER <server> [INTO <schema>]`
+    fn import_foreign_schema(&mut self) -> Result<crate::ast::Statement, ParseError> {
+        use crate::ast::{ImportSelector, Statement};
+        self.expect(&Token::Keyword(Keyword::Import))?;
+        self.expect(&Token::Keyword(Keyword::Foreign))?;
+        self.expect(&Token::Keyword(Keyword::Schema))?;
+        let remote_schema = self.expect_ident()?;
+        let selector = if self.eat_keyword(Keyword::Limit) {
+            self.expect(&Token::Keyword(Keyword::To))?;
+            ImportSelector::LimitTo(self.parse_ident_list()?)
+        } else if self.eat_keyword(Keyword::Except) {
+            ImportSelector::Except(self.parse_ident_list()?)
+        } else {
+            ImportSelector::All
+        };
+        self.expect(&Token::Keyword(Keyword::From))?;
+        self.expect(&Token::Keyword(Keyword::Server))?;
+        let server = self.expect_ident()?;
+        let into_schema = if self.eat_keyword(Keyword::Into) {
+            // INTO public — `public` is a keyword here
+            match self.peek().clone() {
+                Token::Keyword(Keyword::Public) => {
+                    self.bump();
+                    "public".into()
+                }
+                Token::Ident(_) => self.expect_ident()?,
+                other => {
+                    return Err(ParseError::new(
+                        format!("expected schema name after INTO, found {other:?}"),
+                        self.peek_pos(),
+                    ));
+                }
+            }
+        } else {
+            "public".into()
+        };
+        Ok(Statement::ImportForeignSchema {
+            remote_schema,
+            selector,
+            server,
+            into_schema,
+        })
+    }
+
+    /// Parse `( ident, ident, … )` — used by `IMPORT FOREIGN SCHEMA`.
+    fn parse_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&Token::LParen)?;
+        let mut names = vec![self.expect_ident()?];
+        while self.eat_comma() {
+            names.push(self.expect_ident()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(names)
+    }
+
+    /// Consume `IF EXISTS` if present, returning whether it was seen.
+    fn eat_if_exists(&mut self) -> bool {
+        if self.eat_keyword(Keyword::If) {
+            // `EXISTS` is always a keyword (Keyword::Exists) in the lexer.
+            if *self.peek() == Token::Keyword(Keyword::Exists) {
+                self.bump();
+                return true;
+            }
+            // IF was consumed but EXISTS was not found — this is a parse error.
+            // Caller will get confused; let it surface naturally.
+        }
+        false
     }
 }
 
@@ -3675,5 +4009,370 @@ mod tests {
             panic!("expected SetOp")
         };
         assert!(!*all, "UNION DISTINCT is the dedup (all == false) form");
+    }
+
+    // SP40: FDW DDL tests
+
+    #[test]
+    fn parses_create_server() {
+        assert_eq!(
+            one(
+                "CREATE SERVER s FOREIGN DATA WRAPPER kafka_fdw OPTIONS (bootstrap 'h:9092', registry_url 'http://r')"
+            ),
+            Statement::CreateServer {
+                name: "s".into(),
+                wrapper: "kafka_fdw".into(),
+                options: vec![
+                    ("bootstrap".into(), "h:9092".into()),
+                    ("registry_url".into(), "http://r".into()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_create_foreign_table() {
+        match one(
+            "CREATE FOREIGN TABLE orders (id int4, total numeric) SERVER s OPTIONS (topic 'orders', value_format 'avro')",
+        ) {
+            Statement::CreateForeignTable {
+                name,
+                columns,
+                server,
+                options,
+            } => {
+                assert_eq!(name, "orders");
+                assert_eq!(server, "s");
+                assert_eq!(columns.len(), 2);
+                assert_eq!(options[0], ("topic".into(), "orders".into()));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_import_foreign_schema_limit_to() {
+        match one(
+            "IMPORT FOREIGN SCHEMA kafka LIMIT TO (orders, payments) FROM SERVER s INTO public",
+        ) {
+            Statement::ImportForeignSchema {
+                server,
+                into_schema,
+                selector,
+                ..
+            } => {
+                assert_eq!(server, "s");
+                assert_eq!(into_schema, "public");
+                assert!(
+                    matches!(selector, crate::ast::ImportSelector::LimitTo(ref v) if v == &["orders", "payments"])
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_user_mapping_for_public() {
+        match one(
+            "CREATE USER MAPPING FOR PUBLIC SERVER s OPTIONS (sasl_mechanism 'SCRAM-SHA-256', username 'u', password 'p')",
+        ) {
+            Statement::CreateUserMapping { user, server, .. } => {
+                assert_eq!(user, "public");
+                assert_eq!(server, "s");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_create_fdw() {
+        assert_eq!(
+            one("CREATE FOREIGN DATA WRAPPER kafka_fdw OPTIONS (protocol 'kafka')"),
+            Statement::CreateFdw {
+                name: "kafka_fdw".into(),
+                options: vec![("protocol".into(), "kafka".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_drop_fdw() {
+        assert_eq!(
+            one("DROP FOREIGN DATA WRAPPER kafka_fdw"),
+            Statement::DropFdw {
+                name: "kafka_fdw".into(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            one("DROP FOREIGN DATA WRAPPER IF EXISTS kafka_fdw"),
+            Statement::DropFdw {
+                name: "kafka_fdw".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_drop_server() {
+        assert_eq!(
+            one("DROP SERVER s"),
+            Statement::DropServer {
+                name: "s".into(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            one("DROP SERVER IF EXISTS s"),
+            Statement::DropServer {
+                name: "s".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_alter_server() {
+        assert_eq!(
+            one("ALTER SERVER s OPTIONS (bootstrap 'b:9092')"),
+            Statement::AlterServer {
+                name: "s".into(),
+                options: vec![("bootstrap".into(), "b:9092".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_create_user_mapping_for_current_user() {
+        match one("CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS (username 'u')") {
+            Statement::CreateUserMapping {
+                user,
+                server,
+                options,
+            } => {
+                assert_eq!(user, "current_user");
+                assert_eq!(server, "s");
+                assert_eq!(options[0], ("username".into(), "u".into()));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_alter_user_mapping() {
+        match one("ALTER USER MAPPING FOR PUBLIC SERVER s OPTIONS (username 'newu')") {
+            Statement::AlterUserMapping {
+                user,
+                server,
+                options,
+            } => {
+                assert_eq!(user, "public");
+                assert_eq!(server, "s");
+                assert_eq!(options[0], ("username".into(), "newu".into()));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_user_mapping() {
+        assert_eq!(
+            one("DROP USER MAPPING FOR PUBLIC SERVER s"),
+            Statement::DropUserMapping {
+                user: "public".into(),
+                server: "s".into(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            one("DROP USER MAPPING IF EXISTS FOR PUBLIC SERVER s"),
+            Statement::DropUserMapping {
+                user: "public".into(),
+                server: "s".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_drop_foreign_table() {
+        assert_eq!(
+            one("DROP FOREIGN TABLE orders"),
+            Statement::DropForeignTable {
+                name: "orders".into(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            one("DROP FOREIGN TABLE IF EXISTS orders"),
+            Statement::DropForeignTable {
+                name: "orders".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_import_foreign_schema_except() {
+        match one("IMPORT FOREIGN SCHEMA remote EXCEPT (foo, bar) FROM SERVER s INTO myschema") {
+            Statement::ImportForeignSchema {
+                remote_schema,
+                selector,
+                server,
+                into_schema,
+            } => {
+                assert_eq!(remote_schema, "remote");
+                assert_eq!(server, "s");
+                assert_eq!(into_schema, "myschema");
+                assert!(
+                    matches!(selector, crate::ast::ImportSelector::Except(ref v) if v == &["foo", "bar"])
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_import_foreign_schema_all() {
+        match one("IMPORT FOREIGN SCHEMA kafka FROM SERVER s INTO public") {
+            Statement::ImportForeignSchema {
+                remote_schema,
+                selector,
+                server,
+                into_schema,
+            } => {
+                assert_eq!(remote_schema, "kafka");
+                assert_eq!(server, "s");
+                assert_eq!(into_schema, "public");
+                assert!(matches!(selector, crate::ast::ImportSelector::All));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_create_server_no_options() {
+        assert_eq!(
+            one("CREATE SERVER s FOREIGN DATA WRAPPER w"),
+            Statement::CreateServer {
+                name: "s".into(),
+                wrapper: "w".into(),
+                options: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_create_foreign_table_no_options() {
+        match one("CREATE FOREIGN TABLE t (id int4) SERVER s") {
+            Statement::CreateForeignTable {
+                name,
+                columns,
+                server,
+                options,
+            } => {
+                assert_eq!(name, "t");
+                assert_eq!(server, "s");
+                assert_eq!(columns.len(), 1);
+                assert!(options.is_empty());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // Mutant-killing tests for DROP dispatch arms and ALTER guard
+
+    #[test]
+    fn drop_server_with_and_without_if_exists() {
+        // Kills: Token::Keyword(Keyword::Server) arm deletion in DROP dispatch —
+        // if this arm were deleted, DROP SERVER would fall through to drop_table and fail.
+        assert_eq!(
+            one("DROP SERVER myserver"),
+            Statement::DropServer {
+                name: "myserver".into(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            one("DROP SERVER IF EXISTS myserver"),
+            Statement::DropServer {
+                name: "myserver".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_user_mapping_routes_correctly() {
+        // Kills: Token::Keyword(Keyword::User) arm deletion in DROP dispatch
+        assert_eq!(
+            one("DROP USER MAPPING IF EXISTS FOR PUBLIC SERVER s"),
+            Statement::DropUserMapping {
+                user: "public".into(),
+                server: "s".into(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_foreign_table_routes_to_correct_fn() {
+        // Kills: Token::Keyword(Keyword::Foreign) arm + inner Table arm in DROP dispatch.
+        // If the Foreign arm were deleted, this would fall to drop_table and fail on TABLE.
+        assert_eq!(
+            one("DROP FOREIGN TABLE IF EXISTS mytable"),
+            Statement::DropForeignTable {
+                name: "mytable".into(),
+                if_exists: true,
+            }
+        );
+        // Also verify plain DROP FOREIGN TABLE (no IF EXISTS)
+        assert_eq!(
+            one("DROP FOREIGN TABLE mytable"),
+            Statement::DropForeignTable {
+                name: "mytable".into(),
+                if_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_fdw_routes_to_correct_fn() {
+        // Kills: Token::Keyword(Keyword::Data) arm inside DROP FOREIGN dispatch.
+        // If this arm were deleted, DROP FOREIGN DATA WRAPPER would fail on DATA.
+        assert_eq!(
+            one("DROP FOREIGN DATA WRAPPER IF EXISTS myfdw"),
+            Statement::DropFdw {
+                name: "myfdw".into(),
+                if_exists: true,
+            }
+        );
+        assert_eq!(
+            one("DROP FOREIGN DATA WRAPPER myfdw"),
+            Statement::DropFdw {
+                name: "myfdw".into(),
+                if_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn alter_non_server_is_error() {
+        // Kills: `s == "alter"` match guard replaced with true — verifies the guard
+        // is necessary (non-"alter" idents must not be routed here)
+        assert!(crate::parse("ALTER TABLE t ADD COLUMN x int4").is_err());
+    }
+
+    #[test]
+    fn alter_ident_guard_is_case_sensitive_to_alter() {
+        // Also kills: guard `s == "alter"` — "alters" is not "alter" and must error
+        assert!(crate::parse("alters SERVER s OPTIONS (a 'b')").is_err());
+    }
+
+    #[test]
+    fn eat_if_exists_requires_exists_after_if() {
+        // Kills: `s.eq_ignore_ascii_case("exists")` match guard replaced with true/false —
+        // "IF notexists" must NOT consume IF EXISTS
+        assert!(crate::parse("DROP SERVER IF notexists myserver").is_err());
     }
 }
