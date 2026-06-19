@@ -74,6 +74,7 @@ fn unify_col(
 fn resolve_set_columns(
     catalog_kv: &dyn Kv,
     e: &SetExpr,
+    ctes: &crate::cte::CteContext,
     depth: usize,
 ) -> Result<Vec<ResolvedCol>, ExecError> {
     // Defense-in-depth: the parser caps set-op tree depth at MAX_DEPTH (50), so this
@@ -84,15 +85,19 @@ fn resolve_set_columns(
     }
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
+            crate::exec::reject_nested_relation_locking(s)?;
             let scope = if s.from.is_empty() {
                 Scope::empty()
             } else {
-                crate::exec::build_from_schema(catalog_kv, &s.from)?.scope
+                crate::exec::build_from_schema_with_ctes(catalog_kv, &s.from, ctes)?.scope
             };
             // Run the SP34 scalar-subquery type pass (so a subquery column's OID is
             // known without executing), then resolve names + types + unknown-ness.
-            let projection =
-                crate::subquery::resolve_types_in_projection(catalog_kv, &s.projection)?;
+            let projection = crate::subquery::resolve_types_in_projection_with_ctes(
+                catalog_kv,
+                &s.projection,
+                ctes,
+            )?;
             let (fields, exprs, tys) = crate::exec::resolve_projection(&projection, &scope)?;
             Ok(fields
                 .into_iter()
@@ -106,20 +111,20 @@ fn resolve_set_columns(
                 .collect())
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let schema = crate::values::describe_values(v)?;
-            Ok(schema
-                .names
+            let rel = crate::values::values_schema_relation_with_ctes(catalog_kv, v, ctes)?;
+            Ok(rel
+                .scope
+                .columns
                 .into_iter()
-                .zip(schema.types)
-                .map(|(name, ty)| ResolvedCol {
-                    name,
-                    ty,
+                .map(|c| ResolvedCol {
+                    name: c.name,
+                    ty: c.ty,
                     unknown: false,
                 })
                 .collect())
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
-            crate::query::describe_query_expr(catalog_kv, nested)?
+            crate::query::describe_query_expr_with_ctes(catalog_kv, nested, ctes)?
                 .into_iter()
                 .map(|f| {
                     Ok(ResolvedCol {
@@ -133,8 +138,8 @@ fn resolve_set_columns(
         SetExpr::SetOp {
             op, left, right, ..
         } => {
-            let l = resolve_set_columns(catalog_kv, left, depth + 1)?;
-            let r = resolve_set_columns(catalog_kv, right, depth + 1)?;
+            let l = resolve_set_columns(catalog_kv, left, ctes, depth + 1)?;
+            let r = resolve_set_columns(catalog_kv, right, ctes, depth + 1)?;
             if l.len() != r.len() {
                 return Err(ExecError::SetOpColumnCount {
                     op: *op,
@@ -163,11 +168,12 @@ fn output_type(c: &ResolvedCol) -> ColumnType {
     if c.unknown { ColumnType::Text } else { c.ty }
 }
 
-pub(crate) fn describe_set_expr(
+pub(crate) fn describe_set_expr_with_ctes(
     catalog_kv: &dyn Kv,
     body: &SetExpr,
+    ctes: &crate::cte::CteContext,
 ) -> Result<Vec<pgwire::engine::FieldDescription>, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, body, 0)?;
+    let cols = resolve_set_columns(catalog_kv, body, ctes, 0)?;
     Ok(cols
         .iter()
         .map(|c| crate::exec::field(&c.name, output_type(c)))
@@ -186,13 +192,14 @@ pub(crate) fn set_expr_to_relation(
     order_by: &[pgparser::ast::OrderItem],
     offset: Option<i64>,
     limit: Option<i64>,
+    ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
     fctx: crate::exec::ForeignCtx,
 ) -> Result<crate::join::Relation, ExecError> {
-    let cols = resolve_set_columns(catalog_kv, body, 0)?;
+    let cols = resolve_set_columns(catalog_kv, body, ctes, 0)?;
     let out_tys: Vec<ColumnType> = cols.iter().map(output_type).collect();
     let mut rows = fold(
-        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctx, fctx, 0,
+        catalog_kv, kv, global, gsnap, snapshot, own, body, &out_tys, ctes, ctx, fctx, 0,
     )?;
 
     let scope = Scope {
@@ -258,6 +265,7 @@ fn fold(
     own: Option<u64>,
     e: &SetExpr,
     out_tys: &[ColumnType],
+    ctes: &crate::cte::CteContext,
     ctx: &EvalCtx,
     fctx: crate::exec::ForeignCtx,
     depth: usize,
@@ -268,18 +276,20 @@ fn fold(
     }
     match e {
         SetExpr::Query(QueryBody::Select(s)) => {
-            let rel = crate::exec::select_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, s, ctx, fctx,
+            let rel = crate::exec::select_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, s, ctes, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Values(v)) => {
-            let rel = crate::values::values_to_relation(v, ctx)?;
+            let rel = crate::values::values_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, v, ctes, ctx, fctx,
+            )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
         SetExpr::Query(QueryBody::Nested(nested)) => {
-            let rel = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx, fctx,
+            let rel = crate::query::query_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctes, ctx, fctx,
             )?;
             coerce_rows(rel.rows, &rel.scope, out_tys, ctx)
         }
@@ -298,6 +308,7 @@ fn fold(
                 own,
                 left,
                 out_tys,
+                ctes,
                 ctx,
                 fctx,
                 depth + 1,
@@ -311,6 +322,7 @@ fn fold(
                 own,
                 right,
                 out_tys,
+                ctes,
                 ctx,
                 fctx,
                 depth + 1,

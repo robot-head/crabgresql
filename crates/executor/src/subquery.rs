@@ -11,7 +11,7 @@
 //! own FROM, so an outer-column reference fails name resolution (42703).
 
 use pgparser::ast::{
-    BinaryOp, Expr, FuncArgs, FuncCall, OrderItem, QueryExpr, SelectItem, SelectStmt,
+    BinaryOp, Expr, FuncArgs, FuncCall, OrderItem, QueryExpr, SelectItem, SelectStmt, ValuesStmt,
 };
 use pgtypes::{ColumnType, Datum};
 
@@ -27,6 +27,7 @@ pub(crate) struct SubCtx<'a> {
     pub gsnap: &'a mvcc::visibility::Snapshot,
     pub snapshot: &'a mvcc::visibility::Snapshot,
     pub own: Option<u64>,
+    pub ctes: &'a crate::cte::CteContext,
     /// The session eval context (zone + clock) — forwarded to the subquery's read
     /// path so a temporal expression inside a subquery evaluates in the session zone.
     pub eval_ctx: &'a crate::clock::EvalCtx,
@@ -76,6 +77,16 @@ pub(crate) fn resolve_order_items(
             })
         })
         .collect()
+}
+
+pub(crate) fn resolve_in_values(ctx: &SubCtx, v: &ValuesStmt) -> Result<ValuesStmt, ExecError> {
+    Ok(ValuesStmt {
+        rows: v
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|expr| resolve_expr(ctx, expr)).collect())
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// Recursively rewrite subquery nodes in `e`, bottom-up.
@@ -223,7 +234,7 @@ fn no_locking(q: &QueryExpr) -> Result<(), ExecError> {
 /// Run a subquery through the join read path to its materialized rows.
 fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, ExecError> {
     no_locking(q)?;
-    crate::query::query_to_relation(
+    crate::query::query_to_relation_with_ctes(
         ctx.catalog_kv,
         ctx.kv,
         ctx.global,
@@ -231,6 +242,7 @@ fn run_relation(ctx: &SubCtx, q: &QueryExpr) -> Result<crate::join::Relation, Ex
         ctx.snapshot,
         ctx.own,
         q,
+        ctx.ctes,
         ctx.eval_ctx,
         ctx.fctx,
     )
@@ -316,11 +328,23 @@ pub(crate) fn resolve_types_in_projection(
     catalog_kv: &dyn kv::Kv,
     items: &[SelectItem],
 ) -> Result<Vec<SelectItem>, ExecError> {
+    let ctes = crate::cte::CteContext::empty();
+    resolve_types_in_projection_with_ctes(catalog_kv, items, &ctes)
+}
+
+/// Execution-time type pass for contexts that already materialized CTEs. This is
+/// still schema-only, but scalar subqueries can resolve FROM entries against the
+/// supplied CTE context instead of catalog tables only.
+pub(crate) fn resolve_types_in_projection_with_ctes(
+    catalog_kv: &dyn kv::Kv,
+    items: &[SelectItem],
+    ctes: &crate::cte::CteContext,
+) -> Result<Vec<SelectItem>, ExecError> {
     items
         .iter()
         .map(|it| match it {
             SelectItem::Expr { expr, alias } => Ok(SelectItem::Expr {
-                expr: resolve_types_in_expr(catalog_kv, expr)?,
+                expr: resolve_types_in_expr(catalog_kv, expr, ctes)?,
                 alias: alias.clone(),
             }),
             other => Ok(other.clone()),
@@ -328,24 +352,46 @@ pub(crate) fn resolve_types_in_projection(
         .collect()
 }
 
+pub(crate) fn resolve_types_in_values_with_ctes(
+    catalog_kv: &dyn kv::Kv,
+    v: &ValuesStmt,
+    ctes: &crate::cte::CteContext,
+) -> Result<ValuesStmt, ExecError> {
+    Ok(ValuesStmt {
+        rows: v
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| resolve_types_in_expr(catalog_kv, expr, ctes))
+                    .collect()
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
 /// Recursively replace scalar subqueries with `Const { Null, <type> }` (type-only).
-fn resolve_types_in_expr(catalog_kv: &dyn kv::Kv, e: &Expr) -> Result<Expr, ExecError> {
+fn resolve_types_in_expr(
+    catalog_kv: &dyn kv::Kv,
+    e: &Expr,
+    ctes: &crate::cte::CteContext,
+) -> Result<Expr, ExecError> {
     Ok(match e {
         Expr::ScalarSubquery(s) => Expr::Const {
             value: Datum::Null,
-            ty: scalar_subquery_type(catalog_kv, s)?,
+            ty: scalar_subquery_type(catalog_kv, s, ctes)?,
         },
         Expr::Unary { op, expr } => Expr::Unary {
             op: *op,
-            expr: Box::new(resolve_types_in_expr(catalog_kv, expr)?),
+            expr: Box::new(resolve_types_in_expr(catalog_kv, expr, ctes)?),
         },
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
-            left: Box::new(resolve_types_in_expr(catalog_kv, left)?),
-            right: Box::new(resolve_types_in_expr(catalog_kv, right)?),
+            left: Box::new(resolve_types_in_expr(catalog_kv, left, ctes)?),
+            right: Box::new(resolve_types_in_expr(catalog_kv, right, ctes)?),
         },
         Expr::Cast { expr, ty } => Expr::Cast {
-            expr: Box::new(resolve_types_in_expr(catalog_kv, expr)?),
+            expr: Box::new(resolve_types_in_expr(catalog_kv, expr, ctes)?),
             ty: *ty,
         },
         // Everything else (incl. EXISTS / IN / quantified, which infer as bool) is
@@ -355,8 +401,12 @@ fn resolve_types_in_expr(catalog_kv: &dyn kv::Kv, e: &Expr) -> Result<Expr, Exec
 }
 
 /// The static type of a scalar subquery's single projection column (catalog only).
-fn scalar_subquery_type(catalog_kv: &dyn kv::Kv, q: &QueryExpr) -> Result<ColumnType, ExecError> {
-    let fields = crate::query::describe_query_expr(catalog_kv, q)?;
+fn scalar_subquery_type(
+    catalog_kv: &dyn kv::Kv,
+    q: &QueryExpr,
+    ctes: &crate::cte::CteContext,
+) -> Result<ColumnType, ExecError> {
+    let fields = crate::query::describe_query_expr_with_ctes(catalog_kv, q, ctes)?;
     if fields.len() != 1 {
         return Err(ExecError::SubqueryColumns);
     }

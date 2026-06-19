@@ -179,6 +179,7 @@ pub struct SelectStmt {
 /// query expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExpr {
+    pub with: Option<WithClause>,
     pub body: SetExpr,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<i64>,
@@ -191,6 +192,19 @@ pub struct QueryExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValuesStmt {
     pub rows: Vec<Vec<Expr>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub query: QueryExpr,
 }
 
 /// SP39: query bodies that may appear as set-operation leaves or derived tables.

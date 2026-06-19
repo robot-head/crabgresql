@@ -1006,6 +1006,7 @@ fn mirror_op(op: pgparser::ast::BinaryOp) -> Option<pgparser::ast::BinaryOp> {
 fn is_single_foreign_table(
     catalog_kv: &dyn Kv,
     from: &[pgparser::ast::TableExpr],
+    ctes: &crate::cte::CteContext,
     fctx: ForeignCtx,
 ) -> bool {
     if fctx.scanner.is_none() {
@@ -1014,6 +1015,9 @@ fn is_single_foreign_table(
     let [pgparser::ast::TableExpr::Table { name, .. }] = from else {
         return false;
     };
+    if ctes.lookup(name).is_some() {
+        return false;
+    }
     catalog::get_table(catalog_kv, name).is_ok_and(|t| t.foreign.is_some())
 }
 
@@ -1027,6 +1031,7 @@ fn build_from(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     from: &[pgparser::ast::TableExpr],
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
     fctx: ForeignCtx,
     // SP40 Task 14: pushed-down offset bounds for the single-foreign-table case.
@@ -1039,13 +1044,13 @@ fn build_from(
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
     let mut acc = build_table_expr(
-        catalog_kv, kv, global, gsnap, snapshot, own, first, ctx, fctx, bounds,
+        catalog_kv, kv, global, gsnap, snapshot, own, first, ctes, ctx, fctx, bounds,
     )?;
     for te in iter {
         // A comma-FROM (multiple tables) is a cross join — no single-table
         // pushdown applies, so subsequent items always scan in full.
         let next = build_table_expr(
-            catalog_kv, kv, global, gsnap, snapshot, own, te, ctx, fctx, None,
+            catalog_kv, kv, global, gsnap, snapshot, own, te, ctes, ctx, fctx, None,
         )?;
         acc = join_relations(
             acc,
@@ -1067,6 +1072,7 @@ fn build_table_expr(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     te: &pgparser::ast::TableExpr,
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
     fctx: ForeignCtx,
     // SP40 Task 14: pushed-down offset bounds, `Some` only for a single foreign
@@ -1076,6 +1082,10 @@ fn build_table_expr(
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
+            if let Some(rel) = ctes.lookup(name) {
+                let qualifier = alias.as_deref().unwrap_or(name);
+                return Ok(crate::cte::requalify_cte(rel, qualifier));
+            }
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
             // SP40: a foreign table reads through the registered scanner, not the
@@ -1115,10 +1125,10 @@ fn build_table_expr(
             // A join is never a single foreign table: each side scans in full and
             // the join predicate / residual WHERE filters locally.
             let l = build_table_expr(
-                catalog_kv, kv, global, gsnap, snapshot, own, left, ctx, fctx, None,
+                catalog_kv, kv, global, gsnap, snapshot, own, left, ctes, ctx, fctx, None,
             )?;
             let r = build_table_expr(
-                catalog_kv, kv, global, gsnap, snapshot, own, right, ctx, fctx, None,
+                catalog_kv, kv, global, gsnap, snapshot, own, right, ctes, ctx, fctx, None,
             )?;
             join_relations(l, r, *kind, constraint, ctx)
         }
@@ -1127,20 +1137,18 @@ fn build_table_expr(
             alias,
             columns,
         } => {
-            let inner = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx, fctx,
+            let inner = crate::query::query_to_relation_with_ctes(
+                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctes, ctx, fctx,
             )?;
             crate::values::requalify_derived(inner, alias, columns)
         }
     }
 }
 
-/// Run a SELECT to a `Relation` (output columns + rows). The top-level
-/// `execute_read` renders this to a `QueryResult`; a derived table re-qualifies
-/// its columns under the derived alias. Non-correlated only (the subquery's scope
-/// is built solely from its own FROM clause).
+/// Run a SELECT to a `Relation` with an already-evaluated CTE scope. `WITH`
+/// belongs to `QueryExpr`; this function handles the SELECT body under that scope.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn select_to_relation(
+pub(crate) fn select_to_relation_with_ctes(
     catalog_kv: &dyn Kv,
     kv: &dyn Kv,
     global: &dyn Kv,
@@ -1148,9 +1156,12 @@ pub(crate) fn select_to_relation(
     snapshot: &mvcc::visibility::Snapshot,
     own: Option<u64>,
     s: &SelectStmt,
+    ctes: &crate::cte::CteContext,
     ctx: &crate::clock::EvalCtx,
     fctx: ForeignCtx,
 ) -> Result<Relation, ExecError> {
+    reject_nested_relation_locking(s)?;
+
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
     let sub_ctx = crate::subquery::SubCtx {
@@ -1160,6 +1171,7 @@ pub(crate) fn select_to_relation(
         gsnap,
         snapshot,
         own,
+        ctes,
         eval_ctx: ctx,
         fctx,
     };
@@ -1175,7 +1187,7 @@ pub(crate) fn select_to_relation(
         // `_partition`/`_offset` bounds from the WHERE and push them into the
         // scan. The WHERE is still applied below, so this only ever reads less —
         // it never changes the result set.
-        let pushed = if is_single_foreign_table(catalog_kv, &s.from, fctx) {
+        let pushed = if is_single_foreign_table(catalog_kv, &s.from, ctes, fctx) {
             Some(extract_scan_bounds(s.filter.as_ref()))
         } else {
             None
@@ -1188,6 +1200,7 @@ pub(crate) fn select_to_relation(
             snapshot,
             own,
             &s.from,
+            ctes,
             ctx,
             fctx,
             pushed.as_ref(),
@@ -1222,20 +1235,18 @@ pub(crate) fn select_to_relation(
     })
 }
 
-/// Schema-only relation builder for `describe` — parallels `build_from` but base
-/// tables produce no rows (no `scan_live`). Joining empty relations yields the
-/// correct combined scope with no rows, so it reuses `join_relations`.
-pub(crate) fn build_from_schema(
+pub(crate) fn build_from_schema_with_ctes(
     catalog_kv: &dyn Kv,
     from: &[pgparser::ast::TableExpr],
+    ctes: &crate::cte::CteContext,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from_schema on empty FROM".into()))?;
-    let mut acc = build_table_expr_schema(catalog_kv, first)?;
+    let mut acc = build_table_expr_schema_with_ctes(catalog_kv, first, ctes)?;
     for te in iter {
-        let next = build_table_expr_schema(catalog_kv, te)?;
+        let next = build_table_expr_schema_with_ctes(catalog_kv, te, ctes)?;
         // Schema-only: no rows, so no ON predicate is ever evaluated — a default
         // (UTC/epoch) eval context is correct here.
         acc = join_relations(
@@ -1249,13 +1260,20 @@ pub(crate) fn build_from_schema(
     Ok(acc)
 }
 
-fn build_table_expr_schema(
+fn build_table_expr_schema_with_ctes(
     catalog_kv: &dyn Kv,
     te: &pgparser::ast::TableExpr,
+    ctes: &crate::cte::CteContext,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
+            if let Some(rel) = ctes.lookup(name) {
+                let qualifier = alias.as_deref().unwrap_or(name);
+                let mut rel = crate::cte::requalify_cte(rel, qualifier);
+                rel.rows.clear();
+                return Ok(rel);
+            }
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
             Ok(Relation {
@@ -1269,8 +1287,8 @@ fn build_table_expr_schema(
             kind,
             constraint,
         } => {
-            let l = build_table_expr_schema(catalog_kv, left)?;
-            let r = build_table_expr_schema(catalog_kv, right)?;
+            let l = build_table_expr_schema_with_ctes(catalog_kv, left, ctes)?;
+            let r = build_table_expr_schema_with_ctes(catalog_kv, right, ctes)?;
             // Schema-only: no rows, so no ON predicate is ever evaluated.
             join_relations(
                 l,
@@ -1285,7 +1303,7 @@ fn build_table_expr_schema(
             alias,
             columns,
         } => {
-            let fields = crate::query::describe_query_expr(catalog_kv, subquery)?;
+            let fields = crate::query::describe_query_expr_with_ctes(catalog_kv, subquery, ctes)?;
             let bindings = fields
                 .iter()
                 .map(|f| {
@@ -1303,6 +1321,15 @@ fn build_table_expr_schema(
             crate::values::requalify_derived(inner, alias, columns)
         }
     }
+}
+
+pub(crate) fn reject_nested_relation_locking(s: &SelectStmt) -> Result<(), ExecError> {
+    if s.locking.is_some() {
+        return Err(ExecError::Unsupported(
+            "FOR UPDATE/SHARE is not supported in CTEs or derived tables".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1346,6 +1373,7 @@ pub(crate) async fn execute_read_locking(
 ) -> Result<QueryResult, ExecError> {
     // SP34: resolve uncorrelated subqueries (e.g. in the WHERE of a FOR UPDATE) to
     // constants first, under this statement's snapshot handles.
+    let empty_ctes = crate::cte::CteContext::empty();
     let sub_ctx = crate::subquery::SubCtx {
         catalog_kv,
         kv,
@@ -1353,6 +1381,7 @@ pub(crate) async fn execute_read_locking(
         gsnap,
         snapshot,
         own: Some(xid),
+        ctes: &empty_ctes,
         eval_ctx: ctx,
         // A locking SELECT only operates over local tables; a subquery referencing a
         // foreign table here would surface the no-scanner error, which is acceptable

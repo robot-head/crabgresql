@@ -8,6 +8,7 @@
 mod agg;
 pub mod clock;
 mod commit;
+mod cte;
 mod datetime_fn;
 mod error;
 mod eval;

@@ -195,12 +195,12 @@ impl Parser {
         // `timestamp with time zone` / `timestamp without time zone` /
         // `time with time zone` / `time without time zone`.
         if (type_word.eq_ignore_ascii_case("timestamp") || type_word.eq_ignore_ascii_case("time"))
-            && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with") || w.eq_ignore_ascii_case("without"))
+            && (matches!(self.peek(), Token::Keyword(Keyword::With))
+                || matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("without")))
             && matches!(self.peek2(), Token::Ident(w) if w.eq_ignore_ascii_case("time"))
         {
             // Consume `{with|without}`; require `time` `zone` to follow.
-            let with_zone =
-                matches!(self.bump(), Token::Ident(w) if w.eq_ignore_ascii_case("with"));
+            let with_zone = matches!(self.bump(), Token::Keyword(Keyword::With));
             self.expect_ident_eq("time")?;
             self.expect_ident_eq("zone")?;
             let qualifier = if with_zone { "with" } else { "without" };
@@ -437,7 +437,7 @@ impl Parser {
                 // parenthesised (grouping) expression.
                 if matches!(
                     self.peek2(),
-                    Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+                    Token::Keyword(Keyword::Select | Keyword::Values | Keyword::With)
                 ) {
                     self.bump();
                     let sub = self.query_expr_after_open_paren()?;
@@ -667,7 +667,7 @@ impl Parser {
         // SP34: `IN ( SELECT … )` is a subquery; otherwise a value list.
         if matches!(
             self.peek(),
-            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+            Token::Keyword(Keyword::Select | Keyword::Values | Keyword::With)
         ) {
             let subquery = self.query_expr_after_open_paren()?;
             return Ok(Expr::InSubquery {
@@ -1371,24 +1371,33 @@ impl Parser {
     }
 
     fn query_expr(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
+        let with = self.parse_with_clause()?;
         if *self.peek() == Token::LParen {
             let q = self.parenthesized_query_expr()?;
             if self.peek_is_set_op() {
                 let left = self.query_expr_as_set_branch(q)?;
                 let body = self.set_expr_rest(left, 0)?;
                 let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
-                return self.finish_query_expr(body, order_by, limit, offset, locking);
+                let mut q = self.finish_query_expr(body, order_by, limit, offset, locking)?;
+                q.with = with;
+                return Ok(q);
             }
             if !self.query_tail_or_locking_starts() {
+                let mut q = q;
+                q.with = with;
                 return Ok(q);
             }
             let body = self.query_expr_as_outer_primary(q);
             let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
-            return self.finish_query_expr(body, order_by, limit, offset, locking);
+            let mut q = self.finish_query_expr(body, order_by, limit, offset, locking)?;
+            q.with = with;
+            return Ok(q);
         }
         let body = self.set_expr(0)?;
         let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
-        self.finish_query_expr(body, order_by, limit, offset, locking)
+        let mut q = self.finish_query_expr(body, order_by, limit, offset, locking)?;
+        q.with = with;
+        Ok(q)
     }
 
     fn parse_query_tail_and_locking(&mut self) -> Result<QueryTailAndLocking, ParseError> {
@@ -1402,7 +1411,8 @@ impl Parser {
         q: crate::ast::QueryExpr,
     ) -> Result<crate::ast::SetExpr, ParseError> {
         use crate::ast::{QueryBody, SetExpr};
-        let has_tail = !q.order_by.is_empty()
+        let has_tail = q.with.is_some()
+            || !q.order_by.is_empty()
             || q.limit.is_some()
             || q.offset.is_some()
             || q.locking.is_some();
@@ -1424,6 +1434,7 @@ impl Parser {
             }
             body => Ok(SetExpr::Query(QueryBody::Nested(Box::new(
                 crate::ast::QueryExpr {
+                    with: q.with,
                     body,
                     order_by: q.order_by,
                     limit: q.limit,
@@ -1436,7 +1447,8 @@ impl Parser {
 
     fn query_expr_as_outer_primary(&self, q: crate::ast::QueryExpr) -> crate::ast::SetExpr {
         use crate::ast::{QueryBody, SetExpr};
-        let has_tail = !q.order_by.is_empty()
+        let has_tail = q.with.is_some()
+            || !q.order_by.is_empty()
             || q.limit.is_some()
             || q.offset.is_some()
             || q.locking.is_some();
@@ -1480,6 +1492,7 @@ impl Parser {
             }
         }
         Ok(QueryExpr {
+            with: None,
             body,
             order_by,
             limit,
@@ -1500,6 +1513,53 @@ impl Parser {
             self.peek(),
             Token::Keyword(Keyword::Order | Keyword::Limit | Keyword::Offset | Keyword::For)
         )
+    }
+
+    fn parse_with_clause(&mut self) -> Result<Option<crate::ast::WithClause>, ParseError> {
+        use crate::ast::{Cte, WithClause};
+        if !self.eat_keyword(Keyword::With) {
+            return Ok(None);
+        }
+        let recursive = self.eat_keyword(Keyword::Recursive);
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            if ctes.iter().any(|c: &Cte| c.name == name) {
+                return Err(ParseError::new_sqlstate(
+                    "42712",
+                    format!("table name \"{name}\" specified more than once"),
+                    self.peek_pos(),
+                ));
+            }
+            let columns = if *self.peek() == Token::LParen {
+                self.bump();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.expect_ident()?);
+                    if self.eat_comma() {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(&Token::RParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+            self.expect(&Token::Keyword(Keyword::As))?;
+            self.expect(&Token::LParen)?;
+            let query = self.query_expr()?;
+            self.expect(&Token::RParen)?;
+            ctes.push(Cte {
+                name,
+                columns,
+                query,
+            });
+            if !self.eat_comma() {
+                break;
+            }
+        }
+        Ok(Some(WithClause { recursive, ctes }))
     }
 
     /// Precedence-climbing set-op tree. INTERSECT = 2, UNION/EXCEPT = 1; all
@@ -1563,16 +1623,23 @@ impl Parser {
     }
 
     fn query_expr_after_open_paren(&mut self) -> Result<crate::ast::QueryExpr, ParseError> {
+        let with = self.parse_with_clause()?;
         let body = self.set_expr(0)?;
         let (order_by, limit, offset, locking) = self.parse_query_tail_and_locking()?;
         self.expect(&Token::RParen)?;
-        self.finish_query_expr(body, order_by, limit, offset, locking)
+        let mut q = self.finish_query_expr(body, order_by, limit, offset, locking)?;
+        q.with = with;
+        Ok(q)
     }
 
     fn set_primary(&mut self) -> Result<crate::ast::SetExpr, ParseError> {
         use crate::ast::{QueryBody, SetExpr};
         if *self.peek() == Token::LParen {
             self.bump(); // (
+            if matches!(self.peek(), Token::Keyword(Keyword::With)) {
+                let query = self.query_expr_after_open_paren()?;
+                return Ok(self.query_expr_as_outer_primary(query));
+            }
             let inner = self.set_expr(0)?;
             let inner = self.attach_paren_tail(inner)?;
             self.expect(&Token::RParen)?;
@@ -1613,6 +1680,7 @@ impl Parser {
             body => {
                 let (order_by, limit, offset) = self.parse_set_tail()?;
                 Ok(SetExpr::Query(QueryBody::Nested(Box::new(QueryExpr {
+                    with: None,
                     body,
                     order_by,
                     limit,
@@ -1718,7 +1786,10 @@ impl Parser {
     fn starts_query_expr(&self) -> bool {
         matches!(
             self.peek(),
-            Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values) | Token::LParen
+            Token::Keyword(Keyword::Select)
+                | Token::Keyword(Keyword::Values)
+                | Token::Keyword(Keyword::With)
+                | Token::LParen
         )
     }
 
@@ -1730,7 +1801,7 @@ impl Parser {
             self.bump();
             if matches!(
                 self.peek(),
-                Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::Values)
+                Token::Keyword(Keyword::Select | Keyword::Values | Keyword::With)
             ) {
                 let subquery = self.query_expr_after_open_paren()?;
                 let alias = self.opt_alias()?.ok_or_else(|| {
@@ -3696,6 +3767,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_with_in_nested_select_subquery_positions() {
+        use crate::ast::{QueryBody, SetExpr, TableExpr};
+
+        let sel = only_select("SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT * FROM c) AS d");
+        let TableExpr::Derived { subquery, .. } = &sel.from[0] else {
+            panic!("expected derived table");
+        };
+        assert!(subquery.with.is_some());
+        let SetExpr::Query(QueryBody::Select(_)) = &subquery.body else {
+            panic!("expected SELECT derived table");
+        };
+
+        match expr("(WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::ScalarSubquery(s) => assert!(s.with.is_some()),
+            other => panic!("expected scalar subquery, got {other:?}"),
+        }
+        match expr("EXISTS (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::Exists(s) => assert!(s.with.is_some()),
+            other => panic!("expected EXISTS, got {other:?}"),
+        }
+        match expr("1 IN (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::InSubquery { subquery, .. } => assert!(subquery.with.is_some()),
+            other => panic!("expected IN subquery, got {other:?}"),
+        }
+        match expr("1 = ANY (WITH c AS (SELECT 1 AS x) SELECT x FROM c)") {
+            Expr::Quantified { subquery, .. } => assert!(subquery.with.is_some()),
+            other => panic!("expected quantified subquery, got {other:?}"),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Recursion-depth guard (54001 / statement_too_complex).
     //
@@ -4017,6 +4119,57 @@ mod tests {
             panic!("expected SetOp")
         };
         assert!(!*all, "UNION DISTINCT is the dedup (all == false) form");
+    }
+
+    #[test]
+    fn parses_with_select_values_and_setop_bodies() {
+        use crate::ast::{QueryBody, SetExpr};
+
+        let q = only_query("WITH a AS (SELECT 1 AS x), b(y) AS (VALUES (2)) SELECT x FROM a");
+        let with = q.with.as_ref().expect("with clause");
+        assert!(!with.recursive);
+        assert_eq!(with.ctes.len(), 2);
+        assert_eq!(with.ctes[0].name, "a");
+        assert!(with.ctes[0].columns.is_none());
+        assert_eq!(with.ctes[1].name, "b");
+        assert_eq!(
+            with.ctes[1].columns.as_deref(),
+            Some(&["y".to_string()][..])
+        );
+        assert!(matches!(
+            with.ctes[0].query.body,
+            SetExpr::Query(QueryBody::Select(_))
+        ));
+        assert!(matches!(
+            with.ctes[1].query.body,
+            SetExpr::Query(QueryBody::Values(_))
+        ));
+
+        let q = only_query("WITH u AS (SELECT 1 UNION SELECT 2) SELECT * FROM u");
+        assert!(matches!(
+            q.with.as_ref().expect("with").ctes[0].query.body,
+            SetExpr::SetOp { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_with_recursive_and_rejects_duplicate_cte_names() {
+        let q = only_query("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r");
+        assert!(q.with.as_ref().expect("with").recursive);
+
+        let err = parse("WITH a AS (SELECT 1), a AS (SELECT 2) SELECT * FROM a")
+            .expect_err("duplicate CTE names rejected during parse");
+        assert_eq!(err.sqlstate(), "42712");
+    }
+
+    #[test]
+    fn duplicate_cte_names_follow_identifier_normalization() {
+        let err = parse("WITH a AS (SELECT 1), A AS (SELECT 2) SELECT * FROM a")
+            .expect_err("unquoted identifiers normalize before duplicate CTE check");
+        assert_eq!(err.sqlstate(), "42712");
+
+        parse("WITH \"A\" AS (SELECT 1), a AS (SELECT 2) SELECT * FROM a")
+            .expect("quoted case-distinct CTE names are parser-distinct");
     }
 
     // SP40: FDW DDL tests

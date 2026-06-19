@@ -24,6 +24,47 @@ pub(crate) fn values_to_relation(
     values_to_relation_with_schema(v, ctx, schema)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn values_to_relation_with_ctes(
+    catalog_kv: &dyn kv::Kv,
+    kv: &dyn kv::Kv,
+    global: &dyn kv::Kv,
+    gsnap: &mvcc::visibility::Snapshot,
+    snapshot: &mvcc::visibility::Snapshot,
+    own: Option<u64>,
+    v: &ValuesStmt,
+    ctes: &crate::cte::CteContext,
+    ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
+) -> Result<crate::join::Relation, ExecError> {
+    let sub_ctx = crate::subquery::SubCtx {
+        catalog_kv,
+        kv,
+        global,
+        gsnap,
+        snapshot,
+        own,
+        ctes,
+        eval_ctx: ctx,
+        fctx,
+    };
+    let resolved = crate::subquery::resolve_in_values(&sub_ctx, v)?;
+    values_to_relation(&resolved, ctx)
+}
+
+pub(crate) fn values_schema_relation_with_ctes(
+    catalog_kv: &dyn kv::Kv,
+    v: &ValuesStmt,
+    ctes: &crate::cte::CteContext,
+) -> Result<crate::join::Relation, ExecError> {
+    let resolved = crate::subquery::resolve_types_in_values_with_ctes(catalog_kv, v, ctes)?;
+    let schema = describe_values(&resolved)?;
+    Ok(crate::join::Relation {
+        scope: scope_from_schema(&schema, None),
+        rows: Vec::new(),
+    })
+}
+
 fn values_to_relation_with_schema(
     v: &ValuesStmt,
     ctx: &EvalCtx,
