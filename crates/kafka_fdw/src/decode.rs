@@ -3,10 +3,46 @@
 //! DynamicMessage.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crabka_schema_serde::SchemaCache;
+use crabka_schema_serde::{SchemaCache, SchemaSerdeError};
 
 use crate::error::KafkaFdwError;
+
+/// Total time the cold-cache schema fetch is allowed to take before giving up.
+const SCHEMA_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll cadence while waiting for the background schema fetch to populate the
+/// cache.
+const SCHEMA_FETCH_POLL: Duration = Duration::from_millis(20);
+
+/// Resolve a writer schema by id, awaiting the cache's background fetch.
+///
+/// [`SchemaCache::writer_schema`] is a *synchronous hot-path read*: on a cold
+/// miss it spawns a background fetch and immediately returns
+/// [`SchemaSerdeError::WriterSchemaPending`]. The FDW decode path runs inside
+/// an async scan, so we retry with a bounded backoff until the background
+/// fetch populates the cache (or [`SCHEMA_FETCH_TIMEOUT`] elapses). Any other
+/// error is returned immediately.
+async fn resolve_writer_schema(
+    cache: &Arc<SchemaCache>,
+    schema_id: u32,
+) -> Result<String, KafkaFdwError> {
+    let deadline = tokio::time::Instant::now() + SCHEMA_FETCH_TIMEOUT;
+    loop {
+        match cache.writer_schema(schema_id) {
+            Ok(text) => return Ok(text),
+            Err(SchemaSerdeError::WriterSchemaPending(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(KafkaFdwError::Other(format!(
+                        "schema registry: writer schema for id {schema_id} not fetched within {SCHEMA_FETCH_TIMEOUT:?}"
+                    )));
+                }
+                tokio::time::sleep(SCHEMA_FETCH_POLL).await;
+            }
+            Err(e) => return Err(KafkaFdwError::Other(format!("schema registry: {e}"))),
+        }
+    }
+}
 
 /// Wire format declared in the foreign table OPTIONS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +103,7 @@ pub async fn decode_value(
                 .map_err(|e| KafkaFdwError::Other(format!("avro wire decode: {e}")))?;
 
             // Fetch (or await) the writer schema by id.
-            let schema_text = cache
-                .writer_schema(schema_id)
-                .map_err(|e| KafkaFdwError::Other(format!("schema registry: {e}")))?;
+            let schema_text = resolve_writer_schema(cache, schema_id).await?;
 
             let schema = apache_avro::Schema::parse_str(&schema_text)
                 .map_err(|e| KafkaFdwError::Other(format!("avro schema parse: {e}")))?;
@@ -98,9 +132,7 @@ pub async fn decode_value(
 
             // Fetch the schema text (a base64-encoded serialised FileDescriptorSet)
             // from the registry by id.
-            let schema_text = cache
-                .writer_schema(schema_id)
-                .map_err(|e| KafkaFdwError::Other(format!("schema registry: {e}")))?;
+            let schema_text = resolve_writer_schema(cache, schema_id).await?;
 
             // The Confluent Schema Registry stores the Protobuf schema as the raw
             // `.proto` source text, NOT as binary FileDescriptorSet bytes.

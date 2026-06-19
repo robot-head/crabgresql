@@ -1334,7 +1334,7 @@ mod tests {
 
         use crate::clock::EvalCtx;
         use crate::error::ExecError;
-        use crate::foreign::{ForeignScanner, ImportFilter, ScanBounds};
+        use crate::foreign::{ForeignScanner, ImportFilter, ImportedTable, ScanBounds};
 
         /// Returns two canned tables; records the filter it was handed.
         struct FakeImporter;
@@ -1355,27 +1355,35 @@ mod tests {
                 _server: &ForeignServer,
                 _mapping: Option<&UserMapping>,
                 filter: &ImportFilter,
-            ) -> Result<Vec<(String, Vec<Column>)>, ExecError> {
+            ) -> Result<Vec<ImportedTable>, ExecError> {
                 // Honor the filter so the test can assert LIMIT TO works end-to-end.
                 let all = vec![
-                    (
-                        "orders".to_string(),
-                        vec![Column {
+                    ImportedTable {
+                        name: "orders".to_string(),
+                        columns: vec![Column {
                             name: "id".to_string(),
                             ty: ColumnType::Int8,
                         }],
-                    ),
-                    (
-                        "payments".to_string(),
-                        vec![Column {
+                        options: vec![
+                            ("topic".to_string(), "orders".to_string()),
+                            ("value_format".to_string(), "raw".to_string()),
+                        ],
+                    },
+                    ImportedTable {
+                        name: "payments".to_string(),
+                        columns: vec![Column {
                             name: "amount".to_string(),
                             ty: ColumnType::Float8,
                         }],
-                    ),
+                        options: vec![
+                            ("topic".to_string(), "payments".to_string()),
+                            ("value_format".to_string(), "raw".to_string()),
+                        ],
+                    },
                 ];
                 Ok(all
                     .into_iter()
-                    .filter(|(name, _)| filter.retains(name))
+                    .filter(|t| filter.retains(&t.name))
                     .collect())
             }
         }

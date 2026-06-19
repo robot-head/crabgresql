@@ -192,13 +192,13 @@ pub(crate) fn execute_ddl(
             })?;
             let filter = crate::foreign::ImportFilter::from_selector(selector);
             let tables = scanner.import_schema(&srv, mapping.as_ref(), &filter)?;
-            for (name, value_columns) in tables {
+            for table in tables {
                 catalog::create_foreign_table(
                     kv,
-                    &name,
-                    value_columns,
+                    &table.name,
+                    table.columns,
                     &srv.name,
-                    vec![("topic".to_string(), name.clone())],
+                    table.options,
                 )?;
             }
             Ok((command("IMPORT FOREIGN SCHEMA"), Vec::new()))
@@ -3079,7 +3079,7 @@ mod tests {
     mod pushdown {
         use std::sync::{Arc, Mutex};
 
-        use catalog::{Column, ForeignServer, Table, UserMapping};
+        use catalog::{ForeignServer, Table, UserMapping};
         use pgtypes::Datum;
         use pgwire::engine::{Engine, QueryResult, Session};
 
@@ -3206,7 +3206,7 @@ mod tests {
                 _server: &ForeignServer,
                 _mapping: Option<&UserMapping>,
                 _filter: &ImportFilter,
-            ) -> Result<Vec<(String, Vec<Column>)>, ExecError> {
+            ) -> Result<Vec<crate::foreign::ImportedTable>, ExecError> {
                 Ok(Vec::new())
             }
         }

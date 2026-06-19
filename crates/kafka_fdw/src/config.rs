@@ -106,6 +106,63 @@ pub fn resolve(
     })
 }
 
+/// Server-level connection info, resolved without a per-table `topic`.
+///
+/// `IMPORT FOREIGN SCHEMA` has no table OPTIONS to supply a `topic` — it
+/// *discovers* topics — so it resolves only the bootstrap + registry +
+/// security from the [`catalog::ForeignServer`] / [`catalog::UserMapping`].
+#[derive(Debug)]
+pub struct ServerProfile {
+    /// Bootstrap broker addresses, e.g. `["h1:9092", "h2:9092"]`.
+    pub bootstrap: Vec<String>,
+    /// Schema registry URL (empty string when not configured).
+    pub registry_url: String,
+    /// TLS/SASL security settings; `None` for plain PLAINTEXT with no auth.
+    pub security: Option<ClientSecurity>,
+}
+
+/// Resolve a [`catalog::ForeignServer`] (+ optional [`catalog::UserMapping`])
+/// into the connection-level [`ServerProfile`], **without** requiring a
+/// `topic`. Used by the `IMPORT FOREIGN SCHEMA` path.
+///
+/// # Errors
+/// Returns [`KafkaFdwError::Config`] when `bootstrap` is missing, the
+/// `security_protocol` is unrecognised, or SASL credentials are required but
+/// absent.
+pub fn resolve_server(
+    server: &catalog::ForeignServer,
+    mapping: Option<&catalog::UserMapping>,
+) -> Result<ServerProfile, KafkaFdwError> {
+    let server_opt = |key: &str| -> Option<&str> {
+        server
+            .options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+
+    let bootstrap_raw = server_opt("bootstrap")
+        .ok_or_else(|| KafkaFdwError::Config("missing required option: bootstrap".to_string()))?;
+    let bootstrap: Vec<String> = bootstrap_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let registry_url = server_opt("registry_url").unwrap_or("").to_string();
+
+    let protocol_str = server_opt("security_protocol").unwrap_or("PLAINTEXT");
+    let protocol = parse_listener_protocol(protocol_str)?;
+    let mapping_options: &[(String, String)] = mapping.map_or(&[], |m| m.options.as_slice());
+    let security = build_security(protocol, &bootstrap, mapping_options)?;
+
+    Ok(ServerProfile {
+        bootstrap,
+        registry_url,
+        security,
+    })
+}
+
 fn parse_wire(s: &str) -> Result<Wire, KafkaFdwError> {
     match s {
         "raw" => Ok(Wire::Raw),

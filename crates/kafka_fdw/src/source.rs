@@ -8,7 +8,7 @@
 //!   bounds)` → [`FetchPlan`]; it is unit-tested independently of any broker.
 
 use crabka_client_admin::AdminClient;
-use crabka_client_core::{Client, fetch_partition_with_isolation};
+use crabka_client_core::{Connection, fetch_partition_with_isolation};
 use crabka_protocol::owned::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
@@ -36,10 +36,11 @@ pub struct RawRecord {
     /// Record headers as (key, optional-value) pairs.
     ///
     /// **Note:** the raw `Fetch` response (v2 `RecordBatch`) does carry
-    /// per-record headers; `crabka_client_core::FetchedRecord` does not
-    /// yet expose them. `headers` is always empty in the current
-    /// implementation — Task 16 can refine once `FetchedRecord` is
-    /// extended or replaced.
+    /// per-record headers, but `crabka_client_core::FetchedRecord` (the item
+    /// type returned by `fetch_partition_with_isolation`) only exposes
+    /// `offset`, `key`, `value`, and `timestamp` — it has no `headers` field.
+    /// Until the client-core helper is extended to surface them, `headers` is
+    /// always empty here. We deliberately do not fabricate them.
     pub headers: Vec<(String, Option<Vec<u8>>)>,
 }
 
@@ -135,12 +136,15 @@ const PARTITION_MAX_BYTES: i32 = 10 * 1024 * 1024; // 10 MiB
 /// # Behaviour
 /// 1. Installs the rustcrypto TLS provider (idempotent).
 /// 2. Resolves partition metadata via `AdminClient`.
-/// 3. For each partition (filtered by `bounds.start_offsets`/`end_offsets` when
-///    non-empty), sends a `ListOffsets` RPC to obtain the earliest retained
+/// 3. Opens a **single** [`Connection`] to the first bootstrap address and
+///    reuses it for both the `ListOffsets` RPCs and the per-partition fetch
+///    loop — no second connect, no `Client`/`ApiVersionsRequest` probe.
+/// 4. For each partition (filtered by `bounds.start_offsets`/`end_offsets` when
+///    non-empty), the batched `ListOffsets` RPCs supply the earliest retained
 ///    offset and the current high-water mark.
-/// 4. Computes a [`FetchPlan`] per partition and loops
+/// 5. Computes a [`FetchPlan`] per partition and loops
 ///    `fetch_partition_with_isolation` until the plan is exhausted.
-/// 5. Returns all records in (partition, offset) order.
+/// 6. Returns all records in (partition, offset) order.
 ///
 /// The broker-backed path is exercised end-to-end in Task 16 (in-process
 /// broker).  The pure [`plan_fetch`] tests are the gate here.
@@ -214,16 +218,8 @@ pub async fn scan_topic(
         return Ok(Vec::new());
     }
 
-    // Step 3: build a fetch client (shared connection for ListOffsets + Fetch).
-    let bootstrap_str = profile.bootstrap.first().cloned().unwrap_or_default();
-
-    let client = Client::builder()
-        .bootstrap(bootstrap_str)
-        .client_id("crabka-fdw")
-        .maybe_security(profile.security.clone())
-        .build()
-        .await
-        .map_err(|e| KafkaFdwError::Other(format!("client connect: {e}")))?;
+    // Step 3: open ONE connection and reuse it for ListOffsets + Fetch.
+    let conn = open_connection(profile).await?;
 
     // Step 4: ListOffsets — batch earliest + HWM for all partitions in one RPC.
     let list_offsets_req_earliest = ListOffsetsRequest {
@@ -262,12 +258,12 @@ pub async fn scan_topic(
         ..Default::default()
     };
 
-    let earliest_resp = client
+    let earliest_resp = conn
         .send(list_offsets_req_earliest)
         .await
         .map_err(|e| KafkaFdwError::Other(format!("ListOffsets(earliest): {e}")))?;
 
-    let latest_resp = client
+    let latest_resp = conn
         .send(list_offsets_req_latest)
         .await
         .map_err(|e| KafkaFdwError::Other(format!("ListOffsets(latest): {e}")))?;
@@ -295,37 +291,7 @@ pub async fn scan_topic(
         }
     }
 
-    // Step 5: fetch loop per partition.
-    let bootstrap_conn = client
-        .send(crabka_protocol::owned::api_versions_request::ApiVersionsRequest::default())
-        .await
-        .map_err(|e| KafkaFdwError::Other(format!("api versions probe: {e}")))?;
-    // We don't actually need the api_versions response — we just needed a way
-    // to get the raw Connection out of the Client.  Unfortunately Client
-    // doesn't expose its Connection directly.  Use the fetch helper that
-    // accepts a &Client ... but fetch_partition_with_isolation takes &Connection.
-    //
-    // WORKAROUND: Re-use the crabka_client_core::Connection by creating a
-    // fresh AdminClient connection whose `.conn` is `pub(crate)` — not
-    // accessible here.  Instead, we use `fetch_partition_with_isolation` via
-    // a `Connection` obtained from `crabka_client_core::Client`'s pool
-    // bootstrap accessor — but that is also not public.
-    //
-    // PUBLIC API GAP (Task 16): `fetch_partition_with_isolation` requires a
-    // `&Connection`, but `Client` does not expose its bootstrap `Connection`.
-    // Resolution options:
-    //   a) crabka-client-core adds a `fetch_partition` method on `Client` (preferred).
-    //   b) kafka_fdw calls `Connection::connect_with_options` directly and
-    //      manages its own connection.
-    //   c) `Client` exposes `bootstrap_connection() -> &Connection` as pub.
-    //
-    // For now we use option (b): open a dedicated `Connection` directly.
-    drop(bootstrap_conn);
-    drop(client);
-
-    // Open a Connection directly for the fetch loop.
-    let conn = open_connection(profile).await?;
-
+    // Step 5: fetch loop per partition, over the same `conn` used above.
     let mut records: Vec<RawRecord> = Vec::new();
 
     for partition in &partitions {
@@ -389,9 +355,9 @@ pub async fn scan_topic(
                     timestamp_ms: fr.timestamp,
                     key: fr.key.map(|b| b.to_vec()),
                     value: fr.value.map(|b| b.to_vec()),
-                    // FetchedRecord does not expose per-record headers yet;
-                    // they will be populated in Task 16 once the fetch helper
-                    // is extended or replaced.
+                    // `FetchedRecord` exposes no `headers` field, so we cannot
+                    // populate per-record headers here without fabricating them.
+                    // Left empty by design; see `RawRecord::headers`.
                     headers: Vec::new(),
                 });
 
@@ -414,15 +380,14 @@ pub async fn scan_topic(
     Ok(records)
 }
 
-/// Open a raw `crabka_client_core::Connection` to the first bootstrap address.
+/// Open a single raw [`Connection`] to the first bootstrap address.
 ///
-/// This is the workaround for the `Client`/`Connection` gap documented in
-/// [`scan_topic`]: `fetch_partition_with_isolation` needs a `&Connection` but
-/// `Client` does not expose one publicly.  A direct `Connection` avoids
-/// duplicating the fetch-loop logic.
-async fn open_connection(
-    profile: &ConnProfile,
-) -> Result<crabka_client_core::Connection, KafkaFdwError> {
+/// `fetch_partition_with_isolation` requires a `&Connection`, and `Connection`
+/// also serves the `ListOffsets` RPCs via [`Connection::send`], so one
+/// connection covers the whole scan. (`Client` exposes neither a fetch method
+/// nor its underlying `Connection`, so there is nothing to be gained by also
+/// building a `Client`.)
+async fn open_connection(profile: &ConnProfile) -> Result<Connection, KafkaFdwError> {
     let host_port = profile.bootstrap.first().ok_or_else(|| {
         KafkaFdwError::Config("no bootstrap address in connection profile".to_string())
     })?;

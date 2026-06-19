@@ -242,7 +242,8 @@ use pgtypes::Datum;
 /// table's column layout (envelope columns first, then value columns). Records the
 /// last server/mapping it was handed so a test can assert they were resolved.
 /// `import_tables` are the canned `(name, value_columns)` pairs IMPORT FOREIGN
-/// SCHEMA materializes (after the requested filter is applied).
+/// SCHEMA materializes (after the requested filter is applied); the FakeScanner
+/// supplies the standard `topic`/`value_format=raw` OPTIONS for each.
 struct FakeScanner {
     rows: Vec<Vec<Datum>>,
     import_tables: Vec<(String, Vec<catalog::Column>)>,
@@ -273,12 +274,19 @@ impl ForeignScanner for FakeScanner {
         _server: &ForeignServer,
         _mapping: Option<&UserMapping>,
         filter: &executor::foreign::ImportFilter,
-    ) -> Result<Vec<(String, Vec<catalog::Column>)>, ExecError> {
+    ) -> Result<Vec<executor::foreign::ImportedTable>, ExecError> {
         Ok(self
             .import_tables
             .iter()
             .filter(|(name, _)| filter.retains(name))
-            .cloned()
+            .map(|(name, columns)| executor::foreign::ImportedTable {
+                name: name.clone(),
+                columns: columns.clone(),
+                options: vec![
+                    ("topic".to_string(), name.clone()),
+                    ("value_format".to_string(), "raw".to_string()),
+                ],
+            })
             .collect())
     }
 }

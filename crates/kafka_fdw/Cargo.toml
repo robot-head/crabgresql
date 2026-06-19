@@ -34,3 +34,19 @@ prost-reflect = { workspace = true, optional = true }
 
 [dev-dependencies]
 protox = "0.9"
+# In-process round-trip test (kafka feature): broker + registry + producer +
+# pgwire client. Dev-deps are exempt from the workspace zero-C boundary.
+crabka-broker = "0.3"
+crabka-schema-registry = "0.3"
+crabka-client-producer = "0.3"
+crabka-client-consumer = "0.3"
+crabka-protocol = "0.3"
+crabka-client-core = "0.3"
+crabka-schema-serde = { version = "0.3", features = ["avro", "json"] }
+apache-avro = "0.21"
+pgwire = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = { workspace = true }
+bytes = { workspace = true }
+serde_json = "1"

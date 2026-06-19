@@ -93,19 +93,35 @@ pub trait ForeignScanner: Send + Sync {
 
     /// Enumerate the importable tables for `IMPORT FOREIGN SCHEMA`.
     ///
-    /// Returns one `(table_name, value_columns)` pair per table the server
-    /// exposes that survives `filter` — the `value_columns` are the decoded
-    /// value-schema columns ONLY (the executor's [`catalog::create_foreign_table`]
-    /// prepends the envelope columns). The Kafka FDW enumerates every topic and
-    /// derives `value_columns` from the topic's Schema Registry `"<topic>-value"`
-    /// subject, falling back to a single raw `value bytea` column when no subject
-    /// is registered.
+    /// Returns one [`ImportedTable`] per table the server exposes that survives
+    /// `filter`. Each carries the decoded value-schema columns (the executor's
+    /// [`catalog::create_foreign_table`] prepends the envelope columns) AND the
+    /// table OPTIONS the executor must persist so a later `scan` decodes
+    /// consistently — crucially the `value_format`, which must match the
+    /// schema the columns were derived from. The Kafka FDW enumerates every
+    /// topic and derives `value_columns` from the topic's Schema Registry
+    /// `"<topic>-value"` subject, falling back to a single raw `value bytea`
+    /// column (and `value_format=raw`) when no subject is registered.
     fn import_schema(
         &self,
         server: &ForeignServer,
         mapping: Option<&UserMapping>,
         filter: &ImportFilter,
-    ) -> Result<Vec<(String, Vec<Column>)>, ExecError>;
+    ) -> Result<Vec<ImportedTable>, ExecError>;
+}
+
+/// One table materialized by `IMPORT FOREIGN SCHEMA`: its name, its decoded
+/// value columns (envelope columns are prepended by the executor), and the
+/// table OPTIONS to persist (e.g. `topic`, `value_format`) so a subsequent
+/// `scan` decodes the value bytes the same way the import derived the columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTable {
+    /// The foreign table (and Kafka topic) name.
+    pub name: String,
+    /// The value-schema columns ONLY (no envelope columns).
+    pub columns: Vec<Column>,
+    /// Table OPTIONS to store on the created foreign table.
+    pub options: Vec<(String, String)>,
 }
 
 #[cfg(test)]
