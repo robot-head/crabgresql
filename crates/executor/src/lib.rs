@@ -12,6 +12,7 @@ mod datetime_fn;
 mod error;
 mod eval;
 mod exec;
+pub mod foreign;
 mod format_fn;
 mod func;
 mod gtm;
@@ -87,6 +88,10 @@ pub struct SqlEngine {
     /// later, `now()`/`current_timestamp`). `SystemClock` in production; tests
     /// inject a `FixedClock` via `with_clock` for deterministic temporal eval.
     pub(crate) clock: Arc<dyn crate::clock::Clock>,
+    /// SP40: the foreign-table scanner (the `kafka_fdw` seam). `None` until the
+    /// binary registers one via `set_foreign_scanner`; a `SELECT` from a foreign
+    /// table with no scanner registered returns `0A000`.
+    pub(crate) foreign_scanner: Option<Arc<dyn foreign::ForeignScanner>>,
 }
 
 impl Default for SqlEngine {
@@ -125,6 +130,7 @@ impl SqlEngine {
             gtm: None,
             range0_barrier: None,
             clock: Arc::new(crate::clock::SystemClock),
+            foreign_scanner: None,
         })
     }
 
@@ -158,6 +164,7 @@ impl SqlEngine {
             gtm: None,
             range0_barrier: None,
             clock: Arc::new(crate::clock::SystemClock),
+            foreign_scanner: None,
         })
     }
 
@@ -186,6 +193,7 @@ impl SqlEngine {
             gtm: self.gtm.as_ref().map(Arc::clone),
             range0_barrier: self.range0_barrier.as_ref().map(Arc::clone),
             clock: Arc::clone(&self.clock),
+            foreign_scanner: self.foreign_scanner.as_ref().map(Arc::clone),
         }
     }
 
@@ -193,6 +201,14 @@ impl SqlEngine {
     pub fn with_clock(mut self, clock: Arc<dyn crate::clock::Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// SP40: register the foreign-table scanner (the `kafka_fdw` seam). The binary
+    /// calls this once at startup; every `SqlSession` this engine `connect`s then
+    /// shares the same `Arc`. With no scanner registered, a `SELECT` from a foreign
+    /// table returns `0A000`.
+    pub fn set_foreign_scanner(&mut self, s: Arc<dyn foreign::ForeignScanner>) {
+        self.foreign_scanner = Some(s);
     }
 
     /// Open a GTM over this engine's `kv` (range 0's store) and make this engine
@@ -529,6 +545,7 @@ impl Engine for SqlEngine {
             self.gtm.as_ref().map(Arc::clone),
             self.range0_barrier.as_ref().map(Arc::clone),
             Arc::clone(&self.clock),
+            self.foreign_scanner.as_ref().map(Arc::clone),
         )
     }
 }

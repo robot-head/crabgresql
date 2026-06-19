@@ -1,5 +1,7 @@
 //! Per-statement execution.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use catalog::{Column, Table, TableId};
 use kv::Kv;
@@ -10,8 +12,33 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U64;
 
 use crate::error::ExecError;
+use crate::foreign::{ForeignScanner, ScanBounds};
 use crate::join::{Relation, join_relations};
 use crate::scope::{ColumnBinding, Scope};
+
+/// SP40: the foreign-table read context threaded through the SELECT pipeline. It
+/// carries the registered scanner (the `kafka_fdw` seam) and the current user (for
+/// resolving the per-user `UserMapping`). Bundled into one borrowed struct so the
+/// already-wide read signatures gain a single argument rather than two. Paths that
+/// never reach a registered scanner (`describe`, the schema-only build) use
+/// `ForeignCtx::none()`; a foreign `SELECT` with no scanner registered returns
+/// `0A000` ("foreign tables require the `kafka` feature").
+#[derive(Clone, Copy)]
+pub(crate) struct ForeignCtx<'a> {
+    pub scanner: Option<&'a Arc<dyn ForeignScanner>>,
+    pub current_user: &'a str,
+}
+
+impl ForeignCtx<'_> {
+    /// A context with no scanner and the conventional `"public"` user — for paths
+    /// that never reach a registered scanner (schema-only describe).
+    pub(crate) fn none() -> Self {
+        Self {
+            scanner: None,
+            current_user: "public",
+        }
+    }
+}
 
 /// Read a table's durable next-rowid (1 if unset). Single source of truth for
 /// the sequence read.
@@ -63,7 +90,102 @@ pub(crate) fn execute_ddl(
                 ops,
             ))
         }
+        // SP40 FDW DDL. The catalog's foreign-object CRUD writes its single small
+        // batch directly (it is not on the row-write hot path and has no ops-only
+        // variant), so these arms persist via the catalog and return an EMPTY ops
+        // vec — `run_ddl` then commits an empty batch (a no-op). The catalog
+        // validates existence/duplication and surfaces 42710 / 42704 / 42P07 / 42P01.
+        Statement::CreateFdw { name, options } => {
+            catalog::create_fdw(kv, name, options.clone())?;
+            Ok((command("CREATE FOREIGN DATA WRAPPER"), Vec::new()))
+        }
+        Statement::DropFdw { name, if_exists } => {
+            ignore_missing(catalog::drop_fdw(kv, name), *if_exists)?;
+            Ok((command("DROP FOREIGN DATA WRAPPER"), Vec::new()))
+        }
+        Statement::CreateServer {
+            name,
+            wrapper,
+            options,
+        } => {
+            catalog::create_server(kv, name, wrapper, options.clone())?;
+            Ok((command("CREATE SERVER"), Vec::new()))
+        }
+        Statement::DropServer { name, if_exists } => {
+            ignore_missing(catalog::drop_server(kv, name), *if_exists)?;
+            Ok((command("DROP SERVER"), Vec::new()))
+        }
+        Statement::CreateUserMapping {
+            user,
+            server,
+            options,
+        } => {
+            catalog::create_user_mapping(kv, user, server, options.clone())?;
+            Ok((command("CREATE USER MAPPING"), Vec::new()))
+        }
+        Statement::DropUserMapping {
+            user,
+            server,
+            if_exists,
+        } => {
+            ignore_missing(catalog::drop_user_mapping(kv, user, server), *if_exists)?;
+            Ok((command("DROP USER MAPPING"), Vec::new()))
+        }
+        Statement::CreateForeignTable {
+            name,
+            columns,
+            server,
+            options,
+        } => {
+            let cols = columns
+                .iter()
+                .map(|c| Column {
+                    name: c.name.clone(),
+                    ty: c.ty,
+                })
+                .collect();
+            catalog::create_foreign_table(kv, name, cols, server, options.clone())?;
+            Ok((command("CREATE FOREIGN TABLE"), Vec::new()))
+        }
+        Statement::DropForeignTable { name, if_exists } => {
+            // A foreign table shares the ordinary table catalog key, so `drop_table`
+            // removes it (catalog entry + sequence + any rows).
+            match catalog::drop_table(kv, name) {
+                Ok(()) => {}
+                Err(catalog::CatalogError::UndefinedTable(_)) if *if_exists => {}
+                Err(e) => return Err(e.into()),
+            }
+            Ok((command("DROP FOREIGN TABLE"), Vec::new()))
+        }
+        // The catalog has no ALTER for foreign objects, and phase-1 querying does
+        // not need one — surface a clear 0A000 rather than silently no-op'ing.
+        Statement::AlterServer { .. } => {
+            Err(ExecError::Unsupported("ALTER SERVER not supported".into()))
+        }
+        Statement::AlterUserMapping { .. } => Err(ExecError::Unsupported(
+            "ALTER USER MAPPING not supported".into(),
+        )),
+        // IMPORT FOREIGN SCHEMA's real logic (catalog inspection over the wire)
+        // lands in a later task; keep the match exhaustive + the build green.
+        Statement::ImportForeignSchema { .. } => Err(ExecError::Unsupported(
+            "IMPORT FOREIGN SCHEMA: implemented in a later task".into(),
+        )),
         _ => Err(ExecError::Unsupported("not a DDL statement".into())),
+    }
+}
+
+/// A `QueryResult::Command` with the given PostgreSQL completion tag.
+fn command(tag: &str) -> QueryResult {
+    QueryResult::Command { tag: tag.into() }
+}
+
+/// Swallow a `42704` (undefined object) when `IF EXISTS` was given; propagate
+/// every other error. Used by the foreign-object `DROP … IF EXISTS` arms.
+fn ignore_missing(r: Result<(), catalog::CatalogError>, if_exists: bool) -> Result<(), ExecError> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(catalog::CatalogError::UndefinedObject(_)) if if_exists => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -621,14 +743,17 @@ fn build_from(
     own: Option<u64>,
     from: &[pgparser::ast::TableExpr],
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<Relation, ExecError> {
     let mut iter = from.iter();
     let first = iter
         .next()
         .ok_or_else(|| ExecError::Unsupported("build_from on empty FROM".into()))?;
-    let mut acc = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, first, ctx)?;
+    let mut acc = build_table_expr(
+        catalog_kv, kv, global, gsnap, snapshot, own, first, ctx, fctx,
+    )?;
     for te in iter {
-        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctx)?;
+        let next = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, te, ctx, fctx)?;
         acc = join_relations(
             acc,
             next,
@@ -650,12 +775,30 @@ fn build_table_expr(
     own: Option<u64>,
     te: &pgparser::ast::TableExpr,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<Relation, ExecError> {
     use pgparser::ast::TableExpr;
     match te {
         TableExpr::Table { name, alias } => {
             let t = catalog::get_table(catalog_kv, name)?;
             let qualifier = alias.as_deref().unwrap_or(&t.name);
+            // SP40: a foreign table reads through the registered scanner, not the
+            // local MVCC version store. `build_from` materializes BEFORE WHERE, so
+            // this scan runs even for `WHERE false` — there is no skip path.
+            if let Some(meta) = &t.foreign {
+                let scanner = fctx.scanner.ok_or_else(|| {
+                    ExecError::Unsupported("foreign tables require the `kafka` feature".into())
+                })?;
+                let server = catalog::get_server(catalog_kv, &meta.server)?;
+                // A per-user mapping is optional: fall back to no credentials when
+                // the current user has none registered for this server.
+                let mapping =
+                    catalog::get_user_mapping(catalog_kv, fctx.current_user, &meta.server).ok();
+                let rows =
+                    scanner.scan(&t, &server, mapping.as_ref(), &ScanBounds::default(), ctx)?;
+                let scope = Scope::single(&t, qualifier);
+                return Ok(Relation { scope, rows });
+            }
             let scope = Scope::single(&t, qualifier);
             let rows = scan_live(kv, global, gsnap, snapshot, own, &t)?
                 .into_iter()
@@ -669,8 +812,12 @@ fn build_table_expr(
             kind,
             constraint,
         } => {
-            let l = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, left, ctx)?;
-            let r = build_table_expr(catalog_kv, kv, global, gsnap, snapshot, own, right, ctx)?;
+            let l = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, left, ctx, fctx,
+            )?;
+            let r = build_table_expr(
+                catalog_kv, kv, global, gsnap, snapshot, own, right, ctx, fctx,
+            )?;
             join_relations(l, r, *kind, constraint, ctx)
         }
         TableExpr::Derived {
@@ -679,7 +826,7 @@ fn build_table_expr(
             columns,
         } => {
             let inner = crate::query::query_to_relation(
-                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx,
+                catalog_kv, kv, global, gsnap, snapshot, own, subquery, ctx, fctx,
             )?;
             crate::values::requalify_derived(inner, alias, columns)
         }
@@ -700,6 +847,7 @@ pub(crate) fn select_to_relation(
     own: Option<u64>,
     s: &SelectStmt,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<Relation, ExecError> {
     // SP34: resolve this (sub)query's uncorrelated subquery expressions to constants
     // first, under the same snapshot handles. Nested subqueries recurse here.
@@ -711,6 +859,7 @@ pub(crate) fn select_to_relation(
         snapshot,
         own,
         eval_ctx: ctx,
+        fctx,
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;
@@ -720,7 +869,9 @@ pub(crate) fn select_to_relation(
             rows: vec![vec![]],
         }
     } else {
-        build_from(catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx)?
+        build_from(
+            catalog_kv, kv, global, gsnap, snapshot, own, &s.from, ctx, fctx,
+        )?
     };
     let mut kept = Vec::new();
     for row in &relation.rows {
@@ -844,12 +995,14 @@ pub(crate) fn execute_read(
     own: Option<u64>,
     stmt: &Statement,
     ctx: &crate::clock::EvalCtx,
+    fctx: ForeignCtx,
 ) -> Result<QueryResult, ExecError> {
     let Statement::Query(q) = stmt else {
         return Err(ExecError::Unsupported("not a query statement".into()));
     };
-    let rel =
-        crate::query::query_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, q, ctx)?;
+    let rel = crate::query::query_to_relation(
+        catalog_kv, kv, global, gsnap, snapshot, own, q, ctx, fctx,
+    )?;
     Ok(crate::query::relation_to_rows_result(rel, ctx))
 }
 
@@ -881,6 +1034,10 @@ pub(crate) async fn execute_read_locking(
         snapshot,
         own: Some(xid),
         eval_ctx: ctx,
+        // A locking SELECT only operates over local tables; a subquery referencing a
+        // foreign table here would surface the no-scanner error, which is acceptable
+        // (FOR UPDATE over Kafka is not a phase-1 path).
+        fctx: ForeignCtx::none(),
     };
     let resolved = crate::subquery::resolve_in_select(&sub_ctx, s)?;
     let s = &resolved;

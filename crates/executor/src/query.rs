@@ -18,6 +18,7 @@ pub(crate) fn query_to_relation(
     own: Option<u64>,
     q: &QueryExpr,
     ctx: &EvalCtx,
+    fctx: crate::exec::ForeignCtx,
 ) -> Result<Relation, ExecError> {
     let sub_ctx = crate::subquery::SubCtx {
         catalog_kv,
@@ -27,6 +28,7 @@ pub(crate) fn query_to_relation(
         snapshot,
         own,
         eval_ctx: ctx,
+        fctx,
     };
     match &q.body {
         SetExpr::Query(QueryBody::Select(s)) => {
@@ -40,7 +42,9 @@ pub(crate) fn query_to_relation(
             s.limit = q.limit;
             s.offset = q.offset;
             s.locking = q.locking;
-            crate::exec::select_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, &s, ctx)
+            crate::exec::select_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, &s, ctx, fctx,
+            )
         }
         SetExpr::Query(QueryBody::Values(v)) => {
             let mut rel = crate::values::values_to_relation(v, ctx)?;
@@ -54,8 +58,9 @@ pub(crate) fn query_to_relation(
                     "locking SELECT must use execute_read_locking".into(),
                 ));
             }
-            let mut rel =
-                query_to_relation(catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx)?;
+            let mut rel = query_to_relation(
+                catalog_kv, kv, global, gsnap, snapshot, own, nested, ctx, fctx,
+            )?;
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::values::apply_query_order(&mut rel, &order_by, q.offset, q.limit, ctx)?;
             Ok(rel)
@@ -64,7 +69,7 @@ pub(crate) fn query_to_relation(
             let order_by = crate::subquery::resolve_order_items(&sub_ctx, &q.order_by)?;
             crate::setops::set_expr_to_relation(
                 catalog_kv, kv, global, gsnap, snapshot, own, &q.body, &order_by, q.offset,
-                q.limit, ctx,
+                q.limit, ctx, fctx,
             )
         }
     }

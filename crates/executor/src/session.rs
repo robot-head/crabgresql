@@ -186,6 +186,10 @@ pub struct SqlSession {
     /// `EvalCtx`'s `time_zone`; `SET`/`SHOW`/`RESET timezone` mutate/read it, and
     /// COMMIT/ROLLBACK promote/revert it in lockstep with the transaction outcome.
     guc: GucState,
+    /// SP40: the foreign-table scanner (shared from the engine). `Some` when the
+    /// binary registered a `kafka_fdw` via `SqlEngine::set_foreign_scanner`; a
+    /// `SELECT` from a foreign table with this `None` returns `0A000`.
+    foreign_scanner: Option<Arc<dyn crate::foreign::ForeignScanner>>,
     state: TxnState,
 }
 
@@ -207,6 +211,7 @@ impl SqlSession {
         gtm: Option<Arc<crate::gtm::Gtm>>,
         range0_barrier: Option<Arc<dyn crate::read_gate::Linearizer>>,
         clock: Arc<dyn crate::clock::Clock>,
+        foreign_scanner: Option<Arc<dyn crate::foreign::ForeignScanner>>,
     ) -> Self {
         Self {
             kv,
@@ -223,6 +228,7 @@ impl SqlSession {
             global_xid: None,
             clock,
             guc: GucState::default(),
+            foreign_scanner,
             state: TxnState::Idle,
         }
     }
@@ -393,7 +399,22 @@ impl SqlSession {
             Statement::Begin { isolation } => self.begin(*isolation).await,
             Statement::Commit => self.commit_cmd().await,
             Statement::Rollback => self.rollback_cmd().await,
-            Statement::CreateTable { .. } | Statement::DropTable { .. } => self.run_ddl(stmt).await,
+            Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            // SP40: FDW DDL funnels through the same catalog-lock + execute_ddl + commit
+            // path as ordinary DDL. ALTER/IMPORT variants resolve to a clear 0A000 inside
+            // execute_ddl (not yet supported / deferred to a later task).
+            | Statement::CreateFdw { .. }
+            | Statement::DropFdw { .. }
+            | Statement::CreateServer { .. }
+            | Statement::AlterServer { .. }
+            | Statement::DropServer { .. }
+            | Statement::CreateUserMapping { .. }
+            | Statement::AlterUserMapping { .. }
+            | Statement::DropUserMapping { .. }
+            | Statement::CreateForeignTable { .. }
+            | Statement::DropForeignTable { .. }
+            | Statement::ImportForeignSchema { .. } => self.run_ddl(stmt).await,
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 self.run_write(stmt).await
             }
@@ -561,6 +582,12 @@ impl SqlSession {
     async fn run_select(&mut self, stmt: &Statement) -> Result<QueryResult, ExecError> {
         let (snapshot, own, gsnap) = self.read_context().await?;
         let ctx = self.eval_ctx();
+        // SP40: the session does not track an authenticated SQL user, so foreign-table
+        // user-mapping lookups resolve against the conventional `"public"` mapping.
+        let fctx = crate::exec::ForeignCtx {
+            scanner: self.foreign_scanner.as_ref(),
+            current_user: "public",
+        };
         crate::exec::execute_read(
             &*self.catalog_kv,
             &*self.kv,
@@ -570,6 +597,7 @@ impl SqlSession {
             own,
             stmt,
             &ctx,
+            fctx,
         )
     }
 
