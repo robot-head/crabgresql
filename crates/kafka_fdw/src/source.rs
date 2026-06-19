@@ -312,6 +312,14 @@ pub async fn scan_topic(
             if next_offset >= plan.stop {
                 break;
             }
+            // LATENT CROSS-PARTITION TRUNCATION: `plan.max_records` is compared
+            // against the CUMULATIVE `records.len()` across ALL partitions, not
+            // just the current one.  Today this is masked because pushdown emits
+            // at most one `_partition=N` anchor per query (so ≤1 partition has
+            // an end bound and `plan.stop` is the real guard), but if multi-
+            // partition pushdown is added, the first partition can consume the
+            // entire `max_records` budget and silently truncate later partitions.
+            // Fix before enabling multi-partition end_offsets pushdown.
             if let Some(max) = plan.max_records
                 && records.len() >= max
             {

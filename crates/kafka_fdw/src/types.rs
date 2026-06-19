@@ -296,27 +296,41 @@ fn avro_value_to_datum(value: &AvroValue, col_ty: ColumnType, decimal_scale: Opt
         AvroValue::String(s) => Datum::Text(s.clone()),
 
         // Logical date: i32 days since the Unix epoch (1970-01-01).
+        //
+        // A malicious or buggy producer can send an `int` value that overflows
+        // jiff's representable range when added to the epoch.  Fall back to
+        // `Datum::Null` rather than panicking — unrepresentable values are
+        // NULL in phase-1; correctness for in-range values is unchanged.
+        //
+        // NOTE: `jiff::Span::new().days(n)` panics for |n| > 7304484, so we
+        // must NOT pass the raw i32 to Span; instead convert to seconds first
+        // (i64 arithmetic is safe for all i32 values) and use SignedDuration
+        // so that out-of-range values produce an Err via checked_add.
         AvroValue::Date(days) => {
-            let span = jiff::Span::new().days(*days);
-            let date = unix_epoch_date()
-                .checked_add(span)
-                .expect("avro Date value in jiff range");
-            Datum::Date(date)
+            let secs = i64::from(*days) * 86_400;
+            let dur = jiff::SignedDuration::from_secs(secs);
+            match unix_epoch_date().checked_add(dur) {
+                Ok(date) => Datum::Date(date),
+                Err(_) => Datum::Null,
+            }
         }
 
         // Logical timestamp-millis: i64 milliseconds since Unix epoch → Timestamptz.
-        AvroValue::TimestampMillis(ms) => {
-            let ts = jiff::Timestamp::from_millisecond(*ms)
-                .expect("avro TimestampMillis value in jiff range");
-            Datum::Timestamptz(ts)
-        }
+        //
+        // Same rationale as `Date`: an out-of-range value from an untrusted
+        // broker falls back to `Datum::Null` instead of panicking.
+        AvroValue::TimestampMillis(ms) => match jiff::Timestamp::from_millisecond(*ms) {
+            Ok(ts) => Datum::Timestamptz(ts),
+            Err(_) => Datum::Null,
+        },
 
         // Logical timestamp-micros: i64 microseconds since Unix epoch → Timestamptz.
-        AvroValue::TimestampMicros(us) => {
-            let ts = jiff::Timestamp::from_microsecond(*us)
-                .expect("avro TimestampMicros value in jiff range");
-            Datum::Timestamptz(ts)
-        }
+        //
+        // Same rationale: out-of-range → `Datum::Null`, no panic.
+        AvroValue::TimestampMicros(us) => match jiff::Timestamp::from_microsecond(*us) {
+            Ok(ts) => Datum::Timestamptz(ts),
+            Err(_) => Datum::Null,
+        },
 
         // Decimal → Numeric (bigdecimal).
         // apache-avro's `Decimal` wraps a `BigInt` (unscaled value). The real
@@ -1009,6 +1023,68 @@ mod tests {
         let datums = project(&DecodedValue::Protobuf(msg), &cols, None);
         assert_eq!(datums[0], Datum::Int8(1), "id → Int8(1)");
         assert_eq!(datums[1], Datum::Null, "unset optional comment → Null");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: out-of-range Avro temporal values → Datum::Null, NOT a panic.
+    //
+    // Avro date/timestamp-millis/timestamp-micros are bare int/long on the
+    // wire, so a malicious or buggy producer can send a value outside jiff's
+    // representable range.  We must not panic; the result must be Datum::Null.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn avro_out_of_range_timestamp_millis_produces_null() {
+        // i64::MAX milliseconds is far outside jiff's Timestamp range.
+        let val = AvroValue::Record(vec![(
+            "ts".to_string(),
+            AvroValue::TimestampMillis(i64::MAX),
+        )]);
+        let cols = vec![Column {
+            name: "ts".to_string(),
+            ty: ColumnType::Timestamptz,
+        }];
+        let datums = project(&DecodedValue::Avro(val), &cols, None);
+        assert_eq!(
+            datums[0],
+            Datum::Null,
+            "out-of-range TimestampMillis must produce Datum::Null, not panic"
+        );
+    }
+
+    #[test]
+    fn avro_out_of_range_date_produces_null() {
+        // i32::MAX days since epoch is ~5.8 million years — outside jiff's range.
+        let val = AvroValue::Record(vec![("d".to_string(), AvroValue::Date(i32::MAX))]);
+        let cols = vec![Column {
+            name: "d".to_string(),
+            ty: ColumnType::Date,
+        }];
+        let datums = project(&DecodedValue::Avro(val), &cols, None);
+        assert_eq!(
+            datums[0],
+            Datum::Null,
+            "out-of-range Date must produce Datum::Null, not panic"
+        );
+    }
+
+    #[test]
+    fn avro_out_of_range_timestamp_micros_produces_null() {
+        // i64::MAX microseconds is also outside jiff's range.
+        let val = AvroValue::Record(vec![(
+            "ts".to_string(),
+            AvroValue::TimestampMicros(i64::MAX),
+        )]);
+        let cols = vec![Column {
+            name: "ts".to_string(),
+            ty: ColumnType::Timestamptz,
+        }];
+        let datums = project(&DecodedValue::Avro(val), &cols, None);
+        assert_eq!(
+            datums[0],
+            Datum::Null,
+            "out-of-range TimestampMicros must produce Datum::Null, not panic"
+        );
     }
 
     // -----------------------------------------------------------------------

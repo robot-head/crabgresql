@@ -121,7 +121,13 @@ pub(crate) fn execute_ddl(
             server,
             options,
         } => {
-            catalog::create_user_mapping(kv, user, server, options.clone())?;
+            // Normalize `FOR CURRENT_USER` and `FOR PUBLIC` to the catalog key
+            // `"public"` — the same key that the scan path looks up via
+            // `get_user_mapping(kv, fctx.current_user, …)` where
+            // `current_user` is always `"public"` under trust-auth.
+            // Per-named-user mappings await real SQL authentication (phase-2).
+            let resolved_user = normalize_mapping_user(user);
+            catalog::create_user_mapping(kv, resolved_user, server, options.clone())?;
             Ok((command("CREATE USER MAPPING"), Vec::new()))
         }
         Statement::DropUserMapping {
@@ -129,7 +135,12 @@ pub(crate) fn execute_ddl(
             server,
             if_exists,
         } => {
-            ignore_missing(catalog::drop_user_mapping(kv, user, server), *if_exists)?;
+            // Same normalization as CreateUserMapping so DROP matches CREATE.
+            let resolved_user = normalize_mapping_user(user);
+            ignore_missing(
+                catalog::drop_user_mapping(kv, resolved_user, server),
+                *if_exists,
+            )?;
             Ok((command("DROP USER MAPPING"), Vec::new()))
         }
         Statement::CreateForeignTable {
@@ -210,6 +221,22 @@ pub(crate) fn execute_ddl(
 /// A `QueryResult::Command` with the given PostgreSQL completion tag.
 fn command(tag: &str) -> QueryResult {
     QueryResult::Command { tag: tag.into() }
+}
+
+/// Normalize the `user` spec from `CREATE / DROP USER MAPPING FOR <user>` to
+/// the catalog key used by the scan path.
+///
+/// The parser emits `"current_user"` for `FOR CURRENT_USER` and `"public"` for
+/// `FOR PUBLIC`.  Under trust-auth crabgresql has no authenticated SQL user, so
+/// the scan path always looks up the mapping under `"public"`.  Both variants
+/// must therefore resolve to the same catalog key so that a `FOR CURRENT_USER`
+/// mapping is actually found at scan time.
+fn normalize_mapping_user(user: &str) -> &str {
+    if user.eq_ignore_ascii_case("current_user") || user.eq_ignore_ascii_case("public") {
+        "public"
+    } else {
+        user
+    }
 }
 
 /// Swallow a `42704` (undefined object) when `IF EXISTS` was given; propagate
@@ -3304,5 +3331,58 @@ mod tests {
             // And the bounds were pushed (proves it is a real pushdown, not a no-op).
             assert_eq!(seen.lock().expect("lock")[0].start_offsets, vec![(0, 10)]);
         }
+    }
+
+    // ─────────────────── Fix 2: CURRENT_USER / PUBLIC normalization ───────────
+
+    /// `normalize_mapping_user` must map both `"current_user"` and `"public"`
+    /// (any case) to `"public"`, and pass through any other user name unchanged.
+    #[test]
+    fn normalize_mapping_user_maps_current_user_and_public_to_public() {
+        use super::normalize_mapping_user;
+        assert_eq!(normalize_mapping_user("current_user"), "public");
+        assert_eq!(normalize_mapping_user("CURRENT_USER"), "public");
+        assert_eq!(normalize_mapping_user("Current_User"), "public");
+        assert_eq!(normalize_mapping_user("public"), "public");
+        assert_eq!(normalize_mapping_user("PUBLIC"), "public");
+        // Named users pass through unchanged.
+        assert_eq!(normalize_mapping_user("alice"), "alice");
+        assert_eq!(normalize_mapping_user("bob"), "bob");
+    }
+
+    /// `CREATE USER MAPPING FOR CURRENT_USER` must be findable via
+    /// `catalog::get_user_mapping(kv, "public", server)` — confirming the key is
+    /// stored under "public", not "current_user".
+    #[test]
+    fn create_user_mapping_for_current_user_stored_under_public() {
+        use kv::MemKv;
+
+        let kv = MemKv::new();
+        let stmt = pgparser::parser::parse(
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS (username 'u', password 'p')",
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+
+        // execute_ddl must succeed and store under "public".
+        let fctx = super::ForeignCtx {
+            scanner: None,
+            current_user: "public",
+        };
+        let (result, _ops) = super::execute_ddl(&kv, &stmt, fctx).expect("execute_ddl ok");
+        assert!(
+            matches!(result, pgwire::engine::QueryResult::Command { tag } if tag == "CREATE USER MAPPING"),
+            "expected CREATE USER MAPPING command tag"
+        );
+
+        // The mapping must be retrievable under the "public" key.
+        let mapping = catalog::get_user_mapping(&kv, "public", "s")
+            .expect("FOR CURRENT_USER mapping must be stored under 'public'");
+        assert!(
+            mapping.options.iter().any(|(k, _)| k == "username"),
+            "options preserved"
+        );
     }
 }
