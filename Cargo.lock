@@ -1119,9 +1119,9 @@ dependencies = [
 
 [[package]]
 name = "crabka-compression"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96ea50c1bf12b9a4a256488aa08f0f8619e3cf5a7a9b4b40f6002e3917d07b4"
+checksum = "73646e1ba43da95d44da5593b8fb6f6be4bd9e408514fcee5cb2804e7d367996"
 dependencies = [
  "bytes",
  "flate2",
@@ -1187,9 +1187,9 @@ dependencies = [
 
 [[package]]
 name = "crabka-protocol"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fb446754ed3eaf5712134405267aec84ddab1de80af2a58b5673044385be53d"
+checksum = "68f38fee849546c9416b01c3c4d04604e711beddc4f375f2424f77f45c7d2527"
 dependencies = [
  "arbitrary",
  "bytes",
