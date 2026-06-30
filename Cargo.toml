@@ -60,7 +60,7 @@ hmac = "0.13"
 # so the kafka_fdw optional deps unify with the workspace. Both are pure-Rust
 # RustCrypto with an identical pbkdf2_hmac API; zero-C is unaffected. Long-term
 # fix: crabka-security moves to stable pbkdf2 0.13.0.
-pbkdf2 = { version = "=0.13.0-rc.10", default-features = false, features = ["hmac"] }
+pbkdf2 = { version = "=0.13.0", default-features = false, features = ["hmac"] }
 base64 = "0.22"
 rand = "0.10"
 subtle = "2"
